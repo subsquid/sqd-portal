@@ -1,0 +1,110 @@
+{{ $keys := .Values.gateway.libp2p_private_keys }}
+{{ $gatewaysCount := len $keys }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gateway
+spec:
+  serviceName: gateway
+  selector:
+    matchLabels:
+      app: gateway
+  replicas: {{ required "Specify at least one private key for gateways" $gatewaysCount }}
+  template:
+    metadata:
+      labels:
+        app: gateway
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
+        checksum/config: {{ include "gateway_config.yaml" . | sha256sum }}
+    spec:
+      terminationGracePeriodSeconds: 5
+      # podManagementPolicy: Parallel
+      {{- if .Values.gateway.tolerations }}
+      tolerations:
+        {{- toYaml .Values.gateway.tolerations | nindent 8  }}
+      {{- end }}
+      {{- if .Values.gateway.affinity }}
+      affinity:
+        {{- toYaml .Values.gateway.affinity | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: gateway
+        image: {{ .Values.gateway.image }}
+        imagePullPolicy: "Always"
+        ports:
+        - name: http
+          containerPort: 8080
+        env:
+          - name: HTTP_LISTEN_ADDR
+            value: 0.0.0.0:8080
+          - name: BOOT_NODES
+            value: {{ .Values.network.boot_nodes }}
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: KEY_PATH
+            value: /run/keys/$(POD_NAME).key
+          - name: CONFIG_PATH
+            value: /run/config/gateway_config.yaml
+          - name: ALLOCATIONS_DB_PATH
+            value: /data/allocations.db
+          {{- if .Values.gateway.logLevel }}
+          - name: RUST_LOG
+            value: {{ .Values.gateway.logLevel }}
+          {{- end }}
+          - name: RPC_URL
+            value: {{ .Values.rpc.url }}
+          - name: L1_RPC_URL
+            value: {{ .Values.rpc.l1_url }}
+          - name: NETWORK
+            value: {{ .Values.rpc.network }}
+          - name: MTU_DISCOVERY_MAX
+            value: "{{ .Values.network.mtu_discovery_max }}"
+        volumeMounts:
+          - mountPath: /run/keys
+            name: keys
+            readOnly: true
+          - mountPath: /run/config
+            name: conf
+            readOnly: true
+          - mountPath: /data
+            name: epoch-data
+        livenessProbe:
+          tcpSocket:
+            port: http
+          initialDelaySeconds: 1
+          periodSeconds: 30
+        resources:
+          requests:
+            cpu: {{ .Values.gateway.resources.requests.cpu | quote }}
+            memory: {{ .Values.gateway.resources.requests.memory | quote }}
+      volumes:
+        - name: keys
+          secret:
+            secretName: secrets
+            items:
+              {{- range $index, $_ := $keys }}
+              - key: gateway-{{ $index }}.key
+                path: gateway-{{ $index }}.key
+              {{- end }}
+        - name: conf
+          configMap:
+            name: gateway-config
+            items:
+              - key: gateway_config.yaml
+                path: gateway_config.yaml
+        - name: epoch-data
+          persistentVolumeClaim:
+            claimName: epoch-data
+  volumeClaimTemplates:
+    - metadata:
+        name: epoch-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1G

@@ -1,6 +1,7 @@
 /target
 /.vscode
 /.idea
+/chart
 .env
 LICENSE.md
 README.md

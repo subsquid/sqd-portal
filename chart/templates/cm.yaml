@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+data:
+  gateway_config.yaml: |-
+    {{- include "gateway_config.yaml" . | indent 4 }}
