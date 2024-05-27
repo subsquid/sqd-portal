@@ -1,0 +1,6 @@
+/target
+/.vscode
+/.idea
+.env
+LICENSE.md
+README.md
