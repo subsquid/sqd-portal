@@ -1,10 +1,18 @@
 services:
-
   query_gateway:
     image: subsquid/query-gateway:1.0.0
+    environment:
+      KEY_PATH: /run/secrets/network_key
     env_file:
       - .env
+    working_dir: /app/data
     volumes:
       - ./:/app/data
+    secrets:
+      - network_key
     ports:
       - "8000:8000"
+
+secrets:
+  network_key:
+    file: "${KEY_PATH}"
