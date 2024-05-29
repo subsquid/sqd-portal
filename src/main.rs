@@ -60,6 +60,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Init logger and parse arguments and config
+    dotenv::dotenv().ok();
     env_logger::Builder::from_env(Env::default().default_filter_or("info, ethers_providers=warn"))
         .init();
     let args: Cli = Cli::parse();

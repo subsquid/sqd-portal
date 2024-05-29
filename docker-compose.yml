@@ -3,9 +3,13 @@ services:
     image: subsquid/query-gateway:1.0.0
     environment:
       KEY_PATH: /run/secrets/network_key
-    env_file:
-      - .env
-    working_dir: /app/data
+      CONFIG_PATH: /app/data/config.yml
+      ALLOCATIONS_DB_PATH: /app/data/allocations.db
+      HTTP_LISTEN_ADDR: 0.0.0.0:8000
+      NETWORK: "${NETWORK}"
+      BOOT_NODES: "${BOOT_NODES}"
+      RPC_URL: "${RPC_URL}"
+      L1_RPC_URL: "${L1_RPC_URL}"
     volumes:
       - ./:/app/data
     secrets:
