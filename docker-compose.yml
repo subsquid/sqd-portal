@@ -15,7 +15,7 @@ services:
     secrets:
       - network_key
     ports:
-      - "8000:8000"
+      - "${HTTP_LISTEN_ADDR}:8000"
 
 secrets:
   network_key:
