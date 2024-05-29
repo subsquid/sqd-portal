@@ -1,0 +1,10 @@
+services:
+
+  query_gateway:
+    image: subsquid/query-gateway:1.0.0
+    env_file:
+      - .env
+    volumes:
+      - ./:/app/data
+    ports:
+      - "8000:8000"

@@ -1,4 +1,6 @@
 /target
 /.vscode
 /.idea
+.env
 allocations.db
+gateway.key
