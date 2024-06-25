@@ -6,7 +6,7 @@ default_query_timeout_sec: 60
 summary_print_interval_sec: 30
 workers_update_interval_sec: 180
 available_datasets:
-  ethereum-mainnet: "czM6Ly9ldGhlcmV1bS1tYWlubmV0LTE"
-  binance-mainnet: "czM6Ly9ic2MtbWFpbm5ldC0x"
+  ethereum-mainnet: "czM6Ly9ldGhlcmV1bS1tYWlubmV0"
+  binance-mainnet: "czM6Ly9iaW5hbmNlLW1haW5uZXQ"
   base-mainnet: "czM6Ly9iYXNlLTE"
-  moonbeam-mainnet: "czM6Ly9tb29uYmVhbS1ldm0tMQ"
+  arbitrum-one: "czM6Ly9hcmJpdHJ1bS1vbmU"
