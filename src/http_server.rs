@@ -7,7 +7,7 @@ use axum::extract::{Extension, Host, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router, Server};
+use axum::{Json, Router};
 use duration_string::DurationString;
 use flate2::write::GzDecoder;
 use serde::Deserialize;
@@ -188,8 +188,8 @@ pub async fn run_server(
         }
     };
 
-    Server::bind(addr)
-        .serve(app.into_make_service())
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;
 

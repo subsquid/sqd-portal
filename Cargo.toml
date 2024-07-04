@@ -1,17 +1,17 @@
 [package]
 name = "query-gateway"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 
 [dependencies]
 anyhow = "1"
-axum = "0.6"
+axum = "0.7"
 base64 = "0.22"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 derivative = "2"
 dotenv = "0.15"
-duration-string = { version = "0.3", features = ["serde"] }
+duration-string = { version = "0.4", features = ["serde"] }
 env_logger = "0.11"
 flate2 = "1"
 futures = "0.3"
@@ -29,9 +29,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-rusqlite = "0.5"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
-contract-client = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.0" }
-subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.0", features = ["semver"] }
-subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.0", features = ["gateway"] }
+contract-client = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.2" }
+subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.1", features = ["semver"] }
+subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.4", features = ["gateway"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.5"
