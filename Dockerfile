@@ -43,7 +43,7 @@ RUN curl -sL https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq
 WORKDIR /run
 
 COPY --from=builder /app/target/release/query-gateway /usr/local/bin/query-gateway
-COPY config.yml .
+COPY tethys.config.yml ./config.yml
 
 ENV P2P_LISTEN_ADDRS="/ip4/0.0.0.0/udp/12345/quic-v1"
 ENV HTTP_LISTEN_ADDR="0.0.0.0:8000"

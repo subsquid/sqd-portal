@@ -1,9 +1,9 @@
 services:
   query_gateway:
-    image: subsquid/query-gateway:1.0.0
+    image: subsquid/query-gateway:1.0.1
     environment:
       KEY_PATH: /run/secrets/network_key
-      CONFIG_PATH: /app/data/config.yml
+      CONFIG_PATH: /app/data/${NETWORK}.config.yml
       ALLOCATIONS_DB_PATH: /app/data/allocations.db
       HTTP_LISTEN_ADDR: 0.0.0.0:8000
       NETWORK: "${NETWORK}"
