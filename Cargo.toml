@@ -1,6 +1,6 @@
 [package]
 name = "query-gateway"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 
 [dependencies]
@@ -29,7 +29,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-rusqlite = "0.5"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
-contract-client = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.2" }
+contract-client = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.3" }
 subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.1", features = ["semver"] }
 subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.4", features = ["gateway"] }
 
