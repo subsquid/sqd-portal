@@ -2,16 +2,18 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use contract_client::Worker;
 use rand::prelude::IteratorRandom;
+use serde::{Deserialize, Serialize};
 use tabled::Tabled;
 
-use crate::config::{Config, DatasetId};
-use contract_client::Worker;
 use subsquid_messages::RangeSet;
 use subsquid_network_transport::PeerId;
 
-#[derive(Default)]
-struct DatasetState {
+use crate::config::{Config, DatasetId};
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetState {
     worker_ranges: HashMap<PeerId, RangeSet>,
     highest_seen_block: u32,
 }
@@ -191,5 +193,9 @@ impl NetworkState {
             .available_datasets
             .iter()
             .map(|(name, id)| DatasetSummary::new(name, self.dataset_states.get(id)))
+    }
+
+    pub fn network_state(&self) -> HashMap<DatasetId, DatasetState> {
+        self.dataset_states.clone()
     }
 }

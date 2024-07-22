@@ -1,11 +1,12 @@
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use base64::Engine;
-use serde::Deserialize;
-use serde_with::{serde_as, DurationSeconds};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 use std::time::Duration;
+
+use base64::Engine;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
+use serde_with::{DurationSeconds, serde_as};
 use subsquid_network_transport::PeerId;
 use tokio::sync::OnceCell;
 
@@ -32,7 +33,7 @@ fn default_workers_update_interval() -> Duration {
 }
 
 /// This struct exists not to confuse dataset name with it's encoded ID
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetId(pub String);
 
 impl Display for DatasetId {

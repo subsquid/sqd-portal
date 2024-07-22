@@ -12,10 +12,10 @@ use duration_string::DurationString;
 use flate2::write::GzDecoder;
 use serde::Deserialize;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::RwLock;
 
 use subsquid_messages::OkResult;
 use subsquid_network_transport::PeerId;
-use tokio::sync::RwLock;
 
 use crate::client::QueryClient;
 use crate::config::{Config, DatasetId};
@@ -164,6 +164,12 @@ async fn greylisted_workers(
     Json(network_state.read().await.greylisted_workers()).into_response()
 }
 
+async fn get_network_state(
+    Extension(network_state): Extension<Arc<RwLock<NetworkState>>>,
+) -> Response {
+    Json(network_state.read().await.network_state()).into_response()
+}
+
 pub async fn run_server(
     query_client: QueryClient,
     network_state: Arc<RwLock<NetworkState>>,
@@ -173,6 +179,7 @@ pub async fn run_server(
     let app = Router::new()
         .route("/network/:dataset/height", get(get_height))
         .route("/network/:dataset/:start_block/worker", get(get_worker))
+        .route("/network/state", get(get_network_state))
         .route("/query/:dataset_id/:worker_id", post(execute_query))
         .route("/metrics", get(get_metrics))
         .route("/workers/greylisted", get(greylisted_workers))

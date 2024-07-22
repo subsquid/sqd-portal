@@ -6,11 +6,11 @@ default_query_timeout_sec: 60
 summary_print_interval_sec: 30
 workers_update_interval_sec: 180
 available_datasets:
-  arbitrum-one: czM6Ly9hcmJpdHJ1bS1vbmU
-  base-mainnet: czM6Ly9iYXNlLTE
-  binance-mainnet: czM6Ly9iaW5hbmNlLW1haW5uZXQ
-  ethereum-mainnet: czM6Ly9ldGhlcmV1bS1tYWlubmV0
-  ethereum-sepolia: czM6Ly9ldGhlcmV1bS1zZXBvbGlhLTE
-  polygon-mainnet: czM6Ly9wb2x5Z29uLW1haW5uZXQtdHJhY2VsZXNzLTE
-  polygon-zkevm-mainnet: czM6Ly9wb2x5Z29uLXprZXZtLW1haW5uZXQtdHJhY2VsZXNz
-  zksync-mainnet: czM6Ly96a3N5bmMtbWFpbm5ldC0x
+  ethereum-mainnet: "czM6Ly9ldGhlcmV1bS1tYWlubmV0"
+  binance-mainnet: "czM6Ly9iaW5hbmNlLW1haW5uZXQ"
+  base-mainnet: "czM6Ly9iYXNlLTE"
+  arbitrum-one: "czM6Ly9hcmJpdHJ1bS1vbmU"
+  ethereum-sepolia: "czM6Ly9ldGhlcmV1bS1zZXBvbGlhLTE"
+  polygon-mainnet: "czM6Ly9wb2x5Z29uLW1haW5uZXQtdHJhY2VsZXNzLTE"
+  polygon-zkevm-mainnet: "czM6Ly9wb2x5Z29uLXprZXZtLW1haW5uZXQtdHJhY2VsZXNz"
+  zksync-mainnet: "czM6Ly96a3N5bmMtbWFpbm5ldC0x"
