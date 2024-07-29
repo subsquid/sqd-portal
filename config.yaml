@@ -1,0 +1,6 @@
+worker_inactive_threshold_sec: 120
+worker_greylist_time_sec: 1800
+available_datasets:
+  ethereum-mainnet: "s3://ethereum-mainnet"
+  binance-mainnet: "s3://binance-mainnet"
+  base: "s3://base-1"
