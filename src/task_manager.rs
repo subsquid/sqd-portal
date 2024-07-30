@@ -18,16 +18,14 @@ const MAX_PARALLEL_STREAMS: u8 = 5;
 /// Tracks all existing streams
 pub struct TaskManager {
     network_client: Arc<NetworkClient>,
-    stream_buffer_size: usize,
     running_tasks: AtomicU8,
     next_stream_id: AtomicUsize,
 }
 
 impl TaskManager {
-    pub fn new(network_client: Arc<NetworkClient>, stream_buffer_size: usize) -> TaskManager {
+    pub fn new(network_client: Arc<NetworkClient>) -> TaskManager {
         TaskManager {
             network_client,
-            stream_buffer_size,
             running_tasks: 0.into(),
             next_stream_id: 0.into(),
         }
@@ -51,10 +49,9 @@ impl TaskManager {
             metrics::COMPLETED_STREAMS.inc();
         });
 
-        let streamer = StreamController::spawn(
+        let streamer = StreamController::new(
             request,
             self.next_stream_id.fetch_add(1, Ordering::Relaxed),
-            self.stream_buffer_size,
             self.network_client.clone(),
         );
         let mut streamer = streamer?;

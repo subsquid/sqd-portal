@@ -21,9 +21,6 @@ pub struct Cli {
     #[arg(long, env)]
     pub logs_collector_id: PeerId,
 
-    #[arg(long, env, default_value_t = 10)]
-    pub buffer_size: usize,
-
     #[arg(long, env, value_parser = Config::read)]
     pub config: Config,
 }
@@ -41,7 +38,27 @@ fn default_worker_greylist_time() -> Duration {
 }
 
 fn default_transport_timeout() -> Duration {
-    Duration::from_secs(5)
+    Duration::from_secs(60)
+}
+
+fn default_default_buffer_size() -> usize {
+    10
+}
+
+fn default_default_chunk_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn default_default_backoff() -> Duration {
+    Duration::from_secs(1)
+}
+
+fn default_default_request_multiplier() -> usize {
+    1
+}
+
+fn default_default_retries() -> usize {
+    3
 }
 
 #[serde_as]
@@ -67,6 +84,26 @@ pub struct Config {
         default = "default_transport_timeout"
     )]
     pub transport_timeout: Duration,
+
+    #[serde(default = "default_default_buffer_size")]
+    pub default_buffer_size: usize,
+
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(
+        rename = "default_chunk_timeout_sec",
+        default = "default_default_chunk_timeout"
+    )]
+    pub default_chunk_timeout: Duration,
+
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(rename = "default_backoff_sec", default = "default_default_backoff")]
+    pub default_backoff: Duration,
+
+    #[serde(default = "default_default_request_multiplier")]
+    pub default_request_multiplier: usize,
+
+    #[serde(default = "default_default_retries")]
+    pub default_retries: usize,
 
     // Dataset alias -> bucket URL
     pub available_datasets: HashMap<String, String>,

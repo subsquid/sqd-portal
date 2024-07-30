@@ -5,7 +5,11 @@ use super::{DataChunk, DatasetId};
 pub struct ClientRequest {
     pub dataset_id: DatasetId,
     pub query: ParsedQuery,
+    pub buffer_size: usize,
     pub chunk_timeout: Duration,
+    pub request_multiplier: usize,
+    pub backoff: Duration,
+    pub retries: usize,
 }
 
 pub struct ParsedQuery {

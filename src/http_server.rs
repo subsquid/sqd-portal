@@ -1,12 +1,13 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
+    async_trait,
     body::Body,
-    extract::Path,
+    extract::{FromRequest, Path, Query, Request},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Extension, Router,
+    Extension, RequestExt, Router,
 };
 use futures::StreamExt;
 use prometheus_client::registry::Registry;
@@ -41,28 +42,11 @@ async fn get_height(
 async fn execute_query(
     Path(dataset): Path<String>,
     Extension(task_manager): Extension<Arc<TaskManager>>,
-    Extension(config): Extension<Arc<Config>>,
-    query: String, // request body
+    request: ClientRequest,
 ) -> Response {
     tracing::info!("Processing query for dataset {dataset}");
-    let Some(dataset_id) = config.dataset_id(&dataset) else {
-        return RequestError::NotFound(format!("Unknown dataset: {dataset}")).into_response();
-    };
-    let query = match query.parse() {
-        Ok(query) => query,
-        Err(e) => {
-            return RequestError::BadRequest(format!("Couldn't parse query: {e}")).into_response()
-        }
-    };
 
-    let stream = match task_manager
-        .spawn_stream(ClientRequest {
-            chunk_timeout: Duration::from_secs(60),
-            dataset_id,
-            query,
-        })
-        .await
-    {
+    let stream = match task_manager.spawn_stream(request).await {
         Ok(stream) => stream,
         Err(e) => return e.into_response(),
     };
@@ -112,4 +96,105 @@ pub async fn run_server(
 
     tracing::info!("HTTP server stopped");
     Ok(())
+}
+
+#[async_trait]
+impl<S> FromRequest<S> for ClientRequest
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let Path(dataset) = req
+            .extract_parts::<Path<String>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Query(params) = req
+            .extract_parts::<Query<HashMap<String, String>>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Extension(config) = req
+            .extract_parts::<Extension<Arc<Config>>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let query: String = req.extract().await.map_err(IntoResponse::into_response)?;
+
+        let Some(dataset_id) = config.dataset_id(&dataset) else {
+            return Err(
+                RequestError::NotFound(format!("Unknown dataset: {dataset}")).into_response(),
+            );
+        };
+        let query = query.parse().map_err(|e| {
+            RequestError::BadRequest(format!("Couldn't parse query: {e}")).into_response()
+        })?;
+        let buffer_size = match params.get("buffer_size").map(|v| v.parse()) {
+            Some(Ok(value)) => value,
+            Some(Err(e)) => {
+                return Err(
+                    RequestError::BadRequest(format!("Couldn't parse buffer_size: {e}"))
+                        .into_response(),
+                )
+            }
+            None => config.default_buffer_size,
+        };
+        let chunk_timeout = match params.get("chunk_timeout") {
+            Some(value) => match value.parse() {
+                Ok(seconds) => Duration::from_secs(seconds),
+                Err(e) => {
+                    return Err(RequestError::BadRequest(format!(
+                        "Couldn't parse chunk_timeout: {e}"
+                    ))
+                    .into_response())
+                }
+            },
+            None => config.default_chunk_timeout,
+        };
+        let backoff = match params.get("backoff") {
+            Some(value) => match value.parse() {
+                Ok(seconds) => Duration::from_secs(seconds),
+                Err(e) => {
+                    return Err(
+                        RequestError::BadRequest(format!("Couldn't parse backoff: {e}"))
+                            .into_response(),
+                    )
+                }
+            },
+            None => config.default_backoff,
+        };
+        let request_multiplier = match params.get("request_multiplier") {
+            Some(value) => match value.parse() {
+                Ok(value) => value,
+                Err(e) => {
+                    return Err(RequestError::BadRequest(format!(
+                        "Couldn't parse request_multiplier: {e}"
+                    ))
+                    .into_response())
+                }
+            },
+            None => config.default_request_multiplier,
+        };
+        let retries = match params.get("retries") {
+            Some(value) => match value.parse() {
+                Ok(value) => value,
+                Err(e) => {
+                    return Err(
+                        RequestError::BadRequest(format!("Couldn't parse retries: {e}"))
+                            .into_response(),
+                    )
+                }
+            },
+            None => config.default_retries,
+        };
+
+        Ok(ClientRequest {
+            dataset_id,
+            query,
+            buffer_size,
+            chunk_timeout,
+            backoff,
+            request_multiplier,
+            retries,
+        })
+    }
 }

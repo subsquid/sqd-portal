@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let network_client =
         Arc::new(NetworkClient::new(args.transport, args.logs_collector_id, config.clone()).await?);
     tracing::info!("Network client initialized");
-    let task_manager = Arc::new(TaskManager::new(network_client.clone(), args.buffer_size));
+    let task_manager = Arc::new(TaskManager::new(network_client.clone()));
 
     let (res, ()) = tokio::join!(
         run_server(
