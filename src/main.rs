@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 mod cli;
 mod http_server;
+mod metrics;
 mod network;
 mod stream;
 mod task_manager;
@@ -44,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         run_server(
             task_manager,
             network_client.clone(),
+            metrics::create_registry(),
             &args.http_listen,
             config
         ),

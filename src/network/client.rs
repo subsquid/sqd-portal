@@ -12,9 +12,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    cli::Config,
-    types::{generate_query_id, DatasetId, QueryId},
-    utils::UseOnce,
+    cli::Config, metrics, types::{generate_query_id, DatasetId, QueryId}, utils::UseOnce
 };
 
 use super::{NetworkState, StorageClient};
@@ -91,7 +89,7 @@ impl NetworkClient {
             .find_worker(dataset, chunk.first_block())
     }
 
-    pub fn get_height(&self, dataset: &DatasetId) -> Option<u64> {
+    pub fn get_height(&self, dataset: &DatasetId) -> Option<u32> {
         self.network_state.read().get_height(dataset)
     }
 
@@ -114,6 +112,7 @@ impl NetworkClient {
             },
         )?;
         tracing::trace!("Sent query {query_id} to {worker}");
+        metrics::QUERIES_SENT.inc();
 
         let (result_tx, result_rx) = oneshot::channel();
         let task = QueryTask {
@@ -126,6 +125,7 @@ impl NetworkClient {
 
     fn handle_ping(&self, peer_id: PeerId, ping: Ping) {
         tracing::trace!("Ping from {peer_id}");
+        metrics::PINGS_TOTAL.inc();
         let worker_state = ping
             .stored_ranges
             .into_iter()
@@ -140,6 +140,7 @@ impl NetworkClient {
         let QueryResult { query_id, result } = result;
         let result = result.ok_or_else(|| anyhow::anyhow!("Result missing"))?;
         tracing::trace!("Got result for query {query_id}");
+        metrics::report_query_result(&result);
 
         let (query_id, task) = self
             .tasks

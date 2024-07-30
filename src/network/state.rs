@@ -6,6 +6,7 @@ use std::time::Instant;
 use rand::prelude::IteratorRandom;
 
 use crate::cli::Config;
+use crate::metrics;
 use crate::types::DatasetId;
 use contract_client::Worker;
 use subsquid_messages::RangeSet;
@@ -15,6 +16,7 @@ use subsquid_network_transport::PeerId;
 struct DatasetState {
     worker_ranges: HashMap<PeerId, RangeSet>,
     highest_seen_block: u32,
+    first_gap: u32,
 }
 
 impl DatasetState {
@@ -25,13 +27,20 @@ impl DatasetState {
     }
 
     pub fn update(&mut self, peer_id: PeerId, state: RangeSet) {
+        let mut could_close_gap = false;
         if let Some(range) = state.ranges.last() {
-            self.highest_seen_block = max(self.highest_seen_block, range.end)
+            self.highest_seen_block = max(self.highest_seen_block, range.end);
+            if range.end >= self.first_gap {
+                could_close_gap = true;
+            }
         }
         self.worker_ranges.insert(peer_id, state);
+        if could_close_gap {
+            self.first_gap = self.highest_indexable_block() + 1;
+        }
     }
 
-    pub fn highest_indexable_block(&self) -> u64 {
+    pub fn highest_indexable_block(&self) -> u32 {
         let range_set: RangeSet = self
             .worker_ranges
             .values()
@@ -39,7 +48,7 @@ impl DatasetState {
             .flat_map(|r| r.ranges)
             .into();
         match range_set.ranges.first() {
-            Some(range) if range.begin == 0 => range.end as u64,
+            Some(range) if range.begin == 0 => range.end,
             _ => 0,
         }
     }
@@ -138,14 +147,18 @@ impl NetworkState {
         mut worker_state: HashMap<DatasetId, RangeSet>,
     ) {
         self.last_pings.insert(worker_id, Instant::now());
+        metrics::KNOWN_WORKERS.set(self.last_pings.len() as i64);
         for dataset_id in self.config.dataset_ids() {
             let dataset_state = worker_state
                 .remove(&dataset_id)
                 .unwrap_or_else(RangeSet::empty);
-            self.dataset_states
-                .entry(dataset_id)
-                .or_default()
-                .update(worker_id, dataset_state);
+            let entry = self.dataset_states.entry(dataset_id.clone()).or_default();
+            entry.update(worker_id, dataset_state);
+            metrics::report_dataset_updated(
+                &dataset_id,
+                entry.highest_seen_block,
+                entry.highest_seen_block,
+            );
         }
     }
 
@@ -159,7 +172,7 @@ impl NetworkState {
         self.worker_greylist.insert(worker_id, Instant::now());
     }
 
-    pub fn get_height(&self, dataset_id: &DatasetId) -> Option<u64> {
+    pub fn get_height(&self, dataset_id: &DatasetId) -> Option<u32> {
         self.dataset_states
             .get(dataset_id)
             .map(|state| state.highest_indexable_block())

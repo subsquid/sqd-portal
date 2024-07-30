@@ -5575,6 +5575,7 @@ dependencies = [
  "contract-client",
  "dotenv",
  "futures",
+ "lazy_static",
  "parking_lot",
  "prometheus-client",
  "rand",

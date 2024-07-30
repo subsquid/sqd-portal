@@ -7,6 +7,7 @@ use async_stream::stream;
 use futures::Stream;
 
 use crate::{
+    metrics,
     network::NetworkClient,
     stream::StreamController,
     types::{ClientRequest, RequestError, ResponseChunk},
@@ -36,13 +37,18 @@ impl TaskManager {
         self: Arc<Self>,
         request: ClientRequest,
     ) -> Result<impl Stream<Item = ResponseChunk>, RequestError> {
-        if self.running_tasks.fetch_add(1, Ordering::Relaxed) >= MAX_PARALLEL_STREAMS {
+        let running_tasks = self.running_tasks.fetch_add(1, Ordering::Relaxed);
+        if running_tasks >= MAX_PARALLEL_STREAMS {
             self.running_tasks.fetch_sub(1, Ordering::Relaxed);
             return Err(RequestError::Busy);
         }
+        metrics::ACTIVE_STREAMS.set(running_tasks as i64 + 1);
+
         let self_clone = self.clone();
         let guard = scopeguard::guard((), move |_| {
-            self_clone.running_tasks.fetch_sub(1, Ordering::Relaxed);
+            let prev = self_clone.running_tasks.fetch_sub(1, Ordering::Relaxed);
+            metrics::ACTIVE_STREAMS.set(prev as i64 - 1);
+            metrics::COMPLETED_STREAMS.inc();
         });
 
         let streamer = StreamController::spawn(

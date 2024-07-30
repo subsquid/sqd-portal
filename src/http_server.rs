@@ -3,12 +3,13 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{
     body::Body,
     extract::Path,
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Router,
 };
 use futures::StreamExt;
+use prometheus_client::registry::Registry;
 
 use crate::{
     cli::Config,
@@ -58,7 +59,7 @@ async fn execute_query(
         .spawn_stream(ClientRequest {
             chunk_timeout: Duration::from_secs(60),
             dataset_id,
-            query: query,
+            query,
         })
         .await
     {
@@ -69,9 +70,30 @@ async fn execute_query(
     Response::builder().body(Body::from_stream(stream)).unwrap()
 }
 
+async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {
+    lazy_static::lazy_static! {
+        static ref HEADERS: HeaderMap = {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                "application/openmetrics-text; version=1.0.0; charset=utf-8"
+                    .parse()
+                    .unwrap(),
+            );
+            headers
+        };
+    }
+
+    let mut buffer = String::new();
+    prometheus_client::encoding::text::encode(&mut buffer, &registry).unwrap();
+
+    (HEADERS.clone(), buffer)
+}
+
 pub async fn run_server(
     task_manager: Arc<TaskManager>,
     network_state: Arc<NetworkClient>,
+    metrics_registry: Registry,
     addr: &SocketAddr,
     config: Arc<Config>,
 ) -> anyhow::Result<()> {
@@ -79,9 +101,11 @@ pub async fn run_server(
     let app = Router::new()
         .route("/network/:dataset/height", get(get_height))
         .route("/stream/:dataset", post(execute_query))
+        .route("/metrics", get(get_metrics))
         .layer(Extension(task_manager))
         .layer(Extension(network_state))
-        .layer(Extension(config));
+        .layer(Extension(config))
+        .layer(Extension(Arc::new(metrics_registry)));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
