@@ -1,6 +1,6 @@
 [package]
 name = "query-gateway"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 
 [dependencies]
@@ -31,7 +31,7 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 contract-client = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.4" }
 subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.2", features = ["semver"] }
-subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.8", features = ["gateway"] }
+subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.9", features = ["gateway"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
