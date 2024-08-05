@@ -34,6 +34,9 @@ async fn main() -> anyhow::Result<()> {
     setup_tracing()?;
     let args = Cli::parse();
     let config = Arc::new(args.config);
+    let mut metrics_registry = Default::default();
+    metrics::register_metrics(&mut metrics_registry);
+    subsquid_network_transport::metrics::register_metrics(&mut metrics_registry);
     let cancellation_token = CancellationToken::new();
 
     let network_client =
@@ -45,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         run_server(
             task_manager,
             network_client.clone(),
-            metrics::create_registry(),
+            metrics_registry,
             &args.http_listen,
             config
         ),

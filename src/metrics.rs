@@ -39,13 +39,7 @@ pub fn report_dataset_updated(dataset_id: &DatasetId, highest_block: u32, first_
         .set(first_gap as i64);
 }
 
-pub fn create_registry() -> Registry {
-    let mut registry = Default::default();
-    register_metrics(&mut registry);
-    registry
-}
-
-fn register_metrics(registry: &mut Registry) {
+pub fn register_metrics(registry: &mut Registry) {
     registry.register("pings", "Number of received pings", PINGS_TOTAL.clone());
     registry.register(
         "queries_sent",

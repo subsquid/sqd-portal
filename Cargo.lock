@@ -1204,6 +1204,22 @@ checksum = "245097e9a4535ee1e3e3931fcfcd55a796a44c643e8596ff6566d68f09b87bbc"
 [[package]]
 name = "contract-client"
 version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "ethers",
+ "libp2p",
+ "log",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "url",
+]
+
+[[package]]
+name = "contract-client"
+version = "1.0.0"
 source = "git+https://github.com/subsquid/subsquid-network.git?rev=3735454#373545485445c56e44285ef26965fba071f9146b"
 dependencies = [
  "async-trait",
@@ -5507,7 +5523,6 @@ dependencies = [
 [[package]]
 name = "subsquid-messages"
 version = "1.0.0"
-source = "git+https://github.com/subsquid/subsquid-network.git?rev=3735454#373545485445c56e44285ef26965fba071f9146b"
 dependencies = [
  "anyhow",
  "hex",
@@ -5536,13 +5551,12 @@ dependencies = [
 [[package]]
 name = "subsquid-network-transport"
 version = "1.0.0"
-source = "git+https://github.com/subsquid/subsquid-network.git?rev=3735454#373545485445c56e44285ef26965fba071f9146b"
 dependencies = [
  "anyhow",
  "async-trait",
  "bimap",
  "clap",
- "contract-client",
+ "contract-client 1.0.0",
  "derivative",
  "env_logger",
  "futures",
@@ -5572,7 +5586,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
- "contract-client",
+ "contract-client 1.0.0 (git+https://github.com/subsquid/subsquid-network.git?rev=3735454)",
  "dotenv",
  "futures",
  "lazy_static",

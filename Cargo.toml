@@ -32,5 +32,5 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 contract-client = { git = "https://github.com/subsquid/subsquid-network.git", rev="3735454", version = "1.0.0" }
 subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", rev="3735454", version = "1.0.0", features = ["semver"] }
-subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", rev="3735454", version = "1.0.0", features = ["gateway"] }
+subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", rev="3735454", version = "1.0.0", features = ["gateway", "metrics"] }
 subsquid-datasets = { path = "../archive-router/crates/datasets" }
