@@ -33,8 +33,12 @@ fn default_worker_inactive_threshold() -> Duration {
     Duration::from_secs(120)
 }
 
-fn default_worker_greylist_time() -> Duration {
-    Duration::from_secs(1800)
+fn default_min_worker_priority() -> i8 {
+    -5
+}
+
+fn default_max_worker_priority() -> i8 {
+    3
 }
 
 fn default_transport_timeout() -> Duration {
@@ -71,12 +75,11 @@ pub struct Config {
     )]
     pub worker_inactive_threshold: Duration,
 
-    #[serde_as(as = "DurationSeconds")]
-    #[serde(
-        rename = "worker_greylist_time_sec",
-        default = "default_worker_greylist_time"
-    )]
-    pub worker_greylist_time: Duration,
+    #[serde(default = "default_min_worker_priority")]
+    pub min_worker_priority: i8,
+
+    #[serde(default = "default_max_worker_priority")]
+    pub max_worker_priority: i8,
 
     #[serde_as(as = "DurationSeconds")]
     #[serde(

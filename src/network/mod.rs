@@ -1,4 +1,5 @@
 mod client;
+mod priorities;
 mod state;
 mod storage;
 

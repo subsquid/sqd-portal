@@ -16,7 +16,6 @@ futures = "0.3"
 lazy_static = "1.4.0"
 parking_lot = "0.12"
 prometheus-client = "0.22"
-rand = "0.8.5"
 scopeguard = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
@@ -34,3 +33,4 @@ contract-client = { git = "https://github.com/subsquid/subsquid-network.git", re
 subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", rev="3735454", version = "1.0.0", features = ["semver"] }
 subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", rev="3735454", version = "1.0.0", features = ["gateway", "metrics"] }
 subsquid-datasets = { path = "../archive-router/crates/datasets" }
+static_assertions = "1.1.0"

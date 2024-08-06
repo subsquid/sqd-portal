@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use contract_client::PeerId;
 use futures::{Stream, StreamExt};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use subsquid_messages::{data_chunk::DataChunk, query_result, Ping, Query, QueryResult};
 use subsquid_network_transport::{
     GatewayConfig, GatewayEvent, GatewayTransportHandle, P2PTransportBuilder, QueueFull,
@@ -12,7 +12,10 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    cli::Config, metrics, types::{generate_query_id, DatasetId, QueryId}, utils::UseOnce
+    cli::Config,
+    metrics,
+    types::{generate_query_id, DatasetId, QueryId},
+    utils::UseOnce,
 };
 
 use super::{NetworkState, StorageClient};
@@ -21,7 +24,7 @@ use super::{NetworkState, StorageClient};
 pub struct NetworkClient {
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
     transport_handle: GatewayTransportHandle,
-    network_state: RwLock<NetworkState>,
+    network_state: Mutex<NetworkState>,
     tasks: Mutex<HashMap<QueryId, QueryTask>>,
     dataset_storage: StorageClient,
 }
@@ -47,7 +50,7 @@ impl NetworkClient {
         Ok(NetworkClient {
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
-            network_state: RwLock::new(NetworkState::new(config)),
+            network_state: Mutex::new(NetworkState::new(config)),
             tasks: Mutex::new(HashMap::new()),
             dataset_storage,
         })
@@ -85,12 +88,12 @@ impl NetworkClient {
 
     pub fn find_worker(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<PeerId> {
         self.network_state
-            .read()
+            .lock()
             .find_worker(dataset, chunk.first_block())
     }
 
     pub fn get_height(&self, dataset: &DatasetId) -> Option<u32> {
-        self.network_state.read().get_height(dataset)
+        self.network_state.lock().get_height(dataset)
     }
 
     pub fn query_worker(
@@ -132,7 +135,7 @@ impl NetworkClient {
             .map(|r| (DatasetId::from_url(r.url), r.ranges.into()))
             .collect();
         self.network_state
-            .write()
+            .lock()
             .update_dataset_states(peer_id, worker_state);
     }
 
@@ -153,21 +156,31 @@ impl NetworkClient {
                 task.worker_id,
                 peer_id
             );
-            self.network_state.write().greylist_worker(peer_id);
+            self.network_state.lock().report_query_error(peer_id);
         }
 
         match &result {
-            // Greylist worker if server error occurred during query execution
             query_result::Result::ServerError(e) => {
                 tracing::warn!("Server error returned for query {query_id}: {e}");
-                self.network_state.write().greylist_worker(peer_id);
+                self.network_state.lock().report_query_error(peer_id);
             }
-            // Add worker to the missing allocations cache
             query_result::Result::NoAllocation(()) => {
-                self.network_state.write().no_allocation_for_worker(peer_id);
+                self.network_state.lock().report_no_allocation(peer_id);
             }
-            _ => {}
-        }
+            query_result::Result::Timeout(_) => {
+                self.network_state.lock().report_query_timeout(peer_id);
+            }
+            query_result::Result::Ok(_) | query_result::Result::BadRequest(_) => {
+                if task.result_tx.send(result).is_ok() {
+                    self.network_state.lock().report_query_success(peer_id);
+                } else {
+                    // The result is no longer needed. Either another query has got the result first,
+                    // or the stream has been dropped. In either case, consider the query timed out.
+                    self.network_state.lock().report_query_timeout(peer_id);
+                }
+                return Ok(());
+            }
+        };
 
         task.result_tx.send(result).ok();
 

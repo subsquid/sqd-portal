@@ -1,16 +1,15 @@
 use std::cmp::max;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-
-use rand::prelude::IteratorRandom;
 
 use crate::cli::Config;
 use crate::metrics;
 use crate::types::DatasetId;
-use contract_client::Worker;
 use subsquid_messages::RangeSet;
 use subsquid_network_transport::PeerId;
+
+use super::priorities::WorkersPool;
 
 #[derive(Default)]
 struct DatasetState {
@@ -58,87 +57,31 @@ pub struct NetworkState {
     config: Arc<Config>,
     dataset_states: HashMap<DatasetId, DatasetState>,
     last_pings: HashMap<PeerId, Instant>,
-    worker_greylist: HashMap<PeerId, Instant>,
-    workers_without_allocation: HashSet<PeerId>,
-    registered_workers: HashSet<PeerId>,
+    pool: WorkersPool,
 }
 
 impl NetworkState {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
-            config,
+            config: config.clone(),
             dataset_states: Default::default(),
             last_pings: Default::default(),
-            worker_greylist: Default::default(),
-            workers_without_allocation: Default::default(),
-            registered_workers: Default::default(),
+            pool: WorkersPool::new(config),
         }
     }
 
-    pub fn find_worker(&self, dataset_id: &DatasetId, start_block: u32) -> Option<PeerId> {
-        // tracing::debug!("Looking for worker dataset_id={dataset_id}, start_block={start_block}");
+    pub fn find_worker(&mut self, dataset_id: &DatasetId, start_block: u32) -> Option<PeerId> {
         let dataset_state = match self.dataset_states.get(dataset_id) {
             None => return None,
             Some(state) => state,
         };
 
-        // Choose a random active worker having the requested start_block
-        let mut worker = dataset_state
+        // Choose an active worker having the requested start_block with the top priority
+        let deadline = Instant::now() - self.config.worker_inactive_threshold;
+        let available = dataset_state
             .get_workers_with_block(start_block)
-            .filter(|peer_id| self.worker_available(peer_id, false))
-            .choose(&mut rand::thread_rng());
-
-        // If no worker is found, try grey-listed workers
-        if worker.is_none() {
-            worker = dataset_state
-                .get_workers_with_block(start_block)
-                .filter(|peer_id| self.worker_available(peer_id, true))
-                .choose(&mut rand::thread_rng());
-        }
-
-        worker
-    }
-
-    fn worker_available(&self, worker_id: &PeerId, allow_greylisted: bool) -> bool {
-        // self.registered_workers.contains(worker_id)
-        self.worker_has_allocation(worker_id)
-            && self.worker_active(worker_id)
-            && (allow_greylisted || !self.worker_greylisted(worker_id))
-    }
-
-    fn worker_active(&self, worker_id: &PeerId) -> bool {
-        let inactive_threshold = self.config.worker_inactive_threshold;
-        self.last_pings
-            .get(worker_id)
-            .is_some_and(|t| *t + inactive_threshold > Instant::now())
-    }
-
-    fn worker_greylisted(&self, worker_id: &PeerId) -> bool {
-        let greylist_time = self.config.worker_greylist_time;
-        self.worker_greylist
-            .get(worker_id)
-            .is_some_and(|t| *t + greylist_time > Instant::now())
-    }
-
-    pub fn greylisted_workers(&self) -> Vec<PeerId> {
-        let greylist_time = self.config.worker_greylist_time;
-        let now = Instant::now();
-        self.worker_greylist
-            .iter()
-            .filter_map(|(worker_id, t)| (*t + greylist_time > now).then_some(*worker_id))
-            .collect()
-    }
-
-    pub fn reset_allocations_cache(&mut self) {
-        self.workers_without_allocation.clear();
-    }
-
-    pub fn no_allocation_for_worker(&mut self, worker_id: PeerId) {
-        self.workers_without_allocation.insert(worker_id);
-    }
-
-    pub fn worker_has_allocation(&self, worker_id: &PeerId) -> bool {
-        !self.workers_without_allocation.contains(worker_id)
+            .filter(|peer_id| Self::worker_active(&self.last_pings, peer_id, deadline));
+        self.pool.pick(available)
     }
 
     pub fn update_dataset_states(
@@ -162,19 +105,37 @@ impl NetworkState {
         }
     }
 
-    pub fn update_registered_workers(&mut self, workers: Vec<Worker>) {
-        tracing::debug!("Updating registered workers: {workers:?}");
-        self.registered_workers = workers.into_iter().map(|w| w.peer_id).collect();
+    pub fn report_query_success(&mut self, worker: PeerId) {
+        self.pool.success(worker);
     }
 
-    pub fn greylist_worker(&mut self, worker_id: PeerId) {
-        tracing::info!("Grey-listing worker {worker_id}");
-        self.worker_greylist.insert(worker_id, Instant::now());
+    pub fn report_query_error(&mut self, worker: PeerId) {
+        self.pool.error(worker);
+    }
+
+    pub fn report_query_timeout(&mut self, worker: PeerId) {
+        self.pool.timeout(worker);
+    }
+
+    pub fn report_no_allocation(&mut self, worker: PeerId) {
+        self.pool.unavailable(worker);
+    }
+
+    pub fn reset_cache(&mut self) {
+        self.pool.reset();
     }
 
     pub fn get_height(&self, dataset_id: &DatasetId) -> Option<u32> {
         self.dataset_states
             .get(dataset_id)
             .map(|state| state.highest_indexable_block())
+    }
+
+    fn worker_active(
+        last_pings: &HashMap<PeerId, Instant>,
+        worker_id: &PeerId,
+        deadline: Instant,
+    ) -> bool {
+        last_pings.get(worker_id).is_some_and(|t| *t > deadline)
     }
 }
