@@ -229,9 +229,8 @@ impl<S: Stream<Item = GatewayEvent> + Send + Unpin + 'static> Server<S> {
     async fn ping(&mut self, peer_id: PeerId, ping: Ping) {
         log::trace!("Ping from {peer_id}: {ping:?}");
 
-        let version = ping.sem_version();
-        if !SUPPORTED_WORKER_VERSIONS.matches(&version) {
-            return log::debug!("Worker {peer_id} version not supported: {}", version);
+        if !ping.version_matches(&SUPPORTED_WORKER_VERSIONS) {
+            return log::debug!("Worker {peer_id} version not supported: {:?}", ping.version);
         }
 
         let worker_state = ping
