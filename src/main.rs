@@ -8,6 +8,7 @@ use task_manager::TaskManager;
 use tokio_util::sync::CancellationToken;
 
 mod cli;
+mod controller;
 mod http_server;
 mod metrics;
 mod network;

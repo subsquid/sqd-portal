@@ -65,6 +65,10 @@ fn default_default_retries() -> usize {
     3
 }
 
+fn default_default_timeout_quantile() -> f32 {
+    0.5
+}
+
 #[serde_as]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -107,6 +111,9 @@ pub struct Config {
 
     #[serde(default = "default_default_retries")]
     pub default_retries: usize,
+
+    #[serde(default = "default_default_timeout_quantile")]
+    pub default_timeout_quantile: f32,
 
     // Dataset alias -> bucket URL
     pub available_datasets: HashMap<String, String>,

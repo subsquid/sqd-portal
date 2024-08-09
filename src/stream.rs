@@ -6,6 +6,7 @@ use tokio::task::JoinSet;
 use tracing::instrument;
 
 use crate::{
+    controller::timeouts::TimeoutManager,
     network::NetworkClient,
     types::{ClientRequest, DatasetId, RequestError, ResponseChunk},
     utils::SlidingArray,
@@ -19,6 +20,7 @@ pub struct StreamController {
     next_chunk: Option<DataChunk>,
     downloads: JoinSet<(Result<ResponseChunk, RequestError>, usize)>,
     buffer: SlidingArray<Option<Result<ResponseChunk, RequestError>>>,
+    timeouts: Arc<TimeoutManager>,
     // The first request is sent out to probe it's validity.
     // Only after that multiple requests are sent in parallel.
     trial: bool,
@@ -44,6 +46,7 @@ impl StreamController {
         };
 
         let buffer = SlidingArray::with_capacity(request.buffer_size);
+        let timeout_quantile = request.timeout_quantile;
         let mut streamer = Self {
             request,
             stream_id,
@@ -52,6 +55,7 @@ impl StreamController {
             next_chunk: Some(first_chunk),
             downloads: Default::default(),
             buffer,
+            timeouts: Arc::new(TimeoutManager::new(timeout_quantile)),
             trial: true,
         };
 
@@ -128,39 +132,38 @@ impl StreamController {
         index: usize,
         chunk: DataChunk,
     ) -> impl Future<Output = Result<ResponseChunk, RequestError>> {
-        // TODO: simplify this function
         let network = self.network.clone();
+        let timeouts = self.timeouts.clone();
         let query = self.request.query.with_set_chunk(&chunk);
         let dataset_id = self.request.dataset_id.clone();
-        let chunk_timeout = self.request.chunk_timeout;
         let retries = self.request.retries;
         let backoff = self.request.backoff;
         let request_multiplier = self.request.request_multiplier;
+        let send_query = move || {
+            let start_time = tokio::time::Instant::now();
+            Self::query_once(
+                network.clone(),
+                query.clone(),
+                dataset_id.clone(),
+                index,
+                chunk.clone(),
+            )
+            .map(move |result| (result, start_time))
+        };
         async move {
+            let timeouts = timeouts.clone();
             let mut requests = JoinSet::new();
             let mut tries_left = retries;
             for _ in 0..request_multiplier {
-                requests.spawn(Self::query_once(
-                    network.clone(),
-                    query.clone(),
-                    dataset_id.clone(),
-                    index,
-                    chunk.clone(),
-                ));
+                requests.spawn(send_query());
                 tries_left -= 1;
             }
             loop {
-                let send_result = tokio::select! {
-                    _ = tokio::time::sleep(chunk_timeout) => {
+                let (send_result, start_time) = tokio::select! {
+                    _ = timeouts.sleep() => {
                         if tries_left > 0 {
-                            tracing::debug!("Timeout for chunk {index}, sending one more query");
-                            requests.spawn(Self::query_once(
-                                network.clone(),
-                                query.clone(),
-                                dataset_id.clone(),
-                                index,
-                                chunk.clone(),
-                            ));
+                            tracing::debug!("Request for chunk {index} is running for too long, sending one more query");
+                            requests.spawn(send_query());
                             tries_left -= 1;
                         } else {
                             return Err(RequestError::InternalError(format!("No response in {retries} tries")));
@@ -181,37 +184,47 @@ impl StreamController {
                         }
                         tries_left -= 1;
                         tracing::debug!("Couldn't schedule query ({e:?}), retrying in {backoff:?}");
-                        let network = network.clone();
-                        let query = query.clone();
-                        let dataset_id = dataset_id.clone();
-                        let chunk = chunk.clone();
+                        let fut = send_query();
                         requests.spawn(async move {
                             tokio::time::sleep(backoff).await;
-                            Self::query_once(network, query, dataset_id, index, chunk).await
+                            fut.await
                         });
                         continue;
                     }
                 };
-                if retriable(&result) {
-                    if tries_left == 0 {
-                        return Err(RequestError::try_from(result).unwrap());
+                match result {
+                    query_result::Result::Ok(_) => {
+                        let elapsed = start_time.elapsed();
+                        timeouts.complete_ok(elapsed);
+                        tracing::debug!("Query for chunk {index} completed in {elapsed:?}");
                     }
-                    tries_left -= 1;
-                    tracing::info!("Retrying query for chunk number {index}, {result:?}");
-                    requests.spawn(Self::query_once(
-                        network.clone(),
-                        query.clone(),
-                        dataset_id.clone(),
-                        index,
-                        chunk.clone(),
-                    ));
-                    continue;
-                } else {
-                    return match result {
-                        query_result::Result::Ok(result) => Ok(result.data),
-                        _ => Err(RequestError::try_from(result).unwrap()),
-                    };
-                }
+                    query_result::Result::Timeout(_) => {
+                        timeouts.complete_timeout();
+                    }
+                    _ => {
+                        timeouts.complete_err();
+                    }
+                };
+                match result {
+                    query_result::Result::ServerError(_)
+                    | query_result::Result::Timeout(_)
+                    | query_result::Result::NoAllocation(_) => {
+                        if tries_left == 0 {
+                            tracing::info!(
+                                "Giving up on query for chunk number {index}, {result:?}"
+                            );
+                            return Err(RequestError::try_from(result).unwrap());
+                        }
+                        tries_left -= 1;
+                        tracing::info!("Retrying query for chunk number {index}, {result:?}");
+                        requests.spawn(send_query());
+                        continue;
+                    }
+                    query_result::Result::Ok(result) => return Ok(result.data),
+                    query_result::Result::BadRequest(_) => {
+                        return Err(RequestError::try_from(result).unwrap())
+                    }
+                };
             }
         }
     }
@@ -243,7 +256,7 @@ impl Drop for StreamController {
     }
 }
 
-fn retriable(result: &query_result::Result) -> bool {
+fn _retriable(result: &query_result::Result) -> bool {
     use query_result::Result;
     match result {
         Result::ServerError(_) | Result::Timeout(_) | Result::NoAllocation(_) => true,

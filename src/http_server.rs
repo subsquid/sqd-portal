@@ -150,6 +150,18 @@ where
             },
             None => config.default_chunk_timeout,
         };
+        let timeout_quantile = match params.get("timeout_quantile") {
+            Some(value) => match value.parse() {
+                Ok(quantile) => quantile,
+                Err(e) => {
+                    return Err(RequestError::BadRequest(format!(
+                        "Couldn't parse timeout_quantile: {e}"
+                    ))
+                    .into_response())
+                }
+            },
+            None => config.default_timeout_quantile,
+        };
         let backoff = match params.get("backoff") {
             Some(value) => match value.parse() {
                 Ok(seconds) => Duration::from_secs(seconds),
@@ -192,6 +204,7 @@ where
             query,
             buffer_size,
             chunk_timeout,
+            timeout_quantile,
             backoff,
             request_multiplier,
             retries,
