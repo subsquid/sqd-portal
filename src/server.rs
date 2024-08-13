@@ -163,6 +163,7 @@ impl<S: Stream<Item = GatewayEvent> + Send + Unpin + 'static> Server<S> {
             profiling: Some(profiling),
             client_state_json: Some("{}".to_string()), // This is a placeholder field
             signature: vec![],
+            block_range: None,
         };
         self.transport_handle.send_query(worker_id, query_msg)?;
 

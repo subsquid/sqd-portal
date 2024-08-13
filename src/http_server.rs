@@ -104,7 +104,7 @@ fn server_error(err: impl Display) -> Response {
 fn ok_response(result: OkResult, request_headers: HeaderMap) -> Response {
     let OkResult {
         mut data,
-        exec_plan,
+        exec_plan, ..
     } = result;
     if let Some(exec_plan) = exec_plan {
         save_exec_plan(exec_plan);

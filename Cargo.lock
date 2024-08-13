@@ -785,7 +785,7 @@ checksum = "245097e9a4535ee1e3e3931fcfcd55a796a44c643e8596ff6566d68f09b87bbc"
 [[package]]
 name = "contract-client"
 version = "1.0.4"
-source = "git+https://github.com/subsquid/subsquid-network.git#2f18ffcf93f98c6ed73b327a461234442bb988c4"
+source = "git+https://github.com/subsquid/subsquid-network.git#7906af9805553b868a8d617a9bcdac83af5c98df"
 dependencies = [
  "async-trait",
  "clap",
@@ -4020,7 +4020,7 @@ checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "query-gateway"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -4952,8 +4952,8 @@ dependencies = [
 
 [[package]]
 name = "subsquid-messages"
-version = "1.0.3"
-source = "git+https://github.com/subsquid/subsquid-network.git#2f18ffcf93f98c6ed73b327a461234442bb988c4"
+version = "1.1.0"
+source = "git+https://github.com/subsquid/subsquid-network.git#7906af9805553b868a8d617a9bcdac83af5c98df"
 dependencies = [
  "anyhow",
  "hex",
@@ -4967,8 +4967,8 @@ dependencies = [
 
 [[package]]
 name = "subsquid-network-transport"
-version = "1.0.11"
-source = "git+https://github.com/subsquid/subsquid-network.git#2f18ffcf93f98c6ed73b327a461234442bb988c4"
+version = "1.0.12"
+source = "git+https://github.com/subsquid/subsquid-network.git#7906af9805553b868a8d617a9bcdac83af5c98df"
 dependencies = [
  "anyhow",
  "async-trait",
