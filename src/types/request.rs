@@ -1,7 +1,10 @@
 use std::{str::FromStr, time::Duration};
 
-use super::{DataChunk, DatasetId};
+use subsquid_messages::Range;
 
+use super::DatasetId;
+
+#[derive(Debug, Clone)]
 pub struct ClientRequest {
     pub dataset_id: DatasetId,
     pub query: ParsedQuery,
@@ -13,6 +16,7 @@ pub struct ClientRequest {
     pub retries: usize,
 }
 
+#[derive(Debug, Clone)]
 pub struct ParsedQuery {
     json: serde_json::Value,
     first_block: u64,
@@ -32,20 +36,16 @@ impl ParsedQuery {
         self.first_block
     }
 
-    pub fn with_range(
-        &self,
-        from_block: impl Into<u64>,
-        to_block: impl Into<u64>,
-    ) -> serde_json::Value {
+    pub fn with_range(&self, range: &Range) -> String {
         let mut json = self.json.clone();
-        json["fromBlock"] = serde_json::Value::from(from_block.into());
-        json["toBlock"] = serde_json::Value::from(to_block.into());
-        json
+        json["fromBlock"] = serde_json::Value::from(range.begin);
+        json["toBlock"] = serde_json::Value::from(range.end);
+        serde_json::to_string(&json).expect("Couldn't serialize query")
     }
 
-    pub fn with_set_chunk(&mut self, chunk: &DataChunk) -> String {
-        self.json["fromBlock"] = serde_json::Value::from(chunk.first_block());
-        self.json["toBlock"] = serde_json::Value::from(chunk.last_block());
+    pub fn with_set_range(&mut self, range: &Range) -> String {
+        self.json["fromBlock"] = serde_json::Value::from(range.begin);
+        self.json["toBlock"] = serde_json::Value::from(range.end);
         serde_json::to_string(&self.json).expect("Couldn't serialize query")
     }
 }

@@ -1,7 +1,7 @@
 use std::{future::Future, sync::Arc};
 
 use futures::FutureExt;
-use subsquid_messages::{data_chunk::DataChunk, query_result};
+use subsquid_messages::{data_chunk::DataChunk, query_result, Range};
 use tokio::task::JoinSet;
 use tracing::instrument;
 
@@ -60,7 +60,7 @@ impl StreamController {
         };
 
         // Intentionally schedule only one download not to waste resources in case of bad request
-        streamer.schedule_next_chunk()?;
+        streamer.schedule_next_chunk();
 
         Ok(streamer)
     }
@@ -71,12 +71,7 @@ impl StreamController {
             && self.next_chunk.is_some()
             && !self.trial
         {
-            let result = self.schedule_next_chunk();
-            tokio::task::yield_now().await;
-            if let Err(e) = result {
-                tracing::debug!("Couldn't schedule next chunk: {e}");
-                break;
-            }
+            self.schedule_next_chunk();
         }
 
         while !self.buffer.front().is_some_and(Option::is_some) {
@@ -111,11 +106,11 @@ impl StreamController {
     }
 
     // Schedules downloading `self.next_chunk`
-    fn schedule_next_chunk(&mut self) -> Result<(), RequestError> {
+    fn schedule_next_chunk(&mut self) {
         let chunk = self.next_chunk.clone().expect("No next chunk to download");
         let index: usize = self.next_index;
         let future = self
-            .query_chunk_with_retries(index, chunk.clone())
+            .get_entire_chunk(index, chunk.clone())
             .map(move |result| (result, index));
         self.downloads.spawn(future);
         self.next_chunk = self.network.next_chunk(&self.request.dataset_id, &chunk);
@@ -124,50 +119,97 @@ impl StreamController {
         }
         self.next_index += 1;
         self.buffer.push_back(None);
-        Ok(())
     }
 
-    fn query_chunk_with_retries(
-        &mut self,
+    fn get_entire_chunk(
+        &self,
         index: usize,
         chunk: DataChunk,
     ) -> impl Future<Output = Result<ResponseChunk, RequestError>> {
         let network = self.network.clone();
         let timeouts = self.timeouts.clone();
-        let query = self.request.query.with_set_chunk(&chunk);
-        let dataset_id = self.request.dataset_id.clone();
-        let retries = self.request.retries;
-        let backoff = self.request.backoff;
-        let request_multiplier = self.request.request_multiplier;
+        let mut range = Range {
+            begin: chunk.first_block(),
+            end: chunk.last_block(),
+        };
+        let request = self.request.clone();
+        async move {
+            let mut accum_response = Vec::new();
+            loop {
+                let fut = Self::get_one_response(
+                    request.clone(),
+                    network.clone(),
+                    timeouts.clone(),
+                    index,
+                    range,
+                );
+                let result = match fut.await {
+                    Err(e) => return Err(e),
+                    Ok(query_result::Result::Ok(result)) => result,
+                    Ok(e) => return Err(RequestError::try_from(e).unwrap()),
+                };
+                let Some(last_block) = result.last_block else {
+                    return Err(RequestError::InternalError(
+                        "No last block in response".to_string(),
+                    ));
+                };
+                accum_response.extend(result.data);
+                if last_block == chunk.last_block() as u64 {
+                    return Ok(accum_response);
+                } else if last_block < range.begin as u64 {
+                    tracing::warn!("Got empty response for range {}-{}", range.begin, range.end);
+                    return Err(RequestError::InternalError(
+                        "Got empty response".to_string(),
+                    ));
+                } else {
+                    tracing::debug!(
+                        "Got response for chunk {} with blocks {}-{}. {}/{} blocks fetched from this chunk. Current response length: {}",
+                        index,
+                        range.begin,
+                        last_block,
+                        last_block - chunk.first_block() as u64 + 1,
+                        chunk.last_block() - chunk.first_block() + 1,
+                        accum_response.len()
+                    );
+                    range.begin = (last_block + 1) as u32;
+                }
+            }
+        }
+    }
+
+    fn get_one_response(
+        request: ClientRequest,
+        network: Arc<NetworkClient>,
+        timeouts: Arc<TimeoutManager>,
+        index: usize,
+        range: Range,
+    ) -> impl Future<Output = Result<query_result::Result, RequestError>> {
+        // TODO: don't modify the query
         let send_query = move || {
             let start_time = tokio::time::Instant::now();
-            Self::query_once(
+            Self::query_some_worker(
                 network.clone(),
-                query.clone(),
-                dataset_id.clone(),
+                request.query.with_range(&range),
+                request.dataset_id.clone(),
                 index,
-                chunk.clone(),
+                range,
             )
             .map(move |result| (result, start_time))
         };
         async move {
             let timeouts = timeouts.clone();
             let mut requests = JoinSet::new();
-            let mut tries_left = retries;
-            for _ in 0..request_multiplier {
+            let mut tries_left = request.retries;
+            for _ in 0..request.request_multiplier {
                 requests.spawn(send_query());
                 tries_left -= 1;
             }
             loop {
                 let (send_result, start_time) = tokio::select! {
-                    _ = timeouts.sleep() => {
-                        if tries_left > 0 {
-                            tracing::debug!("Request for chunk {index} is running for too long, sending one more query");
-                            requests.spawn(send_query());
-                            tries_left -= 1;
-                        } else {
-                            return Err(RequestError::InternalError(format!("No response in {retries} tries")));
-                        }
+                    _ = timeouts.sleep(), if tries_left > 0 => {
+                        tracing::debug!("Request for chunk {index} is running for too long, sending one more query");
+                        requests.spawn(send_query());
+                        tries_left -= 1;
                         continue;
                     }
                     result = requests.join_next() => {
@@ -183,11 +225,15 @@ impl StreamController {
                             return Err(e);
                         }
                         tries_left -= 1;
-                        tracing::debug!("Couldn't schedule query ({e:?}), retrying in {backoff:?}");
-                        let fut = send_query();
+                        tracing::debug!(
+                            "Couldn't schedule query ({e:?}), retrying in {:?}",
+                            request.backoff
+                        );
+                        let backoff = request.backoff;
+                        let send_query = send_query.clone();
                         requests.spawn(async move {
                             tokio::time::sleep(backoff).await;
-                            fut.await
+                            send_query().await
                         });
                         continue;
                     }
@@ -205,45 +251,45 @@ impl StreamController {
                         timeouts.complete_err();
                     }
                 };
-                match result {
-                    query_result::Result::ServerError(_)
-                    | query_result::Result::Timeout(_)
-                    | query_result::Result::TimeoutV1(_)
-                    | query_result::Result::NoAllocation(_) => {
-                        if tries_left == 0 {
-                            tracing::info!(
-                                "Giving up on query for chunk number {index}, {result:?}"
-                            );
-                            return Err(RequestError::try_from(result).unwrap());
-                        }
-                        tries_left -= 1;
-                        tracing::info!("Retrying query for chunk number {index}, {result:?}");
-                        requests.spawn(send_query());
-                        continue;
+                if retriable(&result) {
+                    if tries_left == 0 {
+                        tracing::info!("Giving up on query for chunk number {index}, {result:?}");
+                        return Ok(result);
                     }
-                    query_result::Result::Ok(result) => return Ok(result.data),
-                    query_result::Result::BadRequest(_) => {
-                        return Err(RequestError::try_from(result).unwrap())
-                    }
-                };
+                    tries_left -= 1;
+                    tracing::info!("Retrying query for chunk number {index}, {result:?}");
+                    requests.spawn(send_query());
+                    continue;
+                } else {
+                    return Ok(result);
+                }
             }
         }
     }
 
-    async fn query_once(
+    async fn query_some_worker(
         network: Arc<NetworkClient>,
         query: String,
         dataset_id: DatasetId,
         index: usize,
-        chunk: DataChunk,
+        range: Range,
     ) -> Result<query_result::Result, RequestError> {
-        let worker = network.find_worker(&dataset_id, &chunk);
+        let worker = network.find_worker(&dataset_id, range.begin);
         let Some(worker) = worker else {
-            let msg = format!("No workers available for chunk {}/{:?}", dataset_id, chunk);
+            let msg = format!(
+                "No workers available for block {} in dataset {}",
+                range.begin, dataset_id
+            );
             tracing::warn!(msg);
             return Err(RequestError::NotFound(msg));
         };
-        tracing::debug!("Sending query for chunk {} to worker {}", index, worker);
+        tracing::debug!(
+            "Sending query for chunk {} ({}-{}) to worker {}",
+            index,
+            range.begin,
+            range.end,
+            worker,
+        );
         let receiver = network
             .query_worker(&worker, &dataset_id, query)
             .map_err(|_| RequestError::Busy)?;
@@ -257,7 +303,7 @@ impl Drop for StreamController {
     }
 }
 
-fn _retriable(result: &query_result::Result) -> bool {
+fn retriable(result: &query_result::Result) -> bool {
     use query_result::Result;
     match result {
         Result::ServerError(_)

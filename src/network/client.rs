@@ -90,10 +90,10 @@ impl NetworkClient {
         self.dataset_storage.next_chunk(dataset, chunk)
     }
 
-    pub fn find_worker(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<PeerId> {
+    pub fn find_worker(&self, dataset: &DatasetId, block: u32) -> Option<PeerId> {
         self.network_state
             .lock()
-            .find_worker(dataset, chunk.first_block())
+            .find_worker(dataset, block)
     }
 
     pub fn get_height(&self, dataset: &DatasetId) -> Option<u32> {
