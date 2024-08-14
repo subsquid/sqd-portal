@@ -20,6 +20,10 @@ use crate::{
 
 use super::{NetworkState, StorageClient};
 
+lazy_static::lazy_static! {
+    static ref SUPPORTED_VERSIONS: semver::VersionReq = ">=1.1.0-rc1".parse().expect("Invalid version requirement");
+}
+
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
@@ -128,8 +132,12 @@ impl NetworkClient {
     }
 
     fn handle_ping(&self, peer_id: PeerId, ping: Ping) {
+        if !ping.version_matches(&*SUPPORTED_VERSIONS) {
+            metrics::IGNORED_PINGS.inc();
+            return;
+        }
         tracing::trace!("Ping from {peer_id}");
-        metrics::PINGS_TOTAL.inc();
+        metrics::VALID_PINGS.inc();
         let worker_state = ping
             .stored_ranges
             .into_iter()

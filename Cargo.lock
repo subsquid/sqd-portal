@@ -5592,6 +5592,7 @@ dependencies = [
  "parking_lot",
  "prometheus-client",
  "scopeguard",
+ "semver",
  "serde",
  "serde_json",
  "serde_with",

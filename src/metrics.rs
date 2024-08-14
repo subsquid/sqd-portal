@@ -7,7 +7,8 @@ use subsquid_messages::query_result;
 use crate::types::DatasetId;
 
 lazy_static::lazy_static! {
-    pub static ref PINGS_TOTAL: Counter = Default::default();
+    pub static ref VALID_PINGS: Counter = Default::default();
+    pub static ref IGNORED_PINGS: Counter = Default::default();
     pub static ref QUERIES_SENT: Counter = Default::default();
     static ref QUERY_RESULTS: Family<Vec<(String, String)>, Counter> = Default::default();
     pub static ref KNOWN_WORKERS: Gauge = Default::default();
@@ -41,7 +42,16 @@ pub fn report_dataset_updated(dataset_id: &DatasetId, highest_block: u32, first_
 }
 
 pub fn register_metrics(registry: &mut Registry) {
-    registry.register("pings", "Number of received pings", PINGS_TOTAL.clone());
+    registry.register(
+        "pings",
+        "Number of received valid pings",
+        VALID_PINGS.clone(),
+    );
+    registry.register(
+        "ignored_pings",
+        "Number of pings from unsupported workers",
+        IGNORED_PINGS.clone(),
+    );
     registry.register(
         "queries_sent",
         "Number of sent queries",
