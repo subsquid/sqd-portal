@@ -23,8 +23,9 @@ pub fn report_query_result(result: &query_result::Result) {
         query_result::Result::BadRequest(_) => "bad_request",
         query_result::Result::ServerError(_) => "server_error",
         query_result::Result::NoAllocation(_) => "no_allocation",
-        query_result::Result::Timeout(_) => "timeout",
-    }.to_owned();
+        query_result::Result::TimeoutV1(()) | query_result::Result::Timeout(_) => "timeout",
+    }
+    .to_owned();
     QUERY_RESULTS
         .get_or_create(&vec![("status".to_owned(), status)])
         .inc();
@@ -66,7 +67,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "Number of completed client streams",
         COMPLETED_STREAMS.clone(),
     );
-    registry.register("dataset_highest_block", "Highest seen block", HIGHEST_BLOCK.clone());
+    registry.register(
+        "dataset_highest_block",
+        "Highest seen block",
+        HIGHEST_BLOCK.clone(),
+    );
     registry.register(
         "dataset_first_gap",
         "First block not owned by any worker",

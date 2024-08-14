@@ -208,6 +208,7 @@ impl StreamController {
                 match result {
                     query_result::Result::ServerError(_)
                     | query_result::Result::Timeout(_)
+                    | query_result::Result::TimeoutV1(_)
                     | query_result::Result::NoAllocation(_) => {
                         if tries_left == 0 {
                             tracing::info!(
@@ -259,7 +260,10 @@ impl Drop for StreamController {
 fn _retriable(result: &query_result::Result) -> bool {
     use query_result::Result;
     match result {
-        Result::ServerError(_) | Result::Timeout(_) | Result::NoAllocation(_) => true,
+        Result::ServerError(_)
+        | Result::TimeoutV1(_)
+        | Result::Timeout(_)
+        | Result::NoAllocation(_) => true,
         Result::Ok(_) | Result::BadRequest(_) => false,
     }
 }

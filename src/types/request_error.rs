@@ -24,8 +24,11 @@ impl TryFrom<query_result::Result> for RequestError {
             query_result::Result::NoAllocation(()) => {
                 Ok(Self::InternalError("Not enough CU allocated".to_string()))
             }
-            query_result::Result::Timeout(()) => {
+            query_result::Result::TimeoutV1(()) => {
                 Ok(Self::InternalError("Query timed out".to_string()))
+            }
+            query_result::Result::Timeout(e) => {
+                Ok(Self::InternalError(format!("Query timed out: {}", e)))
             }
         }
     }

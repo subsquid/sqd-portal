@@ -44,7 +44,7 @@ impl NetworkClient {
         let dataset_storage = StorageClient::new(config.available_datasets.values()).await?;
         let transport_builder = P2PTransportBuilder::from_cli(args).await?;
         let mut gateway_config = GatewayConfig::new(logs_collector);
-        gateway_config.query_config.send_timeout = config.transport_timeout;
+        gateway_config.query_config.request_timeout = config.transport_timeout;
         let (incoming_events, transport_handle) =
             transport_builder.build_gateway(gateway_config)?;
         Ok(NetworkClient {
@@ -111,6 +111,7 @@ impl NetworkClient {
                 query_id: Some(query_id.clone()),
                 query: Some(query),
                 client_state_json: Some("{}".to_string()), // This is a placeholder field
+                profiling: Some(false),
                 ..Default::default()
             },
         )?;
@@ -167,7 +168,7 @@ impl NetworkClient {
             query_result::Result::NoAllocation(()) => {
                 self.network_state.lock().report_no_allocation(peer_id);
             }
-            query_result::Result::Timeout(_) => {
+            query_result::Result::Timeout(_) | query_result::Result::TimeoutV1(_) => {
                 self.network_state.lock().report_query_timeout(peer_id);
             }
             query_result::Result::Ok(_) | query_result::Result::BadRequest(_) => {
