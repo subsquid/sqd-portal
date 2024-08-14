@@ -27,7 +27,7 @@ pub enum QueryResult {
     BadRequest(String),
     ServerError(String),
     NoAllocation,
-    Timeout,
+    Timeout(String),
 }
 
 impl From<query_result::Result> for QueryResult {
@@ -37,7 +37,8 @@ impl From<query_result::Result> for QueryResult {
             query_result::Result::BadRequest(err) => Self::BadRequest(err),
             query_result::Result::ServerError(err) => Self::ServerError(err),
             query_result::Result::NoAllocation(()) => Self::NoAllocation,
-            query_result::Result::Timeout(()) => Self::Timeout,
+            query_result::Result::TimeoutV1(()) => Self::Timeout("".to_string()),
+            query_result::Result::Timeout(msg) => Self::Timeout(msg),
         }
     }
 }
@@ -49,7 +50,7 @@ impl Display for QueryResult {
             QueryResult::BadRequest(e) => write!(f, "{}", e),
             QueryResult::ServerError(e) => write!(f, "{}", e),
             QueryResult::NoAllocation => write!(f, "Not enough compute units allocated"),
-            QueryResult::Timeout => write!(f, "Query execution timed out"),
+            QueryResult::Timeout(msg) => write!(f, "Query timed out: {}", msg),
         }
     }
 }
@@ -61,7 +62,7 @@ impl QueryResult {
             QueryResult::BadRequest(_) => StatusCode::BAD_REQUEST,
             QueryResult::ServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             QueryResult::NoAllocation => StatusCode::FORBIDDEN,
-            QueryResult::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            QueryResult::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
         }
     }
 }

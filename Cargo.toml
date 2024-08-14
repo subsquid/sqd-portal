@@ -1,6 +1,6 @@
 [package]
 name = "query-gateway"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2021"
 
 [dependencies]
@@ -30,8 +30,8 @@ tokio-rusqlite = "0.5"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 contract-client = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.4" }
-subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.1.0", features = ["semver"] }
-subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.12", features = ["gateway"] }
+subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.1.1", features = ["semver"] }
+subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.14", features = ["gateway"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"

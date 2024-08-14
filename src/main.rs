@@ -70,8 +70,10 @@ async fn main() -> anyhow::Result<()> {
     let transport_builder = P2PTransportBuilder::from_cli(args.transport).await?;
     let contract_client = transport_builder.contract_client();
     let local_peer_id = transport_builder.local_peer_id();
+    let mut gateway_config = GatewayConfig::new(Config::get().logs_collector_id);
+    gateway_config.query_config = Config::get().query_config;
     let (incoming_messages, transport_handle) =
-        transport_builder.build_gateway(GatewayConfig::new(Config::get().logs_collector_id))?;
+        transport_builder.build_gateway(gateway_config)?;
 
     // Instantiate contract client and check RPC connection
     anyhow::ensure!(

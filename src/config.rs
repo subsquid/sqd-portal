@@ -7,8 +7,9 @@ use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_with::{DurationSeconds, serde_as};
-use subsquid_network_transport::PeerId;
 use tokio::sync::OnceCell;
+
+use subsquid_network_transport::{ClientConfig, PeerId};
 
 static CONFIG: OnceCell<Config> = OnceCell::const_new();
 
@@ -93,6 +94,8 @@ pub struct Config {
     )]
     pub workers_update_interval: Duration,
     pub available_datasets: HashMap<String, DatasetId>,
+    #[serde(default)]
+    pub query_config: ClientConfig,
 }
 
 impl Config {

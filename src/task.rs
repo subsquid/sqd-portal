@@ -20,7 +20,7 @@ pub struct RunningTask {
 
 impl RunningTask {
     fn timeout(self) -> FinishedTask {
-        self.finish(QueryResult::Timeout)
+        self.finish(QueryResult::Timeout("client timeout".to_string()))
     }
 
     fn result_received(self, result: query_result::Result) -> FinishedTask {

@@ -210,7 +210,7 @@ impl<S: Stream<Item = GatewayEvent> + Send + Unpin + 'static> Server<S> {
                 worker_id: task.worker_id.to_base58(),
                 query_id,
                 exec_time_ms: task.exec_time_ms(),
-                result: Some(query_finished::Result::Timeout(())),
+                result: Some(query_finished::Result::Timeout("client timeout".to_string())),
             };
             self.transport_handle.query_finished(metrics_msg)?;
         }
