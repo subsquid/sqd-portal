@@ -1,8 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use contract_client::PeerId;
 use futures::{Stream, StreamExt};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use subsquid_messages::{data_chunk::DataChunk, query_result, Ping, Query, QueryResult};
 use subsquid_network_transport::{
     GatewayConfig, GatewayEvent, GatewayTransportHandle, P2PTransportBuilder, QueueFull,
@@ -30,7 +30,8 @@ pub struct NetworkClient {
     transport_handle: GatewayTransportHandle,
     network_state: Mutex<NetworkState>,
     tasks: Mutex<HashMap<QueryId, QueryTask>>,
-    dataset_storage: StorageClient,
+    dataset_storage: RwLock<StorageClient>,
+    dataset_update_interval: Duration,
 }
 
 struct QueryTask {
@@ -44,7 +45,6 @@ impl NetworkClient {
         logs_collector: PeerId,
         config: Arc<Config>,
     ) -> anyhow::Result<NetworkClient> {
-        tracing::info!("Listing existing chunks");
         let dataset_storage = StorageClient::new(config.available_datasets.values()).await?;
         let transport_builder = P2PTransportBuilder::from_cli(args).await?;
         let mut gateway_config = GatewayConfig::new(logs_collector);
@@ -52,15 +52,37 @@ impl NetworkClient {
         let (incoming_events, transport_handle) =
             transport_builder.build_gateway(gateway_config)?;
         Ok(NetworkClient {
+            dataset_update_interval: config.dataset_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
             network_state: Mutex::new(NetworkState::new(config)),
             tasks: Mutex::new(HashMap::new()),
-            dataset_storage,
+            dataset_storage: RwLock::new(dataset_storage),
         })
     }
 
     pub async fn run(&self, cancellation_token: CancellationToken) {
+        // TODO: run coroutines in parallel
+        tokio::join!(
+            self.run_event_stream(cancellation_token.clone()),
+            self.run_storage_update(cancellation_token)
+        );
+    }
+
+    async fn run_storage_update(&self, cancellation_token: CancellationToken) {
+        let mut interval = tokio::time::interval(self.dataset_update_interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = cancellation_token.cancelled() => {
+                    break;
+                }
+            }
+            self.dataset_storage.write().update().await;
+        }
+    }
+
+    async fn run_event_stream(&self, cancellation_token: CancellationToken) {
         let stream = self
             .incoming_events
             .take()
@@ -83,17 +105,15 @@ impl NetworkClient {
     }
 
     pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
-        self.dataset_storage.find_chunk(dataset, block)
+        self.dataset_storage.read().find_chunk(dataset, block)
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
-        self.dataset_storage.next_chunk(dataset, chunk)
+        self.dataset_storage.read().next_chunk(dataset, chunk)
     }
 
     pub fn find_worker(&self, dataset: &DatasetId, block: u32) -> Option<PeerId> {
-        self.network_state
-            .lock()
-            .find_worker(dataset, block)
+        self.network_state.lock().find_worker(dataset, block)
     }
 
     pub fn get_height(&self, dataset: &DatasetId) -> Option<u32> {

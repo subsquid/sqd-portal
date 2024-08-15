@@ -69,6 +69,10 @@ fn default_default_timeout_quantile() -> f32 {
     0.5
 }
 
+fn default_dataset_update_interval() -> Duration {
+    Duration::from_secs(60 * 5)
+}
+
 #[serde_as]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -114,6 +118,10 @@ pub struct Config {
 
     #[serde(default = "default_default_timeout_quantile")]
     pub default_timeout_quantile: f32,
+
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(rename = "dataset_update_interval_sec", default = "default_dataset_update_interval")]
+    pub dataset_update_interval: Duration,
 
     // Dataset alias -> bucket URL
     pub available_datasets: HashMap<String, String>,
