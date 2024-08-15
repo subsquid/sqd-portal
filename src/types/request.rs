@@ -20,6 +20,7 @@ pub struct ClientRequest {
 pub struct ParsedQuery {
     json: serde_json::Value,
     first_block: u64,
+    last_block: Option<u64>,
 }
 
 impl ParsedQuery {
@@ -29,11 +30,20 @@ impl ParsedQuery {
             .get("fromBlock")
             .and_then(|v| v.as_u64())
             .ok_or(anyhow::anyhow!("fromBlock is required"))?;
-        Ok(Self { json, first_block })
+        let last_block = json.get("toBlock").and_then(|v| v.as_u64());
+        Ok(Self {
+            json,
+            first_block,
+            last_block,
+        })
     }
 
     pub fn first_block(&self) -> u64 {
         self.first_block
+    }
+
+    pub fn last_block(&self) -> Option<u64> {
+        self.last_block
     }
 
     pub fn with_range(&self, range: &Range) -> String {

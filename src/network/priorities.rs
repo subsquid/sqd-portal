@@ -32,7 +32,7 @@ impl WorkersPool {
             .into_iter()
             .map(|worker| (*self.priorities.entry(worker).or_default(), worker))
             .max_by_key(|(priority, _worker)| *priority)?;
-        if priority < self.config.min_worker_priority {
+        if priority <= self.config.min_worker_priority {
             return None;
         }
 

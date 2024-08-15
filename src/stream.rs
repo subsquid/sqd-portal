@@ -114,7 +114,17 @@ impl StreamController {
             .map(move |result| (result, index));
         self.downloads.spawn(future);
         self.next_chunk = self.network.next_chunk(&self.request.dataset_id, &chunk);
-        if self.next_chunk.is_none() {
+        if let Some(next_chunk) = &self.next_chunk {
+            if self
+                .request
+                .query
+                .last_block()
+                .is_some_and(|last_block| last_block < next_chunk.first_block() as u64)
+            {
+                tracing::debug!("The end of the requested range reached");
+                self.next_chunk = None;
+            }
+        } else {
             tracing::debug!("No more chunks available");
         }
         self.next_index += 1;
@@ -128,10 +138,15 @@ impl StreamController {
     ) -> impl Future<Output = Result<ResponseChunk, RequestError>> {
         let network = self.network.clone();
         let timeouts = self.timeouts.clone();
-        let mut range = Range {
-            begin: chunk.first_block(),
-            end: chunk.last_block(),
+        let full_range = Range {
+            begin: std::cmp::max(chunk.first_block(), self.request.query.first_block() as u32),
+            end: if let Some(last_block) = self.request.query.last_block() {
+                std::cmp::min(chunk.last_block(), last_block as u32)
+            } else {
+                chunk.last_block()
+            },
         };
+        let mut current_range = full_range;
         let request = self.request.clone();
         async move {
             let mut accum_response = Vec::new();
@@ -141,7 +156,7 @@ impl StreamController {
                     network.clone(),
                     timeouts.clone(),
                     index,
-                    range,
+                    current_range,
                 );
                 let result = match fut.await {
                     Err(e) => return Err(e),
@@ -154,10 +169,10 @@ impl StreamController {
                     ));
                 };
                 accum_response.extend(result.data);
-                if last_block == chunk.last_block() as u64 {
+                if last_block == full_range.end as u64 {
                     return Ok(accum_response);
-                } else if last_block < range.begin as u64 {
-                    tracing::warn!("Got empty response for range {}-{}", range.begin, range.end);
+                } else if last_block < current_range.begin as u64 {
+                    tracing::warn!("Got empty response for range {}-{}", current_range.begin, current_range.end);
                     return Err(RequestError::InternalError(
                         "Got empty response".to_string(),
                     ));
@@ -165,13 +180,13 @@ impl StreamController {
                     tracing::debug!(
                         "Got response for chunk {} with blocks {}-{}. {}/{} blocks fetched from this chunk. Current response length: {}",
                         index,
-                        range.begin,
+                        current_range.begin,
                         last_block,
-                        last_block - chunk.first_block() as u64 + 1,
-                        chunk.last_block() - chunk.first_block() + 1,
+                        last_block - full_range.begin as u64 + 1,
+                        full_range.end - full_range.begin + 1,
                         accum_response.len()
                     );
-                    range.begin = (last_block + 1) as u32;
+                    current_range.begin = (last_block + 1) as u32;
                 }
             }
         }
