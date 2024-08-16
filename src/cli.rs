@@ -25,10 +25,6 @@ pub struct Cli {
     pub config: Config,
 }
 
-fn parse_seconds(s: &str) -> anyhow::Result<Duration> {
-    Ok(Duration::from_secs(s.parse()?))
-}
-
 fn default_worker_inactive_threshold() -> Duration {
     Duration::from_secs(120)
 }
@@ -120,7 +116,10 @@ pub struct Config {
     pub default_timeout_quantile: f32,
 
     #[serde_as(as = "DurationSeconds")]
-    #[serde(rename = "dataset_update_interval_sec", default = "default_dataset_update_interval")]
+    #[serde(
+        rename = "dataset_update_interval_sec",
+        default = "default_dataset_update_interval"
+    )]
     pub dataset_update_interval: Duration,
 
     // Dataset alias -> bucket URL

@@ -1,5 +1,5 @@
-mod sliding_array;
 mod once;
+mod sliding_array;
 
-pub use sliding_array::SlidingArray;
 pub use once::UseOnce;
+pub use sliding_array::SlidingArray;

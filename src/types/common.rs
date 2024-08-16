@@ -1,5 +1,3 @@
-pub use subsquid_messages::data_chunk::DataChunk;
-
 pub type ResponseChunk = Vec<u8>;
 
 pub type QueryId = String;

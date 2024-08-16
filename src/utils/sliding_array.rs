@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, ops::{Index, IndexMut}};
+use std::{
+    collections::VecDeque,
+    ops::{Index, IndexMut},
+};
 
 pub struct SlidingArray<T> {
     data: VecDeque<T>,
@@ -48,10 +51,6 @@ impl<T> SlidingArray<T> {
 
     pub fn len(&self) -> usize {
         self.data.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
     }
 }
 

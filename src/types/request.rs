@@ -52,12 +52,6 @@ impl ParsedQuery {
         json["toBlock"] = serde_json::Value::from(range.end);
         serde_json::to_string(&json).expect("Couldn't serialize query")
     }
-
-    pub fn with_set_range(&mut self, range: &Range) -> String {
-        self.json["fromBlock"] = serde_json::Value::from(range.begin);
-        self.json["toBlock"] = serde_json::Value::from(range.end);
-        serde_json::to_string(&self.json).expect("Couldn't serialize query")
-    }
 }
 
 impl FromStr for ParsedQuery {

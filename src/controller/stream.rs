@@ -172,7 +172,11 @@ impl StreamController {
                 if last_block == full_range.end as u64 {
                     return Ok(accum_response);
                 } else if last_block < current_range.begin as u64 {
-                    tracing::warn!("Got empty response for range {}-{}", current_range.begin, current_range.end);
+                    tracing::warn!(
+                        "Got empty response for range {}-{}",
+                        current_range.begin,
+                        current_range.end
+                    );
                     return Err(RequestError::InternalError(
                         "Got empty response".to_string(),
                     ));

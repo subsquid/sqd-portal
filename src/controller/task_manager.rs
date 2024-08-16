@@ -9,9 +9,10 @@ use futures::Stream;
 use crate::{
     metrics,
     network::NetworkClient,
-    stream::StreamController,
     types::{ClientRequest, RequestError, ResponseChunk},
 };
+
+use super::stream::StreamController;
 
 const MAX_PARALLEL_STREAMS: u8 = 5;
 

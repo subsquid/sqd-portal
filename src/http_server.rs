@@ -14,8 +14,8 @@ use prometheus_client::registry::Registry;
 
 use crate::{
     cli::Config,
+    controller::task_manager::TaskManager,
     network::NetworkClient,
-    task_manager::TaskManager,
     types::{ClientRequest, RequestError},
 };
 

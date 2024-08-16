@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 use cli::Cli;
+use controller::task_manager::TaskManager;
 use http_server::run_server;
 use network::NetworkClient;
-use task_manager::TaskManager;
 use tokio_util::sync::CancellationToken;
 
 mod cli;
@@ -12,8 +12,6 @@ mod controller;
 mod http_server;
 mod metrics;
 mod network;
-mod stream;
-mod task_manager;
 mod types;
 mod utils;
 
