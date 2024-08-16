@@ -1,8 +1,10 @@
 use std::{collections::HashMap, str::FromStr};
 
 use aws_sdk_s3 as s3;
+use parking_lot::RwLock;
 use subsquid_datasets::DatasetStorage;
 use subsquid_messages::data_chunk::DataChunk;
+use tokio::sync::Mutex;
 
 use crate::types::DatasetId;
 
@@ -35,9 +37,9 @@ impl StorageClient {
         Ok(Self { datasets })
     }
 
-    pub async fn update(&mut self) {
+    pub async fn update(&self) {
         tracing::info!("Updating known chunks");
-        futures::future::join_all(self.datasets.iter_mut().map(|(id, dataset)| async move {
+        futures::future::join_all(self.datasets.iter().map(|(id, dataset)| async move {
             let result = dataset.update().await;
             if let Err(e) = result {
                 tracing::warn!("Failed to update dataset {}: {:?}", id, e);
@@ -47,55 +49,55 @@ impl StorageClient {
     }
 
     pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
-        self.datasets.get(dataset)?.find(block).cloned()
+        self.datasets.get(dataset)?.find(block)
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
         self.datasets
             .get(dataset)?
             .find(chunk.last_block() as u64 + 1)
-            .cloned()
     }
 }
 
 struct Dataset {
-    storage: DatasetStorage,
-    chunks: Vec<DataChunk>,
+    storage: Mutex<DatasetStorage>,
+    chunks: RwLock<Vec<DataChunk>>,
 }
 
 impl Dataset {
     fn new(bucket: &str, s3_client: aws_sdk_s3::Client) -> anyhow::Result<Self> {
         let storage = DatasetStorage::new(bucket, s3_client);
         Ok(Self {
-            chunks: Vec::new(),
-            storage,
+            chunks: RwLock::new(Vec::new()),
+            storage: Mutex::new(storage),
         })
     }
 
-    async fn update(&mut self) -> anyhow::Result<()> {
-        let new_chunks = self.storage.list_all_new_chunks().await?;
+    async fn update(&self) -> anyhow::Result<()> {
+        // TODO: move synchronization inside the list_all_new_chunks method
+        let new_chunks = self.storage.lock().await.list_all_new_chunks().await?;
         if !new_chunks.is_empty() {
             tracing::info!(
                 "Found {} new chunks for dataset {}",
                 new_chunks.len(),
-                self.storage.bucket
+                self.storage.lock().await.bucket
             );
         }
+        let mut chunks = self.chunks.write();
         for chunk in new_chunks {
             let chunk = DataChunk::from_str(&chunk.chunk_str)
                 .unwrap_or_else(|_| panic!("Failed to parse chunk: {}", chunk.chunk_str));
-            self.chunks.push(chunk);
+            chunks.push(chunk);
         }
         Ok(())
     }
 
-    fn find(&self, block: u64) -> Option<&DataChunk> {
-        if block < self.chunks.first()?.first_block() as u64 {
+    fn find(&self, block: u64) -> Option<DataChunk> {
+        let chunks = self.chunks.read();
+        if block < chunks.first()?.first_block() as u64 {
             return None;
         }
-        let first_suspect = self
-            .chunks
-            .partition_point(|chunk| (chunk.last_block() as u64) < block);
-        (first_suspect < self.chunks.len()).then(|| &self.chunks[first_suspect])
+        let first_suspect = chunks.partition_point(|chunk| (chunk.last_block() as u64) < block);
+        (first_suspect < chunks.len()).then(|| chunks[first_suspect].clone())
     }
 }

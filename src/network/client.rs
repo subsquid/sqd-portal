@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use contract_client::PeerId;
 use futures::{Stream, StreamExt};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use subsquid_messages::{data_chunk::DataChunk, query_result, Ping, Query, QueryResult};
 use subsquid_network_transport::{
     GatewayConfig, GatewayEvent, GatewayTransportHandle, P2PTransportBuilder, QueueFull,
@@ -31,7 +31,7 @@ pub struct NetworkClient {
     network_state: Mutex<NetworkState>,
     contract_client: Box<dyn contract_client::Client>,
     tasks: Mutex<HashMap<QueryId, QueryTask>>,
-    dataset_storage: RwLock<StorageClient>,
+    dataset_storage: StorageClient,
     dataset_update_interval: Duration,
     chain_update_interval: Duration,
 }
@@ -62,7 +62,7 @@ impl NetworkClient {
             network_state: Mutex::new(NetworkState::new(config)),
             contract_client,
             tasks: Mutex::new(HashMap::new()),
-            dataset_storage: RwLock::new(dataset_storage),
+            dataset_storage,
         })
     }
 
@@ -84,7 +84,7 @@ impl NetworkClient {
                     break;
                 }
             }
-            self.dataset_storage.write().update().await;
+            self.dataset_storage.update().await;
         }
     }
 
@@ -144,11 +144,11 @@ impl NetworkClient {
     }
 
     pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
-        self.dataset_storage.read().find_chunk(dataset, block)
+        self.dataset_storage.find_chunk(dataset, block)
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
-        self.dataset_storage.read().next_chunk(dataset, chunk)
+        self.dataset_storage.next_chunk(dataset, chunk)
     }
 
     pub fn find_worker(&self, dataset: &DatasetId, block: u32) -> Option<PeerId> {
