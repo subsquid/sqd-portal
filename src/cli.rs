@@ -70,6 +70,10 @@ fn default_dataset_update_interval() -> Duration {
     Duration::from_secs(60 * 5)
 }
 
+fn default_chain_update_interval() -> Duration {
+    Duration::from_secs(60)
+}
+
 #[serde_as]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -122,6 +126,13 @@ pub struct Config {
         default = "default_dataset_update_interval"
     )]
     pub dataset_update_interval: Duration,
+
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(
+        rename = "chain_update_interval_sec",
+        default = "default_chain_update_interval"
+    )]
+    pub chain_update_interval: Duration,
 
     // Dataset alias -> bucket URL
     pub available_datasets: HashMap<String, String>,

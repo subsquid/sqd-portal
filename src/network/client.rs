@@ -8,7 +8,7 @@ use subsquid_network_transport::{
     GatewayConfig, GatewayEvent, GatewayTransportHandle, P2PTransportBuilder, QueueFull,
     TransportArgs,
 };
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -29,9 +29,11 @@ pub struct NetworkClient {
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
     transport_handle: GatewayTransportHandle,
     network_state: Mutex<NetworkState>,
+    contract_client: Box<dyn contract_client::Client>,
     tasks: Mutex<HashMap<QueryId, QueryTask>>,
     dataset_storage: RwLock<StorageClient>,
     dataset_update_interval: Duration,
+    chain_update_interval: Duration,
 }
 
 struct QueryTask {
@@ -47,15 +49,18 @@ impl NetworkClient {
     ) -> anyhow::Result<NetworkClient> {
         let dataset_storage = StorageClient::new(config.available_datasets.values()).await?;
         let transport_builder = P2PTransportBuilder::from_cli(args).await?;
+        let contract_client = transport_builder.contract_client();
         let mut gateway_config = GatewayConfig::new(logs_collector);
         gateway_config.query_config.request_timeout = config.transport_timeout;
         let (incoming_events, transport_handle) =
             transport_builder.build_gateway(gateway_config)?;
         Ok(NetworkClient {
             dataset_update_interval: config.dataset_update_interval,
+            chain_update_interval: config.chain_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
             network_state: Mutex::new(NetworkState::new(config)),
+            contract_client,
             tasks: Mutex::new(HashMap::new()),
             dataset_storage: RwLock::new(dataset_storage),
         })
@@ -65,11 +70,12 @@ impl NetworkClient {
         // TODO: run coroutines in parallel
         tokio::join!(
             self.run_event_stream(cancellation_token.clone()),
-            self.run_storage_update(cancellation_token)
+            self.run_storage_updates(cancellation_token.clone()),
+            self.run_chain_updates(cancellation_token),
         );
     }
 
-    async fn run_storage_update(&self, cancellation_token: CancellationToken) {
+    async fn run_storage_updates(&self, cancellation_token: CancellationToken) {
         let mut interval = tokio::time::interval(self.dataset_update_interval);
         loop {
             tokio::select! {
@@ -79,6 +85,39 @@ impl NetworkClient {
                 }
             }
             self.dataset_storage.write().update().await;
+        }
+    }
+
+    async fn run_chain_updates(&self, cancellation_token: CancellationToken) {
+        let mut current_epoch = self
+            .contract_client
+            .current_epoch()
+            .await
+            .unwrap_or_else(|e| panic!("Couldn't get current epoch: {e}"));
+        tracing::info!("Current epoch: {current_epoch}");
+        let mut interval = tokio::time::interval_at(
+            Instant::now() + self.chain_update_interval,
+            self.chain_update_interval,
+        );
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = cancellation_token.cancelled() => {
+                    break;
+                }
+            }
+            let epoch = match self.contract_client.current_epoch().await {
+                Ok(epoch) => epoch,
+                Err(e) => {
+                    tracing::warn!("Couldn't get current epoch: {e}");
+                    continue;
+                }
+            };
+            if epoch != current_epoch {
+                tracing::info!("Epoch {epoch} started");
+                current_epoch = epoch;
+                self.network_state.lock().reset_cache();
+            }
         }
     }
 
@@ -152,7 +191,7 @@ impl NetworkClient {
     }
 
     fn handle_ping(&self, peer_id: PeerId, ping: Ping) {
-        if !ping.version_matches(&*SUPPORTED_VERSIONS) {
+        if !ping.version_matches(&SUPPORTED_VERSIONS) {
             metrics::IGNORED_PINGS.inc();
             return;
         }
