@@ -1,12 +1,14 @@
-logs_collector_id: "12D3KooWC3GvQVqnvPwWz23sTW8G8HVokMnox62A7mnL9wwaSujk"
-send_metrics: true
 worker_inactive_threshold_sec: 120
-worker_greylist_time_sec: 1800
-default_query_timeout_sec: 60
-summary_print_interval_sec: 30
-workers_update_interval_sec: 180
+min_worker_priority: -4
+max_worker_priority: 3
+default_buffer_size: 10
+default_chunk_timeout_sec: 30
+default_backoff_sec: 1
+default_request_multiplier: 1
+default_retries: 3
+default_timeout_quantile: 0.5
+dataset_update_interval: 300
 available_datasets:
-  ethereum-mainnet: "czM6Ly9ldGhlcmV1bS1tYWlubmV0"
-  binance-mainnet: "czM6Ly9iaW5hbmNlLW1haW5uZXQ"
-  base-mainnet: "czM6Ly9iYXNlLTE"
-  arbitrum-one: "czM6Ly9hcmJpdHJ1bS1vbmU"
+  ethereum-mainnet: "s3://ethereum-mainnet"
+  arbitrum-one: "s3://arbitrum-one"
+  base-mainnet: "s3://base-1"

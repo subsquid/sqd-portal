@@ -1,205 +1,213 @@
-use std::fmt::Display;
-use std::io::Write;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
-use axum::extract::{Extension, Host, Path, Query};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
-use duration_string::DurationString;
-use flate2::write::GzDecoder;
-use serde::Deserialize;
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::RwLock;
+use axum::{
+    async_trait,
+    body::Body,
+    extract::{FromRequest, Path, Query, Request},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Extension, RequestExt, Router,
+};
+use futures::StreamExt;
+use prometheus_client::registry::Registry;
 
-use subsquid_messages::OkResult;
-use subsquid_network_transport::PeerId;
-
-use crate::client::QueryClient;
-use crate::config::{Config, DatasetId};
-use crate::metrics;
-use crate::network_state::NetworkState;
-use crate::query::QueryResult;
-use crate::scheme_extractor::Scheme;
+use crate::{
+    cli::Config,
+    controller::task_manager::TaskManager,
+    network::NetworkClient,
+    types::{ClientRequest, RequestError},
+};
 
 async fn get_height(
+    Extension(network_state): Extension<Arc<NetworkClient>>,
+    Extension(config): Extension<Arc<Config>>,
     Path(dataset): Path<String>,
-    Extension(client): Extension<Arc<QueryClient>>,
 ) -> impl IntoResponse {
-    log::debug!("Get height dataset={dataset}");
-    let dataset_id = match Config::get().dataset_id(&dataset) {
+    tracing::debug!("Get height dataset={dataset}");
+    let dataset_id = match config.dataset_id(&dataset) {
         Some(dataset_id) => dataset_id,
         None => return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")),
     };
 
-    match client.get_height(&dataset_id).await {
+    match network_state.get_height(&dataset_id) {
         Some(height) => (StatusCode::OK, height.to_string()),
         None => (
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::NOT_FOUND,
             format!("No data for dataset {dataset}"),
         ),
     }
 }
 
-async fn get_worker(
-    Scheme(scheme): Scheme,
-    Host(host): Host,
-    Path((dataset, start_block)): Path<(String, u32)>,
-    Extension(client): Extension<Arc<QueryClient>>,
-) -> impl IntoResponse {
-    log::debug!("Get worker dataset={dataset} start_block={start_block}");
-    let dataset_id = match Config::get().dataset_id(&dataset) {
-        Some(dataset_id) => dataset_id,
-        None => return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")),
-    };
-
-    let worker_id = match client.find_worker(&dataset_id, start_block).await {
-        Some(worker_id) => worker_id,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("No available worker for dataset {dataset} block {start_block}"),
-            )
-        }
-    };
-
-    (
-        StatusCode::OK,
-        format!("{scheme}://{host}/query/{dataset_id}/{worker_id}"),
-    )
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ExecuteParams {
-    timeout: Option<DurationString>,
-    #[serde(default)]
-    profiling: bool,
-}
-
 async fn execute_query(
-    Path((dataset_id, worker_id)): Path<(DatasetId, PeerId)>,
-    Query(ExecuteParams { timeout, profiling }): Query<ExecuteParams>,
-    Extension(client): Extension<Arc<QueryClient>>,
-    headers: HeaderMap,
-    query: String, // request body
+    Path(dataset): Path<String>,
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    request: ClientRequest,
 ) -> Response {
-    log::debug!("Execute query dataset_id={dataset_id} worker_id={worker_id}");
-    match client
-        .execute_query(dataset_id, query, worker_id, timeout, profiling)
-        .await
-    {
-        Err(err) => server_error(err),
-        Ok(QueryResult::Ok(result)) => ok_response(result, headers),
-        Ok(res) => (res.status_code(), res.to_string()).into_response(),
-    }
+    tracing::info!("Processing query for dataset {dataset}");
+
+    let stream = match task_manager.spawn_stream(request).await {
+        Ok(stream) => stream,
+        Err(e) => return e.into_response(),
+    };
+    let stream = stream.map(anyhow::Ok);
+    Response::builder().body(Body::from_stream(stream)).unwrap()
 }
 
-#[inline(always)]
-fn server_error(err: impl Display) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-}
-
-fn ok_response(result: OkResult, request_headers: HeaderMap) -> Response {
-    let OkResult {
-        mut data,
-        exec_plan, ..
-    } = result;
-    if let Some(exec_plan) = exec_plan {
-        save_exec_plan(exec_plan);
-    }
-
-    let mut headers = HeaderMap::new();
-    headers.insert("content-type", "application/json".parse().unwrap());
-
-    // If client accepts gzip compressed data, return it as-is. Otherwise, decompress.
-    let gzip_accepted = request_headers
-        .get_all("accept-encoding")
-        .iter()
-        .filter_map(|x| x.to_str().ok())
-        .any(|x| x.contains("gzip"));
-    if gzip_accepted {
-        headers.insert("content-encoding", "gzip".parse().unwrap());
-    } else {
-        data = match decode_gzip(data) {
-            Ok(data) => data,
-            Err(err) => return server_error(err),
-        }
+async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {
+    lazy_static::lazy_static! {
+        static ref HEADERS: HeaderMap = {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                "application/openmetrics-text; version=1.0.0; charset=utf-8"
+                    .parse()
+                    .unwrap(),
+            );
+            headers
+        };
     }
 
-    (StatusCode::OK, headers, data).into_response()
-}
+    let mut buffer = String::new();
+    prometheus_client::encoding::text::encode(&mut buffer, &registry).unwrap();
 
-fn save_exec_plan(exec_plan: Vec<u8>) {
-    tokio::spawn(async move {
-        let mut output_path = std::env::temp_dir();
-        let now = chrono::Utc::now();
-        output_path.extend([format!("exec_plan_{}.json.gz", now.to_rfc3339())]);
-        if let Err(e) = tokio::fs::write(&output_path, exec_plan).await {
-            log::error!("Error saving exec_plan: {e:?}");
-        } else {
-            log::info!("Exec plan saved to {}", output_path.display());
-        }
-    });
-}
-
-fn decode_gzip(data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-    let buffer = Vec::new();
-    let mut decoder = GzDecoder::new(buffer);
-    decoder.write_all(data.as_slice())?;
-    Ok(decoder.finish()?)
-}
-
-async fn get_metrics() -> Response {
-    match metrics::gather_metrics() {
-        Ok(metrics) => (StatusCode::OK, metrics).into_response(),
-        Err(err) => server_error(err.to_string()),
-    }
-}
-
-async fn greylisted_workers(
-    Extension(network_state): Extension<Arc<RwLock<NetworkState>>>,
-) -> Response {
-    Json(network_state.read().await.greylisted_workers()).into_response()
-}
-
-async fn get_network_state(
-    Extension(network_state): Extension<Arc<RwLock<NetworkState>>>,
-) -> Response {
-    Json(network_state.read().await.network_state()).into_response()
+    (HEADERS.clone(), buffer)
 }
 
 pub async fn run_server(
-    query_client: QueryClient,
-    network_state: Arc<RwLock<NetworkState>>,
+    task_manager: Arc<TaskManager>,
+    network_state: Arc<NetworkClient>,
+    metrics_registry: Registry,
     addr: &SocketAddr,
+    config: Arc<Config>,
 ) -> anyhow::Result<()> {
-    log::info!("Starting HTTP server listening on {addr}");
+    tracing::info!("Starting HTTP server listening on {addr}");
     let app = Router::new()
         .route("/network/:dataset/height", get(get_height))
-        .route("/network/:dataset/:start_block/worker", get(get_worker))
-        .route("/network/state", get(get_network_state))
-        .route("/query/:dataset_id/:worker_id", post(execute_query))
+        .route("/stream/:dataset", post(execute_query))
         .route("/metrics", get(get_metrics))
-        .route("/workers/greylisted", get(greylisted_workers))
-        .layer(Extension(Arc::new(query_client)))
-        .layer(Extension(network_state));
-
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let shutdown = async move {
-        tokio::select! {
-            _ = sigint.recv() => (),
-            _ = sigterm.recv() =>(),
-        }
-    };
+        .layer(Extension(task_manager))
+        .layer(Extension(network_state))
+        .layer(Extension(config))
+        .layer(Extension(Arc::new(metrics_registry)));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(listener, app).await?;
 
-    log::info!("HTTP server stopped");
+    tracing::info!("HTTP server stopped");
     Ok(())
+}
+
+#[async_trait]
+impl<S> FromRequest<S> for ClientRequest
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let Path(dataset) = req
+            .extract_parts::<Path<String>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Query(params) = req
+            .extract_parts::<Query<HashMap<String, String>>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Extension(config) = req
+            .extract_parts::<Extension<Arc<Config>>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let query: String = req.extract().await.map_err(IntoResponse::into_response)?;
+
+        let Some(dataset_id) = config.dataset_id(&dataset) else {
+            return Err(
+                RequestError::NotFound(format!("Unknown dataset: {dataset}")).into_response(),
+            );
+        };
+        let query = query.parse().map_err(|e| {
+            RequestError::BadRequest(format!("Couldn't parse query: {e}")).into_response()
+        })?;
+        let buffer_size = match params.get("buffer_size").map(|v| v.parse()) {
+            Some(Ok(value)) => value,
+            Some(Err(e)) => {
+                return Err(
+                    RequestError::BadRequest(format!("Couldn't parse buffer_size: {e}"))
+                        .into_response(),
+                )
+            }
+            None => config.default_buffer_size,
+        };
+        let chunk_timeout = match params.get("chunk_timeout") {
+            Some(value) => match value.parse() {
+                Ok(seconds) => Duration::from_secs(seconds),
+                Err(e) => {
+                    return Err(RequestError::BadRequest(format!(
+                        "Couldn't parse chunk_timeout: {e}"
+                    ))
+                    .into_response())
+                }
+            },
+            None => config.default_chunk_timeout,
+        };
+        let timeout_quantile = match params.get("timeout_quantile") {
+            Some(value) => match value.parse() {
+                Ok(quantile) => quantile,
+                Err(e) => {
+                    return Err(RequestError::BadRequest(format!(
+                        "Couldn't parse timeout_quantile: {e}"
+                    ))
+                    .into_response())
+                }
+            },
+            None => config.default_timeout_quantile,
+        };
+        let backoff = match params.get("backoff") {
+            Some(value) => match value.parse() {
+                Ok(seconds) => Duration::from_secs(seconds),
+                Err(e) => {
+                    return Err(
+                        RequestError::BadRequest(format!("Couldn't parse backoff: {e}"))
+                            .into_response(),
+                    )
+                }
+            },
+            None => config.default_backoff,
+        };
+        let request_multiplier = match params.get("request_multiplier") {
+            Some(value) => match value.parse() {
+                Ok(value) => value,
+                Err(e) => {
+                    return Err(RequestError::BadRequest(format!(
+                        "Couldn't parse request_multiplier: {e}"
+                    ))
+                    .into_response())
+                }
+            },
+            None => config.default_request_multiplier,
+        };
+        let retries = match params.get("retries") {
+            Some(value) => match value.parse() {
+                Ok(value) => value,
+                Err(e) => {
+                    return Err(
+                        RequestError::BadRequest(format!("Couldn't parse retries: {e}"))
+                            .into_response(),
+                    )
+                }
+            },
+            None => config.default_retries,
+        };
+
+        Ok(ClientRequest {
+            dataset_id,
+            query,
+            buffer_size,
+            chunk_timeout,
+            timeout_quantile,
+            backoff,
+            request_multiplier,
+            retries,
+        })
+    }
 }

@@ -1,37 +1,37 @@
 [package]
-name = "query-gateway"
-version = "1.0.8"
+name = "subsquid-query-gateway"
+version = "2.0.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1"
-axum = "0.7"
+async-stream = "0.3.5"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+axum = { version = "0.7", features = ["http2"] }
 base64 = "0.22"
-chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
-derivative = "2"
 dotenv = "0.15"
-duration-string = { version = "0.4", features = ["serde"] }
-env_logger = "0.11"
-flate2 = "1"
 futures = "0.3"
-lazy_static = "1"
-log = "0.4"
-prometheus = "0.13"
-rand = "0.8"
-rusqlite = { version = "0.31", features = ["trace", "bundled"] }
+lazy_static = "1.4.0"
+parking_lot = "0.12"
+prometheus-client = "0.22"
+scopeguard = "1.2"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
-serde_with = "3"
+serde_json = "1.0"
+serde_with = "3.9"
 serde_yaml = "0.9"
-tabled = "0.15"
+static_assertions = "1.1.0"
+thiserror = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
-tokio-rusqlite = "0.5"
+tokio-stream = "0.1"
+tokio-util = "0.7.11"
+tracing = { version = "0.1", features = ["async-await"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 contract-client = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.4" }
-subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.1.1", features = ["semver"] }
-subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.14", features = ["gateway"] }
-
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.1.0", features = ["semver"] }
+subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.12", features = ["gateway", "metrics"] }
+subsquid-datasets = { git = "https://github.com/subsquid/archive-router.git", version = "0.0.1", branch = "datasets-crate" }

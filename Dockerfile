@@ -9,6 +9,7 @@ COPY src ./src
 
 RUN cargo chef prepare --recipe-path recipe.json
 
+
 FROM --platform=$BUILDPLATFORM chef AS builder
 
 RUN --mount=target=/var/lib/apt/lists,type=cache,sharing=locked \
@@ -26,6 +27,7 @@ COPY src ./src
 
 RUN cargo build --release --workspace
 
+
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim
 ARG TARGETOS
 ARG TARGETARCH
@@ -42,14 +44,14 @@ RUN curl -sL https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq
 
 WORKDIR /run
 
-COPY --from=builder /app/target/release/query-gateway /usr/local/bin/query-gateway
-COPY tethys.config.yml ./config.yml
+COPY --from=builder /app/target/release/subsquid-query-gateway /usr/local/bin/subsquid-query-gateway
+COPY tethys.config.yml .
 
 ENV P2P_LISTEN_ADDRS="/ip4/0.0.0.0/udp/12345/quic-v1"
 ENV HTTP_LISTEN_ADDR="0.0.0.0:8000"
-ENV CONFIG_PATH="/run/config.yml"
+ENV RUST_LOG=info,subsquid_query_gateway=debug
 
-CMD ["query-gateway"]
+CMD ["subsquid-query-gateway"]
 
 COPY healthcheck.sh .
 RUN chmod +x ./healthcheck.sh

@@ -1,75 +1,90 @@
-use std::ops::Deref;
-
-use crate::task::FinishedTask;
-use lazy_static::lazy_static;
-use prometheus::{
-    register_histogram_vec, register_int_gauge, register_int_gauge_vec, HistogramVec, IntGauge,
-    IntGaugeVec, TextEncoder,
+use prometheus_client::{
+    metrics::{counter::Counter, family::Family, gauge::Gauge},
+    registry::Registry,
 };
+use subsquid_messages::query_result;
 
-lazy_static! {
-    static ref ALLOCATED_COMP_UNITS: IntGaugeVec = register_int_gauge_vec!(
-        "allocated_comp_units",
-        "amount of compute units allocated for this epoch",
-        &["worker_id"]
-    )
-    .unwrap();
-    static ref SPENT_COMP_UNITS: IntGaugeVec = register_int_gauge_vec!(
-        "spent_comp_units",
-        "amount of compute units spent this epoch",
-        &["worker_id"]
-    )
-    .unwrap();
-    static ref QUERY_DURATION: HistogramVec = register_histogram_vec!(
-        "query_duration",
-        "time of query execution in seconds, labeled with worker_id and status",
-        &["worker_id", "status"],
-        vec![1.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 45.0, 60.0, 90.0, 120.0]
-    )
-    .unwrap();
-    static ref CURRENT_EPOCH: IntGauge =
-        register_int_gauge!("current_epoch", "current epoch number").unwrap();
+use crate::types::DatasetId;
+
+lazy_static::lazy_static! {
+    pub static ref VALID_PINGS: Counter = Default::default();
+    pub static ref IGNORED_PINGS: Counter = Default::default();
+    pub static ref QUERIES_SENT: Counter = Default::default();
+    static ref QUERY_RESULTS: Family<Vec<(String, String)>, Counter> = Default::default();
+    pub static ref KNOWN_WORKERS: Gauge = Default::default();
+    pub static ref ACTIVE_STREAMS: Gauge = Default::default();
+    pub static ref COMPLETED_STREAMS: Counter = Default::default();
+    static ref HIGHEST_BLOCK: Family<Vec<(String, String)>, Gauge> = Default::default();
+    static ref FIRST_GAP: Family<Vec<(String, String)>, Gauge> = Default::default();
 }
 
-pub fn init_workers<T, S>(workers: T)
-where
-    T: IntoIterator<Item = S>,
-    S: Deref<Target = str>,
-{
-    for worker_id in workers.into_iter() {
-        ALLOCATED_COMP_UNITS.with_label_values(&[&worker_id]).set(0);
-        SPENT_COMP_UNITS.with_label_values(&[&worker_id]).set(0);
+pub fn report_query_result(result: &query_result::Result) {
+    let status = match result {
+        query_result::Result::Ok(_) => "ok",
+        query_result::Result::BadRequest(_) => "bad_request",
+        query_result::Result::ServerError(_) => "server_error",
+        query_result::Result::NoAllocation(_) => "no_allocation",
+        query_result::Result::TimeoutV1(()) | query_result::Result::Timeout(_) => "timeout",
     }
+    .to_owned();
+    QUERY_RESULTS
+        .get_or_create(&vec![("status".to_owned(), status)])
+        .inc();
 }
 
-pub fn new_epoch(epoch: u32) {
-    CURRENT_EPOCH.set(epoch as i64);
-    ALLOCATED_COMP_UNITS.reset();
-    SPENT_COMP_UNITS.reset();
+pub fn report_dataset_updated(dataset_id: &DatasetId, highest_block: u32, first_gap: u32) {
+    HIGHEST_BLOCK
+        .get_or_create(&vec![("dataset".to_owned(), dataset_id.0.clone())])
+        .set(highest_block as i64);
+    FIRST_GAP
+        .get_or_create(&vec![("dataset".to_owned(), dataset_id.0.clone())])
+        .set(first_gap as i64);
 }
 
-pub fn update_allocations(allocations: Vec<(String, u32)>) {
-    for (worker_id, comp_units) in allocations.into_iter() {
-        ALLOCATED_COMP_UNITS
-            .with_label_values(&[&worker_id])
-            .set(comp_units as i64)
-    }
-}
-
-pub fn spend_comp_units(worker_id: &str, spent_cus: u32) {
-    SPENT_COMP_UNITS
-        .with_label_values(&[worker_id])
-        .add(spent_cus as i64);
-}
-
-pub fn query_finished(task: &FinishedTask) {
-    let worker_id = task.worker_id.to_string();
-    let status = task.result.status_code();
-    QUERY_DURATION
-        .with_label_values(&[&worker_id, status.as_str()])
-        .observe(task.exec_time_ms() as f64 / 1000.0);
-}
-
-pub fn gather_metrics() -> anyhow::Result<String> {
-    Ok(TextEncoder::new().encode_to_string(&prometheus::gather())?)
+pub fn register_metrics(registry: &mut Registry) {
+    registry.register(
+        "pings",
+        "Number of received valid pings",
+        VALID_PINGS.clone(),
+    );
+    registry.register(
+        "ignored_pings",
+        "Number of pings from unsupported workers",
+        IGNORED_PINGS.clone(),
+    );
+    registry.register(
+        "queries_sent",
+        "Number of sent queries",
+        QUERIES_SENT.clone(),
+    );
+    registry.register(
+        "queries_responded",
+        "Number of received responses",
+        QUERY_RESULTS.clone(),
+    );
+    registry.register(
+        "known_workers",
+        "Number of workers seen in the network",
+        KNOWN_WORKERS.clone(),
+    );
+    registry.register(
+        "streams_active",
+        "Number of currently open client streams",
+        ACTIVE_STREAMS.clone(),
+    );
+    registry.register(
+        "streams_completed",
+        "Number of completed client streams",
+        COMPLETED_STREAMS.clone(),
+    );
+    registry.register(
+        "dataset_highest_block",
+        "Highest seen block",
+        HIGHEST_BLOCK.clone(),
+    );
+    registry.register(
+        "dataset_first_gap",
+        "First block not owned by any worker",
+        FIRST_GAP.clone(),
+    );
 }

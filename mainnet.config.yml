@@ -1,16 +1,9 @@
-logs_collector_id: "12D3KooWFnRhNqgsKtsDDhsozaWuyrTvtQA2Eu4XWvSPRd4UZynd"
-send_metrics: true
-worker_inactive_threshold_sec: 120
-worker_greylist_time_sec: 1800
-default_query_timeout_sec: 60
-summary_print_interval_sec: 30
-workers_update_interval_sec: 180
 available_datasets:
-  ethereum-mainnet: "czM6Ly9ldGhlcmV1bS1tYWlubmV0"
-  binance-mainnet: "czM6Ly9iaW5hbmNlLW1haW5uZXQ"
-  base-mainnet: "czM6Ly9iYXNlLTE"
-  arbitrum-one: "czM6Ly9hcmJpdHJ1bS1vbmU"
-  ethereum-sepolia: "czM6Ly9ldGhlcmV1bS1zZXBvbGlhLTE"
-  polygon-mainnet: "czM6Ly9wb2x5Z29uLW1haW5uZXQtdHJhY2VsZXNzLTE"
-  polygon-zkevm-mainnet: "czM6Ly9wb2x5Z29uLXprZXZtLW1haW5uZXQtdHJhY2VsZXNz"
-  zksync-mainnet: "czM6Ly96a3N5bmMtbWFpbm5ldC0x"
+  ethereum-mainnet: "s3://ethereum-mainnet"
+  arbitrum-one: "s3://arbitrum-one"
+  base-mainnet: "s3://base-1"
+  binance-mainnet: "s3://binance-mainnet"
+  ethereum-sepolia: "s3://ethereum-sepolia-1"
+  polygon-mainnet: "s3://polygon-mainnet-1"
+  polygon-zkevm-mainnet: "s3://polygon-zkevm-mainnet-traceless"
+  zksync-mainnet: "s3://zksync-mainnet-1"

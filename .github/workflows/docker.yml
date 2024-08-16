@@ -36,7 +36,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Get query gateway version
-        run: echo "GATEWAY_VERSION=$(docker run --rm subsquid/query-gateway:test query-gateway --version | cut -d ' ' -f2)" >> $GITHUB_ENV
+        run: echo "GATEWAY_VERSION=$(docker run --rm subsquid/query-gateway:test subsquid-query-gateway --version | cut -d ' ' -f2)" >> $GITHUB_ENV
 
       - name: Build & publish query gateway
         uses: docker/build-push-action@v5
