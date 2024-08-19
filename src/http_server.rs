@@ -84,7 +84,7 @@ pub async fn run_server(
     tracing::info!("Starting HTTP server listening on {addr}");
     let app = Router::new()
         .route("/network/:dataset/height", get(get_height))
-        .route("/stream/:dataset", post(execute_query))
+        .route("/network/:dataset/stream", post(execute_query))
         .route("/metrics", get(get_metrics))
         .layer(Extension(task_manager))
         .layer(Extension(network_state))
