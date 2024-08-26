@@ -21,9 +21,6 @@ pub struct StreamController {
     downloads: JoinSet<(Result<ResponseChunk, RequestError>, usize)>,
     buffer: SlidingArray<Option<Result<ResponseChunk, RequestError>>>,
     timeouts: Arc<TimeoutManager>,
-    // The first request is sent out to probe it's validity.
-    // Only after that multiple requests are sent in parallel.
-    trial: bool,
 }
 
 impl StreamController {
@@ -47,7 +44,7 @@ impl StreamController {
 
         let buffer = SlidingArray::with_capacity(request.buffer_size);
         let timeout_quantile = request.timeout_quantile;
-        let mut streamer = Self {
+        Ok(Self {
             request,
             stream_id,
             network,
@@ -56,21 +53,12 @@ impl StreamController {
             downloads: Default::default(),
             buffer,
             timeouts: Arc::new(TimeoutManager::new(timeout_quantile)),
-            trial: true,
-        };
-
-        // Intentionally schedule only one download not to waste resources in case of bad request
-        streamer.schedule_next_chunk();
-
-        Ok(streamer)
+        })
     }
 
     #[instrument(skip_all, fields(stream_id = self.stream_id))]
     pub async fn poll_next_chunk(&mut self) -> Option<Result<ResponseChunk, RequestError>> {
-        while self.buffer.len() < self.request.buffer_size
-            && self.next_chunk.is_some()
-            && !self.trial
-        {
+        while self.buffer.len() < self.request.buffer_size && self.next_chunk.is_some() {
             self.schedule_next_chunk();
         }
 
@@ -98,7 +86,6 @@ impl StreamController {
         }
 
         let result = self.buffer.pop_front()?.unwrap();
-        self.trial = false;
         if let Ok(bytes) = &result {
             tracing::debug!("Sending {} response bytes", bytes.len());
         }
