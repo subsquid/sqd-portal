@@ -21,10 +21,19 @@ impl<T> SlidingArray<T> {
         self.first_index + self.data.len() - 1
     }
 
+    pub fn push_front(&mut self, value: T) {
+        self.data.push_front(value);
+        self.first_index -= 1;
+    }
+
     pub fn pop_front(&mut self) -> Option<T> {
         let value = self.data.pop_front()?;
         self.first_index += 1;
         Some(value)
+    }
+
+    pub fn first_index(&self) -> usize {
+        self.first_index
     }
 
     pub fn data(&self) -> &VecDeque<T> {

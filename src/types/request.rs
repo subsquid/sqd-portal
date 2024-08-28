@@ -52,6 +52,16 @@ impl ParsedQuery {
         json["toBlock"] = serde_json::Value::from(range.end);
         serde_json::to_string(&json).expect("Couldn't serialize query")
     }
+
+    pub fn intersect_with(&self, range: &Range) -> Option<Range> {
+        let begin = std::cmp::max(range.begin, self.first_block as u32);
+        let end = if let Some(last_block) = self.last_block {
+            std::cmp::min(range.end, last_block as u32)
+        } else {
+            range.end
+        };
+        (begin <= end).then_some(Range { begin, end })
+    }
 }
 
 impl FromStr for ParsedQuery {

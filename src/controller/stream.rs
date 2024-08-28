@@ -18,9 +18,21 @@ pub struct StreamController {
     network: Arc<NetworkClient>,
     next_index: usize,
     next_chunk: Option<DataChunk>,
-    downloads: JoinSet<(Result<ResponseChunk, RequestError>, usize)>,
-    buffer: SlidingArray<Option<Result<ResponseChunk, RequestError>>>,
+    downloads: JoinSet<(Slot, usize)>,
+    buffer: SlidingArray<Slot>,
     timeouts: Arc<TimeoutManager>,
+}
+
+// The size of this structure never exceeds the maximum response size
+enum Slot {
+    Pending,
+    Partial(PartialResult),
+    Done(Result<ResponseChunk, RequestError>),
+}
+
+struct PartialResult {
+    data: Vec<u8>,
+    next_range: Range,
 }
 
 impl StreamController {
@@ -62,42 +74,64 @@ impl StreamController {
             self.schedule_next_chunk();
         }
 
-        while !self.buffer.front().is_some_and(Option::is_some) {
+        while !self.buffer.front().is_some_and(Slot::ready) {
             let (result, index) = self
                 .downloads
                 .join_next()
                 .await?
                 .expect("Awaiting download panicked");
-            if self.buffer.get(index).is_some_and(Option::is_none) {
-                let code = short_code(&result);
-                self.buffer[index] = Some(result);
-                let mask = self
-                    .buffer
+            self.buffer[index] = result;
+
+            tracing::debug!(
+                "Got result for chunk number {index} ({}), buffer:\n[{}]",
+                short_code(&self.buffer[index]),
+                self.buffer
                     .data()
                     .iter()
-                    .map(|slot| if slot.is_some() { '#' } else { '.' })
-                    .collect::<String>();
-                tracing::debug!(
-                    "Got response for chunk number {index} ({code}), buffer:\n[{mask}]",
-                );
-            } else {
-                tracing::debug!("Dropping duplicate response for chunk number {index}");
+                    .map(Slot::debug_symbol)
+                    .collect::<String>()
+            );
+
+            if let Slot::Done(Err(_)) = self.buffer[index] {
+                // The stream will end at the first error. There is no need to start new downloads.
+                self.next_chunk = None;
             }
         }
 
-        let result = self.buffer.pop_front()?.unwrap();
-        if let Ok(bytes) = &result {
+        let index = self.buffer.first_index();
+        let result = match self.buffer.pop_front()? {
+            Slot::Done(result) => Some(result),
+            Slot::Partial(PartialResult { data, next_range }) => {
+                self.buffer.push_front(Slot::Pending);
+                let future = self
+                    .get_chunk_response(index, next_range)
+                    .map(move |result| (result, index));
+                self.downloads.spawn(future);
+                Some(Ok(data))
+            }
+            Slot::Pending => unreachable!("First chunk is not ready"),
+        };
+
+        if let Some(Ok(bytes)) = &result {
             tracing::debug!("Sending {} response bytes", bytes.len());
         }
-        Some(result)
+        result
     }
 
     // Schedules downloading `self.next_chunk`
     fn schedule_next_chunk(&mut self) {
         let chunk = self.next_chunk.clone().expect("No next chunk to download");
+        let range = self
+            .request
+            .query
+            .intersect_with(&Range {
+                begin: chunk.first_block(),
+                end: chunk.last_block(),
+            })
+            .expect("Chunk doesn't contain requested data");
         let index: usize = self.next_index;
         let future = self
-            .get_entire_chunk(index, chunk.clone())
+            .get_chunk_response(index, range)
             .map(move |result| (result, index));
         self.downloads.spawn(future);
         self.next_chunk = self.network.next_chunk(&self.request.dataset_id, &chunk);
@@ -115,87 +149,63 @@ impl StreamController {
             tracing::debug!("No more chunks available");
         }
         self.next_index += 1;
-        self.buffer.push_back(None);
+        self.buffer.push_back(Slot::Pending);
     }
 
-    fn get_entire_chunk(
-        &self,
-        index: usize,
-        chunk: DataChunk,
-    ) -> impl Future<Output = Result<ResponseChunk, RequestError>> {
-        let network = self.network.clone();
-        let timeouts = self.timeouts.clone();
-        let full_range = Range {
-            begin: std::cmp::max(chunk.first_block(), self.request.query.first_block() as u32),
-            end: if let Some(last_block) = self.request.query.last_block() {
-                std::cmp::min(chunk.last_block(), last_block as u32)
-            } else {
-                chunk.last_block()
-            },
-        };
-        let mut current_range = full_range;
-        let request = self.request.clone();
+    fn get_chunk_response(&self, index: usize, range: Range) -> impl Future<Output = Slot> {
+        let fut = self.get_one_response(index, range);
         async move {
-            let mut accum_response = Vec::new();
-            loop {
-                let fut = Self::get_one_response(
-                    request.clone(),
-                    network.clone(),
-                    timeouts.clone(),
+            let result = match fut.await {
+                Err(e) => return Slot::Done(Err(e)),
+                Ok(query_result::Result::Ok(result)) => result,
+                Ok(e) => return Slot::Done(Err(RequestError::try_from(e).unwrap())),
+            };
+            let Some(last_block) = result.last_block else {
+                return Slot::Done(Err(RequestError::InternalError(
+                    "No last block in response".to_string(),
+                )));
+            };
+            if last_block == range.end as u64 {
+                Slot::Done(Ok(result.data))
+            } else if last_block < range.begin as u64 {
+                tracing::warn!("Got empty response for range {}-{}", range.begin, range.end);
+                Slot::Done(Err(RequestError::InternalError(
+                    "Got empty response".to_string(),
+                )))
+            } else {
+                tracing::debug!(
+                    "Got partial response for chunk {} with blocks {}-{}. {} blocks left in this chunk",
                     index,
-                    current_range,
+                    range.begin,
+                    last_block,
+                    range.end - last_block as u32,
                 );
-                let result = match fut.await {
-                    Err(e) => return Err(e),
-                    Ok(query_result::Result::Ok(result)) => result,
-                    Ok(e) => return Err(RequestError::try_from(e).unwrap()),
-                };
-                let Some(last_block) = result.last_block else {
-                    return Err(RequestError::InternalError(
-                        "No last block in response".to_string(),
-                    ));
-                };
-                accum_response.extend(result.data);
-                if last_block == full_range.end as u64 {
-                    return Ok(accum_response);
-                } else if last_block < current_range.begin as u64 {
-                    tracing::warn!(
-                        "Got empty response for range {}-{}",
-                        current_range.begin,
-                        current_range.end
-                    );
-                    return Err(RequestError::InternalError(
-                        "Got empty response".to_string(),
-                    ));
-                } else {
-                    tracing::debug!(
-                        "Got response for chunk {} with blocks {}-{}. {}/{} blocks fetched from this chunk. Current response length: {}",
-                        index,
-                        current_range.begin,
-                        last_block,
-                        last_block - full_range.begin as u64 + 1,
-                        full_range.end - full_range.begin + 1,
-                        accum_response.len()
-                    );
-                    current_range.begin = (last_block + 1) as u32;
-                }
+                Slot::Partial(PartialResult {
+                    data: result.data,
+                    next_range: Range {
+                        begin: (last_block + 1) as u32,
+                        end: range.end,
+                    },
+                })
             }
         }
     }
 
     fn get_one_response(
-        request: ClientRequest,
-        network: Arc<NetworkClient>,
-        timeouts: Arc<TimeoutManager>,
+        &self,
         index: usize,
         range: Range,
     ) -> impl Future<Output = Result<query_result::Result, RequestError>> {
+        let network = self.network.clone();
+        let timeouts = self.timeouts.clone();
+        let request = self.request.clone();
         // TODO: don't modify the query
+        let query = request.query.with_range(&range);
         let send_query = move || {
             let start_time = tokio::time::Instant::now();
             Self::query_some_worker(
                 network.clone(),
-                request.query.with_range(&range),
+                query.clone(),
                 request.dataset_id.clone(),
                 index,
                 range,
@@ -309,6 +319,24 @@ impl Drop for StreamController {
     }
 }
 
+impl Slot {
+    fn ready(&self) -> bool {
+        match &self {
+            Slot::Pending => false,
+            _ => true,
+        }
+    }
+
+    fn debug_symbol(&self) -> char {
+        match &self {
+            Slot::Pending => '.',
+            Slot::Partial(_) => '+',
+            Slot::Done(Ok(_)) => '#',
+            Slot::Done(Err(_)) => '!',
+        }
+    }
+}
+
 fn retriable(result: &query_result::Result) -> bool {
     use query_result::Result;
     match result {
@@ -320,9 +348,11 @@ fn retriable(result: &query_result::Result) -> bool {
     }
 }
 
-fn short_code<T>(result: &Result<T, RequestError>) -> &'static str {
+fn short_code(result: &Slot) -> &'static str {
     match result {
-        Ok(_) => "ok",
-        Err(e) => e.short_code(),
+        Slot::Done(Ok(_)) => "ok",
+        Slot::Done(Err(e)) => e.short_code(),
+        Slot::Partial(_) => "partial",
+        Slot::Pending => "-",
     }
 }
