@@ -1,6 +1,6 @@
 [package]
-name = "subsquid-query-gateway"
-version = "2.0.0"
+name = "sqd-portal"
+version = "0.1.0"
 edition = "2021"
 
 [dependencies]

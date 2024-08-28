@@ -5462,6 +5462,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqd-portal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "aws-config",
+ "aws-sdk-s3",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "contract-client",
+ "dotenv",
+ "futures",
+ "lazy_static",
+ "parking_lot",
+ "prometheus-client",
+ "scopeguard",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "serde_yaml",
+ "static_assertions",
+ "subsquid-datasets",
+ "subsquid-messages",
+ "subsquid-network-transport",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid 1.9.1",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5572,42 +5608,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "subsquid-query-gateway"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "aws-config",
- "aws-sdk-s3",
- "axum",
- "base64 0.22.1",
- "clap",
- "contract-client",
- "dotenv",
- "futures",
- "lazy_static",
- "parking_lot",
- "prometheus-client",
- "scopeguard",
- "semver",
- "serde",
- "serde_json",
- "serde_with",
- "serde_yaml",
- "static_assertions",
- "subsquid-datasets",
- "subsquid-messages",
- "subsquid-network-transport",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid 1.9.1",
 ]
 
 [[package]]
