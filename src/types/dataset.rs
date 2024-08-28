@@ -1,10 +1,10 @@
 use std::fmt::{Display, Formatter};
 
 use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Base64 encoded URL
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetId(pub String);
 
 impl Display for DatasetId {

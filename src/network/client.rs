@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use contract_client::PeerId;
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
+use serde::Serialize;
 use subsquid_messages::{data_chunk::DataChunk, query_result, Ping, Query, QueryResult};
 use subsquid_network_transport::{
     GatewayConfig, GatewayEvent, GatewayTransportHandle, P2PTransportBuilder, QueueFull,
@@ -180,6 +181,7 @@ impl NetworkClient {
         )?;
         tracing::trace!("Sent query {query_id} to {worker}");
         metrics::QUERIES_SENT.inc();
+        self.network_state.lock().lease_worker(*worker);
 
         let (result_tx, result_rx) = oneshot::channel();
         let task = QueryTask {
@@ -253,5 +255,9 @@ impl NetworkClient {
         task.result_tx.send(result).ok();
 
         Ok(())
+    }
+
+    pub fn network_state(&self) -> impl Serialize {
+        self.network_state.lock().network_state()
     }
 }

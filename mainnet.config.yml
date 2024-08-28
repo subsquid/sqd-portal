@@ -1,3 +1,4 @@
+hostname: http://localhost:8000
 available_datasets:
   ethereum-mainnet: "s3://ethereum-mainnet"
   arbitrum-one: "s3://arbitrum-one"

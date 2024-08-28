@@ -6,13 +6,14 @@ use std::time::Instant;
 use crate::cli::Config;
 use crate::metrics;
 use crate::types::DatasetId;
+use serde::Serialize;
 use subsquid_messages::RangeSet;
 use subsquid_network_transport::PeerId;
 
 use super::priorities::WorkersPool;
 
-#[derive(Default)]
-struct DatasetState {
+#[derive(Default, Debug, Clone, Serialize)]
+pub struct DatasetState {
     worker_ranges: HashMap<PeerId, RangeSet>,
     highest_seen_block: u32,
     first_gap: u32,
@@ -71,10 +72,7 @@ impl NetworkState {
     }
 
     pub fn find_worker(&mut self, dataset_id: &DatasetId, start_block: u32) -> Option<PeerId> {
-        let dataset_state = match self.dataset_states.get(dataset_id) {
-            None => return None,
-            Some(state) => state,
-        };
+        let dataset_state = self.dataset_states.get(dataset_id)?;
 
         // Choose an active worker having the requested start_block with the top priority
         let deadline = Instant::now() - self.config.worker_inactive_threshold;
@@ -103,6 +101,10 @@ impl NetworkState {
                 entry.highest_seen_block,
             );
         }
+    }
+
+    pub fn lease_worker(&mut self, worker: PeerId) {
+        self.pool.lease(worker);
     }
 
     pub fn report_query_success(&mut self, worker: PeerId) {
@@ -137,5 +139,9 @@ impl NetworkState {
         deadline: Instant,
     ) -> bool {
         last_pings.get(worker_id).is_some_and(|t| *t > deadline)
+    }
+
+    pub fn network_state(&self) -> HashMap<DatasetId, DatasetState> {
+        self.dataset_states.clone()
     }
 }

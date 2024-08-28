@@ -46,6 +46,10 @@ fn default_default_buffer_size() -> usize {
     10
 }
 
+fn default_max_buffer_size() -> usize {
+    100
+}
+
 fn default_default_chunk_timeout() -> Duration {
     Duration::from_secs(30)
 }
@@ -74,9 +78,20 @@ fn default_chain_update_interval() -> Duration {
     Duration::from_secs(60)
 }
 
+fn parse_hostname<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(s.trim_end_matches('/').to_owned())
+}
+
 #[serde_as]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    #[serde(deserialize_with = "parse_hostname")]
+    pub hostname: String,
+
     #[serde_as(as = "DurationSeconds")]
     #[serde(
         rename = "worker_inactive_threshold_sec",
@@ -99,6 +114,9 @@ pub struct Config {
 
     #[serde(default = "default_default_buffer_size")]
     pub default_buffer_size: usize,
+
+    #[serde(default = "default_max_buffer_size")]
+    pub max_buffer_size: usize,
 
     #[serde_as(as = "DurationSeconds")]
     #[serde(

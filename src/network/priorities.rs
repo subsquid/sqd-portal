@@ -36,9 +36,11 @@ impl WorkersPool {
             return None;
         }
 
-        self.dec(worker, LEASE_PENALTY);
-
         Some(worker)
+    }
+
+    pub fn lease(&mut self, worker: PeerId) {
+        self.dec(worker, LEASE_PENALTY);
     }
 
     pub fn success(&mut self, worker: PeerId) {
