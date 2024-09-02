@@ -1,10 +1,11 @@
 use std::sync::{
-    atomic::{AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicU8, Ordering},
     Arc,
 };
 
 use async_stream::stream;
 use futures::Stream;
+use tracing_futures::Instrument;
 
 use crate::{
     metrics,
@@ -20,7 +21,6 @@ const MAX_PARALLEL_STREAMS: u8 = 5;
 pub struct TaskManager {
     network_client: Arc<NetworkClient>,
     running_tasks: AtomicU8,
-    next_stream_id: AtomicUsize,
 }
 
 impl TaskManager {
@@ -28,7 +28,6 @@ impl TaskManager {
         TaskManager {
             network_client,
             running_tasks: 0.into(),
-            next_stream_id: 0.into(),
         }
     }
 
@@ -50,14 +49,11 @@ impl TaskManager {
             metrics::COMPLETED_STREAMS.inc();
         });
 
-        let streamer = StreamController::new(
-            request,
-            self.next_stream_id.fetch_add(1, Ordering::Relaxed),
-            self.network_client.clone(),
-        );
+        let streamer = StreamController::new(request, self.network_client.clone());
         let mut streamer = streamer?;
         let first_chunk = streamer
             .poll_next_chunk()
+            .in_current_span()
             .await
             .expect("First chunk missing from the stream")?;
         Ok(stream! {
@@ -74,6 +70,7 @@ impl TaskManager {
                     }
                 }
             }
-        })
+        }
+        .in_current_span())
     }
 }

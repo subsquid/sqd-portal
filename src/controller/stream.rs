@@ -3,24 +3,25 @@ use std::{future::Future, sync::Arc};
 use futures::FutureExt;
 use subsquid_messages::{data_chunk::DataChunk, query_result, Range};
 use tokio::task::JoinSet;
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 use crate::{
     controller::timeouts::TimeoutManager,
     network::NetworkClient,
     types::{ClientRequest, DatasetId, RequestError, ResponseChunk},
-    utils::SlidingArray,
+    utils::{logging::StreamStats, SlidingArray},
 };
 
 pub struct StreamController {
     request: ClientRequest,
-    stream_id: usize,
     network: Arc<NetworkClient>,
     next_index: usize,
     next_chunk: Option<DataChunk>,
     downloads: JoinSet<(Slot, usize)>,
     buffer: SlidingArray<Slot>,
     timeouts: Arc<TimeoutManager>,
+    stats: Arc<StreamStats>,
+    span: tracing::Span,
 }
 
 // The size of this structure never exceeds the maximum response size
@@ -36,11 +37,7 @@ struct PartialResult {
 }
 
 impl StreamController {
-    pub fn new(
-        request: ClientRequest,
-        stream_id: usize,
-        network: Arc<NetworkClient>,
-    ) -> Result<Self, RequestError> {
+    pub fn new(request: ClientRequest, network: Arc<NetworkClient>) -> Result<Self, RequestError> {
         let first_chunk = network.find_chunk(&request.dataset_id, request.query.first_block());
         let Some(first_chunk) = first_chunk else {
             tracing::info!(
@@ -58,17 +55,17 @@ impl StreamController {
         let timeout_quantile = request.timeout_quantile;
         Ok(Self {
             request,
-            stream_id,
             network,
             next_index: 0,
             next_chunk: Some(first_chunk),
             downloads: Default::default(),
             buffer,
             timeouts: Arc::new(TimeoutManager::new(timeout_quantile)),
+            stats: Arc::new(StreamStats::new()),
+            span: tracing::Span::current(),
         })
     }
 
-    #[instrument(skip_all, fields(stream_id = self.stream_id))]
     pub async fn poll_next_chunk(&mut self) -> Option<Result<ResponseChunk, RequestError>> {
         while self.buffer.len() < self.request.buffer_size && self.next_chunk.is_some() {
             self.schedule_next_chunk();
@@ -112,7 +109,10 @@ impl StreamController {
             Slot::Pending => unreachable!("First chunk is not ready"),
         };
 
+        self.stats.maybe_write_log();
+
         if let Some(Ok(bytes)) = &result {
+            self.stats.sent_response_chunk(bytes.len());
             tracing::debug!("Sending {} response bytes", bytes.len());
         }
         result
@@ -152,8 +152,9 @@ impl StreamController {
         self.buffer.push_back(Slot::Pending);
     }
 
+    #[instrument(skip_all, fields(chunk_number = index))]
     fn get_chunk_response(&self, index: usize, range: Range) -> impl Future<Output = Slot> {
-        let fut = self.get_one_response(index, range);
+        let fut = self.get_one_response(range).in_current_span();
         async move {
             let result = match fut.await {
                 Err(e) => return Slot::Done(Err(e)),
@@ -174,8 +175,7 @@ impl StreamController {
                 )))
             } else {
                 tracing::debug!(
-                    "Got partial response for chunk {} with blocks {}-{}. {} blocks left in this chunk",
-                    index,
+                    "Got partial response with blocks {}-{}. {} blocks left in this chunk",
                     range.begin,
                     last_block,
                     range.end - last_block as u32,
@@ -189,16 +189,17 @@ impl StreamController {
                 })
             }
         }
+        .in_current_span()
     }
 
     fn get_one_response(
         &self,
-        index: usize,
         range: Range,
     ) -> impl Future<Output = Result<query_result::Result, RequestError>> {
         let network = self.network.clone();
         let timeouts = self.timeouts.clone();
         let request = self.request.clone();
+        let stats = self.stats.clone();
         // TODO: don't modify the query
         let query = request.query.with_range(&range);
         let send_query = move || {
@@ -207,9 +208,10 @@ impl StreamController {
                 network.clone(),
                 query.clone(),
                 request.dataset_id.clone(),
-                index,
                 range,
+                stats.clone(),
             )
+            .in_current_span()
             .map(move |result| (result, start_time))
         };
         async move {
@@ -223,7 +225,7 @@ impl StreamController {
             loop {
                 let (send_result, start_time) = tokio::select! {
                     _ = timeouts.sleep(), if tries_left > 0 => {
-                        tracing::debug!("Request for chunk {index} is running for too long, sending one more query");
+                        tracing::debug!("Request is running for too long, sending one more query");
                         requests.spawn(send_query());
                         tries_left -= 1;
                         continue;
@@ -258,7 +260,7 @@ impl StreamController {
                     query_result::Result::Ok(_) => {
                         let elapsed = start_time.elapsed();
                         timeouts.complete_ok(elapsed);
-                        tracing::debug!("Query for chunk {index} completed in {elapsed:?}");
+                        tracing::debug!("Query completed in {elapsed:?}");
                     }
                     query_result::Result::Timeout(_) => {
                         timeouts.complete_timeout();
@@ -269,11 +271,11 @@ impl StreamController {
                 };
                 if retriable(&result) {
                     if tries_left == 0 {
-                        tracing::info!("Giving up on query for chunk number {index}, {result:?}");
+                        tracing::info!("Giving up on query, {result:?}");
                         return Ok(result);
                     }
                     tries_left -= 1;
-                    tracing::info!("Retrying query for chunk number {index}, {result:?}");
+                    tracing::info!("Retrying query, {result:?}");
                     requests.spawn(send_query());
                     continue;
                 } else {
@@ -281,14 +283,15 @@ impl StreamController {
                 }
             }
         }
+        .in_current_span()
     }
 
     async fn query_some_worker(
         network: Arc<NetworkClient>,
         query: String,
         dataset_id: DatasetId,
-        index: usize,
         range: Range,
+        stats: Arc<StreamStats>,
     ) -> Result<query_result::Result, RequestError> {
         let worker = network.find_worker(&dataset_id, range.begin);
         let Some(worker) = worker else {
@@ -296,12 +299,11 @@ impl StreamController {
                 "No workers available for block {} in dataset {}",
                 range.begin, dataset_id
             );
-            tracing::warn!(msg);
+            tracing::warn!("{}", msg);
             return Err(RequestError::NotFound(msg));
         };
         tracing::debug!(
-            "Sending query for chunk {} ({}-{}) to worker {}",
-            index,
+            "Sending query for range ({}-{}) to worker {}",
             range.begin,
             range.end,
             worker,
@@ -309,13 +311,15 @@ impl StreamController {
         let receiver = network
             .query_worker(&worker, &dataset_id, query)
             .map_err(|_| RequestError::Busy)?;
+        stats.query_sent();
         Ok(receiver.await.expect("Sending query result failed"))
     }
 }
 
 impl Drop for StreamController {
     fn drop(&mut self) {
-        tracing::info!("Finished stream {}", self.stream_id);
+        let _enter = self.span.enter();
+        self.stats.write_summary();
     }
 }
 

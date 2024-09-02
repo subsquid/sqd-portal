@@ -28,7 +28,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = "0.1"
 tokio-util = "0.7.11"
 tracing = { version = "0.1", features = ["async-await"] }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
+tracing-futures = { version = "0.2.5", features = ["tokio", "futures-03"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 contract-client = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.4" }

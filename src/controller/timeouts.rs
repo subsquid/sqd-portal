@@ -9,6 +9,8 @@ use tokio::sync::watch;
 /// Keeps track of sliding percentile of request durations.
 /// Calculates a timeout so that (1-q) fraction of the slowest requests are retried.
 /// Running and timed out requests count as "infinite" duration.
+///
+/// TODO: consider using [tower::hedge](https://docs.rs/tower/latest/tower/hedge/index.html) instead.
 pub struct TimeoutManager {
     quantile: f32,
     durations: Mutex<Vec<Duration>>,

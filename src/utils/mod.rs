@@ -1,3 +1,4 @@
+pub mod logging;
 mod once;
 mod sliding_array;
 

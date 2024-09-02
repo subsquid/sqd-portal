@@ -24,6 +24,10 @@ pub struct Cli {
     /// Path to config file
     #[arg(long, env, value_parser = Config::read)]
     pub config: Config,
+
+    /// Whether the logs should be structured in JSON format
+    #[arg(long, env)]
+    pub json_log: bool,
 }
 
 fn default_worker_inactive_threshold() -> Duration {

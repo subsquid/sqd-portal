@@ -15,23 +15,35 @@ mod network;
 mod types;
 mod utils;
 
-fn setup_tracing() -> anyhow::Result<()> {
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::Layer;
+fn setup_tracing(json: bool) -> anyhow::Result<()> {
+    let env_filter = tracing_subscriber::EnvFilter::builder().parse_lossy(
+        std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV)
+            .unwrap_or(format!("info,{}=debug", std::env!("CARGO_CRATE_NAME"))),
+    );
 
-    let fmt = tracing_subscriber::fmt::layer()
-        .compact()
-        .with_filter(tracing_subscriber::EnvFilter::from_default_env());
-    tracing_subscriber::registry().with(fmt).try_init()?;
+    if json {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .json()
+            .with_span_list(false)
+            .flatten_event(true)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .compact()
+            .init();
+    };
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
-    setup_tracing()?;
     let args = Cli::parse();
+    setup_tracing(args.json_log)?;
     let config = Arc::new(args.config);
     let mut metrics_registry = Default::default();
     metrics::register_metrics(&mut metrics_registry);

@@ -18,7 +18,7 @@ use crate::{
     cli::Config,
     controller::task_manager::TaskManager,
     network::NetworkClient,
-    types::{ClientRequest, DatasetId, RequestError},
+    types::{ClientRequest, DatasetId, RequestError}, utils::logging,
 };
 
 async fn get_height(
@@ -26,8 +26,6 @@ async fn get_height(
     Path(dataset): Path<String>,
     dataset_id: DatasetId,
 ) -> impl IntoResponse {
-    tracing::debug!("Get height dataset={dataset}");
-
     match network_state.get_height(&dataset_id) {
         Some(height) => (StatusCode::OK, height.to_string()),
         None => (
@@ -45,7 +43,6 @@ async fn get_worker(
     let Some(dataset_id) = config.dataset_id(&dataset) else {
         return RequestError::NotFound(format!("Unknown dataset: {dataset}")).into_response();
     };
-    tracing::info!("Get worker dataset={dataset} start_block={start_block}");
 
     let worker_id = match client.find_worker(&dataset_id, start_block) {
         Some(worker_id) => worker_id,
@@ -70,7 +67,6 @@ async fn execute_query(
     Extension(client): Extension<Arc<NetworkClient>>,
     query: String, // request body
 ) -> Response {
-    tracing::info!("Execute query dataset_id={dataset_id} worker_id={worker_id}");
     let Ok(fut) = client.query_worker(&worker_id, &dataset_id, query) else {
         return RequestError::Busy.into_response();
     };
@@ -88,7 +84,6 @@ async fn execute_query(
 }
 
 async fn execute_stream_restricted(
-    Path(dataset): Path<String>,
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
     raw_request: ClientRequest,
@@ -103,16 +98,13 @@ async fn execute_stream_restricted(
         backoff: config.default_backoff,
         retries: config.default_retries,
     };
-    execute_stream(Path(dataset), Extension(task_manager), request).await
+    execute_stream(Extension(task_manager), request).await
 }
 
 async fn execute_stream(
-    Path(dataset): Path<String>,
     Extension(task_manager): Extension<Arc<TaskManager>>,
     request: ClientRequest,
 ) -> Response {
-    tracing::info!("Processing stream for dataset {dataset}");
-
     let stream = match task_manager.spawn_stream(request).await {
         Ok(stream) => stream,
         Err(e) => return e.into_response(),
@@ -165,6 +157,7 @@ pub async fn run_server(
         .route("/network/:dataset/:start_block/worker", get(get_worker))
         .route("/query/:dataset_id/:worker_id", post(execute_query))
         .route("/network/state", get(get_network_state))
+        .layer(axum::middleware::from_fn(logging::middleware))
         .route("/metrics", get(get_metrics))
         .layer(Extension(task_manager))
         .layer(Extension(network_state))
