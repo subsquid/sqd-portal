@@ -256,19 +256,11 @@ impl StreamController {
                         continue;
                     }
                 };
-                match result {
-                    query_result::Result::Ok(_) => {
-                        let elapsed = start_time.elapsed();
-                        timeouts.complete_ok(elapsed);
-                        tracing::debug!("Query completed in {elapsed:?}");
-                    }
-                    query_result::Result::Timeout(_) => {
-                        timeouts.complete_timeout();
-                    }
-                    _ => {
-                        timeouts.complete_err();
-                    }
-                };
+                if matches!(result, query_result::Result::Ok(_)) {
+                    let elapsed = start_time.elapsed();
+                    timeouts.observe(elapsed);
+                    tracing::debug!("Query completed in {elapsed:?}");
+                }
                 if retriable(&result) {
                     if tries_left == 0 {
                         tracing::info!("Giving up on query, {result:?}");

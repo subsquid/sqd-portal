@@ -1,97 +1,51 @@
-use std::{
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
-};
+use std::{collections::VecDeque, time::Duration};
 
 use parking_lot::Mutex;
-use tokio::sync::watch;
 
-/// Keeps track of sliding percentile of request durations.
-/// Calculates a timeout so that (1-q) fraction of the slowest requests are retried.
-/// Running and timed out requests count as "infinite" duration.
-///
-/// TODO: consider using [tower::hedge](https://docs.rs/tower/latest/tower/hedge/index.html) instead.
+const WINDOW_SIZE: usize = 100;
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Keeps track of the sliding percentile of request durations.
 pub struct TimeoutManager {
     quantile: f32,
-    durations: Mutex<Vec<Duration>>,
-    num_infs: AtomicUsize,
-    current_timeout: watch::Sender<Option<Duration>>,
+    durations: Mutex<VecDeque<Duration>>,
 }
 
 impl TimeoutManager {
     pub fn new(quantile: f32) -> Self {
-        let (tx, _) = watch::channel(None);
         Self {
             quantile,
-            durations: Mutex::new(Vec::new()),
-            num_infs: AtomicUsize::new(0),
-            current_timeout: tx,
+            durations: Mutex::new(VecDeque::with_capacity(WINDOW_SIZE)),
         }
     }
 
-    pub fn complete_ok(&self, duration: Duration) {
+    pub fn observe(&self, duration: Duration) {
         let mut durations = self.durations.lock();
-        durations.push(duration);
-        let num_infs = self.num_infs.load(Ordering::Relaxed);
-
-        // TODO: optimize time complexity
-        let kth = ((durations.len() + num_infs) as f32 * self.quantile).floor() as usize;
-        let new_timeout = if kth >= durations.len() {
-            None
-        } else {
-            durations.sort();
-            Some(durations[kth])
-        };
-        tracing::trace!(
-            "Current timeout: {:?}, among {}+{} samples",
-            new_timeout,
-            durations.len(),
-            num_infs
-        );
-        self.current_timeout.send_if_modified(|timeout| {
-            if *timeout != new_timeout {
-                *timeout = new_timeout;
-                true
-            } else {
-                false
-            }
-        });
-    }
-
-    pub fn complete_err(&self) {
-        // Ignore any requests that didn't lead to a result or timeout
-    }
-
-    pub fn complete_timeout(&self) {
-        self.num_infs.fetch_add(1, Ordering::Relaxed);
+        if durations.len() >= WINDOW_SIZE {
+            durations.pop_front();
+        }
+        durations.push_back(duration);
     }
 
     pub async fn sleep(&self) {
         let start = tokio::time::Instant::now();
-        self.num_infs.fetch_add(1, Ordering::Relaxed);
-        let guard = scopeguard::guard((), |_| {
-            let before = self.num_infs.fetch_sub(1, Ordering::Relaxed);
-            assert!(before > 0);
-        });
-        let mut current_timeout = self.current_timeout.subscribe();
-        loop {
-            let timeout = *current_timeout.borrow();
-            if let Some(timeout) = timeout {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(start + timeout) => break,
-                    recv = current_timeout.changed() => {
-                        recv.expect("Timeout publisher dropped");
-                        continue;
-                    },
-                }
-            } else {
-                current_timeout
-                    .changed()
-                    .await
-                    .expect("Timeout publisher dropped");
-            }
+        let timeout = self.current_timeout();
+        tracing::trace!("Current timeout: {:?}", timeout);
+        tokio::time::sleep_until(start + timeout).await;
+    }
+
+    fn current_timeout(&self) -> Duration {
+        let mut durations = self.durations.lock().iter().copied().collect::<Vec<_>>();
+        if durations.is_empty() {
+            return DEFAULT_TIMEOUT;
         }
-        // Defuse the guard to keep the num_infs in case of timeout
-        scopeguard::ScopeGuard::into_inner(guard);
+        let kth = (durations.len() as f32 * self.quantile).floor() as usize;
+        if kth >= durations.len() {
+            // sorted[sorted.len() - 1] * 2
+            return DEFAULT_TIMEOUT;
+        }
+        // TODO: optimize time complexity
+        durations.sort();
+        durations[kth]
     }
 }
