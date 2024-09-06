@@ -8,7 +8,7 @@ use tracing::{instrument, Instrument};
 use crate::{
     controller::timeouts::TimeoutManager,
     network::NetworkClient,
-    types::{ClientRequest, DatasetId, RequestError, ResponseChunk},
+    types::{ClientRequest, DatasetId, RequestError, ResponseChunk, SendQueryError},
     utils::{logging::StreamStats, SlidingArray},
 };
 
@@ -53,7 +53,7 @@ impl StreamController {
 
         let buffer = SlidingArray::with_capacity(request.buffer_size);
         let timeout_quantile = request.timeout_quantile;
-        Ok(Self {
+        let mut controller = Self {
             request,
             network,
             next_index: 0,
@@ -63,12 +63,22 @@ impl StreamController {
             timeouts: Arc::new(TimeoutManager::new(timeout_quantile)),
             stats: Arc::new(StreamStats::new()),
             span: tracing::Span::current(),
-        })
+        };
+        if controller.schedule_next_chunk().is_err() {
+            return Err(RequestError::Busy);
+        } else {
+            controller.buffer.push_back(Slot::Pending);
+        }
+        Ok(controller)
     }
 
     pub async fn poll_next_chunk(&mut self) -> Option<Result<ResponseChunk, RequestError>> {
         while self.buffer.len() < self.request.buffer_size && self.next_chunk.is_some() {
-            self.schedule_next_chunk();
+            if self.schedule_next_chunk().is_ok() {
+                self.buffer.push_back(Slot::Pending);
+            } else {
+                break;
+            }
         }
 
         while !self.buffer.front().is_some_and(Slot::ready) {
@@ -99,11 +109,16 @@ impl StreamController {
         let result = match self.buffer.pop_front()? {
             Slot::Done(result) => Some(result),
             Slot::Partial(PartialResult { data, next_range }) => {
-                self.buffer.push_front(Slot::Pending);
-                let future = self
-                    .get_chunk_response(index, next_range)
-                    .map(move |result| (result, index));
-                self.downloads.spawn(future);
+                match self.get_chunk_response(index, next_range) {
+                    Ok(future) => {
+                        self.downloads
+                            .spawn(future.map(move |result| (result, index)));
+                        self.buffer.push_front(Slot::Pending);
+                    }
+                    Err(_) => {
+                        self.buffer.push_front(Slot::Done(Err(RequestError::Busy)));
+                    }
+                }
                 Some(Ok(data))
             }
             Slot::Pending => unreachable!("First chunk is not ready"),
@@ -119,7 +134,7 @@ impl StreamController {
     }
 
     // Schedules downloading `self.next_chunk`
-    fn schedule_next_chunk(&mut self) {
+    fn schedule_next_chunk(&mut self) -> Result<(), SendQueryError> {
         let chunk = self.next_chunk.clone().expect("No next chunk to download");
         let range = self
             .request
@@ -131,9 +146,11 @@ impl StreamController {
             .expect("Chunk doesn't contain requested data");
         let index: usize = self.next_index;
         let future = self
-            .get_chunk_response(index, range)
+            .get_chunk_response(index, range)?
             .map(move |result| (result, index));
+
         self.downloads.spawn(future);
+
         self.next_chunk = self.network.next_chunk(&self.request.dataset_id, &chunk);
         if let Some(next_chunk) = &self.next_chunk {
             if self
@@ -149,17 +166,20 @@ impl StreamController {
             tracing::debug!("No more chunks available");
         }
         self.next_index += 1;
-        self.buffer.push_back(Slot::Pending);
+        Ok(())
     }
 
     #[instrument(skip_all, fields(chunk_number = index))]
-    fn get_chunk_response(&self, index: usize, range: Range) -> impl Future<Output = Slot> {
-        let fut = self.get_one_response(range).in_current_span();
-        async move {
+    fn get_chunk_response(
+        &self,
+        index: usize,
+        range: Range,
+    ) -> Result<impl Future<Output = Slot>, SendQueryError> {
+        let fut = self.get_one_response(range)?.in_current_span();
+        Ok(async move {
             let result = match fut.await {
-                Err(e) => return Slot::Done(Err(e)),
-                Ok(query_result::Result::Ok(result)) => result,
-                Ok(e) => return Slot::Done(Err(RequestError::try_from(e).unwrap())),
+                query_result::Result::Ok(result) => result,
+                e => return Slot::Done(Err(RequestError::try_from(e).unwrap())),
             };
             let Some(last_block) = result.last_block else {
                 return Slot::Done(Err(RequestError::InternalError(
@@ -189,13 +209,13 @@ impl StreamController {
                 })
             }
         }
-        .in_current_span()
+        .in_current_span())
     }
 
     fn get_one_response(
         &self,
         range: Range,
-    ) -> impl Future<Output = Result<query_result::Result, RequestError>> {
+    ) -> Result<impl Future<Output = query_result::Result>, SendQueryError> {
         let network = self.network.clone();
         let timeouts = self.timeouts.clone();
         let request = self.request.clone();
@@ -211,23 +231,28 @@ impl StreamController {
                 range,
                 stats.clone(),
             )
-            .in_current_span()
-            .map(move |result| (result, start_time))
+            .map(|future| {
+                future
+                    .in_current_span()
+                    .map(move |result| (result, start_time))
+            })
         };
-        async move {
-            let timeouts = timeouts.clone();
-            let mut requests = JoinSet::new();
+        let mut requests = JoinSet::new();
+        for _ in 0..request.request_multiplier {
+            requests.spawn(send_query()?);
+        }
+        Ok(async move {
             let mut tries_left = request.retries;
-            for _ in 0..request.request_multiplier {
-                requests.spawn(send_query());
-                tries_left -= 1;
-            }
+            let timeouts = timeouts.clone();
             loop {
-                let (send_result, start_time) = tokio::select! {
+                let (result, start_time) = tokio::select! {
                     _ = timeouts.sleep(), if tries_left > 0 => {
-                        tracing::debug!("Request is running for too long, sending one more query");
-                        requests.spawn(send_query());
                         tries_left -= 1;
+                        tracing::debug!("Request is running for too long, sending one more query");
+                        match send_query() {
+                            Ok(fut) => _ = requests.spawn(fut),
+                            Err(e) => tracing::warn!("Couldn't schedule query after timeout: {e:?}"),
+                        };
                         continue;
                     }
                     result = requests.join_next() => {
@@ -236,63 +261,42 @@ impl StreamController {
                             .expect("Awaiting download panicked")
                     }
                 };
-                let result = match send_result {
-                    Ok(result) => result,
-                    Err(e) => {
-                        if tries_left == 0 {
-                            return Err(e);
-                        }
-                        tries_left -= 1;
-                        tracing::debug!(
-                            "Couldn't schedule query ({e:?}), retrying in {:?}",
-                            request.backoff
-                        );
-                        let backoff = request.backoff;
-                        let send_query = send_query.clone();
-                        requests.spawn(async move {
-                            tokio::time::sleep(backoff).await;
-                            send_query().await
-                        });
-                        continue;
-                    }
-                };
                 if matches!(result, query_result::Result::Ok(_)) {
                     let elapsed = start_time.elapsed();
                     timeouts.observe(elapsed);
                     tracing::debug!("Query completed in {elapsed:?}");
                 }
-                if retriable(&result) {
-                    if tries_left == 0 {
-                        tracing::info!("Giving up on query, {result:?}");
-                        return Ok(result);
+                if !retriable(&result) || tries_left == 0 {
+                    return result;
+                }
+                tries_left -= 1;
+                match send_query() {
+                    Ok(fut) => {
+                        tracing::debug!("Retrying query, {result:?}");
+                        requests.spawn(fut);
+                    },
+                    Err(e) => {
+                        tracing::warn!("Couldn't schedule retried query: {e:?}");
+                        if requests.is_empty() {
+                            return result;
+                        }
                     }
-                    tries_left -= 1;
-                    tracing::info!("Retrying query, {result:?}");
-                    requests.spawn(send_query());
-                    continue;
-                } else {
-                    return Ok(result);
                 }
             }
         }
-        .in_current_span()
+        .in_current_span())
     }
 
-    async fn query_some_worker(
+    fn query_some_worker(
         network: Arc<NetworkClient>,
         query: String,
         dataset_id: DatasetId,
         range: Range,
         stats: Arc<StreamStats>,
-    ) -> Result<query_result::Result, RequestError> {
+    ) -> Result<impl Future<Output = query_result::Result>, SendQueryError> {
         let worker = network.find_worker(&dataset_id, range.begin);
         let Some(worker) = worker else {
-            let msg = format!(
-                "No workers available for block {} in dataset {}",
-                range.begin, dataset_id
-            );
-            tracing::warn!("{}", msg);
-            return Err(RequestError::NotFound(msg));
+            return Err(SendQueryError::NoWorkers);
         };
         tracing::debug!(
             "Sending query for range ({}-{}) to worker {}",
@@ -302,9 +306,9 @@ impl StreamController {
         );
         let receiver = network
             .query_worker(&worker, &dataset_id, query)
-            .map_err(|_| RequestError::Busy)?;
+            .map_err(|_| SendQueryError::TransportQueueFull)?;
         stats.query_sent();
-        Ok(receiver.await.expect("Sending query result failed"))
+        Ok(receiver.map(|recv_result| recv_result.expect("Sending query result failed")))
     }
 }
 

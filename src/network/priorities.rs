@@ -12,7 +12,7 @@ use crate::cli::Config;
 type Priority = i8;
 
 /// The number subtracted from the priority while the worker is busy executing a query
-const LEASE_PENALTY: Priority = 2;
+const LEASE_PENALTY: Priority = 1;
 
 pub struct WorkersPool {
     config: Arc<Config>,
@@ -32,7 +32,7 @@ impl WorkersPool {
             .into_iter()
             .map(|worker| (*self.priorities.entry(worker).or_default(), worker))
             .max_by_key(|(priority, _worker)| *priority)?;
-        if priority <= self.config.min_worker_priority {
+        if priority < self.config.min_worker_priority {
             return None;
         }
 
@@ -48,11 +48,12 @@ impl WorkersPool {
     }
 
     pub fn error(&mut self, worker: PeerId) {
-        const_assert!(LEASE_PENALTY >= 2);
-        self.inc(worker, LEASE_PENALTY - 2);
+        const_assert!(1 - LEASE_PENALTY >= 0);
+        self.dec(worker, 1 - LEASE_PENALTY);
     }
 
     pub fn timeout(&mut self, worker: PeerId) {
+        const_assert!(LEASE_PENALTY - 1 >= 0);
         self.inc(worker, LEASE_PENALTY - 1);
     }
 

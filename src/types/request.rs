@@ -12,7 +12,6 @@ pub struct ClientRequest {
     pub chunk_timeout: Duration,
     pub timeout_quantile: f32,
     pub request_multiplier: usize,
-    pub backoff: Duration,
     pub retries: usize,
 }
 

@@ -13,6 +13,14 @@ pub enum RequestError {
     Busy,
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum SendQueryError {
+    #[error("Transport queue full")]
+    TransportQueueFull,
+    #[error("No workers available")]
+    NoWorkers,
+}
+
 impl TryFrom<query_result::Result> for RequestError {
     type Error = ();
 

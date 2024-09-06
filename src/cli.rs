@@ -58,10 +58,6 @@ fn default_default_chunk_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
-fn default_default_backoff() -> Duration {
-    Duration::from_secs(1)
-}
-
 fn default_default_request_multiplier() -> usize {
     1
 }
@@ -128,10 +124,6 @@ pub struct Config {
         default = "default_default_chunk_timeout"
     )]
     pub default_chunk_timeout: Duration,
-
-    #[serde_as(as = "DurationSeconds")]
-    #[serde(rename = "default_backoff_sec", default = "default_default_backoff")]
-    pub default_backoff: Duration,
 
     #[serde(default = "default_default_request_multiplier")]
     pub default_request_multiplier: usize,

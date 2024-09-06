@@ -95,7 +95,6 @@ async fn execute_stream_restricted(
         chunk_timeout: config.default_chunk_timeout,
         timeout_quantile: config.default_timeout_quantile,
         request_multiplier: config.default_request_multiplier,
-        backoff: config.default_backoff,
         retries: config.default_retries,
     };
     execute_stream(Extension(task_manager), request).await
@@ -227,18 +226,6 @@ where
             },
             None => config.default_timeout_quantile,
         };
-        let backoff = match params.get("backoff") {
-            Some(value) => match value.parse() {
-                Ok(seconds) => Duration::from_secs(seconds),
-                Err(e) => {
-                    return Err(
-                        RequestError::BadRequest(format!("Couldn't parse backoff: {e}"))
-                            .into_response(),
-                    )
-                }
-            },
-            None => config.default_backoff,
-        };
         let request_multiplier = match params.get("request_multiplier") {
             Some(value) => match value.parse() {
                 Ok(value) => value,
@@ -270,7 +257,6 @@ where
             buffer_size,
             chunk_timeout,
             timeout_quantile,
-            backoff,
             request_multiplier,
             retries,
         })
