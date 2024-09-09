@@ -3,6 +3,8 @@ use std::fmt::{Display, Formatter};
 use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 
+pub type DataChunk = std::ops::RangeInclusive<u64>;
+
 /// Base64 encoded URL
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetId(pub String);

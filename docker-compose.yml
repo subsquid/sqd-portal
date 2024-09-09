@@ -1,6 +1,6 @@
 services:
   query_gateway:
-    image: ghcr.io/subsquid/query-gateway:2.0.0-dev1
+    image: ghcr.io/subsquid/query-gateway:2.0.0-dev2
     environment:
       KEY_PATH: /run/secrets/network_key
       CONFIG: /app/data/${NETWORK}.config.yml
@@ -10,10 +10,6 @@ services:
       LOGS_COLLECTOR_ID: "${LOGS_COLLECTOR_ID}"
       RPC_URL: "${RPC_URL}"
       L1_RPC_URL: "${L1_RPC_URL}"
-      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
-      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
-      AWS_S3_ENDPOINT: "${AWS_S3_ENDPOINT}"
-      AWS_REGION: "${AWS_REGION}"
     volumes:
       - ./:/app/data
     secrets:

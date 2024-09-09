@@ -1,14 +1,14 @@
 use std::{future::Future, sync::Arc};
 
 use futures::FutureExt;
-use subsquid_messages::{data_chunk::DataChunk, query_result, Range};
+use subsquid_messages::{query_result, Range};
 use tokio::task::JoinSet;
 use tracing::{instrument, Instrument};
 
 use crate::{
     controller::timeouts::TimeoutManager,
     network::NetworkClient,
-    types::{ClientRequest, DatasetId, RequestError, ResponseChunk, SendQueryError},
+    types::{ClientRequest, DataChunk, DatasetId, RequestError, ResponseChunk, SendQueryError},
     utils::{logging::StreamStats, SlidingArray},
 };
 
@@ -36,6 +36,7 @@ struct PartialResult {
     next_range: Range,
 }
 
+// TODO: handle "service overloaded" errors
 impl StreamController {
     pub fn new(request: ClientRequest, network: Arc<NetworkClient>) -> Result<Self, RequestError> {
         let first_chunk = network.find_chunk(&request.dataset_id, request.query.first_block());
@@ -140,8 +141,8 @@ impl StreamController {
             .request
             .query
             .intersect_with(&Range {
-                begin: chunk.first_block(),
-                end: chunk.last_block(),
+                begin: *chunk.start() as u32,
+                end: *chunk.end() as u32,
             })
             .expect("Chunk doesn't contain requested data");
         let index: usize = self.next_index;
@@ -157,7 +158,7 @@ impl StreamController {
                 .request
                 .query
                 .last_block()
-                .is_some_and(|last_block| last_block < next_chunk.first_block() as u64)
+                .is_some_and(|last_block| last_block < *next_chunk.start())
             {
                 tracing::debug!("The end of the requested range reached");
                 self.next_chunk = None;

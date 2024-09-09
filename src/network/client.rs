@@ -4,7 +4,7 @@ use contract_client::PeerId;
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
 use serde::Serialize;
-use subsquid_messages::{data_chunk::DataChunk, query_result, Ping, Query, QueryResult};
+use subsquid_messages::{query_result, Ping, Query, QueryResult};
 use subsquid_network_transport::{
     GatewayConfig, GatewayEvent, GatewayTransportHandle, P2PTransportBuilder, QueueFull,
     TransportArgs,
@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     cli::Config,
     metrics,
-    types::{generate_query_id, DatasetId, QueryId},
+    types::{generate_query_id, DataChunk, DatasetId, QueryId},
     utils::UseOnce,
 };
 
@@ -48,7 +48,7 @@ impl NetworkClient {
         logs_collector: PeerId,
         config: Arc<Config>,
     ) -> anyhow::Result<NetworkClient> {
-        let dataset_storage = StorageClient::new(config.available_datasets.values()).await?;
+        let dataset_storage = StorageClient::new(args.rpc.network)?;
         let transport_builder = P2PTransportBuilder::from_cli(args).await?;
         let contract_client = transport_builder.contract_client();
         let mut gateway_config = GatewayConfig::new(logs_collector);

@@ -6,16 +6,16 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 async-stream = "0.3.5"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
 axum = { version = "0.7", features = ["http2"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 dotenv = "0.15"
+flate2 = "1.0.33"
 futures = "0.3"
 lazy_static = "1.4.0"
 parking_lot = "0.12"
 prometheus-client = "0.22"
+reqwest = { version = "0.12.7", features = ["stream", "gzip"] }
 scopeguard = "1.2"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
@@ -28,11 +28,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = "0.1"
 tokio-util = "0.7.11"
 tracing = { version = "0.1", features = ["async-await"] }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 tracing-futures = { version = "0.2.5", features = ["tokio", "futures-03"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 contract-client = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.4" }
 subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.1.0", features = ["semver"] }
 subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.12", features = ["gateway", "metrics"] }
-subsquid-datasets = { git = "https://github.com/subsquid/archive-router.git", version = "0.0.1", branch = "datasets-crate" }

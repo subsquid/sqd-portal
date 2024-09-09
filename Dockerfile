@@ -44,14 +44,12 @@ RUN curl -sL https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq
 
 WORKDIR /run
 
-COPY --from=builder /app/target/release/subsquid-query-gateway /usr/local/bin/subsquid-query-gateway
-COPY tethys.config.yml .
+COPY --from=builder /app/target/release/sqd-portal /usr/local/bin/sqd-portal
 
 ENV P2P_LISTEN_ADDRS="/ip4/0.0.0.0/udp/12345/quic-v1"
 ENV HTTP_LISTEN_ADDR="0.0.0.0:8000"
-ENV RUST_LOG=info,subsquid_query_gateway=debug
 
-CMD ["subsquid-query-gateway"]
+CMD ["sqd-portal"]
 
 COPY healthcheck.sh .
 RUN chmod +x ./healthcheck.sh

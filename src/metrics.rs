@@ -16,6 +16,10 @@ lazy_static::lazy_static! {
     pub static ref COMPLETED_STREAMS: Counter = Default::default();
     static ref HIGHEST_BLOCK: Family<Vec<(String, String)>, Gauge> = Default::default();
     static ref FIRST_GAP: Family<Vec<(String, String)>, Gauge> = Default::default();
+    static ref KNOWN_CHUNKS: Family<Vec<(String, String)>, Gauge> = Default::default();
+    static ref LAST_STORAGE_BLOCK: Family<Vec<(String, String)>, Gauge> = Default::default();
+
+    // TODO: add metrics for procedure durations
 }
 
 pub fn report_query_result(result: &query_result::Result) {
@@ -39,6 +43,15 @@ pub fn report_dataset_updated(dataset_id: &DatasetId, highest_block: u32, first_
     FIRST_GAP
         .get_or_create(&vec![("dataset".to_owned(), dataset_id.0.clone())])
         .set(first_gap as i64);
+}
+
+pub fn report_chunk_list_updated(dataset_id: &DatasetId, total_chunks: usize, last_block: u64) {
+    KNOWN_CHUNKS
+        .get_or_create(&vec![("dataset".to_owned(), dataset_id.0.clone())])
+        .set(total_chunks as i64);
+    LAST_STORAGE_BLOCK
+        .get_or_create(&vec![("dataset".to_owned(), dataset_id.0.clone())])
+        .set(last_block as i64);
 }
 
 pub fn register_metrics(registry: &mut Registry) {
@@ -86,5 +99,15 @@ pub fn register_metrics(registry: &mut Registry) {
         "dataset_first_gap",
         "First block not owned by any worker",
         FIRST_GAP.clone(),
+    );
+    registry.register(
+        "dataset_storage_known_chunks",
+        "The total chunks number in the persistent storage",
+        KNOWN_CHUNKS.clone(),
+    );
+    registry.register(
+        "dataset_storage_highest_block",
+        "The highest block existing in the persistent storage",
+        LAST_STORAGE_BLOCK.clone(),
     );
 }
