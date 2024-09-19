@@ -5338,6 +5338,7 @@ dependencies = [
  "dotenv",
  "flate2",
  "futures 0.3.30",
+ "itertools 0.12.1",
  "lazy_static",
  "parking_lot 0.12.3",
  "prometheus-client",

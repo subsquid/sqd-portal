@@ -11,6 +11,7 @@ use axum::{
 };
 use contract_client::PeerId;
 use futures::StreamExt;
+use itertools::Itertools;
 use prometheus_client::registry::Registry;
 use subsquid_messages::query_result;
 
@@ -18,7 +19,8 @@ use crate::{
     cli::Config,
     controller::task_manager::TaskManager,
     network::NetworkClient,
-    types::{ClientRequest, DatasetId, RequestError}, utils::logging,
+    types::{ClientRequest, DatasetId, RequestError},
+    utils::logging,
 };
 
 async fn get_height(
@@ -70,16 +72,23 @@ async fn execute_query(
     let Ok(fut) = client.query_worker(&worker_id, &dataset_id, query) else {
         return RequestError::Busy.into_response();
     };
-    match fut.await {
+    let result = match fut.await {
         Err(_) => {
-            RequestError::InternalError("Receiving result failed".to_string()).into_response()
+            return RequestError::InternalError("Receiving result failed".to_string())
+                .into_response()
         }
-        Ok(query_result::Result::Ok(result)) => Response::builder()
+        Ok(query_result::Result::Ok(result)) => result,
+        Ok(res) => return RequestError::try_from(res).into_response(),
+    };
+    match convert_response(&result.data) {
+        Ok(data) => Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::CONTENT_ENCODING, "gzip")
-            .body(Body::from(result.data))
+            .body(Body::from(data))
             .unwrap(),
-        Ok(res) => RequestError::try_from(res).into_response(),
+        Err(e) => {
+            RequestError::InternalError(format!("Couldn't convert response: {e}")).into_response()
+        }
     }
 }
 
@@ -290,4 +299,19 @@ where
 
         Ok(dataset_id)
     }
+}
+
+#[allow(unstable_name_collisions)]
+fn convert_response(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    let mut reader = flate2::bufread::GzDecoder::new(data);
+    let mut json_lines = String::new();
+    reader.read_to_string(&mut json_lines)?;
+    let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    writer.write_all("[".as_bytes())?;
+    for chunk in json_lines.trim_end().lines().intersperse(",") {
+        writer.write_all(chunk.as_bytes())?;
+    }
+    writer.write_all("]".as_bytes())?;
+    Ok(writer.finish()?)
 }
