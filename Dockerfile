@@ -49,7 +49,7 @@ COPY --from=builder /app/target/release/sqd-portal /usr/local/bin/sqd-portal
 ENV P2P_LISTEN_ADDRS="/ip4/0.0.0.0/udp/12345/quic-v1"
 ENV HTTP_LISTEN_ADDR="0.0.0.0:8000"
 
-CMD ["sqd-portal"]
+ENTRYPOINT ["sqd-portal"]
 
 COPY healthcheck.sh .
 RUN chmod +x ./healthcheck.sh

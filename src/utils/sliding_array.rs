@@ -36,6 +36,10 @@ impl<T> SlidingArray<T> {
         self.first_index
     }
 
+    pub fn last_index(&self) -> usize {
+        self.first_index + self.data.len() - 1
+    }
+
     pub fn data(&self) -> &VecDeque<T> {
         &self.data
     }

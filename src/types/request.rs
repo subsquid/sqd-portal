@@ -9,6 +9,7 @@ pub struct ClientRequest {
     pub dataset_id: DatasetId,
     pub query: ParsedQuery,
     pub buffer_size: usize,
+    pub max_chunks: Option<usize>,
     pub chunk_timeout: Duration,
     pub timeout_quantile: f32,
     pub request_multiplier: usize,

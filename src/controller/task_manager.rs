@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc,
 };
 
@@ -15,19 +15,19 @@ use crate::{
 
 use super::stream::StreamController;
 
-const MAX_PARALLEL_STREAMS: u8 = 5;
-
 /// Tracks all existing streams
 pub struct TaskManager {
     network_client: Arc<NetworkClient>,
-    running_tasks: AtomicU8,
+    running_tasks: AtomicUsize,
+    max_tasks: usize,
 }
 
 impl TaskManager {
-    pub fn new(network_client: Arc<NetworkClient>) -> TaskManager {
+    pub fn new(network_client: Arc<NetworkClient>, max_parallel_streams: usize) -> TaskManager {
         TaskManager {
             network_client,
             running_tasks: 0.into(),
+            max_tasks: max_parallel_streams,
         }
     }
 
@@ -36,7 +36,7 @@ impl TaskManager {
         request: ClientRequest,
     ) -> Result<impl Stream<Item = ResponseChunk>, RequestError> {
         let running_tasks = self.running_tasks.fetch_add(1, Ordering::Relaxed);
-        if running_tasks >= MAX_PARALLEL_STREAMS {
+        if running_tasks >= self.max_tasks {
             self.running_tasks.fetch_sub(1, Ordering::Relaxed);
             return Err(RequestError::Busy);
         }

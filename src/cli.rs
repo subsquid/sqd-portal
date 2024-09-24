@@ -30,6 +30,10 @@ pub struct Cli {
     pub json_log: bool,
 }
 
+fn default_max_parallel_streams() -> usize {
+    1024
+}
+
 fn default_worker_inactive_threshold() -> Duration {
     Duration::from_secs(120)
 }
@@ -91,6 +95,11 @@ where
 pub struct Config {
     #[serde(deserialize_with = "parse_hostname")]
     pub hostname: String,
+
+    #[serde(default = "default_max_parallel_streams")]
+    pub max_parallel_streams: usize,
+
+    pub max_chunks_per_stream: Option<usize>,
 
     #[serde_as(as = "DurationSeconds")]
     #[serde(

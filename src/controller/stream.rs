@@ -74,7 +74,13 @@ impl StreamController {
     }
 
     pub async fn poll_next_chunk(&mut self) -> Option<Result<ResponseChunk, RequestError>> {
-        while self.buffer.len() < self.request.buffer_size && self.next_chunk.is_some() {
+        while self.buffer.len() < self.request.buffer_size
+            && self.next_chunk.is_some()
+            && !self
+                .request
+                .max_chunks
+                .is_some_and(|limit| self.buffer.last_index() + 1 >= limit)
+        {
             if self.schedule_next_chunk().is_ok() {
                 self.buffer.push_back(Slot::Pending);
             } else {
