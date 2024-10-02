@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.1.0"
+version = "0.2.9"
 edition = "2021"
 
 [dependencies]
@@ -16,7 +16,7 @@ itertools = "0.12"
 lazy_static = "1.4.0"
 parking_lot = "0.12"
 prometheus-client = "0.22"
-reqwest = { version = "0.12.7", features = ["stream", "gzip"] }
+reqwest = { version = "0.12.7", features = ["stream", "gzip", "json"] }
 scopeguard = "1.2"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +31,7 @@ tokio-util = "0.7.11"
 tracing = { version = "0.1", features = ["async-await"] }
 tracing-futures = { version = "0.2.5", features = ["tokio", "futures-03"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
+tower-http = { version = "0.6.1", features = ["cors"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", version = "1.0.7" }

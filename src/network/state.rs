@@ -95,11 +95,7 @@ impl NetworkState {
                 .unwrap_or_else(RangeSet::empty);
             let entry = self.dataset_states.entry(dataset_id.clone()).or_default();
             entry.update(worker_id, dataset_state);
-            metrics::report_dataset_updated(
-                &dataset_id,
-                entry.highest_seen_block,
-                entry.first_gap,
-            );
+            metrics::report_dataset_updated(&dataset_id, entry.highest_seen_block, entry.first_gap);
         }
     }
 
@@ -145,7 +141,7 @@ impl NetworkState {
         last_pings.get(worker_id).is_some_and(|t| *t > deadline)
     }
 
-    pub fn network_state(&self) -> HashMap<DatasetId, DatasetState> {
-        self.dataset_states.clone()
+    pub fn dataset_state(&self, dataset_id: DatasetId) -> Option<&DatasetState> {
+        self.dataset_states.get(&dataset_id)
     }
 }

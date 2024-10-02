@@ -1,11 +1,11 @@
+use crate::types::DatasetId;
 use clap::Parser;
 use serde::Deserialize;
+use serde_with::serde_derive::Serialize;
 use serde_with::{serde_as, DurationSeconds};
-use std::time::Duration;
-use std::{collections::HashMap, net::SocketAddr};
 use sqd_network_transport::{PeerId, TransportArgs};
-
-use crate::types::DatasetId;
+use std::net::SocketAddr;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(version)]
@@ -82,8 +82,53 @@ where
     Ok(s.trim_end_matches('/').to_owned())
 }
 
+fn default_served_datasets() -> Vec<DatasetConfig> {
+    vec![]
+}
+
+fn default_serve() -> String {
+    "all".into()
+}
+
 #[serde_as]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqdNetworkConfig {
+    pub datasets: String,
+
+    #[serde(default = "default_serve")]
+    pub serve: String,
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetSourceConfig {
+    pub kind: String,
+    pub name_ref: String,
+
+    #[serde(skip_deserializing)]
+    pub id: String,
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetConfig {
+    pub slug: String,
+    pub aliases: Option<Vec<String>>,
+    pub data_sources: Vec<DatasetSourceConfig>,
+}
+
+impl DatasetConfig {
+    pub fn network_dataset_id(&self) -> Option<DatasetId> {
+        if let Some(source) = self.data_sources.iter().find(|s| s.kind == "sqd_network") {
+            Some(DatasetId::from_url(&source.id))
+        } else {
+            None
+        }
+    }
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(deserialize_with = "parse_hostname")]
     pub hostname: String,
@@ -139,8 +184,10 @@ pub struct Config {
     )]
     pub chain_update_interval: Duration,
 
-    // Dataset alias -> bucket URL
-    pub available_datasets: HashMap<String, String>,
+    #[serde(rename = "serve", default = "default_served_datasets")]
+    pub available_datasets: Vec<DatasetConfig>,
+
+    pub sqd_network: SqdNetworkConfig,
 }
 
 impl Config {
@@ -149,13 +196,28 @@ impl Config {
         Ok(serde_yaml::from_slice(file_contents.as_slice())?)
     }
 
-    pub fn dataset_id(&self, dataset: &str) -> Option<DatasetId> {
-        self.available_datasets
-            .get(dataset)
-            .map(DatasetId::from_url)
+    pub fn find_dataset(&self, slug: &str) -> Option<&DatasetConfig> {
+        self.available_datasets.iter().find(|d| {
+            if d.slug == slug {
+                return true;
+            }
+
+            if let Some(ref aliases) = d.aliases {
+                return aliases.contains(&slug.to_string());
+            }
+
+            return false;
+        })
+    }
+
+    pub fn dataset_id(&self, slug: &str) -> Option<DatasetId> {
+        self.find_dataset(slug)
+            .and_then(|dataset| dataset.network_dataset_id())
     }
 
     pub fn dataset_ids(&self) -> impl Iterator<Item = DatasetId> + '_ {
-        self.available_datasets.values().map(DatasetId::from_url)
+        self.available_datasets
+            .iter()
+            .filter_map(|d| d.network_dataset_id())
     }
 }

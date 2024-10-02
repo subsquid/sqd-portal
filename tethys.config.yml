@@ -9,8 +9,15 @@ default_request_multiplier: 1
 default_retries: 3
 default_timeout_quantile: 0.5
 dataset_update_interval_sec: 300
-available_datasets:
-  arbitrum-one: "s3://arbitrum-one"
-  base-mainnet: "s3://base"
-  ethereum-mainnet: "s3://ethereum-mainnet"
-  zksync-mainnet: "s3://zksync-mainnet-1"
+sqd_network:
+  datasets: https://cdn.subsquid.io/sqd-network/datasets.yml
+  serve: "none"
+serve:
+  - slug: arbitrum-one
+    bucket: "s3://arbitrum-one"
+  - slug: base-mainnet
+    bucket: "s3://base"
+  - slug: ethereum-mainnet
+    bucket: "s3://ethereum-mainnet"
+  - slug: zksync-mainnet
+    bucket: "s3://zksync-mainnet-1"
