@@ -34,7 +34,7 @@ impl TimeoutManager {
         tokio::time::sleep_until(start + timeout).await;
     }
 
-    fn current_timeout(&self) -> Duration {
+    pub fn current_timeout(&self) -> Duration {
         let mut durations = self.durations.lock().iter().copied().collect::<Vec<_>>();
         if durations.is_empty() {
             return DEFAULT_TIMEOUT;

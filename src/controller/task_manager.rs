@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use async_stream::stream;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use tracing_futures::Instrument;
 
 use crate::{
@@ -52,7 +52,7 @@ impl TaskManager {
         let streamer = StreamController::new(request, self.network_client.clone());
         let mut streamer = streamer?;
         let first_chunk = streamer
-            .poll_next_chunk()
+            .next()
             .in_current_span()
             .await
             .expect("First chunk missing from the stream")?;
@@ -60,7 +60,7 @@ impl TaskManager {
             let _ = guard;
             yield first_chunk;
             loop {
-                match streamer.poll_next_chunk().await {
+                match streamer.next().await {
                     None => break,
                     Some(Ok(chunk)) => yield chunk,
                     Some(Err(e)) => {

@@ -36,12 +36,23 @@ impl<T> SlidingArray<T> {
         self.first_index
     }
 
-    pub fn last_index(&self) -> usize {
-        self.first_index + self.data.len() - 1
+    pub fn total_size(&self) -> usize {
+        self.first_index + self.data.len()
     }
 
     pub fn data(&self) -> &VecDeque<T> {
         &self.data
+    }
+
+    pub fn mut_data(&mut self) -> &mut VecDeque<T> {
+        &mut self.data
+    }
+
+    pub fn enumerate_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
+        self.data
+            .iter_mut()
+            .enumerate()
+            .map(|(i, v)| (i + self.first_index, v))
     }
 
     pub fn front(&self) -> Option<&T> {
@@ -78,5 +89,11 @@ impl<T> Index<usize> for SlidingArray<T> {
 impl<T> IndexMut<usize> for SlidingArray<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         self.get_mut(index).expect("Index out of bounds")
+    }
+}
+
+impl<T> Default for SlidingArray<T> {
+    fn default() -> Self {
+        Self::with_capacity(0)
     }
 }

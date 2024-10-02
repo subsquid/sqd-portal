@@ -20,10 +20,10 @@ pub struct DatasetState {
 }
 
 impl DatasetState {
-    pub fn get_workers_with_block(&self, block: u32) -> impl Iterator<Item = PeerId> + '_ {
+    pub fn get_workers_with_block(&self, block: u64) -> impl Iterator<Item = PeerId> + '_ {
         self.worker_ranges
             .iter()
-            .filter_map(move |(peer_id, range_set)| range_set.has(block).then_some(*peer_id))
+            .filter_map(move |(peer_id, range_set)| range_set.has(block as u32).then_some(*peer_id))
     }
 
     pub fn update(&mut self, peer_id: PeerId, state: RangeSet) {
@@ -71,7 +71,7 @@ impl NetworkState {
         }
     }
 
-    pub fn find_worker(&mut self, dataset_id: &DatasetId, start_block: u32) -> Option<PeerId> {
+    pub fn find_worker(&mut self, dataset_id: &DatasetId, start_block: u64) -> Option<PeerId> {
         let dataset_state = self.dataset_states.get(dataset_id)?;
 
         // Choose an active worker having the requested start_block with the top priority

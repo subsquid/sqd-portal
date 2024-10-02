@@ -6,11 +6,11 @@ use serde::{de::DeserializeOwned, Deserialize};
 
 use crate::{
     metrics,
-    types::{DataChunk, DatasetId},
+    types::{BlockRange, DatasetId},
 };
 
 pub struct StorageClient {
-    datasets: RwLock<HashMap<DatasetId, Vec<DataChunk>>>,
+    datasets: RwLock<HashMap<DatasetId, Vec<BlockRange>>>,
     fetcher: HttpFetcher,
 }
 
@@ -76,7 +76,7 @@ impl StorageClient {
         tracing::debug!("Chunks parsed in {elapsed} ms");
     }
 
-    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
+    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<BlockRange> {
         let datasets = self.datasets.read();
         let chunks = datasets.get(dataset)?;
         if block < *chunks.first()?.start() {
@@ -86,7 +86,7 @@ impl StorageClient {
         (first_suspect < chunks.len()).then(|| chunks[first_suspect].clone())
     }
 
-    pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
+    pub fn next_chunk(&self, dataset: &DatasetId, chunk: &BlockRange) -> Option<BlockRange> {
         self.find_chunk(dataset, chunk.end() + 1)
     }
 }

@@ -38,7 +38,7 @@ async fn get_height(
 }
 
 async fn get_worker(
-    Path((dataset, start_block)): Path<(String, u32)>,
+    Path((dataset, start_block)): Path<(String, u64)>,
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(config): Extension<Arc<Config>>,
 ) -> Response {

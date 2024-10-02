@@ -1,8 +1,6 @@
 use std::{str::FromStr, time::Duration};
 
-use sqd_messages::Range;
-
-use super::DatasetId;
+use super::{BlockRange, DatasetId};
 
 #[derive(Debug, Clone)]
 pub struct ClientRequest {
@@ -46,21 +44,21 @@ impl ParsedQuery {
         self.last_block
     }
 
-    pub fn with_range(&self, range: &Range) -> String {
+    pub fn with_range(&self, range: &BlockRange) -> String {
         let mut json = self.json.clone();
-        json["fromBlock"] = serde_json::Value::from(range.begin);
-        json["toBlock"] = serde_json::Value::from(range.end);
+        json["fromBlock"] = serde_json::Value::from(*range.start());
+        json["toBlock"] = serde_json::Value::from(*range.end());
         serde_json::to_string(&json).expect("Couldn't serialize query")
     }
 
-    pub fn intersect_with(&self, range: &Range) -> Option<Range> {
-        let begin = std::cmp::max(range.begin, self.first_block as u32);
+    pub fn intersect_with(&self, range: &BlockRange) -> Option<BlockRange> {
+        let begin = std::cmp::max(*range.start(), self.first_block);
         let end = if let Some(last_block) = self.last_block {
-            std::cmp::min(range.end, last_block as u32)
+            std::cmp::min(*range.end(), last_block)
         } else {
-            range.end
+            *range.end()
         };
-        (begin <= end).then_some(Range { begin, end })
+        (begin <= end).then_some(begin..=end)
     }
 }
 

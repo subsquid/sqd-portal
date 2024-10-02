@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     cli::Config,
     metrics,
-    types::{generate_query_id, DataChunk, DatasetId, QueryId},
+    types::{generate_query_id, BlockRange, DatasetId, QueryId},
     utils::UseOnce,
 };
 
@@ -150,15 +150,15 @@ impl NetworkClient {
         }
     }
 
-    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
+    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<BlockRange> {
         self.dataset_storage.find_chunk(dataset, block)
     }
 
-    pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
+    pub fn next_chunk(&self, dataset: &DatasetId, chunk: &BlockRange) -> Option<BlockRange> {
         self.dataset_storage.next_chunk(dataset, chunk)
     }
 
-    pub fn find_worker(&self, dataset: &DatasetId, block: u32) -> Option<PeerId> {
+    pub fn find_worker(&self, dataset: &DatasetId, block: u64) -> Option<PeerId> {
         self.network_state.lock().find_worker(dataset, block)
     }
 

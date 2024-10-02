@@ -10,6 +10,7 @@ const LOG_INTERVAL: Duration = Duration::from_secs(5);
 pub struct StreamStats {
     queries_sent: AtomicU64,
     chunks_downloaded: AtomicU64,
+    response_blocks: AtomicU64,
     response_bytes: AtomicU64,
     start_time: Instant,
     last_log: Mutex<Instant>,
@@ -21,6 +22,7 @@ impl StreamStats {
         Self {
             queries_sent: Default::default(),
             chunks_downloaded: Default::default(),
+            response_blocks: Default::default(),
             response_bytes: Default::default(),
             start_time: now,
             last_log: Mutex::new(now),
@@ -31,10 +33,11 @@ impl StreamStats {
         self.queries_sent.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn sent_response_chunk(&self, size: usize) {
+    pub fn sent_response_chunk(&self, blocks: u64, bytes: usize) {
         self.chunks_downloaded.fetch_add(1, Ordering::Relaxed);
+        self.response_blocks.fetch_add(blocks, Ordering::Relaxed);
         self.response_bytes
-            .fetch_add(size as u64, Ordering::Relaxed);
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     pub fn maybe_write_log(&self) {
@@ -43,6 +46,7 @@ impl StreamStats {
             tracing::info!(
                 queries_sent = self.queries_sent.load(Ordering::Relaxed),
                 chunks_downloaded = self.chunks_downloaded.load(Ordering::Relaxed),
+                blocks_streamed = self.response_blocks.load(Ordering::Relaxed),
                 bytes_streamed = self.response_bytes.load(Ordering::Relaxed),
                 "Streaming..."
             );
@@ -54,6 +58,7 @@ impl StreamStats {
         tracing::info!(
             queries_sent = self.queries_sent.load(Ordering::Relaxed),
             chunks_downloaded = self.chunks_downloaded.load(Ordering::Relaxed),
+            blocks_streamed = self.response_blocks.load(Ordering::Relaxed),
             bytes_streamed = self.response_bytes.load(Ordering::Relaxed),
             total_time = ?self.start_time.elapsed(),
             "Stream finished"
