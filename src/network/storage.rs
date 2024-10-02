@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use sqd_contract_client::Network;
 use parking_lot::{Mutex, RwLock};
 use serde::{de::DeserializeOwned, Deserialize};
+use sqd_contract_client::Network;
 
 use crate::{
     metrics,
