@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(args.config);
     let mut metrics_registry = Default::default();
     metrics::register_metrics(&mut metrics_registry);
-    subsquid_network_transport::metrics::register_metrics(&mut metrics_registry);
+    sqd_network_transport::metrics::register_metrics(&mut metrics_registry);
     let cancellation_token = CancellationToken::new();
 
     let network_client =

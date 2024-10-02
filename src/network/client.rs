@@ -1,13 +1,12 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use contract_client::PeerId;
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
 use serde::Serialize;
-use subsquid_messages::{query_result, Ping, Query, QueryResult};
-use subsquid_network_transport::{
-    GatewayConfig, GatewayEvent, GatewayTransportHandle, P2PTransportBuilder, QueueFull,
-    TransportArgs,
+use sqd_contract_client::{Client as ContractClient, PeerId};
+use sqd_messages::{query_result, Ping, Query, QueryResult};
+use sqd_network_transport::{
+    get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransportHandle, P2PTransportBuilder, QueueFull, TransportArgs
 };
 use tokio::{sync::oneshot, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -30,7 +29,7 @@ pub struct NetworkClient {
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
     transport_handle: GatewayTransportHandle,
     network_state: Mutex<NetworkState>,
-    contract_client: Box<dyn contract_client::Client>,
+    contract_client: Box<dyn ContractClient>,
     tasks: Mutex<HashMap<QueryId, QueryTask>>,
     dataset_storage: StorageClient,
     dataset_update_interval: Duration,
@@ -49,7 +48,8 @@ impl NetworkClient {
         config: Arc<Config>,
     ) -> anyhow::Result<NetworkClient> {
         let dataset_storage = StorageClient::new(args.rpc.network)?;
-        let transport_builder = P2PTransportBuilder::from_cli(args).await?;
+        let agent_into = get_agent_info!();
+        let transport_builder = P2PTransportBuilder::from_cli(args, agent_into).await?;
         let contract_client = transport_builder.contract_client();
         let mut gateway_config = GatewayConfig::new(logs_collector);
         gateway_config.query_config.request_timeout = config.transport_timeout;
@@ -137,8 +137,14 @@ impl NetworkClient {
                 GatewayEvent::QueryResult { peer_id, result } => {
                     self.handle_query_result(peer_id, result)
                         .unwrap_or_else(|e| {
-                            tracing::error!("Error handling query: {e:?}");
+                            tracing::error!("Error handling query result: {e:?}");
                         });
+                }
+                GatewayEvent::QueryDropped { query_id } => {
+                    // No good way to handle this yet, just drop the response sender
+                    if self.tasks.lock().remove_entry(&query_id).is_none() {
+                        tracing::error!("Not expecting response for query {query_id}");
+                    }
                 }
             }
         }

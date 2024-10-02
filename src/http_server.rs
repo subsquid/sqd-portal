@@ -9,11 +9,11 @@ use axum::{
     routing::{get, post},
     Extension, RequestExt, Router,
 };
-use contract_client::PeerId;
+use sqd_contract_client::PeerId;
 use futures::StreamExt;
 use itertools::Itertools;
 use prometheus_client::registry::Registry;
-use subsquid_messages::query_result;
+use sqd_messages::query_result;
 
 use crate::{
     cli::Config,

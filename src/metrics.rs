@@ -2,7 +2,7 @@ use prometheus_client::{
     metrics::{counter::Counter, family::Family, gauge::Gauge},
     registry::Registry,
 };
-use subsquid_messages::query_result;
+use sqd_messages::query_result;
 
 use crate::types::DatasetId;
 

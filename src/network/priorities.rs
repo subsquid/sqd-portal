@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use contract_client::PeerId;
+use sqd_contract_client::PeerId;
 use static_assertions::const_assert;
 
 use crate::cli::Config;

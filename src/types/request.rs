@@ -1,6 +1,6 @@
 use std::{str::FromStr, time::Duration};
 
-use subsquid_messages::Range;
+use sqd_messages::Range;
 
 use super::DatasetId;
 

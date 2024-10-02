@@ -33,6 +33,6 @@ tracing-futures = { version = "0.2.5", features = ["tokio", "futures-03"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
-contract-client = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.4" }
-subsquid-messages = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.1.0", features = ["semver"] }
-subsquid-network-transport = { git = "https://github.com/subsquid/subsquid-network.git", version = "1.0.12", features = ["gateway", "metrics"] }
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", version = "1.0.7" }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", version = "1.1.4", features = ["semver"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", version = "1.0.25", features = ["gateway", "metrics"] }

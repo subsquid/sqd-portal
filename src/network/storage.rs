@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use contract_client::Network;
+use sqd_contract_client::Network;
 use parking_lot::{Mutex, RwLock};
 use serde::{de::DeserializeOwned, Deserialize};
 

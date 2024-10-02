@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_with::{serde_as, DurationSeconds};
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr};
-use subsquid_network_transport::{PeerId, TransportArgs};
+use sqd_network_transport::{PeerId, TransportArgs};
 
 use crate::types::DatasetId;
 

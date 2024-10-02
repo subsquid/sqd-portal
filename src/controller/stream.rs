@@ -1,7 +1,7 @@
 use std::{future::Future, sync::Arc};
 
 use futures::FutureExt;
-use subsquid_messages::{query_result, Range};
+use sqd_messages::{query_result, Range};
 use tokio::task::JoinSet;
 use tracing::{instrument, Instrument};
 

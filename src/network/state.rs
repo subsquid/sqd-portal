@@ -7,8 +7,8 @@ use crate::cli::Config;
 use crate::metrics;
 use crate::types::DatasetId;
 use serde::Serialize;
-use subsquid_messages::RangeSet;
-use subsquid_network_transport::PeerId;
+use sqd_messages::RangeSet;
+use sqd_network_transport::PeerId;
 
 use super::priorities::WorkersPool;
 

@@ -1,5 +1,5 @@
 use axum::http::StatusCode;
-use subsquid_messages::query_result;
+use sqd_messages::query_result;
 
 #[derive(thiserror::Error, Debug)]
 pub enum RequestError {
