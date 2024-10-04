@@ -1,6 +1,8 @@
-# Query gateway
+# SQD Portal
 
 This is an application that connects to the worker network and executes queries submitted via HTTP.
+
+This is a WIP version, the active PR can be found here: https://github.com/subsquid/query-gateway/pull/4
 
 ## Running
 

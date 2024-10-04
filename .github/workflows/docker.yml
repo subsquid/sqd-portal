@@ -26,26 +26,26 @@ jobs:
           username: ${{ secrets.DOCKER_LOGIN }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Build query gateway
+      - name: Build portal
         uses: docker/build-push-action@v5
         with:
           context: .
           load: true
-          tags: subsquid/query-gateway:test
+          tags: subsquid/sqd-portal:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Get query gateway version
-        run: echo "GATEWAY_VERSION=$(docker run --rm subsquid/query-gateway:test subsquid-query-gateway --version | cut -d ' ' -f2)" >> $GITHUB_ENV
+      - name: Get portal version
+        run: echo "PORTAL_VERSION=$(docker run --rm subsquid/sqd-portal:test sqd-portal --version | cut -d ' ' -f2)" >> $GITHUB_ENV
 
-      - name: Build & publish query gateway
+      - name: Build & publish portal
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm/v7,linux/arm64/v8,linux/386
           push: true
           tags: |
-            subsquid/query-gateway:${{ env.GATEWAY_VERSION }}
-            subsquid/query-gateway:${{ inputs.tag }}
+            subsquid/sqd-portal:${{ env.PORTAL_VERSION }}
+            subsquid/sqd-portal:${{ inputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
