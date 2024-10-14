@@ -1,4 +1,4 @@
-hostname: http://localhost:8000
+hostname: http://0.0.0.0:8000
 available_datasets:
   0g-testnet: s3://0g-testnet-traceless-1
   aleph-zero-evm-mainnet: s3://aleph-zero-evm-mainnet

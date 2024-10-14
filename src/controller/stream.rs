@@ -120,7 +120,7 @@ impl StreamController {
 
         self.try_fill_slots();
 
-        return result;
+        result
     }
 
     #[instrument(skip_all, fields(chunk_index = index))]
@@ -147,7 +147,7 @@ impl StreamController {
 
         if result
             .as_ref()
-            .is_some_and(|(response, _, _)| retriable(&response) && pending.tries_left > 0)
+            .is_some_and(|(response, _, _)| retriable(response) && pending.tries_left > 0)
         {
             tracing::debug!("Retrying request: {:?}", result.as_ref().unwrap().0);
             retry = true;
@@ -279,7 +279,7 @@ impl StreamController {
     }
 
     fn get_next_chunk(&self, chunk: &BlockRange) -> Option<BlockRange> {
-        let next_chunk = self.network.next_chunk(&self.request.dataset_id, &chunk);
+        let next_chunk = self.network.next_chunk(&self.request.dataset_id, chunk);
 
         if let Some(next_chunk) = &next_chunk {
             if self
@@ -341,7 +341,7 @@ impl StreamController {
             .query_worker(
                 &worker,
                 &self.request.dataset_id,
-                self.request.query.with_range(&range),
+                self.request.query.with_range(range),
             )
             .map_err(|_| SendQueryError::TransportQueueFull)?;
         self.stats.query_sent();

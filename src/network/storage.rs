@@ -45,7 +45,7 @@ impl StorageClient {
             .chunks
             .into_iter()
             .map(|(dataset_url, chunks)| {
-                let dataset_id = DatasetId::from_url(&dataset_url);
+                let dataset_id = DatasetId::from_url(dataset_url);
                 let mut chunks: Vec<_> = chunks
                     .into_iter()
                     .map(|chunk| chunk.begin..=chunk.end)

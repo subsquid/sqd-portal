@@ -21,7 +21,7 @@ use crate::{
 use super::{NetworkState, StorageClient};
 
 lazy_static::lazy_static! {
-    static ref SUPPORTED_VERSIONS: semver::VersionReq = ">=1.1.0-rc1".parse().expect("Invalid version requirement");
+    static ref SUPPORTED_VERSIONS: semver::VersionReq = "~1.2.0".parse().expect("Invalid version requirement");
 }
 
 /// Tracks the network state and handles p2p communication

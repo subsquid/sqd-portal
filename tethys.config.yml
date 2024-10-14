@@ -1,4 +1,4 @@
-hostname: http://localhost:8000
+hostname: http://0.0.0.0:8000
 worker_inactive_threshold_sec: 120
 min_worker_priority: -4
 max_worker_priority: 3

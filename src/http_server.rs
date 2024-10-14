@@ -120,7 +120,6 @@ async fn execute_stream(
     };
     let stream = stream.map(anyhow::Ok);
     Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
         .header(header::CONTENT_ENCODING, "gzip")
         .body(Body::from_stream(stream))
         .unwrap()
