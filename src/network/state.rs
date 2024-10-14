@@ -67,7 +67,7 @@ impl NetworkState {
             config: config.clone(),
             dataset_states: Default::default(),
             last_pings: Default::default(),
-            pool: WorkersPool::new(config),
+            pool: WorkersPool::default(),
         }
     }
 
@@ -119,12 +119,16 @@ impl NetworkState {
         self.pool.timeout(worker);
     }
 
+    pub fn report_query_outrun(&mut self, worker: PeerId) {
+        self.pool.outrun(worker);
+    }
+
     pub fn report_no_allocation(&mut self, worker: PeerId) {
         self.pool.unavailable(worker);
     }
 
-    pub fn reset_cache(&mut self) {
-        self.pool.reset();
+    pub fn reset_allocations(&mut self) {
+        self.pool.reset_allocations();
     }
 
     pub fn get_height(&self, dataset_id: &DatasetId) -> Option<u32> {

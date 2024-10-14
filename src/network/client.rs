@@ -117,7 +117,7 @@ impl NetworkClient {
             if epoch != current_epoch {
                 tracing::info!("Epoch {epoch} started");
                 current_epoch = epoch;
-                self.network_state.lock().reset_cache();
+                self.network_state.lock().reset_allocations();
             }
         }
     }
@@ -221,23 +221,22 @@ impl NetworkClient {
         tracing::trace!("Got result for query {query_id}");
         metrics::report_query_result(&result);
 
-        let (query_id, task) = self
+        let (_query_id, task) = self
             .tasks
             .lock()
             .remove_entry(&query_id)
             .ok_or_else(|| anyhow::anyhow!("Not expecting response for query {query_id}"))?;
         if peer_id != task.worker_id {
-            tracing::error!(
+            self.network_state.lock().report_query_error(peer_id);
+            anyhow::bail!(
                 "Invalid message sender, expected {}, got {}",
                 task.worker_id,
                 peer_id
             );
-            self.network_state.lock().report_query_error(peer_id);
         }
 
         match &result {
-            query_result::Result::ServerError(e) => {
-                tracing::warn!("Server error returned for query {query_id}: {e}");
+            query_result::Result::ServerError(_) => {
                 self.network_state.lock().report_query_error(peer_id);
             }
             query_result::Result::NoAllocation(()) => {
@@ -251,8 +250,8 @@ impl NetworkClient {
                     self.network_state.lock().report_query_success(peer_id);
                 } else {
                     // The result is no longer needed. Either another query has got the result first,
-                    // or the stream has been dropped. In either case, consider the query timed out.
-                    self.network_state.lock().report_query_timeout(peer_id);
+                    // or the stream has been dropped. In either case, consider the query outrun.
+                    self.network_state.lock().report_query_outrun(peer_id);
                 }
                 return Ok(());
             }
