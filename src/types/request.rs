@@ -1,4 +1,4 @@
-use std::{str::FromStr, time::Duration};
+use std::str::FromStr;
 
 use super::{BlockRange, DatasetId};
 
@@ -8,9 +8,7 @@ pub struct ClientRequest {
     pub query: ParsedQuery,
     pub buffer_size: usize,
     pub max_chunks: Option<usize>,
-    pub chunk_timeout: Duration,
     pub timeout_quantile: f32,
-    pub request_multiplier: usize,
     pub retries: usize,
 }
 
@@ -29,6 +27,10 @@ impl ParsedQuery {
             .and_then(|v| v.as_u64())
             .ok_or(anyhow::anyhow!("fromBlock is required"))?;
         let last_block = json.get("toBlock").and_then(|v| v.as_u64());
+        anyhow::ensure!(
+            last_block.is_none() || last_block >= Some(first_block),
+            "toBlock must be greater or equal to fromBlock"
+        );
         Ok(Self {
             json,
             first_block,
@@ -59,6 +61,10 @@ impl ParsedQuery {
             *range.end()
         };
         (begin <= end).then_some(begin..=end)
+    }
+
+    pub fn to_string(&self) -> String {
+        serde_json::to_string(&self.json).expect("Couldn't serialize query")
     }
 }
 

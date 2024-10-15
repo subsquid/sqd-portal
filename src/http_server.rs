@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
     async_trait,
@@ -9,10 +9,10 @@ use axum::{
     routing::{get, post},
     Extension, RequestExt, Router,
 };
-use sqd_contract_client::PeerId;
 use futures::StreamExt;
 use itertools::Itertools;
 use prometheus_client::registry::Registry;
+use sqd_contract_client::PeerId;
 use sqd_messages::query_result;
 
 use crate::{
@@ -102,9 +102,7 @@ async fn execute_stream_restricted(
         dataset_id: raw_request.dataset_id,
         buffer_size: raw_request.buffer_size.min(config.max_buffer_size),
         max_chunks: config.max_chunks_per_stream,
-        chunk_timeout: config.default_chunk_timeout,
         timeout_quantile: config.default_timeout_quantile,
-        request_multiplier: config.default_request_multiplier,
         retries: config.default_retries,
     };
     execute_stream(Extension(task_manager), request).await
@@ -211,18 +209,6 @@ where
             }
             None => config.default_buffer_size,
         };
-        let chunk_timeout = match params.get("chunk_timeout") {
-            Some(value) => match value.parse() {
-                Ok(seconds) => Duration::from_secs(seconds),
-                Err(e) => {
-                    return Err(RequestError::BadRequest(format!(
-                        "Couldn't parse chunk_timeout: {e}"
-                    ))
-                    .into_response())
-                }
-            },
-            None => config.default_chunk_timeout,
-        };
         let timeout_quantile = match params.get("timeout_quantile") {
             Some(value) => match value.parse() {
                 Ok(quantile) => quantile,
@@ -234,18 +220,6 @@ where
                 }
             },
             None => config.default_timeout_quantile,
-        };
-        let request_multiplier = match params.get("request_multiplier") {
-            Some(value) => match value.parse() {
-                Ok(value) => value,
-                Err(e) => {
-                    return Err(RequestError::BadRequest(format!(
-                        "Couldn't parse request_multiplier: {e}"
-                    ))
-                    .into_response())
-                }
-            },
-            None => config.default_request_multiplier,
         };
         let retries = match params.get("retries") {
             Some(value) => match value.parse() {
@@ -265,9 +239,7 @@ where
             query,
             buffer_size,
             max_chunks: config.max_chunks_per_stream,
-            chunk_timeout,
             timeout_quantile,
-            request_multiplier,
             retries,
         })
     }

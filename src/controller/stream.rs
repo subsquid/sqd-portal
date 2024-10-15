@@ -26,6 +26,7 @@ pub struct StreamController {
     timeouts: Arc<TimeoutManager>,
     stats: Arc<StreamStats>,
     span: tracing::Span,
+    last_error: Option<String>,
 }
 
 struct Slot {
@@ -84,6 +85,7 @@ impl StreamController {
             timeouts: Arc::new(TimeoutManager::new(timeout_quantile)),
             stats: Arc::new(StreamStats::new()),
             span: tracing::Span::current(),
+            last_error: None,
         };
         controller.try_fill_slots();
         if controller.buffer.total_size() == 0 {
@@ -96,6 +98,8 @@ impl StreamController {
         &mut self,
         ctx: &mut Context<'_>,
     ) -> Poll<Option<Result<ResponseChunk, RequestError>>> {
+        self.last_error = None;
+
         // extract this field to be able to pass both its values and `&mut self` to the method
         let mut buffer = std::mem::take(&mut self.buffer);
         let mut updated = false;
@@ -119,6 +123,10 @@ impl StreamController {
         let result = self.pop_response();
 
         self.try_fill_slots();
+
+        if let Poll::Ready(Some(Err(e))) = &result {
+            self.last_error = Some(e.to_string());
+        }
 
         result
     }
@@ -272,6 +280,7 @@ impl StreamController {
                 }
                 Err(e) => {
                     tracing::debug!("Couldn't schedule request: {e:?}");
+                    self.last_error = Some(e.to_string());
                     break;
                 }
             }
@@ -356,7 +365,7 @@ impl StreamController {
 impl Drop for StreamController {
     fn drop(&mut self) {
         let _enter = self.span.enter();
-        self.stats.write_summary();
+        self.stats.write_summary(&self.request, self.last_error.take());
     }
 }
 

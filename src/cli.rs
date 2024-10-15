@@ -58,14 +58,6 @@ fn default_max_buffer_size() -> usize {
     100
 }
 
-fn default_default_chunk_timeout() -> Duration {
-    Duration::from_secs(30)
-}
-
-fn default_default_request_multiplier() -> usize {
-    1
-}
-
 fn default_default_retries() -> usize {
     3
 }
@@ -126,16 +118,6 @@ pub struct Config {
 
     #[serde(default = "default_max_buffer_size")]
     pub max_buffer_size: usize,
-
-    #[serde_as(as = "DurationSeconds")]
-    #[serde(
-        rename = "default_chunk_timeout_sec",
-        default = "default_default_chunk_timeout"
-    )]
-    pub default_chunk_timeout: Duration,
-
-    #[serde(default = "default_default_request_multiplier")]
-    pub default_request_multiplier: usize,
 
     #[serde(default = "default_default_retries")]
     pub default_retries: usize,

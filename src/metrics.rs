@@ -10,6 +10,7 @@ lazy_static::lazy_static! {
     pub static ref VALID_PINGS: Counter = Default::default();
     pub static ref IGNORED_PINGS: Counter = Default::default();
     pub static ref QUERIES_SENT: Counter = Default::default();
+    pub static ref QUERIES_RUNNING: Gauge = Default::default();
     static ref QUERY_RESULTS: Family<Vec<(String, String)>, Counter> = Default::default();
     pub static ref KNOWN_WORKERS: Gauge = Default::default();
     pub static ref ACTIVE_STREAMS: Gauge = Default::default();
@@ -69,6 +70,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "queries_sent",
         "Number of sent queries",
         QUERIES_SENT.clone(),
+    );
+    registry.register(
+        "queries_running",
+        "Number of sent queries",
+        QUERIES_RUNNING.clone(),
     );
     registry.register(
         "queries_responded",

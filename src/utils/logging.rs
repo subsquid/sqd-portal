@@ -5,6 +5,8 @@ use parking_lot::Mutex;
 use tokio::time::{Duration, Instant};
 use tracing::Instrument;
 
+use crate::types::ClientRequest;
+
 const LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct StreamStats {
@@ -54,13 +56,22 @@ impl StreamStats {
         }
     }
 
-    pub fn write_summary(&self) {
+    pub fn write_summary(&self, request: &ClientRequest, error: Option<String>) {
+        // tracing::debug!(
+        //     dataset = %request.dataset_id,
+        //     query = request.query.to_string(),
+        //     "Query processed"
+        // );
         tracing::info!(
+            dataset = %request.dataset_id,
+            first_block = request.query.first_block(),
+            last_block = request.query.last_block(),
             queries_sent = self.queries_sent.load(Ordering::Relaxed),
             chunks_downloaded = self.chunks_downloaded.load(Ordering::Relaxed),
             blocks_streamed = self.response_blocks.load(Ordering::Relaxed),
             bytes_streamed = self.response_bytes.load(Ordering::Relaxed),
             total_time = ?self.start_time.elapsed(),
+            error = error.unwrap_or_else(|| "-".to_string()),
             "Stream finished"
         );
     }

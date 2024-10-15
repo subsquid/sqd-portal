@@ -6,7 +6,8 @@ use serde::Serialize;
 use sqd_contract_client::{Client as ContractClient, PeerId};
 use sqd_messages::{query_result, Ping, Query, QueryResult};
 use sqd_network_transport::{
-    get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransportHandle, P2PTransportBuilder, QueueFull, TransportArgs
+    get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransportHandle,
+    P2PTransportBuilder, QueueFull, TransportArgs,
 };
 use tokio::{sync::oneshot, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,7 @@ use super::{NetworkState, StorageClient};
 lazy_static::lazy_static! {
     static ref SUPPORTED_VERSIONS: semver::VersionReq = "~1.2.0".parse().expect("Invalid version requirement");
 }
+const MAX_CONCURRENT_QUERIES: usize = 1000;
 
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
@@ -141,8 +143,14 @@ impl NetworkClient {
                         });
                 }
                 GatewayEvent::QueryDropped { query_id } => {
-                    // No good way to handle this yet, just drop the response sender
-                    if self.tasks.lock().remove_entry(&query_id).is_none() {
+                    if let Some(task) = self.tasks.lock().remove(&query_id) {
+                        metrics::QUERIES_RUNNING.dec();
+                        task.result_tx
+                            .send(query_result::Result::ServerError(
+                                "Outbound queue overloaded".to_string(),
+                            ))
+                            .ok();
+                    } else {
                         tracing::error!("Not expecting response for query {query_id}");
                     }
                 }
@@ -173,28 +181,42 @@ impl NetworkClient {
         query: String,
     ) -> Result<oneshot::Receiver<query_result::Result>, QueueFull> {
         let query_id = generate_query_id();
+        tracing::trace!("Sending query {query_id} to {worker}");
 
-        self.transport_handle.send_query(
-            *worker,
-            Query {
-                dataset: Some(dataset.to_string()),
-                query_id: Some(query_id.clone()),
-                query: Some(query),
-                client_state_json: Some("{}".to_string()), // This is a placeholder field
-                profiling: Some(false),
-                ..Default::default()
-            },
-        )?;
-        tracing::trace!("Sent query {query_id} to {worker}");
-        metrics::QUERIES_SENT.inc();
         self.network_state.lock().lease_worker(*worker);
 
         let (result_tx, result_rx) = oneshot::channel();
+
         let task = QueryTask {
             result_tx,
             worker_id: *worker,
         };
-        self.tasks.lock().insert(query_id, task);
+        let mut tasks = self.tasks.lock();
+        if tasks.len() >= MAX_CONCURRENT_QUERIES {
+            return Err(QueueFull);
+        }
+        tasks.insert(query_id.clone(), task);
+        drop(tasks);
+
+        self.transport_handle
+            .send_query(
+                *worker,
+                Query {
+                    dataset: Some(dataset.to_string()),
+                    query_id: Some(query_id.clone()),
+                    query: Some(query),
+                    client_state_json: Some("{}".to_string()), // This is a placeholder field
+                    profiling: Some(false),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| {
+                self.tasks.lock().remove(&query_id);
+                e
+            })?;
+
+        metrics::QUERIES_RUNNING.inc();
+        metrics::QUERIES_SENT.inc();
         Ok(result_rx)
     }
 
@@ -221,11 +243,13 @@ impl NetworkClient {
         tracing::trace!("Got result for query {query_id}");
         metrics::report_query_result(&result);
 
-        let (_query_id, task) = self
-            .tasks
-            .lock()
+        let mut tasks = self.tasks.lock();
+        let (_query_id, task) = tasks
             .remove_entry(&query_id)
             .ok_or_else(|| anyhow::anyhow!("Not expecting response for query {query_id}"))?;
+        metrics::QUERIES_RUNNING.set(tasks.len() as i64);
+        drop(tasks);
+
         if peer_id != task.worker_id {
             self.network_state.lock().report_query_error(peer_id);
             anyhow::bail!(
