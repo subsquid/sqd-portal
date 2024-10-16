@@ -5,17 +5,17 @@ use parking_lot::Mutex;
 use tokio::time::{Duration, Instant};
 use tracing::Instrument;
 
-use crate::types::ClientRequest;
+use crate::{metrics, types::ClientRequest};
 
 const LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct StreamStats {
-    queries_sent: AtomicU64,
-    chunks_downloaded: AtomicU64,
-    response_blocks: AtomicU64,
-    response_bytes: AtomicU64,
-    start_time: Instant,
-    last_log: Mutex<Instant>,
+    pub queries_sent: AtomicU64,
+    pub chunks_downloaded: AtomicU64,
+    pub response_blocks: AtomicU64,
+    pub response_bytes: AtomicU64,
+    pub start_time: Instant,
+    pub last_log: Mutex<Instant>,
 }
 
 impl StreamStats {
@@ -74,6 +74,7 @@ impl StreamStats {
             error = error.unwrap_or_else(|| "-".to_string()),
             "Stream finished"
         );
+        metrics::report_stream_completed(&self, request.dataset_id.to_string());
     }
 }
 
@@ -91,6 +92,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
 
     let response = next.run(req).instrument(span.clone()).await;
 
+    let latency = start.elapsed();
     span.in_scope(|| {
         tracing::info!(
             target: "http_request",
@@ -98,10 +100,20 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
             path,
             ?version,
             status = %response.status(),
-            latency = ?start.elapsed(),
+            ?latency,
             "HTTP request processed"
         )
     });
+
+    let endpoint = {
+        if path.starts_with("/query") {
+            "/query".to_string()
+        } else {
+            let path = path.split('/').last().expect("HTTP Path can't be empty");
+            format!("/{path}")
+        }
+    };
+    metrics::report_http_response(endpoint, response.status(), latency.as_secs_f64());
 
     response
 }

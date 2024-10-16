@@ -5,6 +5,7 @@ use cli::Cli;
 use controller::task_manager::TaskManager;
 use http_server::run_server;
 use network::NetworkClient;
+use prometheus_client::registry::Registry;
 use tokio_util::sync::CancellationToken;
 
 mod cli;
@@ -45,15 +46,20 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     setup_tracing(args.json_log)?;
     let config = Arc::new(args.config);
-    let mut metrics_registry = Default::default();
-    metrics::register_metrics(&mut metrics_registry);
-    sqd_network_transport::metrics::register_metrics(&mut metrics_registry);
+    let mut metrics_registry = Registry::default();
+    metrics::register_metrics(metrics_registry.sub_registry_with_prefix("portal"));
+    sqd_network_transport::metrics::register_metrics(
+        metrics_registry.sub_registry_with_prefix("transport"),
+    );
     let cancellation_token = CancellationToken::new();
 
     let network_client =
         Arc::new(NetworkClient::new(args.transport, args.logs_collector_id, config.clone()).await?);
     tracing::info!("Network client initialized");
-    let task_manager = Arc::new(TaskManager::new(network_client.clone(), config.max_parallel_streams));
+    let task_manager = Arc::new(TaskManager::new(
+        network_client.clone(),
+        config.max_parallel_streams,
+    ));
 
     let (res, ()) = tokio::join!(
         run_server(

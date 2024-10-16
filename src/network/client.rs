@@ -216,7 +216,9 @@ impl NetworkClient {
             })?;
 
         metrics::QUERIES_RUNNING.inc();
-        metrics::QUERIES_SENT.inc();
+        metrics::QUERIES_SENT
+            .get_or_create(&vec![("worker".to_string(), worker.to_string())])
+            .inc();
         Ok(result_rx)
     }
 
@@ -241,7 +243,7 @@ impl NetworkClient {
         let QueryResult { query_id, result } = result;
         let result = result.ok_or_else(|| anyhow::anyhow!("Result missing"))?;
         tracing::trace!("Got result for query {query_id}");
-        metrics::report_query_result(&result);
+        metrics::report_query_result(&result, peer_id.to_string());
 
         let mut tasks = self.tasks.lock();
         let (_query_id, task) = tasks

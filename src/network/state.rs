@@ -98,7 +98,7 @@ impl NetworkState {
             metrics::report_dataset_updated(
                 &dataset_id,
                 entry.highest_seen_block,
-                entry.highest_seen_block,
+                entry.first_gap,
             );
         }
     }
