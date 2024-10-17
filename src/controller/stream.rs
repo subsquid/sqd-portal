@@ -23,8 +23,8 @@ pub struct StreamController {
     network: Arc<NetworkClient>,
     buffer: SlidingArray<Slot>,
     next_chunk: Option<BlockRange>,
-    timeouts: Arc<TimeoutManager>,
-    stats: Arc<StreamStats>,
+    timeouts: TimeoutManager,
+    stats: StreamStats,
     span: tracing::Span,
     last_error: Option<String>,
 }
@@ -82,8 +82,8 @@ impl StreamController {
             network,
             buffer,
             next_chunk: Some(first_chunk),
-            timeouts: Arc::new(TimeoutManager::new(timeout_quantile)),
-            stats: Arc::new(StreamStats::new()),
+            timeouts: TimeoutManager::new(timeout_quantile),
+            stats: StreamStats::new(),
             span: tracing::Span::current(),
             last_error: None,
         };
@@ -269,18 +269,19 @@ impl StreamController {
                 .max_chunks
                 .is_some_and(|limit| self.buffer.total_size() >= limit)
         {
-            let Some(chunk) = self.next_chunk.as_ref() else {
+            let Some(chunk) = self.next_chunk.take() else {
                 break;
             };
             let next_index = self.buffer.total_size();
-            match self.start_querying_chunk(chunk, next_index) {
+            match self.start_querying_chunk(&chunk, next_index) {
                 Ok(slot) => {
                     self.buffer.push_back(slot);
-                    self.next_chunk = self.get_next_chunk(chunk);
+                    self.next_chunk = self.get_next_chunk(&chunk);
                 }
                 Err(e) => {
                     tracing::debug!("Couldn't schedule request: {e:?}");
                     self.last_error = Some(e.to_string());
+                    self.next_chunk = Some(chunk);
                     break;
                 }
             }
@@ -307,7 +308,7 @@ impl StreamController {
     }
 
     fn start_querying_chunk(
-        &self,
+        &mut self,
         chunk: &BlockRange,
         index: usize,
     ) -> Result<Slot, SendQueryError> {
@@ -328,7 +329,7 @@ impl StreamController {
     }
 
     fn send_query(
-        &self,
+        &mut self,
         range: &BlockRange,
         chunk_index: usize,
     ) -> Result<WorkerRequest, SendQueryError> {

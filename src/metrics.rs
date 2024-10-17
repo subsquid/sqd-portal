@@ -1,4 +1,4 @@
-use std::{iter, sync::atomic::Ordering};
+use std::iter;
 
 use prometheus_client::{
     metrics::{
@@ -90,9 +90,9 @@ pub fn report_http_response(endpoint: String, status: StatusCode, seconds_to_fir
 pub fn report_stream_completed(stats: &StreamStats, dataset_id: String) {
     let label = vec![("dataset".to_owned(), dataset_id)];
     let duration = stats.start_time.elapsed().as_secs_f64();
-    let bytes = stats.response_bytes.load(Ordering::Relaxed);
-    let blocks = stats.response_blocks.load(Ordering::Relaxed);
-    let chunks = stats.chunks_downloaded.load(Ordering::Relaxed);
+    let bytes = stats.response_bytes;
+    let blocks = stats.response_blocks;
+    let chunks = stats.chunks_downloaded;
     STREAM_DURATIONS.get_or_create(&label).observe(duration);
     STREAM_BYTES.get_or_create(&label).observe(bytes as f64);
     STREAM_BLOCKS.get_or_create(&label).observe(blocks as f64);

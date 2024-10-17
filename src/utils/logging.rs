@@ -1,7 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use axum::{extract::Request, response::IntoResponse};
-use parking_lot::Mutex;
 use tokio::time::{Duration, Instant};
 use tracing::Instrument;
 
@@ -10,49 +7,47 @@ use crate::{metrics, types::ClientRequest};
 const LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct StreamStats {
-    pub queries_sent: AtomicU64,
-    pub chunks_downloaded: AtomicU64,
-    pub response_blocks: AtomicU64,
-    pub response_bytes: AtomicU64,
+    pub queries_sent: u64,
+    pub chunks_downloaded: u64,
+    pub response_blocks: u64,
+    pub response_bytes: u64,
     pub start_time: Instant,
-    pub last_log: Mutex<Instant>,
+    pub last_log: Instant,
 }
 
 impl StreamStats {
     pub fn new() -> Self {
         let now = Instant::now();
         Self {
-            queries_sent: Default::default(),
-            chunks_downloaded: Default::default(),
-            response_blocks: Default::default(),
-            response_bytes: Default::default(),
+            queries_sent: 0,
+            chunks_downloaded: 0,
+            response_blocks: 0,
+            response_bytes: 0,
             start_time: now,
-            last_log: Mutex::new(now),
+            last_log: now,
         }
     }
 
-    pub fn query_sent(&self) {
-        self.queries_sent.fetch_add(1, Ordering::Relaxed);
+    pub fn query_sent(&mut self) {
+        self.queries_sent += 1;
     }
 
-    pub fn sent_response_chunk(&self, blocks: u64, bytes: usize) {
-        self.chunks_downloaded.fetch_add(1, Ordering::Relaxed);
-        self.response_blocks.fetch_add(blocks, Ordering::Relaxed);
-        self.response_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+    pub fn sent_response_chunk(&mut self, blocks: u64, bytes: usize) {
+        self.chunks_downloaded += 1;
+        self.response_blocks += blocks;
+        self.response_bytes += bytes as u64;
     }
 
-    pub fn maybe_write_log(&self) {
-        let mut last_log = self.last_log.lock();
-        if last_log.elapsed() >= LOG_INTERVAL {
+    pub fn maybe_write_log(&mut self) {
+        if self.last_log.elapsed() >= LOG_INTERVAL {
             tracing::info!(
-                queries_sent = self.queries_sent.load(Ordering::Relaxed),
-                chunks_downloaded = self.chunks_downloaded.load(Ordering::Relaxed),
-                blocks_streamed = self.response_blocks.load(Ordering::Relaxed),
-                bytes_streamed = self.response_bytes.load(Ordering::Relaxed),
+                queries_sent = self.queries_sent,
+                chunks_downloaded = self.chunks_downloaded,
+                blocks_streamed = self.response_blocks,
+                bytes_streamed = self.response_bytes,
                 "Streaming..."
             );
-            *last_log = Instant::now();
+            self.last_log = Instant::now();
         }
     }
 
@@ -66,10 +61,10 @@ impl StreamStats {
             dataset = %request.dataset_id,
             first_block = request.query.first_block(),
             last_block = request.query.last_block(),
-            queries_sent = self.queries_sent.load(Ordering::Relaxed),
-            chunks_downloaded = self.chunks_downloaded.load(Ordering::Relaxed),
-            blocks_streamed = self.response_blocks.load(Ordering::Relaxed),
-            bytes_streamed = self.response_bytes.load(Ordering::Relaxed),
+            queries_sent = self.queries_sent,
+            chunks_downloaded = self.chunks_downloaded,
+            blocks_streamed = self.response_blocks,
+            bytes_streamed = self.response_bytes,
             total_time = ?self.start_time.elapsed(),
             error = error.unwrap_or_else(|| "-".to_string()),
             "Stream finished"
