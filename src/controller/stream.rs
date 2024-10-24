@@ -8,13 +8,12 @@ use std::{
 
 use futures::FutureExt;
 use sqd_contract_client::PeerId;
-use sqd_messages::query_result;
 use tracing::instrument;
 
 use crate::{
     controller::timeouts::TimeoutManager,
-    network::NetworkClient,
-    types::{BlockRange, ClientRequest, RequestError, ResponseChunk, SendQueryError},
+    network::{NetworkClient, QueryResult},
+    types::{BlockRange, ClientRequest, QueryError, RequestError, ResponseChunk, SendQueryError},
     utils::{logging::StreamStats, SlidingArray},
 };
 
@@ -55,7 +54,7 @@ struct PartialResult {
 }
 
 struct WorkerRequest {
-    resp: tokio::sync::oneshot::Receiver<query_result::Result>,
+    resp: tokio::sync::oneshot::Receiver<QueryResult>,
     start_time: tokio::time::Instant,
     worker: PeerId,
 }
@@ -196,13 +195,14 @@ impl StreamController {
                     pending.requests.push(worker_request);
                 }
                 Err(e) => {
-                    tracing::debug!("Couldn't schedule request: {e:?}");
+                    tracing::debug!("Couldn't schedule retry: {e:?}");
                     if pending.requests.is_empty() {
                         let (response, _, _) =
                             result.expect("if there are no requests left, there must be a result");
                         // use latest error as the result
-                        slot.state =
-                            RequestState::Done(Err(RequestError::try_from(response).unwrap()));
+                        slot.state = RequestState::Done(Err(RequestError::from(
+                            response.expect_err("non-retriable results should have been handled"),
+                        )));
                         return true;
                     } else {
                         // wait for other requests to complete
@@ -406,16 +406,13 @@ impl PendingRequests {
     }
 }
 
-fn parse_response(response: query_result::Result, range: &BlockRange) -> RequestState {
+fn parse_response(response: QueryResult, range: &BlockRange) -> RequestState {
     let result = match response {
-        query_result::Result::Ok(result) => result,
-        e => return RequestState::Done(Err(RequestError::try_from(e).unwrap())),
+        Ok(result) => result,
+        Err(e) => return RequestState::Done(Err(RequestError::from(e))),
     };
-    let Some(last_block) = result.last_block else {
-        return RequestState::Done(Err(RequestError::InternalError(
-            "No last block in the response".to_string(),
-        )));
-    };
+
+    let last_block = result.last_block;
     if last_block == *range.end() {
         RequestState::Done(Ok(result.data))
     } else if last_block < *range.start() {
@@ -435,25 +432,18 @@ fn parse_response(response: query_result::Result, range: &BlockRange) -> Request
     }
 }
 
-fn better_result(prev: Option<&query_result::Result>, new: &query_result::Result) -> bool {
+fn better_result(prev: Option<&QueryResult>, new: &QueryResult) -> bool {
     let Some(prev) = prev else {
         return true;
     };
     if retriable(prev) {
         return true;
     }
-    matches!(new, query_result::Result::Ok(_))
+    new.is_ok()
 }
 
-fn retriable(result: &query_result::Result) -> bool {
-    use query_result::Result;
-    match result {
-        Result::ServerError(_)
-        | Result::TimeoutV1(_)
-        | Result::Timeout(_)
-        | Result::NoAllocation(_) => true,
-        Result::Ok(_) | Result::BadRequest(_) => false,
-    }
+fn retriable(result: &QueryResult) -> bool {
+    matches!(result, Err(QueryError::Retriable(_)))
 }
 
 fn short_code(result: &RequestState) -> &'static str {

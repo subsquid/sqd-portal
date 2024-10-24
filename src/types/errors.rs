@@ -1,5 +1,4 @@
 use axum::http::StatusCode;
-use sqd_messages::query_result;
 
 #[derive(thiserror::Error, Debug)]
 pub enum RequestError {
@@ -14,6 +13,14 @@ pub enum RequestError {
 }
 
 #[derive(thiserror::Error, Debug)]
+pub enum QueryError {
+    #[error("{0}")]
+    BadRequest(String),
+    #[error("{0}")]
+    Retriable(String),
+}
+
+#[derive(thiserror::Error, Debug)]
 pub enum SendQueryError {
     #[error("Transport queue full")]
     TransportQueueFull,
@@ -21,23 +28,11 @@ pub enum SendQueryError {
     NoWorkers,
 }
 
-impl TryFrom<query_result::Result> for RequestError {
-    type Error = ();
-
-    fn try_from(value: query_result::Result) -> Result<Self, Self::Error> {
+impl From<QueryError> for RequestError {
+    fn from(value: QueryError) -> Self {
         match value {
-            query_result::Result::Ok(_) => Err(()),
-            query_result::Result::BadRequest(e) => Ok(Self::BadRequest(e)),
-            query_result::Result::ServerError(e) => Ok(Self::InternalError(e)),
-            query_result::Result::NoAllocation(()) => {
-                Ok(Self::InternalError("Not enough CU allocated".to_string()))
-            }
-            query_result::Result::TimeoutV1(()) => {
-                Ok(Self::InternalError("Query timed out".to_string()))
-            }
-            query_result::Result::Timeout(e) => {
-                Ok(Self::InternalError(format!("Query timed out: {}", e)))
-            }
+            QueryError::BadRequest(s) => RequestError::BadRequest(s),
+            QueryError::Retriable(s) => RequestError::InternalError(s),
         }
     }
 }

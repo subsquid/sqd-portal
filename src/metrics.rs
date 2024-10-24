@@ -10,7 +10,9 @@ use prometheus_client::{
     registry::Registry,
 };
 use reqwest::StatusCode;
+use sqd_contract_client::PeerId;
 use sqd_messages::query_result;
+use sqd_network_transport::QueryFailure;
 
 use crate::{types::DatasetId, utils::logging::StreamStats};
 
@@ -58,19 +60,14 @@ lazy_static::lazy_static! {
     // TODO: add metrics for procedure durations
 }
 
-pub fn report_query_result(result: &query_result::Result, worker: String) {
-    let status = match result {
-        query_result::Result::Ok(_) => "ok",
-        query_result::Result::BadRequest(_) => "bad_request",
-        query_result::Result::ServerError(_) => "server_error",
-        query_result::Result::NoAllocation(_) => "no_allocation",
-        query_result::Result::TimeoutV1(()) | query_result::Result::Timeout(_) => "timeout",
-    }
-    .to_owned();
+pub fn report_query_result(
+    worker: PeerId,
+    status: &str,
+) {
     QUERY_RESULTS
         .get_or_create(&vec![
-            ("worker".to_owned(), worker),
-            ("status".to_owned(), status),
+            ("worker".to_owned(), worker.to_string()),
+            ("status".to_owned(), status.to_owned()),
         ])
         .inc();
 }
@@ -103,7 +100,7 @@ pub fn report_stream_completed(stats: &StreamStats, dataset_id: String) {
         .observe(blocks as f64 / duration);
 }
 
-pub fn report_dataset_updated(dataset_id: &DatasetId, highest_block: u32, first_gap: u32) {
+pub fn report_dataset_updated(dataset_id: &DatasetId, highest_block: u64, first_gap: u64) {
     HIGHEST_BLOCK
         .get_or_create(&vec![("dataset".to_owned(), dataset_id.0.clone())])
         .set(highest_block as i64);
