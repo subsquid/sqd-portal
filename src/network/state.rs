@@ -1,7 +1,7 @@
 use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cli::Config;
 use crate::metrics;
@@ -15,15 +15,15 @@ use super::priorities::WorkersPool;
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct DatasetState {
     worker_ranges: HashMap<PeerId, RangeSet>,
-    highest_seen_block: u32,
-    first_gap: u32,
+    highest_seen_block: u64,
+    first_gap: u64,
 }
 
 impl DatasetState {
     pub fn get_workers_with_block(&self, block: u64) -> impl Iterator<Item = PeerId> + '_ {
         self.worker_ranges
             .iter()
-            .filter_map(move |(peer_id, range_set)| range_set.has(block as u32).then_some(*peer_id))
+            .filter_map(move |(peer_id, range_set)| range_set.has(block).then_some(*peer_id))
     }
 
     pub fn update(&mut self, peer_id: PeerId, state: RangeSet) {
@@ -40,7 +40,7 @@ impl DatasetState {
         }
     }
 
-    pub fn highest_indexable_block(&self) -> u32 {
+    pub fn highest_indexable_block(&self) -> u64 {
         let range_set: RangeSet = self
             .worker_ranges
             .values()
@@ -111,23 +111,23 @@ impl NetworkState {
         self.pool.error(worker);
     }
 
-    pub fn report_query_timeout(&mut self, worker: PeerId) {
-        self.pool.timeout(worker);
+    pub fn report_query_failure(&mut self, worker: PeerId) {
+        self.pool.failure(worker);
     }
 
     pub fn report_query_outrun(&mut self, worker: PeerId) {
         self.pool.outrun(worker);
     }
 
-    pub fn report_no_allocation(&mut self, worker: PeerId) {
-        self.pool.unavailable(worker);
+    pub fn report_backoff(&mut self, worker: PeerId, duration: Duration) {
+        self.pool.backoff(worker, duration);
     }
 
     pub fn reset_allocations(&mut self) {
         self.pool.reset_allocations();
     }
 
-    pub fn get_height(&self, dataset_id: &DatasetId) -> Option<u32> {
+    pub fn get_height(&self, dataset_id: &DatasetId) -> Option<u64> {
         self.dataset_states
             .get(dataset_id)
             .map(|state| state.highest_indexable_block())

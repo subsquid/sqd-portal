@@ -1,7 +1,7 @@
 use clap::Parser;
 use serde::Deserialize;
 use serde_with::{serde_as, DurationSeconds};
-use sqd_network_transport::{PeerId, TransportArgs};
+use sqd_network_transport::TransportArgs;
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr};
 
@@ -16,10 +16,6 @@ pub struct Cli {
     /// HTTP server listen addr
     #[arg(long, env = "HTTP_LISTEN_ADDR", default_value = "0.0.0.0:8000")]
     pub http_listen: SocketAddr,
-
-    /// Logs collector peer id
-    #[arg(long, env)]
-    pub logs_collector_id: PeerId,
 
     /// Path to config file
     #[arg(long, env, value_parser = Config::read)]

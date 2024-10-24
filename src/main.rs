@@ -47,8 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     setup_tracing(args.json_log)?;
     let config = Arc::new(args.config);
-    let network_client =
-        Arc::new(NetworkClient::new(args.transport, args.logs_collector_id, config.clone()).await?);
+    let network_client = Arc::new(NetworkClient::new(args.transport, config.clone()).await?);
 
     let mut metrics_registry = Registry::with_labels(
         vec![(

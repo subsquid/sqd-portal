@@ -14,7 +14,6 @@ use futures::StreamExt;
 use itertools::Itertools;
 use prometheus_client::registry::Registry;
 use sqd_contract_client::PeerId;
-use sqd_messages::query_result;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::api_types::PortalConfigApiResponse;
@@ -80,8 +79,8 @@ async fn execute_query(
             return RequestError::InternalError("Receiving result failed".to_string())
                 .into_response()
         }
-        Ok(query_result::Result::Ok(result)) => result,
-        Ok(res) => return RequestError::try_from(res).into_response(),
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => return RequestError::from(err).into_response(),
     };
     match convert_response(&result.data) {
         Ok(data) => Response::builder()
