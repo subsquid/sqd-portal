@@ -1,10 +1,6 @@
 name: docker
 on:
   workflow_dispatch: # manually run
-    inputs:
-      tag:
-        description: image tag
-        required: true
 
 env:
   CI: true
@@ -20,32 +16,30 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - uses: SebRollen/toml-action@v1.2.0
+        id: read_toml
+        with:
+          file: 'Cargo.toml'
+          field: 'package.version'
+
       - name: Docker login
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_LOGIN }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Build portal
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          load: true
-          tags: subsquid/sqd-portal:test
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Get portal version
-        run: echo "PORTAL_VERSION=$(docker run --rm subsquid/sqd-portal:test sqd-portal --version | cut -d ' ' -f2)" >> $GITHUB_ENV
-
       - name: Build & publish portal
         uses: docker/build-push-action@v5
+        env:
+          VERSION: ${{ steps.read_toml.outputs.value }}
         with:
           context: .
-          platforms: linux/amd64,linux/arm/v7,linux/arm64/v8,linux/386
+          # Build only for Linux AMD64 now
+          # TODO: uncomment and re-build before public release
+          platforms: linux/amd64
+#          platforms: linux/amd64,linux/arm/v7,linux/arm64/v8,linux/386
           push: true
           tags: |
-            subsquid/sqd-portal:${{ env.PORTAL_VERSION }}
-            subsquid/sqd-portal:${{ inputs.tag }}
+            subsquid/sqd-portal:${{ env.VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
