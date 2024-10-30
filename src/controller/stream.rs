@@ -366,7 +366,8 @@ impl StreamController {
 impl Drop for StreamController {
     fn drop(&mut self) {
         let _enter = self.span.enter();
-        self.stats.write_summary(&self.request, self.last_error.take());
+        self.stats
+            .write_summary(&self.request, self.last_error.take());
     }
 }
 

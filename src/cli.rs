@@ -1,9 +1,9 @@
 use clap::Parser;
 use serde::Deserialize;
 use serde_with::{serde_as, DurationSeconds};
+use sqd_network_transport::{PeerId, TransportArgs};
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr};
-use sqd_network_transport::{PeerId, TransportArgs};
 
 use crate::types::DatasetId;
 
