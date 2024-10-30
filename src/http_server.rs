@@ -131,7 +131,7 @@ async fn get_status(
     Extension(config): Extension<Arc<Config>>,
 ) -> impl IntoResponse {
     axum::Json(PortalConfigApiResponse {
-        libp2p_key: client.peer_id(),
+        peer_id: client.peer_id(),
     })
 }
 

@@ -28,13 +28,14 @@ jobs:
           username: ${{ secrets.DOCKER_LOGIN }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Build & publish query gateway
+      - name: Build & publish portal
         uses: docker/build-push-action@v5
         env:
           VERSION: ${{ steps.read_toml.outputs.value }}
         with:
           context: .
-          # Build only for Linux AMD64 now, uncomment and re-build before public release
+          # Build only for Linux AMD64 now
+          # TODO: uncomment and re-build before public release
           platforms: linux/amd64
 #          platforms: linux/amd64,linux/arm/v7,linux/arm64/v8,linux/386
           push: true

@@ -1,4 +1,4 @@
-# Query gateway
+# SQD Portal
 
 This is an application that connects to the worker network and executes queries submitted via HTTP.
 

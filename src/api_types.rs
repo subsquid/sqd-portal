@@ -2,7 +2,7 @@ use sqd_contract_client::PeerId;
 
 #[derive(serde::Serialize)]
 pub(crate) struct PortalConfigApiResponse {
-    pub libp2p_key: PeerId,
+    pub peer_id: PeerId,
 }
 
 #[derive(serde::Serialize)]
