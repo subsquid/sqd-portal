@@ -41,12 +41,12 @@ async fn get_height(
 }
 
 async fn get_worker(
-    Path((slug, start_block)): Path<(String, u64)>,
+    Path((dataset, start_block)): Path<(String, u64)>,
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(config): Extension<Arc<Config>>,
 ) -> Response {
-    let Some(dataset_id) = config.dataset_id(&slug) else {
-        return RequestError::NotFound(format!("Unknown dataset: {slug}")).into_response();
+    let Some(dataset_id) = config.dataset_id(&dataset) else {
+        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response();
     };
 
     let worker_id = match client.find_worker(&dataset_id, start_block) {
@@ -54,7 +54,7 @@ async fn get_worker(
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("No available worker for dataset {slug} block {start_block}"),
+                format!("No available worker for dataset {dataset} block {start_block}"),
             )
                 .into_response()
         }
@@ -133,12 +133,12 @@ async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl In
 }
 
 async fn get_dataset_state(
-    Path(slug): Path<String>,
+    Path(dataset): Path<String>,
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(config): Extension<Arc<Config>>,
 ) -> impl IntoResponse {
-    let Some(dataset_id) = config.dataset_id(&slug) else {
-        return RequestError::NotFound(format!("Unknown dataset: {slug}")).into_response();
+    let Some(dataset_id) = config.dataset_id(&dataset) else {
+        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response();
     };
 
     axum::Json(client.dataset_state(dataset_id)).into_response()
@@ -293,7 +293,7 @@ where
 
         let Some(dataset_id) = config.dataset_id(&dataset) else {
             return Err(
-                RequestError::NotFound(format!("Unknown dataset: {dataset}")).into_response(),
+                (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response(),
             );
         };
 

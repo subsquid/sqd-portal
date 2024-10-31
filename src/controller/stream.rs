@@ -69,7 +69,7 @@ impl StreamController {
                 request.query.first_block(),
                 request.dataset_id
             );
-            return Err(RequestError::NotFound(format!(
+            return Err(RequestError::NoData(format!(
                 "No chunk found for block {}",
                 request.query.first_block()
             )));
