@@ -59,7 +59,7 @@ impl RequestError {
     pub fn short_code(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => "bad_request",
-            Self::NoData(_) => "not_found",
+            Self::NoData(_) => "no_data",
             Self::InternalError(_) => "internal_error",
             Self::Busy => "overloaded",
         }
