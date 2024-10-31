@@ -46,7 +46,7 @@ async fn get_worker(
     Extension(config): Extension<Arc<Config>>,
 ) -> Response {
     let Some(dataset_id) = config.dataset_id(&slug) else {
-        return RequestError::NotFound(format!("Unknown dataset: {slug}")).into_response();
+        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
     let worker_id = match client.find_worker(&dataset_id, start_block) {
@@ -121,6 +121,7 @@ async fn execute_stream(
     };
     let stream = stream.map(anyhow::Ok);
     Response::builder()
+        .header(header::CONTENT_TYPE, "application/jsonl")
         .header(header::CONTENT_ENCODING, "gzip")
         .body(Body::from_stream(stream))
         .unwrap()
@@ -159,7 +160,7 @@ async fn get_dataset_state(
     Extension(config): Extension<Arc<Config>>,
 ) -> impl IntoResponse {
     let Some(dataset_id) = config.dataset_id(&slug) else {
-        return RequestError::NotFound(format!("Unknown dataset: {slug}")).into_response();
+        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
     axum::Json(client.dataset_state(dataset_id)).into_response()
@@ -170,7 +171,7 @@ async fn get_dataset_metadata(
     Extension(config): Extension<Arc<Config>>,
 ) -> impl IntoResponse {
     let Some(dataset) = config.find_dataset(&slug) else {
-        return RequestError::NotFound(format!("Unknown dataset: {slug}")).into_response();
+        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
     axum::Json(AvailableDatasetApiResponse {
@@ -332,7 +333,7 @@ where
 
         let Some(dataset_id) = config.dataset_id(&dataset) else {
             return Err(
-                RequestError::NotFound(format!("Unknown dataset: {dataset}")).into_response(),
+                (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response(),
             );
         };
 
