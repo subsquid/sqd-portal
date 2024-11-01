@@ -17,7 +17,7 @@ use sqd_contract_client::PeerId;
 use sqd_messages::query_result;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::api_types::PortalConfigApiResponse;
+use crate::api_types::AvailableDatasetApiResponse;
 use crate::{
     cli::Config,
     controller::task_manager::TaskManager,
@@ -41,12 +41,12 @@ async fn get_height(
 }
 
 async fn get_worker(
-    Path((dataset, start_block)): Path<(String, u64)>,
+    Path((slug, start_block)): Path<(String, u64)>,
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(config): Extension<Arc<Config>>,
 ) -> Response {
-    let Some(dataset_id) = config.dataset_id(&dataset) else {
-        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response();
+    let Some(dataset_id) = config.dataset_id(&slug) else {
+        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
     let worker_id = match client.find_worker(&dataset_id, start_block) {
@@ -54,7 +54,7 @@ async fn get_worker(
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("No available worker for dataset {dataset} block {start_block}"),
+                format!("No available worker for dataset {slug} block {start_block}"),
             )
                 .into_response()
         }
@@ -128,21 +128,55 @@ async fn execute_stream(
 }
 
 async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
-    axum::Json(PortalConfigApiResponse {
-        peer_id: client.peer_id(),
-    })
+    let status = client.get_status();
+
+    axum::Json(status)
+}
+
+async fn get_datasets(Extension(config): Extension<Arc<Config>>) -> impl IntoResponse {
+    let datasets = (*config).clone().available_datasets;
+
+    let res: Vec<AvailableDatasetApiResponse> = datasets
+        .into_iter()
+        .map(|d| {
+            // FIXME empty strings for id, name?
+            AvailableDatasetApiResponse {
+                slug: d.slug,
+                aliases: d.aliases.unwrap_or_default(),
+                real_time: false,
+            }
+        })
+        .collect();
+
+    axum::Json(res)
 }
 
 async fn get_dataset_state(
-    Path(dataset): Path<String>,
+    Path(slug): Path<String>,
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(config): Extension<Arc<Config>>,
 ) -> impl IntoResponse {
-    let Some(dataset_id) = config.dataset_id(&dataset) else {
-        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response();
+    let Some(dataset_id) = config.dataset_id(&slug) else {
+        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
     axum::Json(client.dataset_state(dataset_id)).into_response()
+}
+
+async fn get_dataset_metadata(
+    Path(slug): Path<String>,
+    Extension(config): Extension<Arc<Config>>,
+) -> impl IntoResponse {
+    let Some(dataset) = config.find_dataset(&slug) else {
+        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
+    };
+
+    axum::Json(AvailableDatasetApiResponse {
+        slug: dataset.slug.clone(),
+        aliases: dataset.aliases.clone().unwrap_or_default(),
+        real_time: false,
+    })
+    .into_response()
 }
 
 async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {
@@ -179,10 +213,12 @@ pub async fn run_server(
 
     tracing::info!("Starting HTTP server listening on {addr}");
     let app = Router::new()
+        .route("/datasets", get(get_datasets))
         .route("/datasets/:dataset/height", get(get_height))
         .route("/datasets/:dataset/stream", post(execute_stream_restricted))
         .route("/datasets/:dataset/stream/debug", post(execute_stream))
         .route("/datasets/:dataset/state", get(get_dataset_state))
+        .route("/datasets/:dataset/metadata", get(get_dataset_metadata))
         // backward compatibility routes
         .route("/datasets/:dataset/:start_block/worker", get(get_worker))
         .route("/network/:dataset/height", get(get_height))

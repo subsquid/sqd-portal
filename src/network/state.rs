@@ -7,6 +7,8 @@ use crate::cli::Config;
 use crate::metrics;
 use crate::types::DatasetId;
 use serde::Serialize;
+use serde_with::serde_as;
+use sqd_contract_client::U256;
 use sqd_messages::RangeSet;
 use sqd_network_transport::PeerId;
 
@@ -17,6 +19,12 @@ pub struct DatasetState {
     worker_ranges: HashMap<PeerId, RangeSet>,
     highest_seen_block: u32,
     first_gap: u32,
+}
+
+pub struct PublicState {
+    pub current_epoch: u32,
+    pub sqd_locked: U256,
+    pub status: Status,
 }
 
 impl DatasetState {
@@ -54,11 +62,22 @@ impl DatasetState {
     }
 }
 
+#[derive(Clone, PartialEq, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    DataLoading,
+    Registered,
+    Unregistered,
+}
+
 pub struct NetworkState {
     config: Arc<Config>,
     dataset_states: HashMap<DatasetId, DatasetState>,
     last_pings: HashMap<PeerId, Instant>,
     pool: WorkersPool,
+    current_epoch: u32,
+    sqd_locked: U256,
+    status: Status,
 }
 
 impl NetworkState {
@@ -67,7 +86,10 @@ impl NetworkState {
             config: config.clone(),
             dataset_states: Default::default(),
             last_pings: Default::default(),
+            current_epoch: Default::default(),
+            sqd_locked: Default::default(),
             pool: WorkersPool::default(),
+            status: Status::DataLoading,
         }
     }
 
@@ -143,5 +165,27 @@ impl NetworkState {
 
     pub fn dataset_state(&self, dataset_id: DatasetId) -> Option<&DatasetState> {
         self.dataset_states.get(&dataset_id)
+    }
+
+    pub fn set_current_epoch(&mut self, epoch: u32) {
+        self.current_epoch = epoch;
+    }
+
+    pub fn set_sqd_locked(&mut self, sqd: Option<(String, U256)>) {
+        if let Some((_, sqd)) = sqd {
+            self.sqd_locked = sqd;
+            self.status = Status::Registered;
+        } else {
+            self.sqd_locked = U256::from(0);
+            self.status = Status::Unregistered;
+        }
+    }
+
+    pub fn get_public_state(&self) -> PublicState {
+        PublicState {
+            current_epoch: self.current_epoch,
+            sqd_locked: self.sqd_locked,
+            status: self.status.clone(),
+        }
     }
 }
