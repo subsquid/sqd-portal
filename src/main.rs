@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     let mut metrics_registry = Registry::with_labels(
         vec![(
             Cow::Borrowed("portal_id"),
-            Cow::Owned(network_client.peer_id().to_string()),
+            Cow::Owned(network_client.get_peer_id().to_string()),
         )]
         .into_iter(),
     );

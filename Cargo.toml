@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.4.1"
+version = "0.4.5"
 edition = "2021"
 
 [dependencies]
@@ -9,6 +9,7 @@ async-stream = "0.3.5"
 axum = { version = "0.7", features = ["http2"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+chrono = "0.4"
 dotenv = "0.15"
 flate2 = "1.0.33"
 futures = "0.3"
@@ -34,6 +35,6 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 tower-http = { version = "0.6.1", features = ["cors"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
-sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", version = "1.0.7" }
-sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", version = "1.1.4", features = ["semver"] }
-sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", version = "1.0.25", features = ["gateway", "metrics"] }
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", branch = "feat/add-sqd-locked", version = "1.2.0" }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", branch = "feat/add-sqd-locked", version = "1.1.4", features = ["semver"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", branch = "feat/add-sqd-locked", version = "1.0.25", features = ["gateway", "metrics"] }

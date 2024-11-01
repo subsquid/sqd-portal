@@ -689,8 +689,10 @@ checksum = "a21f936df1771bf62b77f047b726c4625ff2e8aa607c01ec06e5a05bd8463401"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-targets 0.52.6",
 ]
 
@@ -4329,7 +4331,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9552f850d5f0964a4e4d0bf306459ac29323ddfbae05e35a7c0d35cb0803cc5"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.68",
@@ -5336,8 +5338,8 @@ dependencies = [
 
 [[package]]
 name = "sqd-contract-client"
-version = "1.0.7"
-source = "git+https://github.com/subsquid/sqd-network.git#7774afea3ab157992f5f28a040d219c64422dc18"
+version = "1.2.0"
+source = "git+https://github.com/subsquid/sqd-network.git?branch=feat/add-sqd-locked#00ede40522febd32c339c26212ab40569c14c04f"
 dependencies = [
  "async-trait",
  "clap",
@@ -5354,7 +5356,7 @@ dependencies = [
 [[package]]
 name = "sqd-messages"
 version = "1.1.4"
-source = "git+https://github.com/subsquid/sqd-network.git#7774afea3ab157992f5f28a040d219c64422dc18"
+source = "git+https://github.com/subsquid/sqd-network.git?branch=feat/add-sqd-locked#00ede40522febd32c339c26212ab40569c14c04f"
 dependencies = [
  "anyhow",
  "hex",
@@ -5369,7 +5371,7 @@ dependencies = [
 [[package]]
 name = "sqd-network-transport"
 version = "1.0.25"
-source = "git+https://github.com/subsquid/sqd-network.git#7774afea3ab157992f5f28a040d219c64422dc18"
+source = "git+https://github.com/subsquid/sqd-network.git?branch=feat/add-sqd-locked#00ede40522febd32c339c26212ab40569c14c04f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5399,12 +5401,13 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.4.1"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "async-stream",
  "axum",
  "base64 0.22.1",
+ "chrono",
  "clap",
  "dotenv",
  "flate2",

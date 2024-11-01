@@ -1,12 +1,13 @@
 use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::Config;
 use crate::metrics;
 use crate::types::DatasetId;
 use serde::Serialize;
+use sqd_contract_client::{Worker, U256};
 use sqd_messages::RangeSet;
 use sqd_network_transport::PeerId;
 
@@ -54,11 +55,33 @@ impl DatasetState {
     }
 }
 
+#[derive(Clone, PartialEq, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    DataLoading,
+    Registered,
+    Unregistered,
+}
+
 pub struct NetworkState {
     config: Arc<Config>,
     dataset_states: HashMap<DatasetId, DatasetState>,
     last_pings: HashMap<PeerId, Instant>,
     pool: WorkersPool,
+    contracts_state: ContractsState,
+}
+
+#[derive(Clone)]
+pub struct ContractsState {
+    pub sqd_locked: U256,
+    pub status: Status,
+    pub operator: String,
+    pub current_epoch: u32,
+    pub current_epoch_started: SystemTime,
+    pub compute_units_per_epoch: u64,
+    pub epoch_length: Duration,
+    pub uses_default_strategy: bool,
+    pub active_workers_length: u64,
 }
 
 impl NetworkState {
@@ -68,6 +91,17 @@ impl NetworkState {
             dataset_states: Default::default(),
             last_pings: Default::default(),
             pool: WorkersPool::default(),
+            contracts_state: ContractsState {
+                operator: Default::default(),
+                current_epoch: Default::default(),
+                sqd_locked: Default::default(),
+                status: Status::DataLoading,
+                uses_default_strategy: Default::default(),
+                epoch_length: Default::default(),
+                active_workers_length: Default::default(),
+                current_epoch_started: SystemTime::from(SystemTime::UNIX_EPOCH),
+                compute_units_per_epoch: Default::default(),
+            },
         }
     }
 
@@ -143,5 +177,36 @@ impl NetworkState {
 
     pub fn dataset_state(&self, dataset_id: DatasetId) -> Option<&DatasetState> {
         self.dataset_states.get(&dataset_id)
+    }
+
+    pub fn set_contracts_state(
+        &mut self,
+        current_epoch: u32,
+        sqd_locked: Option<(String, U256)>,
+        epoch_length: Duration,
+        uses_default_strategy: bool,
+        active_workers: Vec<Worker>,
+        current_epoch_started: SystemTime,
+        compute_units_per_epoch: u64,
+    ) {
+        if let Some((operator, sqd)) = sqd_locked {
+            self.contracts_state.operator = operator;
+            self.contracts_state.sqd_locked = sqd;
+            self.contracts_state.status = Status::Registered;
+        } else {
+            self.contracts_state.sqd_locked = U256::from(0);
+            self.contracts_state.status = Status::Unregistered;
+        }
+
+        self.contracts_state.current_epoch = current_epoch;
+        self.contracts_state.epoch_length = epoch_length;
+        self.contracts_state.uses_default_strategy = uses_default_strategy;
+        self.contracts_state.active_workers_length = active_workers.len() as u64;
+        self.contracts_state.current_epoch_started = current_epoch_started;
+        self.contracts_state.compute_units_per_epoch = compute_units_per_epoch;
+    }
+
+    pub fn get_contracts_state(&self) -> ContractsState {
+        self.contracts_state.clone()
     }
 }

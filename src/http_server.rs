@@ -13,11 +13,12 @@ use axum::{
 use futures::StreamExt;
 use itertools::Itertools;
 use prometheus_client::registry::Registry;
+use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
 use sqd_messages::query_result;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::api_types::{AvailableDatasetApiResponse, PortalConfigApiResponse};
+use crate::api_types::AvailableDatasetApiResponse;
 use crate::{
     cli::Config,
     controller::task_manager::TaskManager,
@@ -127,13 +128,23 @@ async fn execute_stream(
         .unwrap()
 }
 
-async fn get_status(
-    Extension(client): Extension<Arc<NetworkClient>>,
-    Extension(config): Extension<Arc<Config>>,
-) -> impl IntoResponse {
-    axum::Json(PortalConfigApiResponse {
-        peer_id: client.peer_id(),
-    })
+async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
+    let status = client.get_status();
+
+    let Ok(mut res) = serde_json::to_value(status) else {
+        return axum::Json(json!({"error": "failed to serialize status"})).into_response();
+    };
+
+    let Value::Object(ref mut map) = res else {
+        return axum::Json(json!({"error": "failed to serialize status"})).into_response();
+    };
+
+    map.insert(
+        "portal_version".into(),
+        Value::String(env!("CARGO_PKG_VERSION").into()),
+    );
+
+    axum::Json(res).into_response()
 }
 
 async fn get_datasets(Extension(config): Extension<Arc<Config>>) -> impl IntoResponse {
