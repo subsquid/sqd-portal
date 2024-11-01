@@ -10,7 +10,7 @@ use serde::Serialize;
 use sqd_messages::RangeSet;
 use sqd_network_transport::PeerId;
 
-use super::priorities::WorkersPool;
+use super::priorities::{NoWorker, WorkersPool};
 
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct DatasetState {
@@ -71,8 +71,15 @@ impl NetworkState {
         }
     }
 
-    pub fn find_worker(&mut self, dataset_id: &DatasetId, start_block: u64) -> Option<PeerId> {
-        let dataset_state = self.dataset_states.get(dataset_id)?;
+    pub fn find_worker(
+        &mut self,
+        dataset_id: &DatasetId,
+        start_block: u64,
+    ) -> Result<PeerId, NoWorker> {
+        let dataset_state = self
+            .dataset_states
+            .get(dataset_id)
+            .ok_or(NoWorker::AllUnavailable)?;
 
         // Choose an active worker having the requested start_block with the top priority
         let deadline = Instant::now() - self.config.worker_inactive_threshold;
@@ -119,8 +126,8 @@ impl NetworkState {
         self.pool.outrun(worker);
     }
 
-    pub fn report_backoff(&mut self, worker: PeerId, duration: Duration) {
-        self.pool.backoff(worker, duration);
+    pub fn hint_backoff(&mut self, worker: PeerId, duration: Duration) {
+        self.pool.hint_backoff(worker, duration);
     }
 
     pub fn reset_allocations(&mut self) {

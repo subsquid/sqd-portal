@@ -14,9 +14,11 @@ use futures::StreamExt;
 use itertools::Itertools;
 use prometheus_client::registry::Registry;
 use sqd_contract_client::PeerId;
+use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::api_types::PortalConfigApiResponse;
+use crate::network::NoWorker;
 use crate::{
     cli::Config,
     controller::task_manager::TaskManager,
@@ -49,13 +51,21 @@ async fn get_worker(
     };
 
     let worker_id = match client.find_worker(&dataset_id, start_block) {
-        Some(worker_id) => worker_id,
-        None => {
+        Ok(worker_id) => worker_id,
+        Err(NoWorker::AllUnavailable) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("No available worker for dataset {slug} block {start_block}"),
             )
-                .into_response()
+                .into_response();
+        }
+        Err(NoWorker::Backoff(retry_at)) => {
+            let seconds = retry_at.duration_since(Instant::now()).as_secs() + 1; // +1 for rounding up
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(header::RETRY_AFTER, seconds)
+                .body(Body::from("Too many requests"))
+                .unwrap();
         }
     };
 
