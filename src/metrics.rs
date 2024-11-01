@@ -60,10 +60,7 @@ lazy_static::lazy_static! {
     // TODO: add metrics for procedure durations
 }
 
-pub fn report_query_result(
-    worker: PeerId,
-    status: &str,
-) {
+pub fn report_query_result(worker: PeerId, status: &str) {
     QUERY_RESULTS
         .get_or_create(&vec![
             ("worker".to_owned(), worker.to_string()),
