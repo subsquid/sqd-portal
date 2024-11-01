@@ -1,18 +1,18 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
-
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
-use sqd_contract_client::{Client as ContractClient, PeerId};
+use serde::Serialize;
+use sqd_contract_client::{Client as ContractClient, PeerId, U256};
 use sqd_messages::{query_result, Ping, Query, QueryResult};
 use sqd_network_transport::{
     get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransportHandle,
     P2PTransportBuilder, QueueFull, TransportArgs,
 };
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{sync::oneshot, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::{NetworkState, StorageClient};
-use crate::network::state::DatasetState;
+use crate::network::state::{DatasetState, Status};
 use crate::{
     cli::Config,
     metrics,
@@ -24,6 +24,14 @@ lazy_static::lazy_static! {
     static ref SUPPORTED_VERSIONS: semver::VersionReq = "~1.2.0".parse().expect("Invalid version requirement");
 }
 const MAX_CONCURRENT_QUERIES: usize = 1000;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkClientStatus {
+    pub peer_id: PeerId,
+    pub status: Status,
+    pub current_epoch: Option<u32>,
+    pub sqd_locked: Option<String>,
+}
 
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
@@ -102,7 +110,24 @@ impl NetworkClient {
             .await
             .unwrap_or_else(|e| panic!("Couldn't get current epoch: {e}"));
 
-        tracing::info!("Current epoch: {current_epoch}");
+        let sqd_locked = self
+            .contract_client
+            .portal_sqd_locked(self.local_peer_id)
+            .await
+            .unwrap_or_else(|e| panic!("Couldn't get SQD locked: {e}"));
+
+        tracing::info!(
+            "Portal operator {}, current epoch: {}",
+            sqd_locked
+                .clone()
+                .map(|s| s.0)
+                .unwrap_or("unknown".to_string()),
+            current_epoch
+        );
+
+        self.network_state.lock().set_current_epoch(current_epoch);
+        self.network_state.lock().set_sqd_locked(sqd_locked);
+
         let mut interval = tokio::time::interval_at(
             Instant::now() + self.chain_update_interval,
             self.chain_update_interval,
@@ -121,11 +146,28 @@ impl NetworkClient {
                     continue;
                 }
             };
+
             if epoch != current_epoch {
                 tracing::info!("Epoch {epoch} started");
                 current_epoch = epoch;
-                self.network_state.lock().reset_allocations();
+
+                let mut state = self.network_state.lock();
+                state.set_current_epoch(current_epoch);
+                state.reset_allocations();
             }
+
+            let sqd_locked = match self
+                .contract_client
+                .portal_sqd_locked(self.local_peer_id)
+                .await
+            {
+                Ok(sqd_locked) => sqd_locked,
+                Err(e) => {
+                    tracing::warn!("Couldn't get current epoch: {e}");
+                    continue;
+                }
+            };
+            self.network_state.lock().set_sqd_locked(sqd_locked);
         }
     }
 
@@ -297,7 +339,23 @@ impl NetworkClient {
         self.network_state.lock().dataset_state(dataset_id).cloned()
     }
 
-    pub fn peer_id(&self) -> PeerId {
-        self.local_peer_id
+    pub fn get_status(&self) -> NetworkClientStatus {
+        let state = self.network_state.lock().get_public_state();
+
+        let loading = state.status == Status::DataLoading;
+        NetworkClientStatus {
+            peer_id: self.local_peer_id,
+            status: state.status,
+            current_epoch: if !loading {
+                Some(state.current_epoch)
+            } else {
+                None
+            },
+            sqd_locked: if !loading {
+                Some(state.sqd_locked.to_string())
+            } else {
+                None
+            },
+        }
     }
 }

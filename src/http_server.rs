@@ -17,7 +17,7 @@ use sqd_contract_client::PeerId;
 use sqd_messages::query_result;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::api_types::{AvailableDatasetApiResponse, PortalConfigApiResponse};
+use crate::api_types::AvailableDatasetApiResponse;
 use crate::{
     cli::Config,
     controller::task_manager::TaskManager,
@@ -127,13 +127,10 @@ async fn execute_stream(
         .unwrap()
 }
 
-async fn get_status(
-    Extension(client): Extension<Arc<NetworkClient>>,
-    Extension(config): Extension<Arc<Config>>,
-) -> impl IntoResponse {
-    axum::Json(PortalConfigApiResponse {
-        peer_id: client.peer_id(),
-    })
+async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
+    let status = client.get_status();
+
+    axum::Json(status)
 }
 
 async fn get_datasets(Extension(config): Extension<Arc<Config>>) -> impl IntoResponse {
