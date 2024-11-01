@@ -11,6 +11,7 @@ use sqd_network_transport::{
 use tokio::{sync::oneshot, time::Instant};
 use tokio_util::sync::CancellationToken;
 
+use super::priorities::NoWorker;
 use super::{NetworkState, StorageClient};
 use crate::network::state::DatasetState;
 use crate::{
@@ -46,10 +47,7 @@ struct QueryTask {
 }
 
 impl NetworkClient {
-    pub async fn new(
-        args: TransportArgs,
-        config: Arc<Config>,
-    ) -> anyhow::Result<NetworkClient> {
+    pub async fn new(args: TransportArgs, config: Arc<Config>) -> anyhow::Result<NetworkClient> {
         let dataset_storage = StorageClient::new(args.rpc.network)?;
         let agent_into = get_agent_info!();
         let transport_builder = P2PTransportBuilder::from_cli(args, agent_into).await?;
@@ -172,7 +170,7 @@ impl NetworkClient {
         self.dataset_storage.next_chunk(dataset, chunk)
     }
 
-    pub fn find_worker(&self, dataset: &DatasetId, block: u64) -> Option<PeerId> {
+    pub fn find_worker(&self, dataset: &DatasetId, block: u64) -> Result<PeerId, NoWorker> {
         self.network_state.lock().find_worker(dataset, block)
     }
 
@@ -271,66 +269,64 @@ impl NetworkClient {
                 result: Some(result),
                 retry_after_ms,
                 ..
-            }) => match result {
-                query_result::Result::Ok(ok) => {
-                    metrics::report_query_result(peer_id, "ok");
-                    if task.result_tx.send(Ok(ok)).is_ok() {
-                        self.network_state.lock().report_query_success(peer_id);
-                    } else {
-                        // The result is no longer needed. Either another query has got the result first,
-                        // or the stream has been dropped. In either case, consider the query outrun.
-                        self.network_state.lock().report_query_outrun(peer_id);
-                    }
-                    return Ok(());
-                }
-                query_result::Result::Err(sqd_messages::QueryError { err: Some(err) }) => match err
-                {
-                    Err::BadRequest(s) => {
-                        metrics::report_query_result(peer_id, "bad_request");
-                        if task.result_tx.send(Err(QueryError::BadRequest(s))).is_ok() {
+            }) => {
+                if let Some(backoff) = retry_after_ms {
+                    self.network_state
+                        .lock()
+                        .hint_backoff(peer_id, Duration::from_millis(backoff as u64));
+                };
+                match result {
+                    query_result::Result::Ok(ok) => {
+                        metrics::report_query_result(peer_id, "ok");
+                        if task.result_tx.send(Ok(ok)).is_ok() {
                             self.network_state.lock().report_query_success(peer_id);
                         } else {
+                            // The result is no longer needed. Either another query has got the result first,
+                            // or the stream has been dropped. In either case, consider the query outrun.
                             self.network_state.lock().report_query_outrun(peer_id);
                         }
                         return Ok(());
                     }
-                    Err::NotFound(s) => {
-                        metrics::report_query_result(peer_id, "not_found");
+                    query_result::Result::Err(sqd_messages::QueryError { err: Some(err) }) => {
+                        match err {
+                            Err::BadRequest(s) => {
+                                metrics::report_query_result(peer_id, "bad_request");
+                                if task.result_tx.send(Err(QueryError::BadRequest(s))).is_ok() {
+                                    self.network_state.lock().report_query_success(peer_id);
+                                } else {
+                                    self.network_state.lock().report_query_outrun(peer_id);
+                                }
+                                return Ok(());
+                            }
+                            Err::NotFound(s) => {
+                                metrics::report_query_result(peer_id, "not_found");
+                                self.network_state.lock().report_query_error(peer_id);
+                                Err(QueryError::Retriable(s))
+                            }
+                            Err::ServerError(s) => {
+                                metrics::report_query_result(peer_id, "server_error");
+                                self.network_state.lock().report_query_error(peer_id);
+                                Err(QueryError::Retriable(s))
+                            }
+                            Err::ServerOverloaded(()) => {
+                                metrics::report_query_result(peer_id, "server_overloaded");
+                                self.network_state.lock().report_query_error(peer_id);
+                                Err(QueryError::Retriable("Server overloaded".to_owned()))
+                            }
+                            Err::TooManyRequests(()) => {
+                                metrics::report_query_result(peer_id, "too_many_requests");
+                                self.network_state.lock().report_query_success(peer_id);
+                                Err(QueryError::Retriable("Too many requests".to_owned()))
+                            }
+                        }
+                    }
+                    query_result::Result::Err(sqd_messages::QueryError { err: None }) => {
+                        metrics::report_query_result(peer_id, "invalid");
                         self.network_state.lock().report_query_error(peer_id);
-                        Err(QueryError::Retriable(s))
+                        anyhow::bail!("Unknown error message")
                     }
-                    Err::ServerError(s) => {
-                        metrics::report_query_result(peer_id, "server_error");
-                        self.network_state.lock().report_query_error(peer_id);
-                        Err(QueryError::Retriable(s))
-                    }
-                    Err::ServerOverloaded(()) => {
-                        metrics::report_query_result(peer_id, "server_overloaded");
-                        self.network_state.lock().report_backoff(
-                            peer_id,
-                            retry_after_ms
-                                .map(|ms| Duration::from_millis(ms as u64))
-                                .unwrap_or(Duration::from_secs(1)),
-                        );
-                        Err(QueryError::Retriable("Server overloaded".to_owned()))
-                    }
-                    Err::TooManyRequests(()) => {
-                        metrics::report_query_result(peer_id, "too_many_requests");
-                        self.network_state.lock().report_backoff(
-                            peer_id,
-                            retry_after_ms
-                                .map(|ms| Duration::from_millis(ms as u64))
-                                .unwrap_or(Duration::from_secs(1)),
-                        );
-                        Err(QueryError::Retriable("Too many requests".to_owned()))
-                    }
-                },
-                query_result::Result::Err(sqd_messages::QueryError { err: None }) => {
-                    metrics::report_query_result(peer_id, "invalid");
-                    self.network_state.lock().report_query_error(peer_id);
-                    anyhow::bail!("Unknown error message")
                 }
-            },
+            }
             Ok(sqd_messages::QueryResult { result: None, .. }) => {
                 metrics::report_query_result(peer_id, "invalid");
                 self.network_state.lock().report_query_error(peer_id);

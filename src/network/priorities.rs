@@ -3,6 +3,14 @@ use tokio::time::Instant;
 
 use sqd_contract_client::PeerId;
 
+const UNAVAILABLE_PENALTY: u8 = 3;
+const BACKOFF_PENALTY: u8 = 2;
+
+pub enum NoWorker {
+    AllUnavailable,
+    Backoff(Instant),
+}
+
 #[derive(Default)]
 pub struct WorkersPool {
     workers: HashMap<PeerId, WorkerStats>,
@@ -11,6 +19,7 @@ pub struct WorkersPool {
 struct WorkerStats {
     last_query: Instant,
     running_queries: u8,
+    paused_until: Option<Instant>,
     ok: EventCounter<3>,
     slow: EventCounter<3>,
     server_errors: Cooldown<30>,
@@ -24,6 +33,7 @@ impl Default for WorkerStats {
         Self {
             last_query: now,
             running_queries: 0,
+            paused_until: None,
             ok: EventCounter::new(now),
             slow: EventCounter::new(now),
             server_errors: Default::default(),
@@ -34,8 +44,13 @@ impl Default for WorkerStats {
 
 // Less is better
 fn priority(worker: &WorkerStats, now: Instant) -> (u8, u8, Instant) {
+    if let Some(paused_until) = worker.paused_until {
+        if now < paused_until {
+            return (BACKOFF_PENALTY, worker.running_queries, paused_until);
+        }
+    }
     let penalty = if worker.server_errors.observed(now) || worker.timeouts.observed(now) {
-        2
+        UNAVAILABLE_PENALTY
     } else if worker.slow.estimate(now) > worker.ok.estimate(now) {
         1
     } else {
@@ -45,7 +60,7 @@ fn priority(worker: &WorkerStats, now: Instant) -> (u8, u8, Instant) {
 }
 
 impl WorkersPool {
-    pub fn pick(&mut self, workers: impl IntoIterator<Item = PeerId>) -> Option<PeerId> {
+    pub fn pick(&mut self, workers: impl IntoIterator<Item = PeerId>) -> Result<PeerId, NoWorker> {
         let now = Instant::now();
         let default_priority = Default::default();
         let (best, best_priority) = workers
@@ -56,9 +71,14 @@ impl WorkersPool {
                     priority(self.workers.get(&peer_id).unwrap_or(&default_priority), now),
                 )
             })
-            .min_by_key(|&(_, priority)| priority)?;
+            .min_by_key(|&(_, priority)| priority)
+            .ok_or(NoWorker::AllUnavailable)?;
         tracing::trace!("Picked worker {:?} with priority {:?}", best, best_priority);
-        (best_priority.0 < 2).then_some(best)
+        match best_priority.0 {
+            UNAVAILABLE_PENALTY => Err(NoWorker::AllUnavailable),
+            BACKOFF_PENALTY => Err(NoWorker::Backoff(best_priority.2)),
+            _ => Ok(best),
+        }
     }
 
     pub fn lease(&mut self, worker: PeerId) {
@@ -98,10 +118,9 @@ impl WorkersPool {
         });
     }
 
-    pub fn backoff(&mut self, worker: PeerId, _backoff: Duration) {
+    pub fn hint_backoff(&mut self, worker: PeerId, backoff: Duration) {
         self.modify(worker, |stats| {
-            stats.running_queries -= 1;
-            todo!("handle backoff");
+            stats.paused_until = Some(Instant::now() + backoff);
         });
     }
 
