@@ -14,7 +14,7 @@ use crate::{
     controller::timeouts::TimeoutManager,
     network::{NetworkClient, QueryResult},
     types::{BlockRange, ClientRequest, QueryError, RequestError, ResponseChunk, SendQueryError},
-    utils::{logging::StreamStats, SlidingArray},
+    utils::{logging::StreamStats, OptionExt, SlidingArray},
 };
 
 pub struct StreamController {
@@ -264,10 +264,10 @@ impl StreamController {
 
     fn try_fill_slots(&mut self) {
         while self.buffer.len() < self.request.buffer_size
-            && !self
+            && self
                 .request
                 .max_chunks
-                .is_some_and(|limit| self.buffer.total_size() >= limit)
+                .is_none_or(|limit| self.buffer.total_size() < limit)
         {
             let Some(chunk) = self.next_chunk.take() else {
                 break;
