@@ -36,6 +36,10 @@ impl<T> SlidingArray<T> {
         self.first_index
     }
 
+    pub fn next_index(&self) -> usize {
+        self.first_index + self.data.len()
+    }
+
     pub fn total_size(&self) -> usize {
         self.first_index + self.data.len()
     }
