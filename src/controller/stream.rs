@@ -74,23 +74,16 @@ impl StreamController {
             )));
         };
 
-        let buffer = SlidingArray::with_capacity(request.buffer_size);
-        let timeout_quantile = request.timeout_quantile;
-        let mut controller = Self {
-            request,
+        Ok(Self {
             network,
-            buffer,
+            buffer: SlidingArray::with_capacity(request.buffer_size),
             next_chunk: Some(first_chunk),
-            timeouts: TimeoutManager::new(timeout_quantile),
+            timeouts: TimeoutManager::new(request.timeout_quantile),
+            request,
             stats: StreamStats::new(),
             span: tracing::Span::current(),
             last_error: None,
-        };
-        controller.try_fill_slots();
-        if controller.buffer.total_size() == 0 {
-            return Err(RequestError::Busy);
-        }
-        Ok(controller)
+        })
     }
 
     pub fn poll_next(
@@ -98,6 +91,10 @@ impl StreamController {
         ctx: &mut Context<'_>,
     ) -> Poll<Option<Result<ResponseChunk, RequestError>>> {
         self.last_error = None;
+
+        if self.buffer.next_index() == 0 {
+            self.try_fill_slots(ctx);
+        }
 
         // extract this field to be able to pass both its values and `&mut self` to the method
         let mut buffer = std::mem::take(&mut self.buffer);
@@ -119,9 +116,9 @@ impl StreamController {
         }
         self.stats.maybe_write_log();
 
-        let result = self.pop_response();
+        let result = self.pop_response(ctx);
 
-        self.try_fill_slots();
+        self.try_fill_slots(ctx);
 
         if let Poll::Ready(Some(Err(e))) = &result {
             self.last_error = Some(e.to_string());
@@ -190,7 +187,7 @@ impl StreamController {
             assert!(pending.tries_left > 0);
             pending.tries_left -= 1;
             pending.set_timeout(self.timeouts.current_timeout());
-            match self.send_query(&slot.range, index) {
+            match self.send_query(&slot.range, index, ctx) {
                 Ok(worker_request) => {
                     pending.requests.push(worker_request);
                 }
@@ -213,7 +210,10 @@ impl StreamController {
         false
     }
 
-    fn pop_response(&mut self) -> Poll<Option<Result<ResponseChunk, RequestError>>> {
+    fn pop_response(
+        &mut self,
+        ctx: &mut Context<'_>,
+    ) -> Poll<Option<Result<ResponseChunk, RequestError>>> {
         let chunk_index = self.buffer.first_index();
         let Some(slot) = self.buffer.pop_front() else {
             return Poll::Ready(None);
@@ -226,12 +226,16 @@ impl StreamController {
                 (Poll::Pending, slot_range)
             }
             RequestState::Partial(PartialResult { data, next_range }) => {
-                let state = match self.send_query(&next_range, chunk_index) {
-                    Ok(request) => RequestState::Pending(PendingRequests::new(
-                        request,
-                        self.timeouts.current_timeout(),
-                        self.request.retries as u8,
-                    )),
+                let state = match self.send_query(&next_range, chunk_index, ctx) {
+                    Ok(request) => {
+                        let mut pending = PendingRequests::new(
+                            request,
+                            self.timeouts.current_timeout(),
+                            self.request.retries as u8,
+                        );
+                        assert!(pending.timeout.poll_unpin(ctx).is_pending());
+                        RequestState::Pending(pending)
+                    }
                     Err(e) => {
                         tracing::debug!("Couldn't schedule continuation request: {e:?}");
                         RequestState::Done(Err(RequestError::Busy))
@@ -262,7 +266,7 @@ impl StreamController {
         result
     }
 
-    fn try_fill_slots(&mut self) {
+    fn try_fill_slots(&mut self, ctx: &mut Context<'_>) {
         while self.buffer.len() < self.request.buffer_size
             && self
                 .request
@@ -273,7 +277,7 @@ impl StreamController {
                 break;
             };
             let next_index = self.buffer.total_size();
-            match self.start_querying_chunk(&chunk, next_index) {
+            match self.start_querying_chunk(&chunk, next_index, ctx) {
                 Ok(slot) => {
                     self.buffer.push_back(slot);
                     self.next_chunk = self.get_next_chunk(&chunk);
@@ -311,20 +315,23 @@ impl StreamController {
         &mut self,
         chunk: &BlockRange,
         index: usize,
+        ctx: &mut Context<'_>,
     ) -> Result<Slot, SendQueryError> {
         let range = self
             .request
             .query
             .intersect_with(chunk)
             .expect("Chunk doesn't contain requested data");
-        let request = self.send_query(&range, index)?;
+        let request = self.send_query(&range, index, ctx)?;
+        let mut pending = PendingRequests::new(
+            request,
+            self.timeouts.current_timeout(),
+            self.request.retries as u8,
+        );
+        assert!(pending.timeout.poll_unpin(ctx).is_pending());
         Ok(Slot {
             range,
-            state: RequestState::Pending(PendingRequests::new(
-                request,
-                self.timeouts.current_timeout(),
-                self.request.retries as u8,
-            )),
+            state: RequestState::Pending(pending),
         })
     }
 
@@ -332,6 +339,7 @@ impl StreamController {
         &mut self,
         range: &BlockRange,
         chunk_index: usize,
+        ctx: &mut Context<'_>,
     ) -> Result<WorkerRequest, SendQueryError> {
         let Some(worker) = self
             .network
@@ -346,7 +354,7 @@ impl StreamController {
             worker,
         );
         let start_time = tokio::time::Instant::now();
-        let receiver = self
+        let mut receiver = self
             .network
             .query_worker(
                 &worker,
@@ -354,6 +362,7 @@ impl StreamController {
                 self.request.query.with_range(range),
             )
             .map_err(|_| SendQueryError::TransportQueueFull)?;
+        assert!(receiver.poll_unpin(ctx).is_pending());
         self.stats.query_sent();
         Ok(WorkerRequest {
             resp: receiver,
