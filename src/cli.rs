@@ -82,10 +82,6 @@ where
     Ok(s.trim_end_matches('/').to_owned())
 }
 
-fn default_served_datasets() -> Vec<DatasetConfig> {
-    vec![]
-}
-
 fn default_serve() -> String {
     "all".into()
 }
@@ -184,9 +180,6 @@ pub struct Config {
     )]
     pub chain_update_interval: Duration,
 
-    #[serde(rename = "serve", default = "default_served_datasets")]
-    pub available_datasets: Vec<DatasetConfig>,
-
     pub sqd_network: SqdNetworkConfig,
 }
 
@@ -194,30 +187,5 @@ impl Config {
     pub fn read(config_path: &str) -> anyhow::Result<Self> {
         let file_contents = std::fs::read(config_path)?;
         Ok(serde_yaml::from_slice(file_contents.as_slice())?)
-    }
-
-    pub fn find_dataset(&self, slug: &str) -> Option<&DatasetConfig> {
-        self.available_datasets.iter().find(|d| {
-            if d.slug == slug {
-                return true;
-            }
-
-            if let Some(ref aliases) = d.aliases {
-                return aliases.contains(&slug.to_string());
-            }
-
-            return false;
-        })
-    }
-
-    pub fn dataset_id(&self, slug: &str) -> Option<DatasetId> {
-        self.find_dataset(slug)
-            .and_then(|dataset| dataset.network_dataset_id())
-    }
-
-    pub fn dataset_ids(&self) -> impl Iterator<Item = DatasetId> + '_ {
-        self.available_datasets
-            .iter()
-            .filter_map(|d| d.network_dataset_id())
     }
 }

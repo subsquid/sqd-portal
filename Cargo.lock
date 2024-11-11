@@ -3712,6 +3712,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-rational"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5339,13 +5350,14 @@ dependencies = [
 [[package]]
 name = "sqd-contract-client"
 version = "1.2.0"
-source = "git+https://github.com/subsquid/sqd-network.git?branch=feat/add-sqd-locked#00ede40522febd32c339c26212ab40569c14c04f"
+source = "git+https://github.com/subsquid/sqd-network.git#66e97476baeaff5881ede704981bb731f087e45b"
 dependencies = [
  "async-trait",
  "clap",
  "ethers",
  "libp2p",
  "log",
+ "num-rational",
  "serde",
  "thiserror",
  "tokio 1.38.0",
@@ -5356,7 +5368,7 @@ dependencies = [
 [[package]]
 name = "sqd-messages"
 version = "1.1.4"
-source = "git+https://github.com/subsquid/sqd-network.git?branch=feat/add-sqd-locked#00ede40522febd32c339c26212ab40569c14c04f"
+source = "git+https://github.com/subsquid/sqd-network.git#66e97476baeaff5881ede704981bb731f087e45b"
 dependencies = [
  "anyhow",
  "hex",
@@ -5371,7 +5383,7 @@ dependencies = [
 [[package]]
 name = "sqd-network-transport"
 version = "1.0.25"
-source = "git+https://github.com/subsquid/sqd-network.git?branch=feat/add-sqd-locked#00ede40522febd32c339c26212ab40569c14c04f"
+source = "git+https://github.com/subsquid/sqd-network.git#66e97476baeaff5881ede704981bb731f087e45b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5401,7 +5413,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.4.4"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -5414,6 +5426,7 @@ dependencies = [
  "futures 0.3.30",
  "itertools 0.12.1",
  "lazy_static",
+ "num-rational",
  "parking_lot 0.12.3",
  "prometheus-client",
  "reqwest 0.12.7",

@@ -1,17 +1,17 @@
+use super::priorities::WorkersPool;
+use crate::cli::Config;
+use crate::datasets::Datasets;
+use crate::metrics;
+use crate::types::DatasetId;
+use num_rational::Ratio;
+use serde::Serialize;
+use sqd_contract_client::Worker;
+use sqd_messages::RangeSet;
+use sqd_network_transport::PeerId;
 use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-
-use crate::cli::Config;
-use crate::metrics;
-use crate::types::DatasetId;
-use serde::Serialize;
-use sqd_contract_client::{Worker, U256};
-use sqd_messages::RangeSet;
-use sqd_network_transport::PeerId;
-
-use super::priorities::WorkersPool;
 
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct DatasetState {
@@ -65,6 +65,7 @@ pub enum Status {
 
 pub struct NetworkState {
     config: Arc<Config>,
+    datasets: Arc<Datasets>,
     dataset_states: HashMap<DatasetId, DatasetState>,
     last_pings: HashMap<PeerId, Instant>,
     pool: WorkersPool,
@@ -73,7 +74,7 @@ pub struct NetworkState {
 
 #[derive(Clone)]
 pub struct ContractsState {
-    pub sqd_locked: U256,
+    pub sqd_locked: Ratio<u128>,
     pub status: Status,
     pub operator: String,
     pub current_epoch: u32,
@@ -85,9 +86,10 @@ pub struct ContractsState {
 }
 
 impl NetworkState {
-    pub fn new(config: Arc<Config>) -> Self {
+    pub fn new(config: Arc<Config>, datasets: Arc<Datasets>) -> Self {
         Self {
             config: config.clone(),
+            datasets: datasets.clone(),
             dataset_states: Default::default(),
             last_pings: Default::default(),
             pool: WorkersPool::default(),
@@ -123,7 +125,7 @@ impl NetworkState {
     ) {
         self.last_pings.insert(worker_id, Instant::now());
         metrics::KNOWN_WORKERS.set(self.last_pings.len() as i64);
-        for dataset_id in self.config.dataset_ids() {
+        for dataset_id in self.datasets.dataset_ids() {
             let dataset_state = worker_state
                 .remove(&dataset_id)
                 .unwrap_or_else(RangeSet::empty);
@@ -182,7 +184,7 @@ impl NetworkState {
     pub fn set_contracts_state(
         &mut self,
         current_epoch: u32,
-        sqd_locked: Option<(String, U256)>,
+        sqd_locked: Option<(String, Ratio<u128>)>,
         epoch_length: Duration,
         uses_default_strategy: bool,
         active_workers: Vec<Worker>,
@@ -194,7 +196,7 @@ impl NetworkState {
             self.contracts_state.sqd_locked = sqd;
             self.contracts_state.status = Status::Registered;
         } else {
-            self.contracts_state.sqd_locked = U256::from(0);
+            self.contracts_state.sqd_locked = Ratio::new(0, 1);
             self.contracts_state.status = Status::Unregistered;
         }
 

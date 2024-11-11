@@ -19,6 +19,7 @@ use sqd_messages::query_result;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::api_types::AvailableDatasetApiResponse;
+use crate::datasets::Datasets;
 use crate::{
     cli::Config,
     controller::task_manager::TaskManager,
@@ -29,24 +30,24 @@ use crate::{
 
 async fn get_height(
     Extension(network_state): Extension<Arc<NetworkClient>>,
-    Path(dataset): Path<String>,
+    Path(slug): Path<String>,
     dataset_id: DatasetId,
 ) -> impl IntoResponse {
     match network_state.get_height(&dataset_id) {
         Some(height) => (StatusCode::OK, height.to_string()),
-        None => (
-            StatusCode::NOT_FOUND,
-            format!("No data for dataset {dataset}"),
-        ),
+        None => (StatusCode::NOT_FOUND, format!("No data for dataset {slug}")),
     }
 }
 
 async fn get_worker(
     Path((slug, start_block)): Path<(String, u64)>,
     Extension(client): Extension<Arc<NetworkClient>>,
+    Extension(datasets): Extension<Arc<Datasets>>,
     Extension(config): Extension<Arc<Config>>,
 ) -> Response {
-    let Some(dataset_id) = config.dataset_id(&slug) else {
+    // println!("{}", format!("Unknown dataset: {_dataset_id}"));
+
+    let Some(dataset_id) = datasets.dataset_id(&slug) else {
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
@@ -63,17 +64,20 @@ async fn get_worker(
 
     (
         StatusCode::OK,
-        format!("{}/query/{dataset_id}/{worker_id}", config.hostname),
+        format!(
+            "{}/datasets/{dataset_id}/query/{worker_id}",
+            config.hostname
+        ),
     )
         .into_response()
 }
 
 async fn execute_query(
-    Path((dataset_id, worker_id)): Path<(DatasetId, PeerId)>,
+    Path((slug, worker_id)): Path<(DatasetId, PeerId)>,
     Extension(client): Extension<Arc<NetworkClient>>,
     query: String, // request body
 ) -> Response {
-    let Ok(fut) = client.query_worker(&worker_id, &dataset_id, query) else {
+    let Ok(fut) = client.query_worker(&worker_id, &slug, query) else {
         return RequestError::Busy.into_response();
     };
     let result = match fut.await {
@@ -147,18 +151,14 @@ async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl In
     axum::Json(res).into_response()
 }
 
-async fn get_datasets(Extension(config): Extension<Arc<Config>>) -> impl IntoResponse {
-    let datasets = (*config).clone().available_datasets;
-
+async fn get_datasets(Extension(datasets): Extension<Arc<Datasets>>) -> impl IntoResponse {
     let res: Vec<AvailableDatasetApiResponse> = datasets
+        .available()
         .into_iter()
-        .map(|d| {
-            // FIXME empty strings for id, name?
-            AvailableDatasetApiResponse {
-                slug: d.slug,
-                aliases: d.aliases.unwrap_or_default(),
-                real_time: false,
-            }
+        .map(|d| AvailableDatasetApiResponse {
+            slug: d.slug,
+            aliases: d.aliases.unwrap_or_default(),
+            real_time: false,
         })
         .collect();
 
@@ -168,9 +168,9 @@ async fn get_datasets(Extension(config): Extension<Arc<Config>>) -> impl IntoRes
 async fn get_dataset_state(
     Path(slug): Path<String>,
     Extension(client): Extension<Arc<NetworkClient>>,
-    Extension(config): Extension<Arc<Config>>,
+    Extension(datasets): Extension<Arc<Datasets>>,
 ) -> impl IntoResponse {
-    let Some(dataset_id) = config.dataset_id(&slug) else {
+    let Some(dataset_id) = datasets.dataset_id(&slug) else {
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
@@ -179,9 +179,9 @@ async fn get_dataset_state(
 
 async fn get_dataset_metadata(
     Path(slug): Path<String>,
-    Extension(config): Extension<Arc<Config>>,
+    Extension(datasets): Extension<Arc<Datasets>>,
 ) -> impl IntoResponse {
-    let Some(dataset) = config.find_dataset(&slug) else {
+    let Some(dataset) = datasets.find_dataset(&slug) else {
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
@@ -219,6 +219,7 @@ pub async fn run_server(
     metrics_registry: Registry,
     addr: &SocketAddr,
     config: Arc<Config>,
+    datasets: Arc<Datasets>,
 ) -> anyhow::Result<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
@@ -228,16 +229,24 @@ pub async fn run_server(
     tracing::info!("Starting HTTP server listening on {addr}");
     let app = Router::new()
         .route("/datasets", get(get_datasets))
-        .route("/datasets/:dataset/height", get(get_height))
-        .route("/datasets/:dataset/stream", post(execute_stream_restricted))
-        .route("/datasets/:dataset/stream/debug", post(execute_stream))
+        .route(
+            "/datasets/:dataset/finalized-stream/height",
+            get(get_height),
+        )
+        .route(
+            "/datasets/:dataset/finalized-stream",
+            post(execute_stream_restricted),
+        )
+        .route(
+            "/datasets/:dataset/finalized-stream/debug",
+            post(execute_stream),
+        )
         .route("/datasets/:dataset/state", get(get_dataset_state))
         .route("/datasets/:dataset/metadata", get(get_dataset_metadata))
         // backward compatibility routes
+        .route("/datasets/:dataset/query/:worker_id", post(execute_query))
+        .route("/datasets/:dataset/height", get(get_height))
         .route("/datasets/:dataset/:start_block/worker", get(get_worker))
-        .route("/network/:dataset/height", get(get_height))
-        .route("/network/:dataset/:start_block/worker", get(get_worker))
-        .route("/query/:dataset_id/:worker_id", post(execute_query))
         // end backward compatibility routes
         .layer(axum::middleware::from_fn(logging::middleware))
         .route("/metrics", get(get_metrics))
@@ -246,7 +255,8 @@ pub async fn run_server(
         .layer(Extension(task_manager))
         .layer(Extension(network_state))
         .layer(Extension(config))
-        .layer(Extension(Arc::new(metrics_registry)));
+        .layer(Extension(Arc::new(metrics_registry)))
+        .layer(Extension(datasets));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -337,12 +347,12 @@ where
             .extract::<Path<String>>()
             .await
             .map_err(IntoResponse::into_response)?;
-        let Extension(config) = parts
-            .extract::<Extension<Arc<Config>>>()
+        let Extension(datasets) = parts
+            .extract::<Extension<Arc<Datasets>>>()
             .await
             .map_err(IntoResponse::into_response)?;
 
-        let Some(dataset_id) = config.dataset_id(&dataset) else {
+        let Some(dataset_id) = datasets.dataset_id(&dataset) else {
             return Err(
                 (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response(),
             );

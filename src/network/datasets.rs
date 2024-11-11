@@ -43,29 +43,16 @@ async fn load_local_file(url: &str) -> anyhow::Result<DatasetList> {
     Ok(parser?)
 }
 
-pub async fn datasets_load(config: &Config) -> anyhow::Result<Vec<DatasetConfig>> {
-    let serve: &str = config.sqd_network.serve.as_ref();
-
-    if let Ok(Some(file)) = load_file(config).await {
+pub async fn datasets_load(config: &Config) -> Vec<DatasetConfig> {
+    if let Ok(file) = load_file(config).await {
         tracing::debug!(
-            "File loaded, {} datasets found",
+            "Datasets file loaded, {} datasets found",
             file.sqd_network_datasets.len()
         );
 
-        let predefined = config.available_datasets.clone();
         let loaded = file
             .sqd_network_datasets
             .iter()
-            // .filter(|n| {
-            //     let exist = defined.iter().find(|d| {
-            //         d.data_sources
-            //             .iter()
-            //             .find(|y| y.kind == "sqd_network" && y.name_ref === )
-            //             .is_some()
-            //     });
-            //
-            //     exist.is_some()
-            // })
             .map(|d| DatasetConfig {
                 slug: d.name.clone(),
                 aliases: None,
@@ -77,26 +64,21 @@ pub async fn datasets_load(config: &Config) -> anyhow::Result<Vec<DatasetConfig>
             })
             .collect();
 
-        // FIXME merge with predefined
-
-        if serve == "none" {
-            return Ok(predefined);
-        }
-
-        Ok(loaded)
+        loaded
     } else {
-        tracing::warn!("File loaded with error");
-
-        Ok(config.available_datasets.clone())
+        panic!(
+            "Datasets file {} can't be loaded",
+            config.sqd_network.datasets
+        )
     }
 }
 
-pub async fn load_file(config: &Config) -> anyhow::Result<Option<DatasetList>> {
+pub async fn load_file(config: &Config) -> anyhow::Result<DatasetList> {
     let url = config.sqd_network.datasets.clone();
 
     if url.starts_with("file://") {
-        load_local_file(&url).await.map(|r| Some(r))
+        load_local_file(&url).await
     } else {
-        fetch_remote_file(&url).await.map(|r| Some(r))
+        fetch_remote_file(&url).await
     }
 }

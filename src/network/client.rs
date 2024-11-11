@@ -1,8 +1,9 @@
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{Stream, StreamExt};
+use num_rational::Ratio;
 use parking_lot::Mutex;
 use serde::Serialize;
-use sqd_contract_client::{Client as ContractClient, ClientError, PeerId, Worker, U256};
+use sqd_contract_client::{Client as ContractClient, ClientError, PeerId, Worker};
 use sqd_messages::{query_result, Ping, Query, QueryResult};
 use sqd_network_transport::{
     get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransportHandle,
@@ -14,6 +15,7 @@ use tokio::{sync::oneshot, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::{NetworkState, StorageClient};
+use crate::datasets::Datasets;
 use crate::network::state::{DatasetState, Status};
 use crate::{
     cli::Config,
@@ -75,6 +77,7 @@ impl NetworkClient {
         args: TransportArgs,
         logs_collector: PeerId,
         config: Arc<Config>,
+        datasets: Arc<Datasets>,
     ) -> anyhow::Result<NetworkClient> {
         let dataset_storage = StorageClient::new(args.rpc.network)?;
         let agent_into = get_agent_info!();
@@ -92,7 +95,7 @@ impl NetworkClient {
             chain_update_interval: config.chain_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
-            network_state: Mutex::new(NetworkState::new(config)),
+            network_state: Mutex::new(NetworkState::new(config, datasets)),
             contract_client,
             tasks: Mutex::new(HashMap::new()),
             dataset_storage,
@@ -127,7 +130,7 @@ impl NetworkClient {
     ) -> Result<
         (
             u32,
-            Option<(String, U256)>,
+            Option<(String, Ratio<u128>)>,
             Duration,
             bool,
             Vec<Worker>,
@@ -141,11 +144,11 @@ impl NetworkClient {
             self.contract_client.portal_sqd_locked(self.local_peer_id),
             self.contract_client.epoch_length(),
             self.contract_client
-                .uses_default_strategy(self.local_peer_id),
+                .portal_uses_default_strategy(self.local_peer_id),
             self.contract_client.active_workers(),
             self.contract_client.current_epoch_start(),
             self.contract_client
-                .compute_units_per_epoch(self.local_peer_id),
+                .portal_compute_units_per_epoch(self.local_peer_id),
         )
     }
 
