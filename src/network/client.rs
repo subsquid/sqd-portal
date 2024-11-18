@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, LinkedList};
 use std::iter::zip;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -52,6 +52,7 @@ pub struct NetworkClient {
     local_peer_id: PeerId,
     network_state_url: String,
     assignments: Mutex<BTreeMap<String, HashMap<String, Vec<(DatasetId, Range)>>>>,
+    heartbeat_buffer: Mutex<LinkedList<(PeerId, Heartbeat)>>,
 }
 
 struct QueryTask {
@@ -83,7 +84,7 @@ impl NetworkClient {
         let agent_into = get_agent_info!();
         let transport_builder = P2PTransportBuilder::from_cli(args, agent_into).await?;
         let contract_client = transport_builder.contract_client();
-        let local_peer_id = transport_builder.local_peer_id().clone();
+        let local_peer_id = transport_builder.local_peer_id();
 
         let mut gateway_config = GatewayConfig::new();
         gateway_config.query_config.request_timeout = config.transport_timeout;
@@ -110,6 +111,7 @@ impl NetworkClient {
             local_peer_id,
             network_state_url,
             assignments: Mutex::new(Default::default()),
+            heartbeat_buffer: Mutex::new(Default::default()),
         })
     }
 
@@ -199,7 +201,8 @@ impl NetworkClient {
                         return;
                     }
                 };
-                tracing::error!("Got assignment {:?}", assignment.id);
+                let assignment_id = assignment.id.clone();
+                tracing::debug!("Got assignment {:?}", assignment_id);
                 let peers = assignment.get_all_peer_ids();
                 let mut condensed_assignment: HashMap<String, Vec<(DatasetId, Range)>> =
                     Default::default();
@@ -222,6 +225,24 @@ impl NetworkClient {
                     if local_assignments.len() > MAX_ASSIGNMENT_BUFFER_SIZE {
                         local_assignments.pop_first();
                     }
+                }
+                let heartbeats;
+                {
+                    let mut heartbeat_buffer = self.heartbeat_buffer.lock();
+                    heartbeats = heartbeat_buffer
+                        .iter()
+                        .filter(|(_, heartbeat)| heartbeat.assignment_id <= assignment_id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    *heartbeat_buffer = heartbeat_buffer
+                        .iter()
+                        .filter(|(_, heartbeat)| heartbeat.assignment_id > assignment_id)
+                        .cloned()
+                        .collect();
+                }
+                for (peer_id, heartbeat) in heartbeats {
+                    tracing::debug!("Replaying heartbeat from {peer_id}");
+                    self.handle_heartbeat(peer_id, heartbeat);
                 }
             })
             .await;
@@ -328,10 +349,20 @@ impl NetworkClient {
     }
 
     fn handle_heartbeat(&self, peer_id: PeerId, heartbeat: Heartbeat) {
-        tracing::error!("Ping from {peer_id} {:?}", heartbeat.assignment_id);
+        tracing::debug!("Ping from {peer_id} {:?}", heartbeat.assignment_id);
         let local_assignments = self.assignments.lock();
         let Some(assignment) = local_assignments.get(&heartbeat.assignment_id) else {
-            tracing::error!("Assignment {:?} not found", heartbeat.assignment_id);
+            tracing::debug!("Assignment {:?} not found", heartbeat.assignment_id);
+            let latest_assignmaent_id = local_assignments
+                .last_key_value()
+                .map(|(assignment_id, _)| assignment_id.clone())
+                .unwrap_or_default();
+            if heartbeat.assignment_id > latest_assignmaent_id {
+                self.heartbeat_buffer.lock().push_back((peer_id, heartbeat));
+                tracing::debug!("Putting heartbeat into waitlist for {peer_id}");
+            } else {
+                tracing::error!("Dropping heartbeat from {peer_id}");
+            }
             return;
         };
         let Some(chunk_list) = assignment.get(&peer_id.to_string()) else {
