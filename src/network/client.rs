@@ -35,6 +35,7 @@ lazy_static::lazy_static! {
 }
 const MAX_CONCURRENT_QUERIES: usize = 1000;
 const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 5;
+const MAX_WAITING_PINGS: usize = 2000;
 
 pub type QueryResult = Result<QueryOk, QueryError>;
 
@@ -360,6 +361,12 @@ impl NetworkClient {
             if heartbeat.assignment_id > latest_assignmaent_id {
                 self.heartbeat_buffer.lock().push_back((peer_id, heartbeat));
                 tracing::debug!("Putting heartbeat into waitlist for {peer_id}");
+                {
+                    let mut heartbeat_buffer = self.heartbeat_buffer.lock();
+                    if heartbeat_buffer.len() > MAX_WAITING_PINGS {
+                        heartbeat_buffer.pop_front();
+                    }
+                }
             } else {
                 tracing::error!("Dropping heartbeat from {peer_id}");
             }
