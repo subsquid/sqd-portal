@@ -181,7 +181,7 @@ impl NetworkClient {
         IntervalStream::new(timer)
             .take_until(cancellation_token.cancelled_owned())
             .for_each(|_| async move {
-                let latest_assignment = None;
+                let latest_assignment = self.assignments.lock().last_key_value().map(|(assignament_id, _)| *assignament_id);
                 let assignment = match Assignment::try_download(
                     self.network_state_url.clone(),
                     latest_assignment,
@@ -207,9 +207,11 @@ impl NetworkClient {
                     let chunks = assignment.dataset_chunks_for_peer_id(&peer_id).unwrap();
                     for dataset in chunks {
                         for chunk in dataset.chunks {
+                            let range = range_from_chunk_id(&chunk.id).unwrap();
+                            let dataset_id = DatasetId::from_url(dataset.id.clone());
                             peer_chunks.push((
-                                DatasetId::from_url(dataset.id.clone()),
-                                range_from_chunk_id(&chunk.id).unwrap(),
+                                dataset_id,
+                                range
                             ));
                         }
                     }
@@ -372,7 +374,7 @@ impl NetworkClient {
                 (
                     group,
                     RangeSet {
-                        ranges: vals.map(|(_, range)| range).collect(),
+                        ranges: vals.map(|(_, range)| range).sorted().collect(),
                     },
                 )
             })
