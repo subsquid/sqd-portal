@@ -34,6 +34,7 @@ lazy_static::lazy_static! {
     static ref SUPPORTED_VERSIONS: semver::VersionReq = "~1.2.0".parse().expect("Invalid version requirement");
 }
 const MAX_CONCURRENT_QUERIES: usize = 1000;
+const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 5;
 
 pub type QueryResult = Result<QueryOk, QueryError>;
 
@@ -64,14 +65,10 @@ pub fn range_from_chunk_id(dirname: &str) -> Result<Range, anyhow::Error> {
     }
     let (beg, end) = RE
         .captures(dirname)
-        .and_then(
-            |cap| match (cap.get(2), cap.get(3)) {
-                (Some(beg), Some(end)) => {
-                    Some((beg.as_str(), end.as_str()))
-                }
-                _ => None,
-            },
-        )
+        .and_then(|cap| match (cap.get(2), cap.get(3)) {
+            (Some(beg), Some(end)) => Some((beg.as_str(), end.as_str())),
+            _ => None,
+        })
         .ok_or_else(|| anyhow!("Could not parse chunk dirname '{dirname}'"))?;
     Ok(Range {
         begin: beg.parse()?,
@@ -181,7 +178,11 @@ impl NetworkClient {
         IntervalStream::new(timer)
             .take_until(cancellation_token.cancelled_owned())
             .for_each(|_| async move {
-                let latest_assignment = self.assignments.lock().last_key_value().map(|(assignament_id, _)| *assignament_id);
+                let latest_assignment = self
+                    .assignments
+                    .lock()
+                    .last_key_value()
+                    .map(|(assignament_id, _)| assignament_id.clone());
                 let assignment = match Assignment::try_download(
                     self.network_state_url.clone(),
                     latest_assignment,
@@ -209,10 +210,7 @@ impl NetworkClient {
                         for chunk in dataset.chunks {
                             let range = range_from_chunk_id(&chunk.id).unwrap();
                             let dataset_id = DatasetId::from_url(dataset.id.clone());
-                            peer_chunks.push((
-                                dataset_id,
-                                range
-                            ));
+                            peer_chunks.push((dataset_id, range));
                         }
                     }
 
@@ -221,7 +219,7 @@ impl NetworkClient {
                 {
                     let mut local_assignments = self.assignments.lock();
                     local_assignments.insert(assignment.id, condensed_assignment);
-                    if local_assignments.len() > 5 {
+                    if local_assignments.len() > MAX_ASSIGNMENT_BUFFER_SIZE {
                         local_assignments.pop_first();
                     }
                 }
