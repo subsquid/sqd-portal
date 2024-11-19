@@ -49,7 +49,7 @@ pub struct NetworkClient {
     dataset_storage: StorageClient,
     dataset_update_interval: Duration,
     chain_update_interval: Duration,
-    assignment_check_interval: Duration,
+    assignment_update_interval: Duration,
     local_peer_id: PeerId,
     network_state_url: String,
     assignments: Mutex<BTreeMap<String, HashMap<String, Vec<(DatasetId, Range)>>>>,
@@ -102,7 +102,7 @@ impl NetworkClient {
         Ok(NetworkClient {
             dataset_update_interval: config.dataset_update_interval,
             chain_update_interval: config.chain_update_interval,
-            assignment_check_interval: Duration::new(60, 0),
+            assignment_update_interval: config.assignments_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
             network_state: Mutex::new(NetworkState::new(config)),
@@ -175,7 +175,7 @@ impl NetworkClient {
 
     async fn run_assignments_loop(&self, cancellation_token: CancellationToken) {
         let mut timer =
-            tokio::time::interval_at(tokio::time::Instant::now(), self.assignment_check_interval);
+            tokio::time::interval_at(tokio::time::Instant::now(), self.assignment_update_interval);
 
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         IntervalStream::new(timer)
