@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, LinkedList};
 use std::iter::zip;
-use std::result;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures::{Stream, StreamExt};
@@ -32,7 +31,7 @@ use crate::{
 };
 
 lazy_static::lazy_static! {
-    static ref SUPPORTED_VERSIONS: semver::VersionReq = "~1.2.0".parse().expect("Invalid version requirement");
+    static ref SUPPORTED_VERSIONS: semver::VersionReq = "2.0.*".parse().expect("Invalid version requirement");
 }
 const MAX_CONCURRENT_QUERIES: usize = 1000;
 const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 5;
@@ -357,6 +356,10 @@ impl NetworkClient {
     }
 
     fn handle_heartbeat(&self, peer_id: PeerId, heartbeat: Heartbeat) {
+        if !heartbeat.version_matches(&SUPPORTED_VERSIONS) {
+            metrics::IGNORED_PINGS.inc();
+            return;
+        }
         tracing::debug!("Ping from {peer_id} {:?}", heartbeat.assignment_id);
         let local_assignments = self.assignments.lock();
         let Some(assignment) = local_assignments.get(&heartbeat.assignment_id) else {
@@ -427,21 +430,6 @@ impl NetworkClient {
             .update_dataset_states(peer_id, worker_state);
 
         metrics::VALID_PINGS.inc();
-        //tracing::error!("Payload: {:?}", heartbeat.missing_chunks.as_ref().unwrap().to_bytes().iter().map(|v| *v as usize).sum::<usize>());
-        // if !heartbeat.version_matches(&SUPPORTED_VERSIONS) {
-        //     metrics::IGNORED_PINGS.inc();
-        //     return;
-        // }
-        // metrics::VALID_PINGS.inc();
-        // todo!();
-        // let worker_state = heartbeat
-        //     .stored_ranges
-        //     .into_iter()
-        //     .map(|r| (DatasetId::from_url(r.url), r.ranges.into()))
-        //     .collect();
-        // self.network_state
-        //     .lock()
-        //     .update_dataset_states(peer_id, worker_state);
     }
 
     fn handle_query_result(
