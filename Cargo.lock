@@ -5373,7 +5373,7 @@ dependencies = [
 [[package]]
 name = "sqd-contract-client"
 version = "1.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=ab775af#ab775af52148618f96af9dd707160d1493b21b25"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=a29d0bd#a29d0bdc62f2024dc62487fe59e0b484c059cc25"
 dependencies = [
  "async-trait",
  "clap",
@@ -5390,7 +5390,7 @@ dependencies = [
 [[package]]
 name = "sqd-messages"
 version = "2.0.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=ab775af#ab775af52148618f96af9dd707160d1493b21b25"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=a29d0bd#a29d0bdc62f2024dc62487fe59e0b484c059cc25"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5407,12 +5407,13 @@ dependencies = [
  "serde_with",
  "sha2",
  "sha3",
+ "tokio 1.38.0",
 ]
 
 [[package]]
 name = "sqd-network-transport"
 version = "2.0.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=ab775af#ab775af52148618f96af9dd707160d1493b21b25"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=a29d0bd#a29d0bdc62f2024dc62487fe59e0b484c059cc25"
 dependencies = [
  "anyhow",
  "async-trait",

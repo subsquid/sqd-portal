@@ -185,25 +185,19 @@ impl NetworkClient {
                     .lock()
                     .last_key_value()
                     .map(|(assignament_id, _)| assignament_id.clone());
-                let url = self.network_state_url.clone();
-                let assignment = match tokio::task::spawn_blocking(move || async {
-                    Assignment::try_download(url, latest_assignment).await
-                })
+                let assignment = match Assignment::try_download(
+                    self.network_state_url.clone(),
+                    latest_assignment,
+                )
                 .await
                 {
-                    Ok(assignment) => match assignment.await {
-                        Ok(Some(assignment)) => assignment,
-                        Ok(None) => {
-                            tracing::info!("Assignment has not been changed");
-                            return;
-                        }
-                        Err(err) => {
-                            tracing::error!("Unable to get assignment: {err:?}");
-                            return;
-                        }
-                    },
+                    Ok(Some(assignment)) => assignment,
+                    Ok(None) => {
+                        tracing::info!("Assignment has not been changed");
+                        return;
+                    }
                     Err(err) => {
-                        tracing::error!("Error while creating fetch thread: {err:?}");
+                        tracing::error!("Unable to get assignment: {err:?}");
                         return;
                     }
                 };
