@@ -70,6 +70,10 @@ fn default_chain_update_interval() -> Duration {
     Duration::from_secs(60)
 }
 
+fn default_assignments_update_interval() -> Duration {
+    Duration::from_secs(60)
+}
+
 fn parse_hostname<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -134,6 +138,13 @@ pub struct Config {
         default = "default_chain_update_interval"
     )]
     pub chain_update_interval: Duration,
+
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(
+        rename = "assignments_update_interval_sec",
+        default = "default_assignments_update_interval"
+    )]
+    pub assignments_update_interval: Duration,
 
     // Dataset alias -> bucket URL
     pub available_datasets: HashMap<String, String>,
