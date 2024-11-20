@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, LinkedList};
 use std::iter::zip;
+use std::result;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures::{Stream, StreamExt};
@@ -176,7 +177,6 @@ impl NetworkClient {
     async fn run_assignments_loop(&self, cancellation_token: CancellationToken) {
         let mut timer =
             tokio::time::interval_at(tokio::time::Instant::now(), self.assignment_update_interval);
-
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         IntervalStream::new(timer)
             .take_until(cancellation_token.cancelled_owned())
@@ -186,22 +186,29 @@ impl NetworkClient {
                     .lock()
                     .last_key_value()
                     .map(|(assignament_id, _)| assignament_id.clone());
-                let assignment = match Assignment::try_download(
-                    self.network_state_url.clone(),
-                    latest_assignment,
-                )
+                let url = self.network_state_url.clone();
+                let assignment = match tokio::task::spawn_blocking(move || async {
+                    Assignment::try_download(url, latest_assignment).await
+                })
                 .await
                 {
-                    Ok(Some(assignment)) => assignment,
-                    Ok(None) => {
-                        tracing::info!("Assignment has not been changed");
-                        return;
-                    }
+                    Ok(assignment) => match assignment.await {
+                        Ok(Some(assignment)) => assignment,
+                        Ok(None) => {
+                            tracing::info!("Assignment has not been changed");
+                            return;
+                        }
+                        Err(err) => {
+                            tracing::error!("Unable to get assignment: {err:?}");
+                            return;
+                        }
+                    },
                     Err(err) => {
-                        tracing::error!("Unable to get assignment: {err:?}");
+                        tracing::error!("Error while creating fetch thread: {err:?}");
                         return;
                     }
                 };
+
                 let assignment_id = assignment.id.clone();
                 tracing::debug!("Got assignment {:?}", assignment_id);
                 let peers = assignment.get_all_peer_ids();
@@ -368,7 +375,7 @@ impl NetworkClient {
                     }
                 }
             } else {
-                tracing::error!("Dropping heartbeat from {peer_id}");
+                tracing::debug!("Dropping heartbeat from {peer_id}");
             }
             return;
         };
@@ -418,6 +425,7 @@ impl NetworkClient {
         self.network_state
             .lock()
             .update_dataset_states(peer_id, worker_state);
+
         metrics::VALID_PINGS.inc();
         //tracing::error!("Payload: {:?}", heartbeat.missing_chunks.as_ref().unwrap().to_bytes().iter().map(|v| *v as usize).sum::<usize>());
         // if !heartbeat.version_matches(&SUPPORTED_VERSIONS) {
