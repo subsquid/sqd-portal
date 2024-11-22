@@ -370,6 +370,7 @@ impl NetworkClient {
             metrics::IGNORED_PINGS.inc();
             return;
         }
+        metrics::VALID_PINGS.inc();
         tracing::debug!("Ping from {peer_id} {:?}", heartbeat.assignment_id);
         let local_assignments = self.assignments.lock();
         let Some(assignment) = local_assignments.get(&heartbeat.assignment_id) else {
@@ -379,13 +380,14 @@ impl NetworkClient {
                 .map(|(assignment_id, _)| assignment_id.clone())
                 .unwrap_or_default();
             if heartbeat.assignment_id > latest_assignmaent_id {
-                self.heartbeat_buffer.lock().push_back((peer_id, heartbeat));
                 tracing::debug!("Putting heartbeat into waitlist for {peer_id}");
-                {
-                    let mut heartbeat_buffer = self.heartbeat_buffer.lock();
-                    if heartbeat_buffer.len() > MAX_WAITING_PINGS {
-                        heartbeat_buffer.pop_front();
-                    }
+                let Some(mut heartbeat_buffer) = self.heartbeat_buffer.try_lock() else {
+                    tracing::debug!("Failed to get lock");
+                    return;
+                };
+                heartbeat_buffer.push_back((peer_id, heartbeat));
+                if heartbeat_buffer.len() > MAX_WAITING_PINGS {
+                    heartbeat_buffer.pop_front();
                 }
             } else {
                 tracing::debug!("Dropping heartbeat from {peer_id}");
@@ -438,8 +440,6 @@ impl NetworkClient {
         self.network_state
             .lock()
             .update_dataset_states(peer_id, worker_state);
-
-        metrics::VALID_PINGS.inc();
     }
 
     fn handle_query_result(
