@@ -116,13 +116,29 @@ impl NetworkClient {
         })
     }
 
-    pub async fn run(&self, cancellation_token: CancellationToken) {
-        // TODO: run coroutines in parallel
-        tokio::join!(
-            self.run_event_stream(cancellation_token.clone()),
-            self.run_storage_updates(cancellation_token.clone()),
-            self.run_chain_updates(cancellation_token.clone()),
-            self.run_assignments_loop(cancellation_token),
+    pub async fn run(self: Arc<Self>, cancellation_token: CancellationToken) {
+        let me = Arc::clone(&self);
+        let token = cancellation_token.clone();
+        let event_stream: tokio::task::JoinHandle<()> =
+            tokio::spawn(async move { me.run_event_stream(token).await });
+        let me = Arc::clone(&self);
+        let token = cancellation_token.clone();
+        let storage_updates: tokio::task::JoinHandle<()> =
+            tokio::spawn(async move { me.run_storage_updates(token).await });
+        let me = Arc::clone(&self);
+        let token = cancellation_token.clone();
+        let chain_updates: tokio::task::JoinHandle<()> =
+            tokio::spawn(async move { me.run_chain_updates(token).await });
+        let me = Arc::clone(&self);
+        let token = cancellation_token.clone();
+        let assignments_loop: tokio::task::JoinHandle<()> =
+            tokio::spawn(async move { me.run_assignments_loop(token).await });
+
+        _ = tokio::join!(
+            event_stream,
+            storage_updates,
+            chain_updates,
+            assignments_loop
         );
     }
 
