@@ -1,5 +1,8 @@
-use std::{borrow::Cow, sync::Arc};
+use std::borrow::Cow;
+use std::sync::Arc;
 
+use crate::datasets::Datasets;
+use crate::network::datasets_load;
 use clap::Parser;
 use cli::Cli;
 use controller::task_manager::TaskManager;
@@ -11,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 mod api_types;
 mod cli;
 mod controller;
+mod datasets;
 mod http_server;
 mod metrics;
 mod network;
@@ -46,14 +50,24 @@ async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let args = Cli::parse();
     setup_tracing(args.json_log)?;
+
+    let datasets = Arc::new(Datasets::new(datasets_load(&args.config).await));
+
     let config = Arc::new(args.config);
-    let network_client =
-        Arc::new(NetworkClient::new(args.transport, args.logs_collector_id, config.clone()).await?);
+    let network_client = Arc::new(
+        NetworkClient::new(
+            args.transport,
+            args.logs_collector_id,
+            config.clone(),
+            datasets.clone(),
+        )
+        .await?,
+    );
 
     let mut metrics_registry = Registry::with_labels(
         vec![(
             Cow::Borrowed("portal_id"),
-            Cow::Owned(network_client.peer_id().to_string()),
+            Cow::Owned(network_client.get_peer_id().to_string()),
         )]
         .into_iter(),
     );
@@ -75,7 +89,8 @@ async fn main() -> anyhow::Result<()> {
             network_client.clone(),
             metrics_registry,
             &args.http_listen,
-            config
+            config,
+            datasets,
         ),
         network_client.run(cancellation_token),
     );

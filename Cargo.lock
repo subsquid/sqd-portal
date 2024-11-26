@@ -689,8 +689,10 @@ checksum = "a21f936df1771bf62b77f047b726c4625ff2e8aa607c01ec06e5a05bd8463401"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-targets 0.52.6",
 ]
 
@@ -3710,6 +3712,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-rational"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4329,7 +4342,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9552f850d5f0964a4e4d0bf306459ac29323ddfbae05e35a7c0d35cb0803cc5"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.68",
@@ -5336,14 +5349,15 @@ dependencies = [
 
 [[package]]
 name = "sqd-contract-client"
-version = "1.0.7"
-source = "git+https://github.com/subsquid/sqd-network.git#7774afea3ab157992f5f28a040d219c64422dc18"
+version = "1.2.0"
+source = "git+https://github.com/subsquid/sqd-network.git#66e97476baeaff5881ede704981bb731f087e45b"
 dependencies = [
  "async-trait",
  "clap",
  "ethers",
  "libp2p",
  "log",
+ "num-rational",
  "serde",
  "thiserror",
  "tokio 1.38.0",
@@ -5354,7 +5368,7 @@ dependencies = [
 [[package]]
 name = "sqd-messages"
 version = "1.1.4"
-source = "git+https://github.com/subsquid/sqd-network.git#7774afea3ab157992f5f28a040d219c64422dc18"
+source = "git+https://github.com/subsquid/sqd-network.git#66e97476baeaff5881ede704981bb731f087e45b"
 dependencies = [
  "anyhow",
  "hex",
@@ -5369,7 +5383,7 @@ dependencies = [
 [[package]]
 name = "sqd-network-transport"
 version = "1.0.25"
-source = "git+https://github.com/subsquid/sqd-network.git#7774afea3ab157992f5f28a040d219c64422dc18"
+source = "git+https://github.com/subsquid/sqd-network.git#66e97476baeaff5881ede704981bb731f087e45b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5399,18 +5413,20 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.3.1"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "async-stream",
  "axum",
  "base64 0.22.1",
+ "chrono",
  "clap",
  "dotenv",
  "flate2",
  "futures 0.3.30",
  "itertools 0.12.1",
  "lazy_static",
+ "num-rational",
  "parking_lot 0.12.3",
  "prometheus-client",
  "reqwest 0.12.7",

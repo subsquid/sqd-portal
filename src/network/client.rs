@@ -1,18 +1,22 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
-
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{Stream, StreamExt};
+use num_rational::Ratio;
 use parking_lot::Mutex;
-use sqd_contract_client::{Client as ContractClient, PeerId};
+use serde::Serialize;
+use sqd_contract_client::{Client as ContractClient, ClientError, PeerId, Worker};
 use sqd_messages::{query_result, Ping, Query, QueryResult};
 use sqd_network_transport::{
     get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransportHandle,
     P2PTransportBuilder, QueueFull, TransportArgs,
 };
+use std::time::SystemTime;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{sync::oneshot, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::{NetworkState, StorageClient};
-use crate::network::state::DatasetState;
+use crate::datasets::Datasets;
+use crate::network::state::{DatasetState, Status};
 use crate::{
     cli::Config,
     metrics,
@@ -24,6 +28,31 @@ lazy_static::lazy_static! {
     static ref SUPPORTED_VERSIONS: semver::VersionReq = "~1.2.0".parse().expect("Invalid version requirement");
 }
 const MAX_CONCURRENT_QUERIES: usize = 1000;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CurrentEpoch {
+    pub number: u32,
+    pub started_at: String,
+    pub ended_at: String,
+    pub duration_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Workers {
+    pub active_count: u64,
+    pub rate_limit_per_worker: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkClientStatus {
+    pub peer_id: PeerId,
+    pub status: Status,
+    pub operator: Option<String>,
+    pub current_epoch: Option<CurrentEpoch>,
+    pub sqd_locked: Option<String>,
+    pub cu_per_epoch: Option<String>,
+    pub workers: Option<Workers>,
+}
 
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
@@ -48,6 +77,7 @@ impl NetworkClient {
         args: TransportArgs,
         logs_collector: PeerId,
         config: Arc<Config>,
+        datasets: Arc<Datasets>,
     ) -> anyhow::Result<NetworkClient> {
         let dataset_storage = StorageClient::new(args.rpc.network)?;
         let agent_into = get_agent_info!();
@@ -65,7 +95,7 @@ impl NetworkClient {
             chain_update_interval: config.chain_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
-            network_state: Mutex::new(NetworkState::new(config)),
+            network_state: Mutex::new(NetworkState::new(config, datasets)),
             contract_client,
             tasks: Mutex::new(HashMap::new()),
             dataset_storage,
@@ -95,14 +125,66 @@ impl NetworkClient {
         }
     }
 
-    async fn run_chain_updates(&self, cancellation_token: CancellationToken) {
-        let mut current_epoch = self
-            .contract_client
-            .current_epoch()
-            .await
-            .unwrap_or_else(|e| panic!("Couldn't get current epoch: {e}"));
+    async fn fetch_blockchain_state(
+        &self,
+    ) -> Result<
+        (
+            u32,
+            Option<(String, Ratio<u128>)>,
+            Duration,
+            bool,
+            Vec<Worker>,
+            SystemTime,
+            u64,
+        ),
+        ClientError,
+    > {
+        tokio::try_join!(
+            self.contract_client.current_epoch(),
+            self.contract_client.portal_sqd_locked(self.local_peer_id),
+            self.contract_client.epoch_length(),
+            self.contract_client
+                .portal_uses_default_strategy(self.local_peer_id),
+            self.contract_client.active_workers(),
+            self.contract_client.current_epoch_start(),
+            self.contract_client
+                .portal_compute_units_per_epoch(self.local_peer_id),
+        )
+    }
 
-        tracing::info!("Current epoch: {current_epoch}");
+    async fn run_chain_updates(&self, cancellation_token: CancellationToken) {
+        let (
+            epoch,
+            sqd_locked,
+            epoch_length,
+            uses_default_strategy,
+            active_workers,
+            epoch_started,
+            compute_units_per_epoch,
+        ) = self
+            .fetch_blockchain_state()
+            .await
+            .unwrap_or_else(|e| panic!("Couldn't get blockchain data: {e}"));
+
+        let mut current_epoch: u32 = epoch;
+
+        let operator = sqd_locked.clone().map(|s| s.0);
+        tracing::info!(
+            "Portal operator {}, current epoch: {}",
+            operator.unwrap_or_else(|| "unknown".to_string()),
+            current_epoch
+        );
+
+        self.network_state.lock().set_contracts_state(
+            current_epoch,
+            sqd_locked,
+            epoch_length,
+            uses_default_strategy,
+            active_workers,
+            epoch_started,
+            compute_units_per_epoch,
+        );
+
         let mut interval = tokio::time::interval_at(
             Instant::now() + self.chain_update_interval,
             self.chain_update_interval,
@@ -114,13 +196,33 @@ impl NetworkClient {
                     break;
                 }
             }
-            let epoch = match self.contract_client.current_epoch().await {
-                Ok(epoch) => epoch,
+
+            let (
+                epoch,
+                sqd_locked,
+                epoch_length,
+                uses_default_strategy,
+                active_workers,
+                epoch_started,
+                compute_units_per_epoch,
+            ) = match self.fetch_blockchain_state().await {
+                Ok(data) => data,
                 Err(e) => {
                     tracing::warn!("Couldn't get current epoch: {e}");
                     continue;
                 }
             };
+
+            self.network_state.lock().set_contracts_state(
+                current_epoch,
+                sqd_locked,
+                epoch_length,
+                uses_default_strategy,
+                active_workers,
+                epoch_started,
+                compute_units_per_epoch,
+            );
+
             if epoch != current_epoch {
                 tracing::info!("Epoch {epoch} started");
                 current_epoch = epoch;
@@ -297,7 +399,58 @@ impl NetworkClient {
         self.network_state.lock().dataset_state(dataset_id).cloned()
     }
 
-    pub fn peer_id(&self) -> PeerId {
+    pub fn get_peer_id(&self) -> PeerId {
         self.local_peer_id
+    }
+
+    pub fn get_status(&self) -> NetworkClientStatus {
+        let state = self.network_state.lock().get_contracts_state();
+
+        let epoch_secs = state.epoch_length.as_secs();
+        let started_at: DateTime<Utc> = state.current_epoch_started.into();
+        let ended_at = started_at + ChronoDuration::seconds(epoch_secs as i64);
+
+        if state.status == Status::DataLoading {
+            NetworkClientStatus {
+                peer_id: self.local_peer_id,
+                status: state.status,
+                operator: None,
+                sqd_locked: None,
+                current_epoch: None,
+                cu_per_epoch: None,
+                workers: None,
+            }
+        } else {
+            NetworkClientStatus {
+                peer_id: self.local_peer_id,
+                status: state.status,
+                operator: Some(state.operator),
+                sqd_locked: Some(state.sqd_locked.to_string()),
+                cu_per_epoch: Some(state.compute_units_per_epoch.to_string()),
+                current_epoch: Some(CurrentEpoch {
+                    number: state.current_epoch,
+                    started_at: started_at.to_rfc3339(),
+                    ended_at: ended_at.to_rfc3339(),
+                    duration_seconds: epoch_secs,
+                }),
+                workers: Some(Workers {
+                    active_count: state.active_workers_length,
+                    rate_limit_per_worker: if state.uses_default_strategy {
+                        let rate_limit = if epoch_secs > 0 && state.active_workers_length > 0 {
+                            let cu_per_worker = (state.compute_units_per_epoch
+                                / state.active_workers_length)
+                                as f64;
+
+                            cu_per_worker / (epoch_secs as f64)
+                        } else {
+                            0.0
+                        };
+                        Some(rate_limit.to_string())
+                    } else {
+                        None
+                    },
+                }),
+            }
+        }
     }
 }
