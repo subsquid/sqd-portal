@@ -1,15 +1,13 @@
-use std::collections::{BTreeMap, LinkedList};
+use std::collections::{BTreeMap, VecDeque};
 use std::iter::zip;
-use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use anyhow::Context;
 use futures::{Stream, StreamExt};
 use itertools::Itertools;
 use parking_lot::Mutex;
 use sqd_contract_client::{Client as ContractClient, Network, PeerId};
 use sqd_messages::assignments::Assignment;
-use sqd_messages::{query_error, query_result, Heartbeat, Query, QueryOk, Range, RangeSet};
+use sqd_messages::{query_error, query_result, Heartbeat, Query, QueryOk, RangeSet};
 use sqd_network_transport::{
     get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransportHandle,
     P2PTransportBuilder, QueryFailure, QueueFull, TransportArgs,
@@ -22,11 +20,11 @@ use tokio_util::sync::CancellationToken;
 use super::priorities::NoWorker;
 use super::{NetworkState, StorageClient};
 use crate::network::state::DatasetState;
-use crate::types::DataChunk;
+use crate::types::{ChunkId, DataChunk};
 use crate::{
     cli::Config,
     metrics,
-    types::{generate_query_id, BlockRange, DatasetId, QueryError, QueryId},
+    types::{generate_query_id, DatasetId, QueryError, QueryId},
     utils::UseOnce,
 };
 
@@ -47,13 +45,12 @@ pub struct NetworkClient {
     contract_client: Box<dyn ContractClient>,
     tasks: Mutex<HashMap<QueryId, QueryTask>>,
     dataset_storage: StorageClient,
-    dataset_update_interval: Duration,
     chain_update_interval: Duration,
     assignment_update_interval: Duration,
     local_peer_id: PeerId,
     network_state_url: String,
-    assignments: Mutex<BTreeMap<String, HashMap<String, Vec<(DatasetId, Range)>>>>,
-    heartbeat_buffer: Mutex<LinkedList<(PeerId, Heartbeat)>>,
+    assignments: Mutex<BTreeMap<String, HashMap<PeerId, Vec<ChunkId>>>>,
+    heartbeat_buffer: Mutex<VecDeque<(PeerId, Heartbeat)>>,
 }
 
 struct QueryTask {
@@ -61,19 +58,10 @@ struct QueryTask {
     worker_id: PeerId,
 }
 
-pub fn range_from_chunk_id(dirname: &str) -> Result<Range, anyhow::Error> {
-    let chunk =
-        DataChunk::from_str(dirname).with_context(|| format!("Invalid chunk: {dirname}"))?;
-    Ok(Range {
-        begin: chunk.first_block,
-        end: chunk.last_block,
-    })
-}
-
 impl NetworkClient {
     pub async fn new(args: TransportArgs, config: Arc<Config>) -> anyhow::Result<NetworkClient> {
         let network = args.rpc.network;
-        let dataset_storage = StorageClient::new(network)?;
+        let dataset_storage = StorageClient::new()?;
         let agent_into = get_agent_info!();
         let transport_builder = P2PTransportBuilder::from_cli(args, agent_into).await?;
         let contract_client = transport_builder.contract_client();
@@ -92,7 +80,6 @@ impl NetworkClient {
             format!("https://metadata.sqd-datasets.io/{network_state_filename}");
 
         Ok(NetworkClient {
-            dataset_update_interval: config.dataset_update_interval,
             chain_update_interval: config.chain_update_interval,
             assignment_update_interval: config.assignments_update_interval,
             transport_handle,
@@ -109,42 +96,18 @@ impl NetworkClient {
     }
 
     pub async fn run(self: Arc<Self>, cancellation_token: CancellationToken) {
-        let me = Arc::clone(&self);
-        let token = cancellation_token.clone();
-        let event_stream: tokio::task::JoinHandle<()> =
-            tokio::spawn(async move { me.run_event_stream(token).await });
-        let me = Arc::clone(&self);
-        let token = cancellation_token.clone();
-        let storage_updates: tokio::task::JoinHandle<()> =
-            tokio::spawn(async move { me.run_storage_updates(token).await });
-        let me = Arc::clone(&self);
-        let token = cancellation_token.clone();
-        let chain_updates: tokio::task::JoinHandle<()> =
-            tokio::spawn(async move { me.run_chain_updates(token).await });
-        let me = Arc::clone(&self);
-        let token = cancellation_token.clone();
-        let assignments_loop: tokio::task::JoinHandle<()> =
-            tokio::spawn(async move { me.run_assignments_loop(token).await });
+        let this = Arc::clone(&self);
+        let token = cancellation_token.child_token();
+        let events_fut = tokio::spawn(async move { this.run_event_stream(token).await });
+        let this = Arc::clone(&self);
+        let token = cancellation_token.child_token();
+        let chain_updates_fut = tokio::spawn(async move { this.run_chain_updates(token).await });
+        let this = Arc::clone(&self);
+        let token = cancellation_token.child_token();
+        let assignments_loop_fut =
+            tokio::spawn(async move { this.run_assignments_loop(token).await });
 
-        _ = tokio::join!(
-            event_stream,
-            storage_updates,
-            chain_updates,
-            assignments_loop
-        );
-    }
-
-    async fn run_storage_updates(&self, cancellation_token: CancellationToken) {
-        let mut interval = tokio::time::interval(self.dataset_update_interval);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {}
-                _ = cancellation_token.cancelled() => {
-                    break;
-                }
-            }
-            self.dataset_storage.update().await;
-        }
+        tokio::try_join!(events_fut, chain_updates_fut, assignments_loop_fut).unwrap();
     }
 
     async fn run_chain_updates(&self, cancellation_token: CancellationToken) {
@@ -211,53 +174,32 @@ impl NetworkClient {
                     }
                 };
 
-                let start_pase = tokio::time::Instant::now();
                 let assignment_id = assignment.id.clone();
                 tracing::debug!("Got assignment {:?}", assignment_id);
-                let peers = assignment.get_all_peer_ids();
-                let mut condensed_assignment: HashMap<String, Vec<(DatasetId, Range)>> =
-                    Default::default();
-                for peer_id in peers {
-                    let mut peer_chunks: Vec<(DatasetId, Range)> = Default::default();
-                    let chunks = assignment.dataset_chunks_for_peer_id(&peer_id).unwrap();
-                    for dataset in chunks {
-                        for chunk in dataset.chunks {
-                            let range = range_from_chunk_id(&chunk.id).unwrap();
-                            let dataset_id = DatasetId::from_url(dataset.id.clone());
-                            peer_chunks.push((dataset_id, range));
-                        }
-                    }
 
-                    condensed_assignment.insert(peer_id, peer_chunks);
-                }
+                let (worker_chunks, datasets) = parse_assignment(assignment).unwrap();
+                tracing::debug!("Assignment parsed");
+
                 {
                     let mut local_assignments = self.assignments.lock();
-                    local_assignments.insert(assignment.id, condensed_assignment);
+                    local_assignments.insert(assignment_id.clone(), worker_chunks);
                     if local_assignments.len() > MAX_ASSIGNMENT_BUFFER_SIZE {
                         local_assignments.pop_first();
                     }
                 }
-                tracing::debug!(
-                    "Assignment parsed in {}ms",
-                    start_pase.elapsed().as_millis()
-                );
 
-                let heartbeats;
-                {
+                self.dataset_storage.update_datasets(datasets);
+
+                let heartbeats = {
                     let mut heartbeat_buffer = self.heartbeat_buffer.lock();
-                    heartbeats = heartbeat_buffer
-                        .iter()
-                        .filter(|(_, heartbeat)| heartbeat.assignment_id <= assignment_id)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    *heartbeat_buffer = heartbeat_buffer
-                        .iter()
-                        .filter(|(_, heartbeat)| heartbeat.assignment_id > assignment_id)
-                        .cloned()
-                        .collect();
-                }
+                    let (unknown, known) = heartbeat_buffer
+                        .drain(..)
+                        .partition(|(_, heartbeat)| heartbeat.assignment_id > assignment_id);
+                    *heartbeat_buffer = unknown;
+                    known
+                };
                 for (peer_id, heartbeat) in heartbeats {
-                    tracing::debug!("Replaying heartbeat from {peer_id}");
+                    tracing::trace!("Replaying heartbeat from {peer_id}");
                     self.handle_heartbeat(peer_id, heartbeat);
                 }
                 tracing::info!("New assignment saved");
@@ -300,11 +242,11 @@ impl NetworkClient {
         }
     }
 
-    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<BlockRange> {
+    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
         self.dataset_storage.find_chunk(dataset, block)
     }
 
-    pub fn next_chunk(&self, dataset: &DatasetId, chunk: &BlockRange) -> Option<BlockRange> {
+    pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
         self.dataset_storage.next_chunk(dataset, chunk)
     }
 
@@ -319,7 +261,7 @@ impl NetworkClient {
     pub fn query_worker(
         &self,
         worker: &PeerId,
-        dataset: &DatasetId,
+        chunk_id: ChunkId,
         query: String,
     ) -> Result<oneshot::Receiver<QueryResult>, QueueFull> {
         let query_id = generate_query_id();
@@ -344,11 +286,11 @@ impl NetworkClient {
             .send_query(
                 *worker,
                 Query {
-                    dataset: dataset.to_string(),
+                    dataset: chunk_id.dataset.to_url().unwrap(), // TODO: store unencoded ids
                     query_id: query_id.clone(),
                     query,
                     block_range: None,
-                    chunk_id: "".to_owned(), // TODO: pass chunk id
+                    chunk_id: chunk_id.chunk.to_string(),
                     timestamp_ms: timestamp_now_ms(),
                     signature: Default::default(),
                 },
@@ -371,10 +313,14 @@ impl NetworkClient {
             return;
         }
         metrics::VALID_PINGS.inc();
-        tracing::debug!("Ping from {peer_id} {:?}", heartbeat.assignment_id);
+        tracing::debug!(
+            "Heartbeat from {peer_id}, assignment: {:?}",
+            heartbeat.assignment_id
+        );
+
         let local_assignments = self.assignments.lock();
         let Some(assignment) = local_assignments.get(&heartbeat.assignment_id) else {
-            tracing::debug!("Assignment {:?} not found", heartbeat.assignment_id);
+            tracing::trace!("Assignment {:?} not found", heartbeat.assignment_id);
             let latest_assignment_id = local_assignments
                 .last_key_value()
                 .map(|(assignment_id, _)| assignment_id.clone())
@@ -382,7 +328,7 @@ impl NetworkClient {
             if heartbeat.assignment_id > latest_assignment_id {
                 tracing::debug!("Putting heartbeat into waitlist for {peer_id}");
                 let Some(mut heartbeat_buffer) = self.heartbeat_buffer.try_lock() else {
-                    tracing::debug!("Failed to get lock");
+                    tracing::debug!("Dropping heartbeat because the buffer is locked");
                     return;
                 };
                 heartbeat_buffer.push_back((peer_id, heartbeat));
@@ -394,7 +340,7 @@ impl NetworkClient {
             }
             return;
         };
-        let Some(chunk_list) = assignment.get(&peer_id.to_string()) else {
+        let Some(chunk_list) = assignment.get(&peer_id) else {
             tracing::error!(
                 "PeerID {:?} not found in Assignment {:?}",
                 peer_id,
@@ -426,13 +372,16 @@ impl NetworkClient {
                     None
                 }
             })
-            .group_by(|(dataset, _)| dataset.clone())
+            .group_by(|chunk_id| chunk_id.dataset.clone())
             .into_iter()
             .map(|(group, vals)| {
                 (
-                    group,
+                    (*group).clone(),
                     RangeSet {
-                        ranges: vals.map(|(_, range)| range).sorted().collect(),
+                        ranges: vals
+                            .map(|chunk_id| chunk_id.chunk.range_msg())
+                            .sorted()
+                            .collect(),
                     },
                 )
             })
@@ -558,6 +507,50 @@ impl NetworkClient {
     pub fn peer_id(&self) -> PeerId {
         self.local_peer_id
     }
+}
+
+#[tracing::instrument(skip_all)]
+fn parse_assignment(
+    assignment: Assignment,
+) -> anyhow::Result<(
+    HashMap<PeerId, Vec<ChunkId>>,
+    HashMap<DatasetId, Vec<DataChunk>>,
+)> {
+    let peers = assignment.get_all_peer_ids();
+    let mut worker_chunks = HashMap::new();
+    for peer_id in peers {
+        let mut peer_chunks: Vec<ChunkId> = Default::default();
+        let chunks = assignment.dataset_chunks_for_peer_id(&peer_id).unwrap();
+        for dataset in chunks {
+            let dataset_id = Arc::new(DatasetId::from_url(&dataset.id));
+            for chunk in dataset.chunks {
+                let chunk = chunk.id.parse().unwrap();
+                peer_chunks.push(ChunkId::new(dataset_id.clone(), chunk));
+            }
+        }
+
+        worker_chunks.insert(peer_id, peer_chunks);
+    }
+    let datasets = assignment
+        .datasets
+        .into_iter()
+        .map(|dataset| {
+            (
+                DatasetId::from_url(dataset.id),
+                dataset
+                    .chunks
+                    .into_iter()
+                    .flat_map(|chunk| {
+                        chunk.id.parse().map_err(|e| {
+                            tracing::warn!("Couldn't parse chunk id '{}': {e}", chunk.id)
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+
+    Ok((worker_chunks, datasets))
 }
 
 #[inline(always)]

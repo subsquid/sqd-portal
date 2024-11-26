@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
             task_manager,
             network_client.clone(),
             metrics_registry,
-            &args.http_listen,
+            args.http_listen,
             config
         ),
         network_client.run(cancellation_token),

@@ -14,7 +14,10 @@ use tracing::instrument;
 use crate::{
     controller::timeouts::TimeoutManager,
     network::{NetworkClient, NoWorker, QueryResult},
-    types::{BlockRange, ClientRequest, QueryError, RequestError, ResponseChunk, SendQueryError},
+    types::{
+        BlockRange, ChunkId, ClientRequest, DataChunk, QueryError, RequestError, ResponseChunk,
+        SendQueryError,
+    },
     utils::{logging::StreamStats, OptionExt, SlidingArray},
 };
 
@@ -24,15 +27,21 @@ pub struct StreamController {
     request: ClientRequest,
     network: Arc<NetworkClient>,
     buffer: SlidingArray<Slot>,
-    next_chunk: Option<BlockRange>,
+    next_chunk: Option<DataChunk>,
     timeouts: TimeoutManager,
     stats: StreamStats,
     span: tracing::Span,
     last_error: Option<String>,
 }
 
+pub struct DataRange {
+    pub range: BlockRange,
+    pub chunk: DataChunk,
+    pub chunk_index: usize,
+}
+
 struct Slot {
-    range: BlockRange,
+    data_range: DataRange,
     state: RequestState,
 }
 
@@ -102,8 +111,8 @@ impl StreamController {
         // extract this field to be able to pass both its values and `&mut self` to the method
         let mut buffer = std::mem::take(&mut self.buffer);
         let mut updated = false;
-        for (index, slot) in buffer.enumerate_mut() {
-            updated |= self.poll_slot(index, slot, ctx);
+        for (_, slot) in buffer.enumerate_mut() {
+            updated |= self.poll_slot(slot, ctx);
         }
         self.buffer = buffer;
 
@@ -130,8 +139,8 @@ impl StreamController {
         result
     }
 
-    #[instrument(skip_all, fields(chunk_index = index))]
-    fn poll_slot(&mut self, index: usize, slot: &mut Slot, ctx: &mut Context<'_>) -> bool {
+    #[instrument(skip_all, fields(chunk_index = slot.data_range.chunk_index))]
+    fn poll_slot(&mut self, slot: &mut Slot, ctx: &mut Context<'_>) -> bool {
         let RequestState::Pending(pending) = &mut slot.state else {
             return false;
         };
@@ -164,7 +173,7 @@ impl StreamController {
             retry = true;
         } else if let Some((response, duration, worker)) = result {
             self.timeouts.observe(duration);
-            slot.state = parse_response(response, &slot.range);
+            slot.state = parse_response(response, &slot.data_range.range);
             tracing::debug!(
                 "Got result ({}) in {}ms from {}",
                 short_code(&slot.state),
@@ -197,7 +206,7 @@ impl StreamController {
         if retry {
             assert!(pending.tries_left > 0);
             pending.tries_left -= 1;
-            match self.send_query(&slot.range, index, ctx) {
+            match self.send_query(&slot.data_range, ctx) {
                 Ok(worker_request) => {
                     pending.set_timeout(self.timeouts.current_timeout());
                     pending.requests.push(worker_request);
@@ -232,13 +241,12 @@ impl StreamController {
         &mut self,
         ctx: &mut Context<'_>,
     ) -> Poll<Option<Result<ResponseChunk, RequestError>>> {
-        let chunk_index = self.buffer.first_index();
         let Some(slot) = self.buffer.pop_front() else {
             return Poll::Ready(None);
         };
-        let slot_range = slot.range.clone();
-        let (result, range) = match slot.state {
-            RequestState::Done(result) => (Poll::Ready(Some(result)), slot_range),
+        let chunk_index = slot.data_range.chunk_index;
+        let (result, read_range) = match slot.state {
+            RequestState::Done(result) => (Poll::Ready(Some(result)), slot.data_range.range),
             RequestState::Pending(ref pending) => {
                 if pending.is_paused() {
                     let duration = pending.time_left();
@@ -246,36 +254,34 @@ impl StreamController {
                         return Poll::Ready(Some(Err(RequestError::BusyFor(duration))));
                     }
                 }
+                let range = slot.data_range.range.clone();
                 self.buffer.push_front(slot);
-                (Poll::Pending, slot_range)
+                (Poll::Pending, range)
             }
             RequestState::Partial(PartialResult { data, next_range }) => {
-                let range = BlockRange::new(*slot.range.start(), *next_range.start() - 1);
-                let slot = match self.start_querying_chunk(&next_range, chunk_index, ctx) {
+                let read_range =
+                    BlockRange::new(*slot.data_range.range.start(), *next_range.start() - 1);
+                let next_data_range = slot.data_range.with_range(next_range);
+                let slot = match self.start_querying_chunk(next_data_range, ctx) {
                     Ok(slot) => slot,
-                    Err(e) => {
+                    Err((slot, e)) => {
                         tracing::debug!("Couldn't schedule continuation request: {e:?}");
-                        Slot {
-                            range: next_range,
-                            state: RequestState::Done(Err(RequestError::InternalError(
-                                e.to_string(),
-                            ))),
-                        }
+                        slot
                     }
                 };
                 self.buffer.push_front(slot);
-                (Poll::Ready(Some(Ok(data))), range)
+                (Poll::Ready(Some(Ok(data))), read_range)
             }
         };
 
         if let Poll::Ready(Some(Ok(bytes))) = &result {
             self.stats
-                .sent_response_chunk(*range.end() - *range.start() + 1, bytes.len());
+                .sent_response_chunk(*read_range.end() - *read_range.start() + 1, bytes.len());
             tracing::debug!(
                 chunk_index,
                 "Writing response blocks {}-{} ({} bytes)",
-                *range.start(),
-                *range.end(),
+                *read_range.start(),
+                *read_range.end(),
                 bytes.len()
             );
         }
@@ -299,7 +305,14 @@ impl StreamController {
                 break;
             };
             let next_index = self.buffer.total_size();
-            match self.start_querying_chunk(&chunk, next_index, ctx) {
+            match self.start_querying_chunk(
+                DataRange {
+                    range: chunk.block_range(),
+                    chunk,
+                    chunk_index: next_index,
+                },
+                ctx,
+            ) {
                 Ok(slot) => {
                     let paused = slot.is_paused();
                     self.buffer.push_back(slot);
@@ -308,7 +321,7 @@ impl StreamController {
                         break;
                     }
                 }
-                Err(e) => {
+                Err((_slot, e)) => {
                     tracing::debug!("Couldn't schedule request: {e:?}");
                     self.last_error = Some(e.to_string());
                     self.next_chunk = Some(chunk);
@@ -318,7 +331,7 @@ impl StreamController {
         }
     }
 
-    fn get_next_chunk(&self, chunk: &BlockRange) -> Option<BlockRange> {
+    fn get_next_chunk(&self, chunk: &DataChunk) -> Option<DataChunk> {
         let next_chunk = self.network.next_chunk(&self.request.dataset_id, chunk);
 
         if let Some(next_chunk) = &next_chunk {
@@ -326,7 +339,7 @@ impl StreamController {
                 .request
                 .query
                 .last_block()
-                .is_some_and(|last_block| last_block < *next_chunk.start())
+                .is_some_and(|last_block| last_block < next_chunk.first_block)
             {
                 tracing::debug!("The end of the requested range reached");
                 return None;
@@ -339,16 +352,16 @@ impl StreamController {
 
     fn start_querying_chunk(
         &mut self,
-        chunk: &BlockRange,
-        index: usize,
+        range: DataRange,
         ctx: &mut Context<'_>,
-    ) -> Result<Slot, SendQueryError> {
-        let range = self
+    ) -> Result<Slot, (Slot, SendQueryError)> {
+        let block_range = self
             .request
             .query
-            .intersect_with(chunk)
+            .intersect_with(&range.range)
             .expect("Chunk doesn't contain requested data");
-        let mut pending = match self.send_query(&range, index, ctx) {
+        let range = range.with_range(block_range);
+        let mut pending = match self.send_query(&range, ctx) {
             Ok(request) => PendingRequests::new(
                 request,
                 self.timeouts.current_timeout(),
@@ -362,33 +375,43 @@ impl StreamController {
                 );
                 request
             }
-            Err(e) => return Err(e),
+            Err(err) => {
+                return Err((
+                    Slot {
+                        data_range: range,
+                        state: RequestState::Done(Err(RequestError::InternalError(
+                            err.to_string(),
+                        ))),
+                    },
+                    err,
+                ))
+            }
         };
         assert!(pending.timeout.poll_unpin(ctx).is_pending());
         Ok(Slot {
-            range,
+            data_range: range,
             state: RequestState::Pending(pending),
         })
     }
 
     fn send_query(
         &mut self,
-        range: &BlockRange,
-        chunk_index: usize,
+        range: &DataRange,
         ctx: &mut Context<'_>,
     ) -> Result<WorkerRequest, SendQueryError> {
         let worker = match self
             .network
-            .find_worker(&self.request.dataset_id, *range.start())
+            .find_worker(&self.request.dataset_id, *range.range.start())
         {
             Ok(worker) => worker,
             Err(NoWorker::AllUnavailable) => return Err(SendQueryError::NoWorkers),
             Err(NoWorker::Backoff(until)) => return Err(SendQueryError::Backoff(until)),
         };
         tracing::debug!(
-            "Sending query for chunk {chunk_index} ({}-{}) to worker {}",
-            range.start(),
-            range.end(),
+            "Sending query for chunk {} ({}-{}) to worker {}",
+            range.chunk_index,
+            range.range.start(),
+            range.range.end(),
             worker,
         );
         let start_time = tokio::time::Instant::now();
@@ -396,8 +419,8 @@ impl StreamController {
             .network
             .query_worker(
                 &worker,
-                &self.request.dataset_id,
-                self.request.query.with_range(range),
+                ChunkId::new(self.request.dataset_id.clone(), range.chunk),
+                self.request.query.with_range(&range.range),
             )
             .map_err(|_| SendQueryError::TransportQueueFull)?;
         assert!(receiver.poll_unpin(ctx).is_pending());
@@ -433,6 +456,16 @@ impl RequestState {
             RequestState::Partial(_) => '+',
             RequestState::Done(Ok(_)) => '#',
             RequestState::Done(Err(_)) => '!',
+        }
+    }
+}
+
+impl DataRange {
+    fn with_range(self, range: BlockRange) -> Self {
+        Self {
+            range,
+            chunk: self.chunk,
+            chunk_index: self.chunk_index,
         }
     }
 }

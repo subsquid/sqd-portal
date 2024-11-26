@@ -3745,6 +3745,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-rational"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5372,14 +5383,15 @@ dependencies = [
 
 [[package]]
 name = "sqd-contract-client"
-version = "1.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=a29d0bd#a29d0bdc62f2024dc62487fe59e0b484c059cc25"
+version = "1.2.0"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=f45d685#f45d685c12cd7738cc2069a46eccf18ee9d23ba3"
 dependencies = [
  "async-trait",
  "clap",
  "ethers",
  "libp2p",
  "log",
+ "num-rational",
  "serde",
  "thiserror",
  "tokio 1.38.0",
@@ -5390,7 +5402,7 @@ dependencies = [
 [[package]]
 name = "sqd-messages"
 version = "2.0.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=a29d0bd#a29d0bdc62f2024dc62487fe59e0b484c059cc25"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=f45d685#f45d685c12cd7738cc2069a46eccf18ee9d23ba3"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5413,7 +5425,7 @@ dependencies = [
 [[package]]
 name = "sqd-network-transport"
 version = "2.0.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=a29d0bd#a29d0bdc62f2024dc62487fe59e0b484c059cc25"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=f45d685#f45d685c12cd7738cc2069a46eccf18ee9d23ba3"
 dependencies = [
  "anyhow",
  "async-trait",

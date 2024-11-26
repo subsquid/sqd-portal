@@ -19,6 +19,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::api_types::PortalConfigApiResponse;
 use crate::network::NoWorker;
+use crate::types::{ChunkId, ParsedQuery};
 use crate::{
     cli::Config,
     controller::task_manager::TaskManager,
@@ -79,9 +80,21 @@ async fn get_worker(
 async fn execute_query(
     Path((dataset_id, worker_id)): Path<(DatasetId, PeerId)>,
     Extension(client): Extension<Arc<NetworkClient>>,
-    query: String, // request body
+    query: ParsedQuery, // request body
 ) -> Response {
-    let Ok(fut) = client.query_worker(&worker_id, &dataset_id, query) else {
+    let Some(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
+        return RequestError::NotFound(format!(
+            "Block {} not found in dataset {}",
+            query.first_block(),
+            dataset_id
+        ))
+        .into_response();
+    };
+    let Ok(fut) = client.query_worker(
+        &worker_id,
+        ChunkId::new(dataset_id, chunk),
+        query.to_string(),
+    ) else {
         return RequestError::Busy.into_response();
     };
     let result = match fut.await {
@@ -177,7 +190,7 @@ pub async fn run_server(
     task_manager: Arc<TaskManager>,
     network_state: Arc<NetworkClient>,
     metrics_registry: Registry,
-    addr: &SocketAddr,
+    addr: SocketAddr,
     config: Arc<Config>,
 ) -> anyhow::Result<()> {
     let cors = CorsLayer::new()
@@ -278,6 +291,24 @@ where
             timeout_quantile,
             retries,
         })
+    }
+}
+
+#[async_trait]
+impl<S> FromRequest<S> for ParsedQuery
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let body: String = req.extract().await.map_err(IntoResponse::into_response)?;
+
+        let query = body.parse().map_err(|e| {
+            RequestError::BadRequest(format!("Couldn't parse query: {e}")).into_response()
+        })?;
+
+        Ok(query)
     }
 }
 
