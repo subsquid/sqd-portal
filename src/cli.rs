@@ -3,9 +3,10 @@ use clap::Parser;
 use serde::Deserialize;
 use serde_with::serde_derive::Serialize;
 use serde_with::{serde_as, DurationSeconds};
-use sqd_network_transport::{PeerId, TransportArgs};
 use std::net::SocketAddr;
 use std::time::Duration;
+
+use sqd_network_transport::TransportArgs;
 
 #[derive(Parser)]
 #[command(version)]
@@ -16,10 +17,6 @@ pub struct Cli {
     /// HTTP server listen addr
     #[arg(long, env = "HTTP_LISTEN_ADDR", default_value = "0.0.0.0:8000")]
     pub http_listen: SocketAddr,
-
-    /// Logs collector peer id
-    #[arg(long, env)]
-    pub logs_collector_id: PeerId,
 
     /// Path to config file
     #[arg(long, env, value_parser = Config::read)]
@@ -71,6 +68,10 @@ fn default_dataset_update_interval() -> Duration {
 }
 
 fn default_chain_update_interval() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn default_assignments_update_interval() -> Duration {
     Duration::from_secs(60)
 }
 
@@ -179,6 +180,13 @@ pub struct Config {
         default = "default_chain_update_interval"
     )]
     pub chain_update_interval: Duration,
+
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(
+        rename = "assignments_update_interval_sec",
+        default = "default_assignments_update_interval"
+    )]
+    pub assignments_update_interval: Duration,
 
     pub sqd_network: SqdNetworkConfig,
 }

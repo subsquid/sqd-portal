@@ -57,11 +57,10 @@ async fn main() -> anyhow::Result<()> {
     let network_client = Arc::new(
         NetworkClient::new(
             args.transport,
-            args.logs_collector_id,
             config.clone(),
             datasets.clone(),
         )
-        .await?,
+        .await?
     );
 
     let mut metrics_registry = Registry::with_labels(
@@ -84,17 +83,17 @@ async fn main() -> anyhow::Result<()> {
 
     let cancellation_token = CancellationToken::new();
     let (res, ()) = tokio::join!(
-        run_server(
+        tokio::spawn(run_server(
             task_manager,
             network_client.clone(),
             metrics_registry,
-            &args.http_listen,
+            args.http_listen,
             config,
             datasets,
-        ),
+        )),
         network_client.run(cancellation_token),
     );
-    res?;
+    res??;
 
     Ok(())
 }

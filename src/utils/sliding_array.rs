@@ -36,16 +36,16 @@ impl<T> SlidingArray<T> {
         self.first_index
     }
 
+    pub fn next_index(&self) -> usize {
+        self.first_index + self.data.len()
+    }
+
     pub fn total_size(&self) -> usize {
         self.first_index + self.data.len()
     }
 
     pub fn data(&self) -> &VecDeque<T> {
         &self.data
-    }
-
-    pub fn mut_data(&mut self) -> &mut VecDeque<T> {
-        &mut self.data
     }
 
     pub fn enumerate_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
@@ -55,8 +55,8 @@ impl<T> SlidingArray<T> {
             .map(|(i, v)| (i + self.first_index, v))
     }
 
-    pub fn front(&self) -> Option<&T> {
-        self.data.front()
+    pub fn back(&self) -> Option<&T> {
+        self.data.back()
     }
 
     pub fn get(&self, index: usize) -> Option<&T> {

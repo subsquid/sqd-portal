@@ -15,16 +15,16 @@ use itertools::Itertools;
 use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
-use sqd_messages::query_result;
+use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::api_types::AvailableDatasetApiResponse;
-use crate::datasets::Datasets;
 use crate::{
+    api_types::AvailableDatasetApiResponse,
     cli::Config,
     controller::task_manager::TaskManager,
-    network::NetworkClient,
-    types::{ClientRequest, DatasetId, RequestError},
+    datasets::Datasets,
+    network::{NetworkClient, NoWorker},
+    types::{ChunkId, ClientRequest, DatasetId, ParsedQuery, RequestError},
     utils::logging,
 };
 
@@ -52,13 +52,21 @@ async fn get_worker(
     };
 
     let worker_id = match client.find_worker(&dataset_id, start_block) {
-        Some(worker_id) => worker_id,
-        None => {
+        Ok(worker_id) => worker_id,
+        Err(NoWorker::AllUnavailable) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("No available worker for dataset {slug} block {start_block}"),
             )
-                .into_response()
+                .into_response();
+        }
+        Err(NoWorker::Backoff(retry_at)) => {
+            let seconds = retry_at.duration_since(Instant::now()).as_secs() + 1; // +1 for rounding up
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(header::RETRY_AFTER, seconds)
+                .body(Body::from("Too many requests"))
+                .unwrap();
         }
     };
 
@@ -75,9 +83,18 @@ async fn get_worker(
 async fn execute_query(
     Path((slug, worker_id)): Path<(DatasetId, PeerId)>,
     Extension(client): Extension<Arc<NetworkClient>>,
-    query: String, // request body
+    query: ParsedQuery, // request body
 ) -> Response {
-    let Ok(fut) = client.query_worker(&worker_id, &slug, query) else {
+    let Some(chunk) = client.find_chunk(&slug, query.first_block()) else {
+        return RequestError::NoData(format!(
+            "Block {} not found in dataset {}",
+            query.first_block(),
+            slug
+        ))
+        .into_response();
+    };
+    let Ok(fut) = client.query_worker(&worker_id, ChunkId::new(slug, chunk), query.to_string())
+    else {
         return RequestError::Busy.into_response();
     };
     let result = match fut.await {
@@ -85,8 +102,8 @@ async fn execute_query(
             return RequestError::InternalError("Receiving result failed".to_string())
                 .into_response()
         }
-        Ok(query_result::Result::Ok(result)) => result,
-        Ok(res) => return RequestError::try_from(res).into_response(),
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => return RequestError::from(err).into_response(),
     };
     match convert_response(&result.data) {
         Ok(data) => Response::builder()
@@ -217,7 +234,7 @@ pub async fn run_server(
     task_manager: Arc<TaskManager>,
     network_state: Arc<NetworkClient>,
     metrics_registry: Registry,
-    addr: &SocketAddr,
+    addr: SocketAddr,
     config: Arc<Config>,
     datasets: Arc<Datasets>,
 ) -> anyhow::Result<()> {
@@ -330,6 +347,24 @@ where
             timeout_quantile,
             retries,
         })
+    }
+}
+
+#[async_trait]
+impl<S> FromRequest<S> for ParsedQuery
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let body: String = req.extract().await.map_err(IntoResponse::into_response)?;
+
+        let query = body.parse().map_err(|e| {
+            RequestError::BadRequest(format!("Couldn't parse query: {e}")).into_response()
+        })?;
+
+        Ok(query)
     }
 }
 

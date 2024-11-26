@@ -1,9 +1,11 @@
+mod chunk;
 mod common;
 mod dataset;
+mod errors;
 mod request;
-mod request_error;
 
+pub use chunk::*;
 pub use common::*;
 pub use dataset::*;
+pub use errors::{QueryError, RequestError, SendQueryError};
 pub use request::*;
-pub use request_error::{RequestError, SendQueryError};

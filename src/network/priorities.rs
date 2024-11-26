@@ -1,7 +1,15 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 use tokio::time::Instant;
 
 use sqd_contract_client::PeerId;
+
+const UNAVAILABLE_PENALTY: u8 = 3;
+const BACKOFF_PENALTY: u8 = 2;
+
+pub enum NoWorker {
+    AllUnavailable,
+    Backoff(Instant),
+}
 
 #[derive(Default)]
 pub struct WorkersPool {
@@ -11,7 +19,7 @@ pub struct WorkersPool {
 struct WorkerStats {
     last_query: Instant,
     running_queries: u8,
-    no_allocation: bool,
+    paused_until: Option<Instant>,
     ok: EventCounter<3>,
     slow: EventCounter<3>,
     server_errors: Cooldown<30>,
@@ -25,7 +33,7 @@ impl Default for WorkerStats {
         Self {
             last_query: now,
             running_queries: 0,
-            no_allocation: false,
+            paused_until: None,
             ok: EventCounter::new(now),
             slow: EventCounter::new(now),
             server_errors: Default::default(),
@@ -36,11 +44,13 @@ impl Default for WorkerStats {
 
 // Less is better
 fn priority(worker: &WorkerStats, now: Instant) -> (u8, u8, Instant) {
-    let penalty = if worker.no_allocation
-        || worker.server_errors.observed(now)
-        || worker.timeouts.observed(now)
-    {
-        2
+    if let Some(paused_until) = worker.paused_until {
+        if now < paused_until {
+            return (BACKOFF_PENALTY, worker.running_queries, paused_until);
+        }
+    }
+    let penalty = if worker.server_errors.observed(now) || worker.timeouts.observed(now) {
+        UNAVAILABLE_PENALTY
     } else if worker.slow.estimate(now) > worker.ok.estimate(now) {
         1
     } else {
@@ -50,7 +60,7 @@ fn priority(worker: &WorkerStats, now: Instant) -> (u8, u8, Instant) {
 }
 
 impl WorkersPool {
-    pub fn pick(&mut self, workers: impl IntoIterator<Item = PeerId>) -> Option<PeerId> {
+    pub fn pick(&mut self, workers: impl IntoIterator<Item = PeerId>) -> Result<PeerId, NoWorker> {
         let now = Instant::now();
         let default_priority = Default::default();
         let (best, best_priority) = workers
@@ -61,9 +71,14 @@ impl WorkersPool {
                     priority(self.workers.get(&peer_id).unwrap_or(&default_priority), now),
                 )
             })
-            .min_by_key(|&(_, priority)| priority)?;
+            .min_by_key(|&(_, priority)| priority)
+            .ok_or(NoWorker::AllUnavailable)?;
         tracing::trace!("Picked worker {:?} with priority {:?}", best, best_priority);
-        (best_priority.0 < 2).then_some(best)
+        match best_priority.0 {
+            UNAVAILABLE_PENALTY => Err(NoWorker::AllUnavailable),
+            BACKOFF_PENALTY => Err(NoWorker::Backoff(best_priority.2)),
+            _ => Ok(best),
+        }
     }
 
     pub fn lease(&mut self, worker: PeerId) {
@@ -80,6 +95,7 @@ impl WorkersPool {
         });
     }
 
+    // Query error has been returned from the worker
     pub fn error(&mut self, worker: PeerId) {
         self.modify(worker, |stats| {
             stats.running_queries -= 1;
@@ -87,7 +103,8 @@ impl WorkersPool {
         });
     }
 
-    pub fn timeout(&mut self, worker: PeerId) {
+    // Query could not be processed, e.g. because the worker couldn't be reached
+    pub fn failure(&mut self, worker: PeerId) {
         self.modify(worker, |stats| {
             stats.running_queries -= 1;
             stats.timeouts.observe(Instant::now());
@@ -101,18 +118,13 @@ impl WorkersPool {
         });
     }
 
-    pub fn unavailable(&mut self, worker: PeerId) {
+    pub fn hint_backoff(&mut self, worker: PeerId, backoff: Duration) {
         self.modify(worker, |stats| {
-            stats.running_queries -= 1;
-            stats.no_allocation = true;
+            stats.paused_until = Some(Instant::now() + backoff);
         });
     }
 
-    pub fn reset_allocations(&mut self) {
-        for worker in self.workers.values_mut() {
-            worker.no_allocation = false;
-        }
-    }
+    pub fn reset_allocations(&mut self) {}
 
     fn modify(&mut self, worker: PeerId, f: impl FnOnce(&mut WorkerStats)) {
         f(self.workers.entry(worker).or_default());
@@ -137,7 +149,7 @@ impl<const S: u64> Cooldown<S> {
 
 /// A counter for the approximate number of events in the last `window` with constant memory usage.
 /// If `estimate` returned `n`, then the number of events observed in
-/// the last `2 * window` is not more than `2 * n`.
+/// the last `2 * S` seconds is not more than `2 * n`.
 struct EventCounter<const S: u64> {
     last_time: Instant,
     count: u32,
