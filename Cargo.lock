@@ -5457,7 +5457,6 @@ dependencies = [
  "lazy_static",
  "parking_lot 0.12.3",
  "prometheus-client",
- "regex",
  "reqwest 0.12.7",
  "scopeguard",
  "semver 1.0.23",

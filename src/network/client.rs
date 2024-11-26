@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, LinkedList};
 use std::iter::zip;
+use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use anyhow::anyhow;
+use anyhow::Context;
 use futures::{Stream, StreamExt};
 use itertools::Itertools;
 use parking_lot::Mutex;
-use regex::Regex;
 use sqd_contract_client::{Client as ContractClient, Network, PeerId};
 use sqd_messages::assignments::Assignment;
 use sqd_messages::{query_error, query_result, Heartbeat, Query, QueryOk, Range, RangeSet};
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use super::priorities::NoWorker;
 use super::{NetworkState, StorageClient};
 use crate::network::state::DatasetState;
+use crate::types::DataChunk;
 use crate::{
     cli::Config,
     metrics,
@@ -61,19 +62,11 @@ struct QueryTask {
 }
 
 pub fn range_from_chunk_id(dirname: &str) -> Result<Range, anyhow::Error> {
-    lazy_static::lazy_static! {
-        static ref RE: Regex = Regex::new(r"(\d{10})/(\d{10})-(\d{10})-(\w{5,8})$").unwrap();
-    }
-    let (beg, end) = RE
-        .captures(dirname)
-        .and_then(|cap| match (cap.get(2), cap.get(3)) {
-            (Some(beg), Some(end)) => Some((beg.as_str(), end.as_str())),
-            _ => None,
-        })
-        .ok_or_else(|| anyhow!("Could not parse chunk dirname '{dirname}'"))?;
+    let chunk =
+        DataChunk::from_str(dirname).with_context(|| format!("Invalid chunk: {dirname}"))?;
     Ok(Range {
-        begin: beg.parse()?,
-        end: end.parse()?,
+        begin: chunk.first_block,
+        end: chunk.last_block,
     })
 }
 
