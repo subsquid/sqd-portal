@@ -1,14 +1,22 @@
+use std::collections::{BTreeMap, LinkedList};
+use std::iter::zip;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use anyhow::anyhow;
 use futures::{Stream, StreamExt};
+use itertools::Itertools;
 use parking_lot::Mutex;
-use sqd_contract_client::{Client as ContractClient, PeerId};
-use sqd_messages::{query_error, query_result, Heartbeat, Query, QueryOk};
+use regex::Regex;
+use sqd_contract_client::{Client as ContractClient, Network, PeerId};
+use sqd_messages::assignments::Assignment;
+use sqd_messages::{query_error, query_result, Heartbeat, Query, QueryOk, Range, RangeSet};
 use sqd_network_transport::{
     get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransportHandle,
     P2PTransportBuilder, QueryFailure, QueueFull, TransportArgs,
 };
+use tokio::time::MissedTickBehavior;
 use tokio::{sync::oneshot, time::Instant};
+use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
 
 use super::priorities::NoWorker;
@@ -25,6 +33,8 @@ lazy_static::lazy_static! {
     static ref SUPPORTED_VERSIONS: semver::VersionReq = "~2.0.0".parse().expect("Invalid version requirement");
 }
 const MAX_CONCURRENT_QUERIES: usize = 1000;
+const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 5;
+const MAX_WAITING_PINGS: usize = 2000;
 
 pub type QueryResult = Result<QueryOk, QueryError>;
 
@@ -38,7 +48,11 @@ pub struct NetworkClient {
     dataset_storage: StorageClient,
     dataset_update_interval: Duration,
     chain_update_interval: Duration,
+    assignment_update_interval: Duration,
     local_peer_id: PeerId,
+    network_state_url: String,
+    assignments: Mutex<BTreeMap<String, HashMap<String, Vec<(DatasetId, Range)>>>>,
+    heartbeat_buffer: Mutex<LinkedList<(PeerId, Heartbeat)>>,
 }
 
 struct QueryTask {
@@ -46,22 +60,48 @@ struct QueryTask {
     worker_id: PeerId,
 }
 
+pub fn range_from_chunk_id(dirname: &str) -> Result<Range, anyhow::Error> {
+    lazy_static::lazy_static! {
+        static ref RE: Regex = Regex::new(r"(\d{10})/(\d{10})-(\d{10})-(\w{5,8})$").unwrap();
+    }
+    let (beg, end) = RE
+        .captures(dirname)
+        .and_then(|cap| match (cap.get(2), cap.get(3)) {
+            (Some(beg), Some(end)) => Some((beg.as_str(), end.as_str())),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("Could not parse chunk dirname '{dirname}'"))?;
+    Ok(Range {
+        begin: beg.parse()?,
+        end: end.parse()?,
+    })
+}
+
 impl NetworkClient {
     pub async fn new(args: TransportArgs, config: Arc<Config>) -> anyhow::Result<NetworkClient> {
-        let dataset_storage = StorageClient::new(args.rpc.network)?;
+        let network = args.rpc.network;
+        let dataset_storage = StorageClient::new(network)?;
         let agent_into = get_agent_info!();
         let transport_builder = P2PTransportBuilder::from_cli(args, agent_into).await?;
         let contract_client = transport_builder.contract_client();
-        let local_peer_id = transport_builder.local_peer_id().clone();
+        let local_peer_id = transport_builder.local_peer_id();
 
         let mut gateway_config = GatewayConfig::new();
         gateway_config.query_config.request_timeout = config.transport_timeout;
         let (incoming_events, transport_handle) =
             transport_builder.build_gateway(gateway_config)?;
 
+        let network_state_filename = match network {
+            Network::Tethys => "network-state-tethys.json",
+            Network::Mainnet => "network-state-mainnet.json",
+        };
+        let network_state_url =
+            format!("https://metadata.sqd-datasets.io/{network_state_filename}");
+
         Ok(NetworkClient {
             dataset_update_interval: config.dataset_update_interval,
             chain_update_interval: config.chain_update_interval,
+            assignment_update_interval: config.assignments_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
             network_state: Mutex::new(NetworkState::new(config)),
@@ -69,15 +109,35 @@ impl NetworkClient {
             tasks: Mutex::new(HashMap::new()),
             dataset_storage,
             local_peer_id,
+            network_state_url,
+            assignments: Mutex::new(Default::default()),
+            heartbeat_buffer: Mutex::new(Default::default()),
         })
     }
 
-    pub async fn run(&self, cancellation_token: CancellationToken) {
-        // TODO: run coroutines in parallel
-        tokio::join!(
-            self.run_event_stream(cancellation_token.clone()),
-            self.run_storage_updates(cancellation_token.clone()),
-            self.run_chain_updates(cancellation_token),
+    pub async fn run(self: Arc<Self>, cancellation_token: CancellationToken) {
+        let me = Arc::clone(&self);
+        let token = cancellation_token.clone();
+        let event_stream: tokio::task::JoinHandle<()> =
+            tokio::spawn(async move { me.run_event_stream(token).await });
+        let me = Arc::clone(&self);
+        let token = cancellation_token.clone();
+        let storage_updates: tokio::task::JoinHandle<()> =
+            tokio::spawn(async move { me.run_storage_updates(token).await });
+        let me = Arc::clone(&self);
+        let token = cancellation_token.clone();
+        let chain_updates: tokio::task::JoinHandle<()> =
+            tokio::spawn(async move { me.run_chain_updates(token).await });
+        let me = Arc::clone(&self);
+        let token = cancellation_token.clone();
+        let assignments_loop: tokio::task::JoinHandle<()> =
+            tokio::spawn(async move { me.run_assignments_loop(token).await });
+
+        _ = tokio::join!(
+            event_stream,
+            storage_updates,
+            chain_updates,
+            assignments_loop
         );
     }
 
@@ -126,6 +186,91 @@ impl NetworkClient {
                 self.network_state.lock().reset_allocations();
             }
         }
+    }
+
+    async fn run_assignments_loop(&self, cancellation_token: CancellationToken) {
+        let mut timer =
+            tokio::time::interval_at(tokio::time::Instant::now(), self.assignment_update_interval);
+        timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        IntervalStream::new(timer)
+            .take_until(cancellation_token.cancelled_owned())
+            .for_each(|_| async move {
+                tracing::debug!("Checking for new assignment");
+                let latest_assignment = self
+                    .assignments
+                    .lock()
+                    .last_key_value()
+                    .map(|(assignment_id, _)| assignment_id.clone());
+                let assignment = match Assignment::try_download(
+                    self.network_state_url.clone(),
+                    latest_assignment,
+                )
+                .await
+                {
+                    Ok(Some(assignment)) => assignment,
+                    Ok(None) => {
+                        tracing::info!("Assignment has not been changed");
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::error!("Unable to get assignment: {err:?}");
+                        return;
+                    }
+                };
+
+                let start_pase = tokio::time::Instant::now();
+                let assignment_id = assignment.id.clone();
+                tracing::debug!("Got assignment {:?}", assignment_id);
+                let peers = assignment.get_all_peer_ids();
+                let mut condensed_assignment: HashMap<String, Vec<(DatasetId, Range)>> =
+                    Default::default();
+                for peer_id in peers {
+                    let mut peer_chunks: Vec<(DatasetId, Range)> = Default::default();
+                    let chunks = assignment.dataset_chunks_for_peer_id(&peer_id).unwrap();
+                    for dataset in chunks {
+                        for chunk in dataset.chunks {
+                            let range = range_from_chunk_id(&chunk.id).unwrap();
+                            let dataset_id = DatasetId::from_url(dataset.id.clone());
+                            peer_chunks.push((dataset_id, range));
+                        }
+                    }
+
+                    condensed_assignment.insert(peer_id, peer_chunks);
+                }
+                {
+                    let mut local_assignments = self.assignments.lock();
+                    local_assignments.insert(assignment.id, condensed_assignment);
+                    if local_assignments.len() > MAX_ASSIGNMENT_BUFFER_SIZE {
+                        local_assignments.pop_first();
+                    }
+                }
+                tracing::debug!(
+                    "Assignment parsed in {}ms",
+                    start_pase.elapsed().as_millis()
+                );
+
+                let heartbeats;
+                {
+                    let mut heartbeat_buffer = self.heartbeat_buffer.lock();
+                    heartbeats = heartbeat_buffer
+                        .iter()
+                        .filter(|(_, heartbeat)| heartbeat.assignment_id <= assignment_id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    *heartbeat_buffer = heartbeat_buffer
+                        .iter()
+                        .filter(|(_, heartbeat)| heartbeat.assignment_id > assignment_id)
+                        .cloned()
+                        .collect();
+                }
+                for (peer_id, heartbeat) in heartbeats {
+                    tracing::debug!("Replaying heartbeat from {peer_id}");
+                    self.handle_heartbeat(peer_id, heartbeat);
+                }
+                tracing::info!("New assignment saved");
+            })
+            .await;
+        tracing::info!("Assignment processing task finished");
     }
 
     async fn run_event_stream(&self, cancellation_token: CancellationToken) {
@@ -232,17 +377,76 @@ impl NetworkClient {
             metrics::IGNORED_PINGS.inc();
             return;
         }
-        tracing::trace!("Ping from {peer_id}");
         metrics::VALID_PINGS.inc();
-        todo!();
-        // let worker_state = heartbeat
-        //     .stored_ranges
-        //     .into_iter()
-        //     .map(|r| (DatasetId::from_url(r.url), r.ranges.into()))
-        //     .collect();
-        // self.network_state
-        //     .lock()
-        //     .update_dataset_states(peer_id, worker_state);
+        tracing::debug!("Ping from {peer_id} {:?}", heartbeat.assignment_id);
+        let local_assignments = self.assignments.lock();
+        let Some(assignment) = local_assignments.get(&heartbeat.assignment_id) else {
+            tracing::debug!("Assignment {:?} not found", heartbeat.assignment_id);
+            let latest_assignment_id = local_assignments
+                .last_key_value()
+                .map(|(assignment_id, _)| assignment_id.clone())
+                .unwrap_or_default();
+            if heartbeat.assignment_id > latest_assignment_id {
+                tracing::debug!("Putting heartbeat into waitlist for {peer_id}");
+                let Some(mut heartbeat_buffer) = self.heartbeat_buffer.try_lock() else {
+                    tracing::debug!("Failed to get lock");
+                    return;
+                };
+                heartbeat_buffer.push_back((peer_id, heartbeat));
+                if heartbeat_buffer.len() > MAX_WAITING_PINGS {
+                    heartbeat_buffer.pop_front();
+                }
+            } else {
+                tracing::debug!("Dropping heartbeat from {peer_id}");
+            }
+            return;
+        };
+        let Some(chunk_list) = assignment.get(&peer_id.to_string()) else {
+            tracing::error!(
+                "PeerID {:?} not found in Assignment {:?}",
+                peer_id,
+                heartbeat.assignment_id
+            );
+            return;
+        };
+        let Some(missing_chunks) = heartbeat.missing_chunks.as_ref() else {
+            tracing::error!(
+                "PeerID {:?}: missing_chunks are missing in heartbeat",
+                peer_id
+            );
+            return;
+        };
+        let unavailability_map = missing_chunks.to_bytes();
+        if unavailability_map.len() != chunk_list.len() {
+            tracing::error!(
+                "Heartbeat of {:?} and assignment {:?} are inconsistent",
+                peer_id,
+                heartbeat.assignment_id
+            );
+            return;
+        }
+        let worker_state = zip(unavailability_map, chunk_list)
+            .filter_map(|(is_missing, val)| {
+                if is_missing == 0 {
+                    Some(val.clone())
+                } else {
+                    None
+                }
+            })
+            .group_by(|(dataset, _)| dataset.clone())
+            .into_iter()
+            .map(|(group, vals)| {
+                (
+                    group,
+                    RangeSet {
+                        ranges: vals.map(|(_, range)| range).sorted().collect(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        self.network_state
+            .lock()
+            .update_dataset_states(peer_id, worker_state);
     }
 
     fn handle_query_result(

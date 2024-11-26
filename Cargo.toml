@@ -17,11 +17,12 @@ lazy_static = "1.4.0"
 parking_lot = "0.12"
 prometheus-client = "0.22"
 reqwest = { version = "0.12.7", features = ["stream", "gzip", "json"] }
+regex = "1.10.2"
 scopeguard = "1.2"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
-serde_with = "3.9"
+serde_with = "3.11"
 serde_yaml = "0.9"
 static_assertions = "1.1.0"
 thiserror = "1.0"
@@ -34,6 +35,6 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 tower-http = { version = "0.6.1", features = ["cors"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
-sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "2941663", version = "1.0.7" }
-sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "2941663", version = "2.0.0", features = ["semver"] }
-sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "2941663", version = "2.0.0", features = ["gateway", "metrics"] }
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "a29d0bd", version = "1.0.7" }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "a29d0bd", version = "2.0.0", features = ["semver", "bitstring", "assignment_reader"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "a29d0bd", version = "2.0.0", features = ["gateway", "metrics"] }
