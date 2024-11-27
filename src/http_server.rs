@@ -18,8 +18,8 @@ use sqd_contract_client::PeerId;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::{
-    api_types::AvailableDatasetApiResponse,
     cli::Config,
     controller::task_manager::TaskManager,
     datasets::Datasets,

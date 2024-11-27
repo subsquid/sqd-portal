@@ -10,7 +10,6 @@ use network::NetworkClient;
 use prometheus_client::registry::Registry;
 use tokio_util::sync::CancellationToken;
 
-mod api_types;
 mod cli;
 mod controller;
 mod datasets;
