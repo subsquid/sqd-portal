@@ -104,7 +104,7 @@ impl NetworkState {
                 uses_default_strategy: Default::default(),
                 epoch_length: Default::default(),
                 active_workers_length: Default::default(),
-                current_epoch_started: SystemTime::from(SystemTime::UNIX_EPOCH),
+                current_epoch_started: SystemTime::UNIX_EPOCH,
                 compute_units_per_epoch: Default::default(),
             },
         }
@@ -191,6 +191,7 @@ impl NetworkState {
         self.dataset_states.get(&dataset_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn set_contracts_state(
         &mut self,
         current_epoch: u32,

@@ -116,11 +116,10 @@ pub struct DatasetConfig {
 
 impl DatasetConfig {
     pub fn network_dataset_id(&self) -> Option<DatasetId> {
-        if let Some(source) = self.data_sources.iter().find(|s| s.kind == "sqd_network") {
-            Some(DatasetId::from_url(&source.id))
-        } else {
-            None
-        }
+        self.data_sources
+            .iter()
+            .find(|s| s.kind == "sqd_network")
+            .map(|source| DatasetId::from_url(&source.id))
     }
 }
 

@@ -24,7 +24,7 @@ impl Datasets {
                 return aliases.contains(&slug.to_string());
             }
 
-            return false;
+            false
         })
     }
 

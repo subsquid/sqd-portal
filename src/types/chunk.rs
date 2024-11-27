@@ -59,7 +59,7 @@ impl FromStr for DataChunk {
         let last_block = s[SEP1_POS + 1..SEP2_POS].parse()?;
         let hash_slice = s[SEP2_POS + 1..].as_bytes();
         let mut last_hash = [0; HASH_MAX_LEN];
-        last_hash[..hash_slice.len()].copy_from_slice(&hash_slice);
+        last_hash[..hash_slice.len()].copy_from_slice(hash_slice);
 
         Ok(Self {
             first_block,

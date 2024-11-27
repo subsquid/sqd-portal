@@ -338,7 +338,7 @@ impl NetworkClient {
                         });
                 }
                 GatewayEvent::QueryDropped { query_id } => {
-                    if let Some(_) = self.tasks.lock().remove(&query_id) {
+                    if self.tasks.lock().remove(&query_id).is_some() {
                         metrics::QUERIES_RUNNING.dec();
                         // drop result_tx
                     } else {
@@ -402,9 +402,8 @@ impl NetworkClient {
                     signature: Default::default(),
                 },
             )
-            .map_err(|e| {
+            .inspect_err(|_| {
                 self.tasks.lock().remove(&query_id);
-                e
             })?;
 
         metrics::QUERIES_RUNNING.inc();
@@ -667,6 +666,7 @@ impl NetworkClient {
     }
 }
 
+#[allow(clippy::type_complexity)]
 #[tracing::instrument(skip_all)]
 fn parse_assignment(
     assignment: Assignment,

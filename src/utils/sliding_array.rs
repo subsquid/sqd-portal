@@ -32,10 +32,6 @@ impl<T> SlidingArray<T> {
         Some(value)
     }
 
-    pub fn first_index(&self) -> usize {
-        self.first_index
-    }
-
     pub fn next_index(&self) -> usize {
         self.first_index + self.data.len()
     }
@@ -48,11 +44,8 @@ impl<T> SlidingArray<T> {
         &self.data
     }
 
-    pub fn enumerate_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
-        self.data
-            .iter_mut()
-            .enumerate()
-            .map(|(i, v)| (i + self.first_index, v))
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.data.iter_mut()
     }
 
     pub fn back(&self) -> Option<&T> {

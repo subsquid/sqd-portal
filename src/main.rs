@@ -54,14 +54,8 @@ async fn main() -> anyhow::Result<()> {
     let datasets = Arc::new(Datasets::new(datasets_load(&args.config).await));
 
     let config = Arc::new(args.config);
-    let network_client = Arc::new(
-        NetworkClient::new(
-            args.transport,
-            config.clone(),
-            datasets.clone(),
-        )
-        .await?
-    );
+    let network_client =
+        Arc::new(NetworkClient::new(args.transport, config.clone(), datasets.clone()).await?);
 
     let mut metrics_registry = Registry::with_labels(
         vec![(

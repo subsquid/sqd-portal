@@ -54,7 +54,7 @@ impl StorageClient {
             return None;
         }
         let first_suspect = chunks.partition_point(|chunk| (chunk.last_block) < block);
-        (first_suspect < chunks.len()).then(|| chunks[first_suspect].clone())
+        (first_suspect < chunks.len()).then(|| chunks[first_suspect])
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {

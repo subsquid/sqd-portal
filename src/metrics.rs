@@ -18,8 +18,7 @@ type Labels = Vec<(String, String)>;
 
 fn buckets(start: f64, count: usize) -> impl Iterator<Item = f64> {
     iter::successors(Some(start), |x| Some(x * 10.))
-        .map(|x| [x, x * 1.5, x * 2.5, x * 5.0])
-        .flatten()
+        .flat_map(|x| [x, x * 1.5, x * 2.5, x * 5.0])
         .take(count)
 }
 

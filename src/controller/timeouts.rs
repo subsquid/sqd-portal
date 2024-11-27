@@ -27,13 +27,6 @@ impl TimeoutManager {
         durations.push_back(duration);
     }
 
-    pub async fn sleep(&self) {
-        let start = tokio::time::Instant::now();
-        let timeout = self.current_timeout();
-        tracing::trace!("Current timeout: {:?}", timeout);
-        tokio::time::sleep_until(start + timeout).await;
-    }
-
     pub fn current_timeout(&self) -> Duration {
         let mut durations = self.durations.lock().iter().copied().collect::<Vec<_>>();
         if durations.len() < WINDOW_SIZE {

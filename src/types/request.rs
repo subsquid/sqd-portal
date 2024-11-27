@@ -63,6 +63,7 @@ impl ParsedQuery {
         (begin <= end).then_some(begin..=end)
     }
 
+    #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
         serde_json::to_string(&self.json).expect("Couldn't serialize query")
     }

@@ -22,10 +22,7 @@ async fn fetch_remote_file(url: &str) -> anyhow::Result<DatasetList> {
     let response = reqwest::get(url).await?;
     let text = response.text().await?;
 
-    let parser =
-        serde_yaml::from_str(&text).with_context(|| format!("failed to parse dataset {}", url));
-
-    Ok(parser?)
+    serde_yaml::from_str(&text).with_context(|| format!("failed to parse dataset {}", url))
 }
 
 async fn load_local_file(url: &str) -> anyhow::Result<DatasetList> {
@@ -37,10 +34,8 @@ async fn load_local_file(url: &str) -> anyhow::Result<DatasetList> {
         .with_context(|| format!("failed to open file {}", full_path))?;
     let reader = BufReader::new(file);
 
-    let parser = serde_yaml::from_reader(reader)
-        .with_context(|| format!("failed to parse dataset {}", full_path));
-
-    Ok(parser?)
+    serde_yaml::from_reader(reader)
+        .with_context(|| format!("failed to parse dataset {}", full_path))
 }
 
 pub async fn datasets_load(config: &Config) -> Vec<DatasetConfig> {

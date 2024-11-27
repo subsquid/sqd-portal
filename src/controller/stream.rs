@@ -1,3 +1,5 @@
+#![allow(unstable_name_collisions)]
+
 use std::{
     future::Future,
     pin::Pin,
@@ -111,7 +113,7 @@ impl StreamController {
         // extract this field to be able to pass both its values and `&mut self` to the method
         let mut buffer = std::mem::take(&mut self.buffer);
         let mut updated = false;
-        for (_, slot) in buffer.enumerate_mut() {
+        for slot in buffer.iter_mut() {
             updated |= self.poll_slot(slot, ctx);
         }
         self.buffer = buffer;
@@ -183,6 +185,7 @@ impl StreamController {
             return true;
         }
 
+        #[allow(clippy::collapsible_else_if)]
         if pending.timeout.as_mut().poll(ctx).is_ready() {
             if pending.tries_left > 0 {
                 retry = true;
