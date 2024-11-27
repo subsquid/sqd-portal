@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{Stream, StreamExt};
 use itertools::Itertools;
 use num_rational::Ratio;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tokio::time::MissedTickBehavior;
 use tokio::{sync::oneshot, time::Instant};
@@ -80,9 +80,11 @@ pub struct NetworkClient {
     assignment_update_interval: Duration,
     local_peer_id: PeerId,
     network_state_url: String,
-    assignments: Mutex<BTreeMap<String, HashMap<PeerId, Vec<ChunkId>>>>,
+    assignments: RwLock<BTreeMap<String, Arc<AssignedChunks>>>,
     heartbeat_buffer: Mutex<VecDeque<(PeerId, Heartbeat)>>,
 }
+
+type AssignedChunks = HashMap<PeerId, Vec<ChunkId>>;
 
 struct QueryTask {
     result_tx: oneshot::Sender<QueryResult>,
@@ -125,7 +127,7 @@ impl NetworkClient {
             dataset_storage,
             local_peer_id,
             network_state_url,
-            assignments: Mutex::new(Default::default()),
+            assignments: Default::default(),
             heartbeat_buffer: Mutex::new(Default::default()),
         })
     }
@@ -261,7 +263,7 @@ impl NetworkClient {
                 tracing::debug!("Checking for new assignment");
                 let latest_assignment = self
                     .assignments
-                    .lock()
+                    .read()
                     .last_key_value()
                     .map(|(assignment_id, _)| assignment_id.clone());
                 let assignment = match Assignment::try_download(
@@ -288,8 +290,8 @@ impl NetworkClient {
                 tracing::debug!("Assignment parsed");
 
                 {
-                    let mut local_assignments = self.assignments.lock();
-                    local_assignments.insert(assignment_id.clone(), worker_chunks);
+                    let mut local_assignments = self.assignments.write();
+                    local_assignments.insert(assignment_id.clone(), Arc::new(worker_chunks));
                     if local_assignments.len() > MAX_ASSIGNMENT_BUFFER_SIZE {
                         local_assignments.pop_first();
                     }
@@ -419,15 +421,15 @@ impl NetworkClient {
             return;
         }
         metrics::VALID_PINGS.inc();
-        tracing::debug!(
+        tracing::trace!(
             "Heartbeat from {peer_id}, assignment: {:?}",
             heartbeat.assignment_id
         );
 
-        let local_assignments = self.assignments.lock();
-        let Some(assignment) = local_assignments.get(&heartbeat.assignment_id) else {
+        let assignments = self.assignments.read();
+        let Some(assignment) = assignments.get(&heartbeat.assignment_id).cloned() else {
             tracing::trace!("Assignment {:?} not found", heartbeat.assignment_id);
-            let latest_assignment_id = local_assignments
+            let latest_assignment_id = assignments
                 .last_key_value()
                 .map(|(assignment_id, _)| assignment_id.clone())
                 .unwrap_or_default();
@@ -446,52 +448,17 @@ impl NetworkClient {
             }
             return;
         };
-        let Some(chunk_list) = assignment.get(&peer_id) else {
-            tracing::error!(
-                "PeerID {:?} not found in Assignment {:?}",
-                peer_id,
-                heartbeat.assignment_id
-            );
-            return;
+        drop(assignments);
+
+        let worker_state = match parse_heartbeat(peer_id, heartbeat, assignment) {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!("Couldn't parse heartbeat from {peer_id}: {e}");
+                return;
+            }
         };
-        let Some(missing_chunks) = heartbeat.missing_chunks.as_ref() else {
-            tracing::error!(
-                "PeerID {:?}: missing_chunks are missing in heartbeat",
-                peer_id
-            );
-            return;
-        };
-        let unavailability_map = missing_chunks.to_bytes();
-        if unavailability_map.len() != chunk_list.len() {
-            tracing::error!(
-                "Heartbeat of {:?} and assignment {:?} are inconsistent",
-                peer_id,
-                heartbeat.assignment_id
-            );
-            return;
-        }
-        let worker_state = zip(unavailability_map, chunk_list)
-            .filter_map(|(is_missing, val)| {
-                if is_missing == 0 {
-                    Some(val.clone())
-                } else {
-                    None
-                }
-            })
-            .group_by(|chunk_id| chunk_id.dataset.clone())
-            .into_iter()
-            .map(|(group, vals)| {
-                (
-                    (*group).clone(),
-                    RangeSet {
-                        ranges: vals
-                            .map(|chunk_id| chunk_id.chunk.range_msg())
-                            .sorted()
-                            .collect(),
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
+
+        // TODO: consider uniting NetworkState with StorageClient
         self.network_state
             .lock()
             .update_dataset_states(peer_id, worker_state);
@@ -666,21 +633,17 @@ impl NetworkClient {
     }
 }
 
-#[allow(clippy::type_complexity)]
 #[tracing::instrument(skip_all)]
 fn parse_assignment(
     assignment: Assignment,
-) -> anyhow::Result<(
-    HashMap<PeerId, Vec<ChunkId>>,
-    HashMap<DatasetId, Vec<DataChunk>>,
-)> {
+) -> anyhow::Result<(AssignedChunks, HashMap<DatasetId, Vec<DataChunk>>)> {
     let peers = assignment.get_all_peer_ids();
     let mut worker_chunks = HashMap::new();
     for peer_id in peers {
         let mut peer_chunks: Vec<ChunkId> = Default::default();
         let chunks = assignment.dataset_chunks_for_peer_id(&peer_id).unwrap();
         for dataset in chunks {
-            let dataset_id = Arc::new(DatasetId::from_url(&dataset.id));
+            let dataset_id = DatasetId::from_url(&dataset.id);
             for chunk in dataset.chunks {
                 let chunk = chunk.id.parse().unwrap();
                 peer_chunks.push(ChunkId::new(dataset_id.clone(), chunk));
@@ -709,6 +672,58 @@ fn parse_assignment(
         .collect();
 
     Ok((worker_chunks, datasets))
+}
+
+fn parse_heartbeat(
+    peer_id: PeerId,
+    heartbeat: Heartbeat,
+    assignment: Arc<AssignedChunks>,
+) -> anyhow::Result<HashMap<DatasetId, RangeSet>> {
+    let Some(chunk_list) = assignment.get(&peer_id) else {
+        anyhow::bail!(
+            "PeerID {:?} not found in Assignment {:?}",
+            peer_id,
+            heartbeat.assignment_id
+        );
+    };
+    let Some(missing_chunks) = heartbeat.missing_chunks.as_ref() else {
+        anyhow::bail!(
+            "PeerID {:?}: missing_chunks are missing in heartbeat",
+            peer_id
+        );
+    };
+
+    let unavailability_map = missing_chunks.to_bytes();
+    anyhow::ensure!(
+        unavailability_map.len() == chunk_list.len(),
+        "Heartbeat of {:?} and assignment {:?} are inconsistent",
+        peer_id,
+        heartbeat.assignment_id
+    );
+
+    let worker_state = zip(unavailability_map, chunk_list)
+        .filter_map(|(is_missing, val)| {
+            if is_missing == 0 {
+                Some(val.clone())
+            } else {
+                None
+            }
+        })
+        .group_by(|chunk_id| chunk_id.dataset.clone())
+        .into_iter()
+        .map(|(dataset_id, vals)| {
+            (
+                dataset_id.clone(),
+                RangeSet {
+                    ranges: vals
+                        .map(|chunk_id| chunk_id.chunk.range_msg())
+                        .sorted()
+                        .collect(),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    Ok(worker_state)
 }
 
 #[inline(always)]
