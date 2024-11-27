@@ -24,7 +24,7 @@ use sqd_network_transport::{
 
 use super::priorities::NoWorker;
 use super::{NetworkState, StorageClient};
-use crate::datasets::Datasets;
+use crate::datasets::DatasetsMapping;
 use crate::network::state::{DatasetState, Status};
 use crate::types::{ChunkId, DataChunk};
 use crate::{
@@ -93,10 +93,10 @@ impl NetworkClient {
     pub async fn new(
         args: TransportArgs,
         config: Arc<Config>,
-        datasets: Arc<Datasets>,
+        datasets: Arc<DatasetsMapping>,
     ) -> anyhow::Result<NetworkClient> {
         let network = args.rpc.network;
-        let dataset_storage = StorageClient::new()?;
+        let dataset_storage = StorageClient::new(datasets.clone())?;
         let agent_into = get_agent_info!();
         let transport_builder = P2PTransportBuilder::from_cli(args, agent_into).await?;
         let contract_client = transport_builder.contract_client();
@@ -393,7 +393,7 @@ impl NetworkClient {
             .send_query(
                 *worker,
                 Query {
-                    dataset: chunk_id.dataset.to_url().unwrap(), // TODO: store unencoded ids
+                    dataset: chunk_id.dataset.to_url().to_owned(),
                     query_id: query_id.clone(),
                     query,
                     block_range: None,

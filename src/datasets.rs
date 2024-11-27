@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::BufReader;
 
-pub struct Datasets {
+pub struct DatasetsMapping {
     available: Vec<DatasetConfig>,
     network_ids: BTreeMap<String, DatasetId>,
     default_names: BTreeMap<DatasetId, String>,
@@ -36,7 +36,7 @@ pub enum DataSourceKind {
     SqdNetwork,
 }
 
-impl Datasets {
+impl DatasetsMapping {
     pub async fn load(config: &Config) -> anyhow::Result<Self> {
         let file = load_networks(config).await?;
         let result = Self::parse(file)?;

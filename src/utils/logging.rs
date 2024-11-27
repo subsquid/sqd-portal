@@ -69,7 +69,7 @@ impl StreamStats {
             error = error.unwrap_or_else(|| "-".to_string()),
             "Stream finished"
         );
-        metrics::report_stream_completed(self, request.dataset_id.to_string());
+        metrics::report_stream_completed(self, &request.dataset_id, Some(&request.dataset_name));
     }
 }
 

@@ -10,7 +10,7 @@ use sqd_messages::RangeSet;
 use sqd_network_transport::PeerId;
 
 use crate::cli::Config;
-use crate::datasets::Datasets;
+use crate::datasets::DatasetsMapping;
 use crate::metrics;
 use crate::types::DatasetId;
 
@@ -68,7 +68,7 @@ pub enum Status {
 
 pub struct NetworkState {
     config: Arc<Config>,
-    datasets: Arc<Datasets>,
+    datasets: Arc<DatasetsMapping>,
     dataset_states: HashMap<DatasetId, DatasetState>,
     last_pings: HashMap<PeerId, Instant>,
     pool: WorkersPool,
@@ -89,7 +89,7 @@ pub struct ContractsState {
 }
 
 impl NetworkState {
-    pub fn new(config: Arc<Config>, datasets: Arc<Datasets>) -> Self {
+    pub fn new(config: Arc<Config>, datasets: Arc<DatasetsMapping>) -> Self {
         Self {
             config: config.clone(),
             datasets: datasets.clone(),
@@ -141,7 +141,13 @@ impl NetworkState {
                 .unwrap_or_else(RangeSet::empty);
             let entry = self.dataset_states.entry(dataset_id.clone()).or_default();
             entry.update(worker_id, dataset_state);
-            metrics::report_dataset_updated(dataset_id, entry.highest_seen_block, entry.first_gap);
+            let dataset_name = self.datasets.dataset_default_name(dataset_id);
+            metrics::report_dataset_updated(
+                dataset_id,
+                dataset_name,
+                entry.highest_seen_block,
+                entry.first_gap,
+            );
         }
     }
 

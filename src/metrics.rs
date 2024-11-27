@@ -78,37 +78,58 @@ pub fn report_http_response(endpoint: String, status: StatusCode, seconds_to_fir
         .observe(seconds_to_first_byte);
 }
 
-pub fn report_stream_completed(stats: &StreamStats, dataset_id: String) {
-    let label = vec![("dataset".to_owned(), dataset_id)];
+pub fn report_stream_completed(
+    stats: &StreamStats,
+    dataset_id: &DatasetId,
+    dataset_name: Option<&str>,
+) {
+    let mut labels = vec![("dataset_id".to_owned(), dataset_id.to_url().to_owned())];
+    if let Some(name) = dataset_name {
+        labels.push(("dataset_name".to_owned(), name.to_owned()));
+    }
     let duration = stats.start_time.elapsed().as_secs_f64();
     let bytes = stats.response_bytes;
     let blocks = stats.response_blocks;
     let chunks = stats.chunks_downloaded;
-    STREAM_DURATIONS.get_or_create(&label).observe(duration);
-    STREAM_BYTES.get_or_create(&label).observe(bytes as f64);
-    STREAM_BLOCKS.get_or_create(&label).observe(blocks as f64);
-    STREAM_CHUNKS.get_or_create(&label).observe(chunks as f64);
+    STREAM_DURATIONS.get_or_create(&labels).observe(duration);
+    STREAM_BYTES.get_or_create(&labels).observe(bytes as f64);
+    STREAM_BLOCKS.get_or_create(&labels).observe(blocks as f64);
+    STREAM_CHUNKS.get_or_create(&labels).observe(chunks as f64);
     STREAM_BYTES_PER_SECOND.observe(bytes as f64 / duration);
     STREAM_BLOCKS_PER_SECOND
-        .get_or_create(&label)
+        .get_or_create(&labels)
         .observe(blocks as f64 / duration);
 }
 
-pub fn report_dataset_updated(dataset_id: &DatasetId, highest_block: u64, first_gap: u64) {
+pub fn report_dataset_updated(
+    dataset_id: &DatasetId,
+    dataset_name: Option<&str>,
+    highest_block: u64,
+    first_gap: u64,
+) {
+    let mut labels = vec![("dataset_id".to_owned(), dataset_id.to_url().to_owned())];
+    if let Some(name) = dataset_name {
+        labels.push(("dataset_name".to_owned(), name.to_owned()));
+    }
     HIGHEST_BLOCK
-        .get_or_create(&vec![("dataset".to_owned(), dataset_id.0.clone())])
+        .get_or_create(&labels)
         .set(highest_block as i64);
-    FIRST_GAP
-        .get_or_create(&vec![("dataset".to_owned(), dataset_id.0.clone())])
-        .set(first_gap as i64);
+    FIRST_GAP.get_or_create(&labels).set(first_gap as i64);
 }
 
-pub fn report_chunk_list_updated(dataset_id: &DatasetId, total_chunks: usize, last_block: u64) {
-    KNOWN_CHUNKS
-        .get_or_create(&vec![("dataset".to_owned(), dataset_id.0.clone())])
-        .set(total_chunks as i64);
+pub fn report_chunk_list_updated(
+    dataset_id: &DatasetId,
+    dataset_name: Option<&str>,
+    total_chunks: usize,
+    last_block: u64,
+) {
+    let mut labels = vec![("dataset_id".to_owned(), dataset_id.to_url().to_owned())];
+    if let Some(name) = dataset_name {
+        labels.push(("dataset_name".to_owned(), name.to_owned()));
+    }
+    KNOWN_CHUNKS.get_or_create(&labels).set(total_chunks as i64);
     LAST_STORAGE_BLOCK
-        .get_or_create(&vec![("dataset".to_owned(), dataset_id.0.clone())])
+        .get_or_create(&labels)
         .set(last_block as i64);
 }
 

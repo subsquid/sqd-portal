@@ -22,7 +22,7 @@ use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::{
     cli::Config,
     controller::task_manager::TaskManager,
-    datasets::Datasets,
+    datasets::DatasetsMapping,
     network::{NetworkClient, NoWorker},
     types::{ChunkId, ClientRequest, DatasetId, ParsedQuery, RequestError},
     utils::logging,
@@ -42,7 +42,7 @@ async fn get_height(
 async fn get_worker(
     Path((slug, start_block)): Path<(String, u64)>,
     Extension(client): Extension<Arc<NetworkClient>>,
-    Extension(datasets): Extension<Arc<Datasets>>,
+    Extension(datasets): Extension<Arc<DatasetsMapping>>,
     Extension(config): Extension<Arc<Config>>,
 ) -> Response {
     // println!("{}", format!("Unknown dataset: {_dataset_id}"));
@@ -73,28 +73,43 @@ async fn get_worker(
     (
         StatusCode::OK,
         format!(
-            "{}/datasets/{dataset_id}/query/{worker_id}",
-            config.hostname
+            "{}/datasets/{}/query/{worker_id}",
+            config.hostname,
+            dataset_id.to_base64(),
         ),
     )
         .into_response()
 }
 
 async fn execute_query(
-    Path((slug, worker_id)): Path<(DatasetId, PeerId)>,
+    Path((dataset_id_encoded, worker_id)): Path<(String, PeerId)>,
     Extension(client): Extension<Arc<NetworkClient>>,
     query: ParsedQuery, // request body
 ) -> Response {
-    let Some(chunk) = client.find_chunk(&slug, query.first_block()) else {
+    let dataset_id = match DatasetId::from_base64(&dataset_id_encoded) {
+        Ok(dataset_id) => dataset_id,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("Couldn't parse dataset id: {e}"),
+            )
+                .into_response()
+        }
+    };
+
+    let Some(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
         return RequestError::NoData(format!(
             "Block {} not found in dataset {}",
             query.first_block(),
-            slug
+            dataset_id
         ))
         .into_response();
     };
-    let Ok(fut) = client.query_worker(&worker_id, ChunkId::new(slug, chunk), query.to_string())
-    else {
+    let Ok(fut) = client.query_worker(
+        &worker_id,
+        ChunkId::new(dataset_id, chunk),
+        query.to_string(),
+    ) else {
         return RequestError::Busy.into_response();
     };
     let result = match fut.await {
@@ -125,6 +140,7 @@ async fn execute_stream_restricted(
     let request = ClientRequest {
         query: raw_request.query,
         dataset_id: raw_request.dataset_id,
+        dataset_name: raw_request.dataset_name,
         buffer_size: raw_request.buffer_size.min(config.max_buffer_size),
         max_chunks: config.max_chunks_per_stream,
         timeout_quantile: config.default_timeout_quantile,
@@ -168,7 +184,7 @@ async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl In
     axum::Json(res).into_response()
 }
 
-async fn get_datasets(Extension(datasets): Extension<Arc<Datasets>>) -> impl IntoResponse {
+async fn get_datasets(Extension(datasets): Extension<Arc<DatasetsMapping>>) -> impl IntoResponse {
     let res: Vec<AvailableDatasetApiResponse> = datasets
         .iter()
         .map(|d| AvailableDatasetApiResponse {
@@ -184,7 +200,7 @@ async fn get_datasets(Extension(datasets): Extension<Arc<Datasets>>) -> impl Int
 async fn get_dataset_state(
     Path(slug): Path<String>,
     Extension(client): Extension<Arc<NetworkClient>>,
-    Extension(datasets): Extension<Arc<Datasets>>,
+    Extension(datasets): Extension<Arc<DatasetsMapping>>,
 ) -> impl IntoResponse {
     let Some(dataset_id) = datasets.dataset_id(&slug) else {
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
@@ -195,7 +211,7 @@ async fn get_dataset_state(
 
 async fn get_dataset_metadata(
     Path(slug): Path<String>,
-    Extension(datasets): Extension<Arc<Datasets>>,
+    Extension(datasets): Extension<Arc<DatasetsMapping>>,
 ) -> impl IntoResponse {
     let Some(dataset) = datasets.find_dataset(&slug) else {
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
@@ -235,7 +251,7 @@ pub async fn run_server(
     metrics_registry: Registry,
     addr: SocketAddr,
     config: Arc<Config>,
-    datasets: Arc<Datasets>,
+    datasets: Arc<DatasetsMapping>,
 ) -> anyhow::Result<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
@@ -260,7 +276,10 @@ pub async fn run_server(
         .route("/datasets/:dataset/state", get(get_dataset_state))
         .route("/datasets/:dataset/metadata", get(get_dataset_metadata))
         // backward compatibility routes
-        .route("/datasets/:dataset/query/:worker_id", post(execute_query))
+        .route(
+            "/datasets/:dataset_id/query/:worker_id",
+            post(execute_query),
+        )
         .route("/datasets/:dataset/height", get(get_height))
         .route("/datasets/:dataset/:start_block/worker", get(get_worker))
         // end backward compatibility routes
@@ -289,6 +308,10 @@ where
     type Rejection = Response;
 
     async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let Path(dataset_name) = req
+            .extract_parts::<Path<String>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
         let dataset_id = req.extract_parts::<DatasetId>().await?;
         let Query(params) = req
             .extract_parts::<Query<HashMap<String, String>>>()
@@ -340,6 +363,7 @@ where
 
         Ok(ClientRequest {
             dataset_id,
+            dataset_name,
             query,
             buffer_size,
             max_chunks: config.max_chunks_per_stream,
@@ -382,7 +406,7 @@ where
             .await
             .map_err(IntoResponse::into_response)?;
         let Extension(datasets) = parts
-            .extract::<Extension<Arc<Datasets>>>()
+            .extract::<Extension<Arc<DatasetsMapping>>>()
             .await
             .map_err(IntoResponse::into_response)?;
 

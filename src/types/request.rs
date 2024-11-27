@@ -5,6 +5,7 @@ use super::{BlockRange, DatasetId};
 #[derive(Debug, Clone)]
 pub struct ClientRequest {
     pub dataset_id: DatasetId,
+    pub dataset_name: String,
     pub query: ParsedQuery,
     pub buffer_size: usize,
     pub max_chunks: Option<usize>,

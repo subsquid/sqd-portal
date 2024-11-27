@@ -1,14 +1,16 @@
-use std::fmt::{Display, Formatter};
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
 
 use super::BlockNumber;
 use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
-use serde::{Deserialize, Serialize};
 
 pub type BlockRange = std::ops::RangeInclusive<BlockNumber>;
 
 /// Base64 encoded URL
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
-pub struct DatasetId(pub String);
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DatasetId(Arc<String>);
 
 impl Display for DatasetId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -17,12 +19,21 @@ impl Display for DatasetId {
 }
 
 impl DatasetId {
-    pub fn from_url(url: impl AsRef<[u8]>) -> Self {
-        Self(BASE64_URL_SAFE_NO_PAD.encode(url))
+    pub fn from_url(url: impl AsRef<str>) -> Self {
+        // TODO: use string interning
+        Self(Arc::new(url.as_ref().to_string()))
     }
 
-    pub fn to_url(&self) -> anyhow::Result<String> {
-        let bytes = BASE64_URL_SAFE_NO_PAD.decode(&self.0)?;
-        Ok(String::from_utf8(bytes)?)
+    pub fn to_url(&self) -> &str {
+        &self.0
+    }
+
+    pub fn to_base64(&self) -> String {
+        BASE64_URL_SAFE_NO_PAD.encode(&*self.0)
+    }
+
+    pub fn from_base64(base64: impl AsRef<str>) -> anyhow::Result<Self> {
+        let bytes = BASE64_URL_SAFE_NO_PAD.decode(base64.as_ref())?;
+        Ok(Self(Arc::new(String::from_utf8(bytes)?)))
     }
 }

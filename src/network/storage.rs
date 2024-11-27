@@ -1,20 +1,21 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 
 use crate::{
-    metrics,
-    types::{DataChunk, DatasetId},
+    datasets::DatasetsMapping, metrics, types::{DataChunk, DatasetId}
 };
 
 pub struct StorageClient {
     datasets: RwLock<HashMap<DatasetId, Vec<DataChunk>>>,
+    network_datasets: Arc<DatasetsMapping>,
 }
 
 impl StorageClient {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(network_datasets: Arc<DatasetsMapping>) -> anyhow::Result<Self> {
         Ok(Self {
             datasets: Default::default(),
+            network_datasets,
         })
     }
 
@@ -40,7 +41,8 @@ impl StorageClient {
                     dataset
                 );
             }
-            metrics::report_chunk_list_updated(&dataset, new_len, last_block);
+            let dataset_name = self.network_datasets.dataset_default_name(&dataset);
+            metrics::report_chunk_list_updated(&dataset, dataset_name, new_len, last_block);
         }
 
         let elapsed = timer.elapsed().as_millis();

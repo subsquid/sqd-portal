@@ -2,7 +2,6 @@ use core::str;
 use std::{
     fmt::{Debug, Display, Formatter},
     str::FromStr,
-    sync::Arc,
 };
 
 use super::{BlockRange, DatasetId};
@@ -95,12 +94,12 @@ impl Debug for DataChunk {
 /// Globally unique data chunk ID
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkId {
-    pub dataset: Arc<DatasetId>,
+    pub dataset: DatasetId,
     pub chunk: DataChunk,
 }
 
 impl ChunkId {
-    pub fn new(dataset: impl Into<Arc<DatasetId>>, chunk: DataChunk) -> Self {
+    pub fn new(dataset: impl Into<DatasetId>, chunk: DataChunk) -> Self {
         Self {
             dataset: dataset.into(),
             chunk,
