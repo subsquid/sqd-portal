@@ -385,10 +385,26 @@ impl NetworkClient {
             worker_id: *worker,
         };
         let mut tasks = self.tasks.lock();
+        // TODO: find out the reason why there are hanging tasks
+        if tasks.len() >= MAX_CONCURRENT_QUERIES {
+            let mut num_dropped = 0;
+            tasks.retain(|_query_id, task| {
+                if task.result_tx.is_closed() {
+                    num_dropped += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            if num_dropped > 0 {
+                tracing::warn!("Dropped {num_dropped} hanging tasks");
+            }
+        }
         if tasks.len() >= MAX_CONCURRENT_QUERIES {
             return Err(QueueFull);
         }
         tasks.insert(query_id.clone(), task);
+        metrics::QUERIES_RUNNING.inc();
         drop(tasks);
 
         self.transport_handle
@@ -408,7 +424,6 @@ impl NetworkClient {
                 self.tasks.lock().remove(&query_id);
             })?;
 
-        metrics::QUERIES_RUNNING.inc();
         metrics::QUERIES_SENT
             .get_or_create(&vec![("worker".to_string(), worker.to_string())])
             .inc();
@@ -475,8 +490,8 @@ impl NetworkClient {
         tracing::trace!("Got result for query {query_id}");
 
         let mut tasks = self.tasks.lock();
-        let (_query_id, task) = tasks
-            .remove_entry(&query_id)
+        let task = tasks
+            .remove(&query_id)
             .ok_or_else(|| anyhow::anyhow!("Not expecting response for query {query_id}"))?;
         metrics::QUERIES_RUNNING.set(tasks.len() as i64);
         drop(tasks);
