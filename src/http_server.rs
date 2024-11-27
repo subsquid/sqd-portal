@@ -170,11 +170,10 @@ async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl In
 
 async fn get_datasets(Extension(datasets): Extension<Arc<Datasets>>) -> impl IntoResponse {
     let res: Vec<AvailableDatasetApiResponse> = datasets
-        .available()
-        .into_iter()
+        .iter()
         .map(|d| AvailableDatasetApiResponse {
-            slug: d.slug,
-            aliases: d.aliases.unwrap_or_default(),
+            slug: d.slug.clone(),
+            aliases: d.aliases.clone(),
             real_time: false,
         })
         .collect();
@@ -204,7 +203,7 @@ async fn get_dataset_metadata(
 
     axum::Json(AvailableDatasetApiResponse {
         slug: dataset.slug.clone(),
-        aliases: dataset.aliases.clone().unwrap_or_default(),
+        aliases: dataset.aliases.clone(),
         real_time: false,
     })
     .into_response()

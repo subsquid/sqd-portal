@@ -1,4 +1,3 @@
-use crate::types::DatasetId;
 use clap::Parser;
 use serde::Deserialize;
 use serde_with::serde_derive::Serialize;
@@ -83,44 +82,20 @@ where
     Ok(s.trim_end_matches('/').to_owned())
 }
 
-fn default_serve() -> String {
-    "all".into()
-}
-
-#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqdNetworkConfig {
-    pub datasets: String,
+    #[serde(rename = "datasets")]
+    pub datasets_url: String,
 
-    #[serde(default = "default_serve")]
-    pub serve: String,
+    #[serde(default)]
+    pub serve: ServeMode,
 }
 
-#[serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatasetSourceConfig {
-    pub kind: String,
-    pub name_ref: String,
-
-    #[serde(skip_deserializing)]
-    pub id: String,
-}
-
-#[serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatasetConfig {
-    pub slug: String,
-    pub aliases: Option<Vec<String>>,
-    pub data_sources: Vec<DatasetSourceConfig>,
-}
-
-impl DatasetConfig {
-    pub fn network_dataset_id(&self) -> Option<DatasetId> {
-        self.data_sources
-            .iter()
-            .find(|s| s.kind == "sqd_network")
-            .map(|source| DatasetId::from_url(&source.id))
-    }
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServeMode {
+    #[default]
+    All,
 }
 
 #[serde_as]
@@ -193,6 +168,7 @@ pub struct Config {
 impl Config {
     pub fn read(config_path: &str) -> anyhow::Result<Self> {
         let file = std::fs::File::open(config_path)?;
-        Ok(serde_yaml::from_reader(file)?)
+        let buf_reader = std::io::BufReader::new(file);
+        Ok(serde_yaml::from_reader(buf_reader)?)
     }
 }

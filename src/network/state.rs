@@ -137,11 +137,11 @@ impl NetworkState {
         metrics::KNOWN_WORKERS.set(self.last_pings.len() as i64);
         for dataset_id in self.datasets.dataset_ids() {
             let dataset_state = worker_state
-                .remove(&dataset_id)
+                .remove(dataset_id)
                 .unwrap_or_else(RangeSet::empty);
             let entry = self.dataset_states.entry(dataset_id.clone()).or_default();
             entry.update(worker_id, dataset_state);
-            metrics::report_dataset_updated(&dataset_id, entry.highest_seen_block, entry.first_gap);
+            metrics::report_dataset_updated(dataset_id, entry.highest_seen_block, entry.first_gap);
         }
     }
 

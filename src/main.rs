@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     setup_tracing(args.json_log)?;
 
-    let datasets = Arc::new(Datasets::load(&args.config).await);
+    let datasets = Arc::new(Datasets::load(&args.config).await?);
 
     let config = Arc::new(args.config);
     let network_client =
