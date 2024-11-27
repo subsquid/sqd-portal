@@ -192,7 +192,7 @@ pub struct Config {
 
 impl Config {
     pub fn read(config_path: &str) -> anyhow::Result<Self> {
-        let file_contents = std::fs::read(config_path)?;
-        Ok(serde_yaml::from_slice(file_contents.as_slice())?)
+        let file = std::fs::File::open(config_path)?;
+        Ok(serde_yaml::from_reader(file)?)
     }
 }
