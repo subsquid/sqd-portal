@@ -35,7 +35,7 @@ use crate::{
 };
 
 lazy_static::lazy_static! {
-    static ref SUPPORTED_VERSIONS: semver::VersionReq = "~2.0.0".parse().expect("Invalid version requirement");
+    static ref SUPPORTED_VERSIONS: semver::VersionReq = "^2.0.0".parse().expect("Invalid version requirement");
 }
 const MAX_CONCURRENT_QUERIES: usize = 1000;
 const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 5;
