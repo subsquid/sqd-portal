@@ -731,12 +731,9 @@ fn parse_heartbeat(
         .map(|(dataset_id, vals)| {
             (
                 dataset_id.clone(),
-                RangeSet {
-                    ranges: vals
-                        .map(|chunk_id| chunk_id.chunk.range_msg())
-                        .sorted()
-                        .collect(),
-                },
+                vals.map(|chunk_id| chunk_id.chunk.range_msg())
+                    .collect_vec()
+                    .into(), // unites adjacent ranges
             )
         })
         .collect::<HashMap<_, _>>();
