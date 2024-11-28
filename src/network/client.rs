@@ -107,6 +107,8 @@ impl NetworkClient {
 
         let mut gateway_config = GatewayConfig::new();
         gateway_config.query_config.request_timeout = config.transport_timeout;
+        gateway_config.queries_queue_size = 10000;
+        gateway_config.events_queue_size = 10000;
         let (incoming_events, transport_handle) =
             transport_builder.build_gateway(gateway_config)?;
 
@@ -343,6 +345,7 @@ impl NetworkClient {
                 GatewayEvent::QueryDropped { query_id } => {
                     if self.tasks.lock().remove(&query_id).is_some() {
                         metrics::QUERIES_RUNNING.dec();
+                        tracing::trace!("Query dropped: {query_id}");
                         // drop result_tx
                     } else {
                         tracing::error!("Not expecting response for query {query_id}");
