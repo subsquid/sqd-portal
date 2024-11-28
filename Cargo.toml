@@ -39,3 +39,4 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "f45d685", version = "1.2.0" }
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "f45d685", version = "2.0.0", features = ["semver", "bitstring", "assignment_reader"] }
 sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "f45d685", version = "2.0.0", features = ["gateway", "metrics"] }
+num-traits = "0.2.19"

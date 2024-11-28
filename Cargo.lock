@@ -5471,6 +5471,7 @@ dependencies = [
  "itertools 0.12.1",
  "lazy_static",
  "num-rational",
+ "num-traits",
  "parking_lot 0.12.3",
  "prometheus-client",
  "reqwest 0.12.7",

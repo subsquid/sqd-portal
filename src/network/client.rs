@@ -7,6 +7,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{Stream, StreamExt};
 use itertools::Itertools;
 use num_rational::Ratio;
+use num_traits::ToPrimitive;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tokio::time::MissedTickBehavior;
@@ -401,10 +402,11 @@ impl NetworkClient {
             }
         }
         if tasks.len() >= MAX_CONCURRENT_QUERIES {
+            metrics::QUERIES_RUNNING.set(tasks.len() as i64);
             return Err(QueueFull);
         }
         tasks.insert(query_id.clone(), task);
-        metrics::QUERIES_RUNNING.inc();
+        metrics::QUERIES_RUNNING.set(tasks.len() as i64);
         drop(tasks);
 
         self.transport_handle
@@ -618,7 +620,7 @@ impl NetworkClient {
                 peer_id: self.local_peer_id,
                 status: state.status,
                 operator: Some(state.operator),
-                sqd_locked: Some(state.sqd_locked.to_string()),
+                sqd_locked: state.sqd_locked.to_f32().map(|r| r.to_string()),
                 cu_per_epoch: Some(state.compute_units_per_epoch.to_string()),
                 current_epoch: Some(CurrentEpoch {
                     number: state.current_epoch,

@@ -116,8 +116,8 @@ struct NetworkDatasets {
 async fn load_networks(config: &Config) -> anyhow::Result<NetworkDatasets> {
     let url = &config.sqd_network.datasets_url;
 
-    if url.starts_with("file://") {
-        load_local_file(url).await
+    if let Some(path) = url.strip_prefix("file://") {
+        load_local_file(path).await
     } else {
         fetch_remote_file(url).await
     }
@@ -132,11 +132,7 @@ async fn fetch_remote_file(url: &str) -> anyhow::Result<NetworkDatasets> {
     serde_yaml::from_str(&text).with_context(|| format!("failed to parse dataset {}", url))
 }
 
-async fn load_local_file(url: &str) -> anyhow::Result<NetworkDatasets> {
-    let full_path = url
-        .strip_prefix("file:/")
-        .expect("Local file path must start with file://");
-
+async fn load_local_file(full_path: &str) -> anyhow::Result<NetworkDatasets> {
     tracing::debug!("Loading local file from {}", full_path);
 
     let file =
