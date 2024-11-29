@@ -108,7 +108,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
     });
 
     let endpoint = {
-        if path.starts_with("/query") {
+        if path.contains("/query") {
             "/query".to_string()
         } else {
             let path = path.split('/').last().expect("HTTP Path can't be empty");
