@@ -13,6 +13,7 @@ pub struct StreamStats {
     pub response_bytes: u64,
     pub start_time: Instant,
     pub last_log: Instant,
+    pub throttled_for: Duration,
 }
 
 impl StreamStats {
@@ -25,6 +26,7 @@ impl StreamStats {
             response_bytes: 0,
             start_time: now,
             last_log: now,
+            throttled_for: Duration::from_secs(0),
         }
     }
 
@@ -36,6 +38,10 @@ impl StreamStats {
         self.chunks_downloaded += 1;
         self.response_blocks += blocks;
         self.response_bytes += bytes as u64;
+    }
+
+    pub fn throttled(&mut self, duration: Duration) {
+        self.throttled_for += duration;
     }
 
     pub fn maybe_write_log(&mut self) {
@@ -66,6 +72,7 @@ impl StreamStats {
             blocks_streamed = self.response_blocks,
             bytes_streamed = self.response_bytes,
             total_time = ?self.start_time.elapsed(),
+            throttled_for = ?self.throttled_for,
             error = error.unwrap_or_else(|| "-".to_string()),
             "Stream finished"
         );

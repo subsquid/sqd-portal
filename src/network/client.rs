@@ -518,6 +518,7 @@ impl NetworkClient {
                     self.network_state
                         .lock()
                         .hint_backoff(peer_id, Duration::from_millis(backoff as u64));
+                    metrics::report_backoff(peer_id);
                 };
                 match result {
                     query_result::Result::Ok(ok) => {

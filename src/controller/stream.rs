@@ -255,6 +255,8 @@ impl StreamController {
                     let duration = pending.time_left();
                     if duration > MAX_IDLE_TIME {
                         return Poll::Ready(Some(Err(RequestError::BusyFor(duration))));
+                    } else {
+                        self.stats.throttled(duration);
                     }
                 }
                 let range = slot.data_range.range.clone();

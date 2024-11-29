@@ -34,6 +34,7 @@ lazy_static::lazy_static! {
     pub static ref QUERIES_SENT: Family<Labels, Counter> = Default::default();
     pub static ref QUERIES_RUNNING: Gauge = Default::default();
     static ref QUERY_RESULTS: Family<Labels, Counter> = Default::default();
+    static ref QUERY_BACKOFF: Family<Labels, Counter> = Default::default();
 
     pub static ref ACTIVE_STREAMS: Gauge = Default::default();
     pub static ref COMPLETED_STREAMS: Counter = Default::default();
@@ -48,6 +49,7 @@ lazy_static::lazy_static! {
     pub static ref STREAM_BYTES_PER_SECOND: Histogram = Histogram::new(exponential_buckets(100., 3.0, 20));
     pub static ref STREAM_BLOCKS_PER_SECOND: Family<Labels, Histogram> =
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 3.0, 20)));
+    pub static ref STREAM_THROTTLED_RATIO: Histogram = Histogram::new(iter::empty());
 
     static ref HIGHEST_BLOCK: Family<Labels, Gauge> = Default::default();
     static ref FIRST_GAP: Family<Labels, Gauge> = Default::default();
@@ -63,6 +65,12 @@ pub fn report_query_result(worker: PeerId, status: &str) {
             ("worker".to_owned(), worker.to_string()),
             ("status".to_owned(), status.to_owned()),
         ])
+        .inc();
+}
+
+pub fn report_backoff(worker: PeerId) {
+    QUERY_BACKOFF
+        .get_or_create(&vec![("worker".to_owned(), worker.to_string())])
         .inc();
 }
 
@@ -88,6 +96,7 @@ pub fn report_stream_completed(
         labels.push(("dataset_name".to_owned(), name.to_owned()));
     }
     let duration = stats.start_time.elapsed().as_secs_f64();
+    let throttled = stats.throttled_for.as_secs_f64();
     let bytes = stats.response_bytes;
     let blocks = stats.response_blocks;
     let chunks = stats.chunks_downloaded;
@@ -99,6 +108,7 @@ pub fn report_stream_completed(
     STREAM_BLOCKS_PER_SECOND
         .get_or_create(&labels)
         .observe(blocks as f64 / duration);
+    STREAM_THROTTLED_RATIO.observe(throttled / duration);
 }
 
 pub fn report_dataset_updated(
@@ -170,6 +180,11 @@ pub fn register_metrics(registry: &mut Registry) {
         QUERY_RESULTS.clone(),
     );
     registry.register(
+        "queries_backoff_hints",
+        "Number of times the RPS limit has been hit",
+        QUERY_BACKOFF.clone(),
+    );
+    registry.register(
         "known_workers",
         "Number of workers seen in the network",
         KNOWN_WORKERS.clone(),
@@ -213,6 +228,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "stream_blocks_per_second",
         "Completed streams speed in blocks",
         STREAM_BLOCKS_PER_SECOND.clone(),
+    );
+    registry.register(
+        "stream_throttled_ratio",
+        "Throttled time of completed streams relative to their duration",
+        STREAM_THROTTLED_RATIO.clone(),
     );
 
     registry.register(
