@@ -7,7 +7,6 @@ services:
       HTTP_LISTEN_ADDR: 0.0.0.0:8000
       NETWORK: "${NETWORK}"
       BOOT_NODES: "${BOOT_NODES}"
-      LOGS_COLLECTOR_ID: "${LOGS_COLLECTOR_ID}"
       RPC_URL: "${RPC_URL}"
       L1_RPC_URL: "${L1_RPC_URL}"
     volumes:
