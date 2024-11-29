@@ -34,14 +34,6 @@ fn default_worker_inactive_threshold() -> Duration {
     Duration::from_secs(120)
 }
 
-fn default_min_worker_priority() -> i8 {
-    -5
-}
-
-fn default_max_worker_priority() -> i8 {
-    3
-}
-
 fn default_transport_timeout() -> Duration {
     Duration::from_secs(60)
 }
@@ -60,10 +52,6 @@ fn default_default_retries() -> usize {
 
 fn default_default_timeout_quantile() -> f32 {
     0.5
-}
-
-fn default_dataset_update_interval() -> Duration {
-    Duration::from_secs(60 * 5)
 }
 
 fn default_chain_update_interval() -> Duration {
@@ -116,12 +104,6 @@ pub struct Config {
     )]
     pub worker_inactive_threshold: Duration,
 
-    #[serde(default = "default_min_worker_priority")]
-    pub min_worker_priority: i8,
-
-    #[serde(default = "default_max_worker_priority")]
-    pub max_worker_priority: i8,
-
     #[serde_as(as = "DurationSeconds")]
     #[serde(
         rename = "transport_timeout_sec",
@@ -140,13 +122,6 @@ pub struct Config {
 
     #[serde(default = "default_default_timeout_quantile")]
     pub default_timeout_quantile: f32,
-
-    #[serde_as(as = "DurationSeconds")]
-    #[serde(
-        rename = "dataset_update_interval_sec",
-        default = "default_dataset_update_interval"
-    )]
-    pub dataset_update_interval: Duration,
 
     #[serde_as(as = "DurationSeconds")]
     #[serde(

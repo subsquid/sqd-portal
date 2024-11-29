@@ -1,14 +1,11 @@
 hostname: http://0.0.0.0:8000
 worker_inactive_threshold_sec: 120
-min_worker_priority: -4
-max_worker_priority: 3
 default_buffer_size: 10
 default_chunk_timeout_sec: 30
 default_backoff_sec: 1
 default_request_multiplier: 1
 default_retries: 3
 default_timeout_quantile: 0.5
-dataset_update_interval_sec: 300
 sqd_network:
   datasets: https://cdn.subsquid.io/sqd-network/datasets.yml
   serve: "all"
