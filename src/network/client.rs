@@ -38,7 +38,7 @@ use crate::{
 lazy_static::lazy_static! {
     static ref SUPPORTED_VERSIONS: semver::VersionReq = "^2.0.0".parse().expect("Invalid version requirement");
 }
-const MAX_CONCURRENT_QUERIES: usize = 1000;
+const MAX_CONCURRENT_QUERIES: usize = 10_000;
 const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 5;
 const MAX_WAITING_PINGS: usize = 2000;
 
@@ -107,6 +107,7 @@ impl NetworkClient {
 
         let mut gateway_config = GatewayConfig::new();
         gateway_config.query_config.request_timeout = config.transport_timeout;
+        gateway_config.query_config.max_buffered = MAX_CONCURRENT_QUERIES + 24;
         gateway_config.queries_queue_size = 10000;
         gateway_config.events_queue_size = 10000;
         let (incoming_events, transport_handle) =
