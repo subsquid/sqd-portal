@@ -110,6 +110,7 @@ impl NetworkState {
         }
     }
 
+    // TODO: return a guard object that will automatically release the worker when dropped
     pub fn find_worker(
         &mut self,
         dataset_id: &DatasetId,

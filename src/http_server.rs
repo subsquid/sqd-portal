@@ -51,7 +51,7 @@ async fn get_worker(
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
-    let worker_id = match client.find_worker(&dataset_id, start_block) {
+    let worker_id = match client.find_worker(&dataset_id, start_block, false) {
         Ok(worker_id) => worker_id,
         Err(NoWorker::AllUnavailable) => {
             return (
@@ -113,6 +113,7 @@ async fn execute_query(
         ChunkId::new(dataset_id, chunk),
         &range,
         query.into_string(),
+        true,
     ) else {
         return RequestError::Busy.into_response();
     };

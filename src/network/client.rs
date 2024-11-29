@@ -364,8 +364,20 @@ impl NetworkClient {
         self.dataset_storage.next_chunk(dataset, chunk)
     }
 
-    pub fn find_worker(&self, dataset: &DatasetId, block: u64) -> Result<PeerId, NoWorker> {
-        self.network_state.lock().find_worker(dataset, block)
+    pub fn find_worker(
+        &self,
+        dataset: &DatasetId,
+        block: u64,
+        lease: bool,
+    ) -> Result<PeerId, NoWorker> {
+        let mut state = self.network_state.lock();
+        let worker = state.find_worker(dataset, block);
+        if lease {
+            if let Ok(worker) = worker.as_ref() {
+                state.lease_worker(*worker);
+            };
+        }
+        worker
     }
 
     pub fn get_height(&self, dataset: &DatasetId) -> Option<u64> {
@@ -378,11 +390,14 @@ impl NetworkClient {
         chunk_id: ChunkId,
         block_range: &BlockRange,
         query: String,
+        lease: bool,
     ) -> Result<oneshot::Receiver<QueryResult>, QueueFull> {
         let query_id = generate_query_id();
         tracing::trace!("Sending query {query_id} to {worker}");
 
-        self.network_state.lock().lease_worker(*worker);
+        if lease {
+            self.network_state.lock().lease_worker(*worker);
+        }
 
         let (result_tx, result_rx) = oneshot::channel();
 

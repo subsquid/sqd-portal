@@ -406,7 +406,7 @@ impl StreamController {
     ) -> Result<WorkerRequest, SendQueryError> {
         let worker = match self
             .network
-            .find_worker(&self.request.dataset_id, *range.range.start())
+            .find_worker(&self.request.dataset_id, *range.range.start(), true)
         {
             Ok(worker) => worker,
             Err(NoWorker::AllUnavailable) => return Err(SendQueryError::NoWorkers),
@@ -427,6 +427,7 @@ impl StreamController {
                 ChunkId::new(self.request.dataset_id.clone(), range.chunk),
                 &range.range,
                 self.request.query.to_string(),
+                false
             )
             .map_err(|_| SendQueryError::TransportQueueFull)?;
         assert!(receiver.poll_unpin(ctx).is_pending());
