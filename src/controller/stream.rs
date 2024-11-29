@@ -423,7 +423,8 @@ impl StreamController {
             .query_worker(
                 &worker,
                 ChunkId::new(self.request.dataset_id.clone(), range.chunk),
-                self.request.query.with_range(&range.range),
+                &range.range,
+                self.request.query.to_string(),
             )
             .map_err(|_| SendQueryError::TransportQueueFull)?;
         assert!(receiver.poll_unpin(ctx).is_pending());

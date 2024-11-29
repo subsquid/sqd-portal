@@ -105,10 +105,14 @@ async fn execute_query(
         ))
         .into_response();
     };
+    let range = query
+        .intersect_with(&chunk.block_range())
+        .expect("Found chunk should intersect with query");
     let Ok(fut) = client.query_worker(
         &worker_id,
         ChunkId::new(dataset_id, chunk),
-        query.to_string(),
+        &range,
+        query.into_string(),
     ) else {
         return RequestError::Busy.into_response();
     };
@@ -321,11 +325,8 @@ where
             .extract_parts::<Extension<Arc<Config>>>()
             .await
             .map_err(IntoResponse::into_response)?;
-        let query: String = req.extract().await.map_err(IntoResponse::into_response)?;
+        let query: ParsedQuery = req.extract().await.map_err(IntoResponse::into_response)?;
 
-        let query = query.parse().map_err(|e| {
-            RequestError::BadRequest(format!("Couldn't parse query: {e}")).into_response()
-        })?;
         let buffer_size = match params.get("buffer_size").map(|v| v.parse()) {
             Some(Ok(value)) => value,
             Some(Err(e)) => {
@@ -383,11 +384,9 @@ where
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
         let body: String = req.extract().await.map_err(IntoResponse::into_response)?;
 
-        let query = body.parse().map_err(|e| {
+        ParsedQuery::try_from(body).map_err(|e| {
             RequestError::BadRequest(format!("Couldn't parse query: {e}")).into_response()
-        })?;
-
-        Ok(query)
+        })
     }
 }
 

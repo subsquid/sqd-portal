@@ -27,7 +27,7 @@ use super::priorities::NoWorker;
 use super::{NetworkState, StorageClient};
 use crate::datasets::DatasetsMapping;
 use crate::network::state::{DatasetState, Status};
-use crate::types::{ChunkId, DataChunk};
+use crate::types::{BlockRange, ChunkId, DataChunk};
 use crate::{
     cli::Config,
     metrics,
@@ -372,6 +372,7 @@ impl NetworkClient {
         &self,
         worker: &PeerId,
         chunk_id: ChunkId,
+        block_range: &BlockRange,
         query: String,
     ) -> Result<oneshot::Receiver<QueryResult>, QueueFull> {
         let query_id = generate_query_id();
@@ -416,7 +417,10 @@ impl NetworkClient {
                     dataset: chunk_id.dataset.to_url().to_owned(),
                     query_id: query_id.clone(),
                     query,
-                    block_range: None,
+                    block_range: Some(sqd_messages::Range {
+                        begin: *block_range.start(),
+                        end: *block_range.end(),
+                    }),
                     chunk_id: chunk_id.chunk.to_string(),
                     timestamp_ms: timestamp_now_ms(),
                     signature: Default::default(),

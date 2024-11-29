@@ -3,7 +3,9 @@ use std::{collections::HashMap, sync::Arc};
 use parking_lot::RwLock;
 
 use crate::{
-    datasets::DatasetsMapping, metrics, types::{DataChunk, DatasetId}
+    datasets::DatasetsMapping,
+    metrics,
+    types::{DataChunk, DatasetId},
 };
 
 pub struct StorageClient {
@@ -56,7 +58,8 @@ impl StorageClient {
             return None;
         }
         let first_suspect = chunks.partition_point(|chunk| (chunk.last_block) < block);
-        (first_suspect < chunks.len()).then(|| chunks[first_suspect])
+        (first_suspect < chunks.len() && chunks[first_suspect].first_block <= block)
+            .then(|| chunks[first_suspect])
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {

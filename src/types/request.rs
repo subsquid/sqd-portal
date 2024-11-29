@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use super::{BlockRange, DatasetId};
 
 #[derive(Debug, Clone)]
@@ -15,14 +13,14 @@ pub struct ClientRequest {
 
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
-    json: serde_json::Value,
+    raw: String,
     first_block: u64,
     last_block: Option<u64>,
 }
 
 impl ParsedQuery {
-    pub fn from_string(query: &str) -> Result<Self, anyhow::Error> {
-        let json: serde_json::Value = serde_json::from_str(query)?;
+    pub fn try_from(query: String) -> Result<Self, anyhow::Error> {
+        let json: serde_json::Value = serde_json::from_str(&query)?;
         let first_block = json
             .get("fromBlock")
             .and_then(|v| v.as_u64())
@@ -33,7 +31,7 @@ impl ParsedQuery {
             "toBlock must be greater or equal to fromBlock"
         );
         Ok(Self {
-            json,
+            raw: query,
             first_block,
             last_block,
         })
@@ -45,13 +43,6 @@ impl ParsedQuery {
 
     pub fn last_block(&self) -> Option<u64> {
         self.last_block
-    }
-
-    pub fn with_range(&self, range: &BlockRange) -> String {
-        let mut json = self.json.clone();
-        json["fromBlock"] = serde_json::Value::from(*range.start());
-        json["toBlock"] = serde_json::Value::from(*range.end());
-        serde_json::to_string(&json).expect("Couldn't serialize query")
     }
 
     pub fn intersect_with(&self, range: &BlockRange) -> Option<BlockRange> {
@@ -66,14 +57,10 @@ impl ParsedQuery {
 
     #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
-        serde_json::to_string(&self.json).expect("Couldn't serialize query")
+        self.raw.clone()
     }
-}
 
-impl FromStr for ParsedQuery {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_string(s)
+    pub fn into_string(self) -> String {
+        self.raw
     }
 }
