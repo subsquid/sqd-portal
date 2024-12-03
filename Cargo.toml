@@ -8,16 +8,17 @@ anyhow = "1"
 async-stream = "0.3.5"
 axum = { version = "0.7", features = ["http2"] }
 base64 = "0.22"
-clap = { version = "4", features = ["derive", "env"] }
 chrono = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
 dotenv = "0.15"
 flate2 = "1.0.33"
 futures = "0.3"
 itertools = "0.12"
 lazy_static = "1.4.0"
+num-rational = "0.4"
+num-traits = "0.2.19"
 parking_lot = "0.12"
 prometheus-client = "0.22"
-num-rational = "0.4"
 reqwest = { version = "0.12.7", features = ["stream", "gzip", "json"] }
 scopeguard = "1.2"
 semver = "1"
@@ -30,13 +31,12 @@ thiserror = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = "0.1"
 tokio-util = "0.7.11"
+tower-http = { version = "0.6.1", features = ["cors"] }
 tracing = { version = "0.1", features = ["async-await"] }
 tracing-futures = { version = "0.2.5", features = ["tokio", "futures-03"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
-tower-http = { version = "0.6.1", features = ["cors"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
-sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "f45d685", version = "1.2.0" }
-sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "f45d685", version = "2.0.0", features = ["semver", "bitstring", "assignment_reader"] }
-sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "f45d685", version = "2.0.0", features = ["gateway", "metrics"] }
-num-traits = "0.2.19"
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "183f213", version = "1.2.0" }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "183f213", version = "2.0.0", features = ["semver", "bitstring", "assignment_reader"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "183f213", version = "2.0.0", features = ["gateway", "metrics"] }

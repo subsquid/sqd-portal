@@ -45,8 +45,6 @@ async fn get_worker(
     Extension(datasets): Extension<Arc<DatasetsMapping>>,
     Extension(config): Extension<Arc<Config>>,
 ) -> Response {
-    // println!("{}", format!("Unknown dataset: {_dataset_id}"));
-
     let Some(dataset_id) = datasets.dataset_id(&slug) else {
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
@@ -384,6 +382,10 @@ where
 
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
         let body: String = req.extract().await.map_err(IntoResponse::into_response)?;
+
+        if body.len() as u64 > sqd_network_transport::protocol::MAX_RAW_QUERY_SIZE {
+            return Err(RequestError::BadRequest("Query is too large".to_string()).into_response());
+        }
 
         ParsedQuery::try_from(body).map_err(|e| {
             RequestError::BadRequest(format!("Couldn't parse query: {e}")).into_response()
