@@ -69,8 +69,7 @@ impl RequestError {
             Self::BadRequest(_) => "bad_request",
             Self::NoData(_) => "no_data",
             Self::InternalError(_) => "internal_error",
-            Self::Busy => "overloaded",
-            Self::BusyFor(_) => "overloaded",
+            Self::Busy | Self::BusyFor(_) => "overloaded",
         }
     }
 }

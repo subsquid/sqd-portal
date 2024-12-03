@@ -36,8 +36,8 @@ impl Default for WorkerStats {
             paused_until: None,
             ok: EventCounter::new(now),
             slow: EventCounter::new(now),
-            server_errors: Default::default(),
-            timeouts: Default::default(),
+            server_errors: Cooldown::default(),
+            timeouts: Cooldown::default(),
         }
     }
 }
@@ -62,7 +62,7 @@ fn priority(worker: &WorkerStats, now: Instant) -> (u8, u8, Instant) {
 impl WorkersPool {
     pub fn pick(&mut self, workers: impl IntoIterator<Item = PeerId>) -> Result<PeerId, NoWorker> {
         let now = Instant::now();
-        let default_priority = Default::default();
+        let default_priority = WorkerStats::default();
         let (best, best_priority) = workers
             .into_iter()
             .map(|peer_id| {

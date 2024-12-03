@@ -57,7 +57,7 @@ impl DatasetsMapping {
             default_names.insert(dataset_id, dataset.name.clone());
             let config = DatasetConfig {
                 slug: dataset.name.clone(),
-                aliases: Default::default(),
+                aliases: vec![],
                 data_sources: vec![DatasetSourceConfig {
                     kind: DataSourceKind::SqdNetwork,
                     name_ref: dataset.name,
@@ -97,7 +97,7 @@ impl DatasetsMapping {
     }
 
     pub fn dataset_default_name(&self, id: &DatasetId) -> Option<&str> {
-        self.default_names.get(id).map(|s| s.as_str())
+        self.default_names.get(id).map(String::as_str)
     }
 }
 
@@ -117,7 +117,7 @@ async fn load_networks(config: &Config) -> anyhow::Result<NetworkDatasets> {
     let url = &config.sqd_network.datasets_url;
 
     if let Some(path) = url.strip_prefix("file://") {
-        load_local_file(path).await
+        load_local_file(path)
     } else {
         fetch_remote_file(url).await
     }
@@ -129,16 +129,14 @@ async fn fetch_remote_file(url: &str) -> anyhow::Result<NetworkDatasets> {
     let response = reqwest::get(url).await?;
     let text = response.text().await?;
 
-    serde_yaml::from_str(&text).with_context(|| format!("failed to parse dataset {}", url))
+    serde_yaml::from_str(&text).with_context(|| format!("failed to parse dataset {url}"))
 }
 
-async fn load_local_file(full_path: &str) -> anyhow::Result<NetworkDatasets> {
+fn load_local_file(full_path: &str) -> anyhow::Result<NetworkDatasets> {
     tracing::debug!("Loading local file from {}", full_path);
 
-    let file =
-        File::open(full_path).with_context(|| format!("failed to open file {}", full_path))?;
+    let file = File::open(full_path).with_context(|| format!("failed to open file {full_path}"))?;
     let reader = BufReader::new(file);
 
-    serde_yaml::from_reader(reader)
-        .with_context(|| format!("failed to parse dataset {}", full_path))
+    serde_yaml::from_reader(reader).with_context(|| format!("failed to parse dataset {full_path}"))
 }

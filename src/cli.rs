@@ -46,7 +46,7 @@ fn default_max_buffer_size() -> usize {
     100
 }
 
-fn default_default_retries() -> usize {
+fn default_default_retries() -> u8 {
     3
 }
 
@@ -118,7 +118,7 @@ pub struct Config {
     pub max_buffer_size: usize,
 
     #[serde(default = "default_default_retries")]
-    pub default_retries: usize,
+    pub default_retries: u8,
 
     #[serde(default = "default_default_timeout_quantile")]
     pub default_timeout_quantile: f32,

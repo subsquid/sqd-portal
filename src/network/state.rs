@@ -91,8 +91,8 @@ pub struct ContractsState {
 impl NetworkState {
     pub fn new(config: Arc<Config>, datasets: Arc<DatasetsMapping>) -> Self {
         Self {
-            config: config.clone(),
-            datasets: datasets.clone(),
+            config,
+            datasets,
             dataset_states: Default::default(),
             last_pings: Default::default(),
             pool: WorkersPool::default(),
@@ -194,8 +194,8 @@ impl NetworkState {
         last_pings.get(worker_id).is_some_and(|t| *t > deadline)
     }
 
-    pub fn dataset_state(&self, dataset_id: DatasetId) -> Option<&DatasetState> {
-        self.dataset_states.get(&dataset_id)
+    pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<&DatasetState> {
+        self.dataset_states.get(dataset_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -205,7 +205,7 @@ impl NetworkState {
         sqd_locked: Option<(String, Ratio<u128>)>,
         epoch_length: Duration,
         uses_default_strategy: bool,
-        active_workers: Vec<Worker>,
+        active_workers: &[Worker],
         current_epoch_started: SystemTime,
         compute_units_per_epoch: u64,
     ) {

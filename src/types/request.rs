@@ -8,7 +8,7 @@ pub struct ClientRequest {
     pub buffer_size: usize,
     pub max_chunks: Option<usize>,
     pub timeout_quantile: f32,
-    pub retries: usize,
+    pub retries: u8,
 }
 
 #[derive(Debug, Clone)]

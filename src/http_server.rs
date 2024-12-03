@@ -108,7 +108,7 @@ async fn execute_query(
         .expect("Found chunk should intersect with query");
     let Ok(fut) = client.query_worker(
         &worker_id,
-        ChunkId::new(dataset_id, chunk),
+        &ChunkId::new(dataset_id, chunk),
         &range,
         query.into_string(),
         true,
@@ -209,7 +209,7 @@ async fn get_dataset_state(
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
-    axum::Json(client.dataset_state(dataset_id)).into_response()
+    axum::Json(client.dataset_state(&dataset_id)).into_response()
 }
 
 async fn get_dataset_metadata(

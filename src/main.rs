@@ -19,7 +19,7 @@ mod network;
 mod types;
 mod utils;
 
-fn setup_tracing(json: bool) -> anyhow::Result<()> {
+fn setup_tracing(json: bool) {
     let env_filter = tracing_subscriber::EnvFilter::builder().parse_lossy(
         std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV)
             .unwrap_or(format!("info,{}=debug", std::env!("CARGO_CRATE_NAME"))),
@@ -40,14 +40,13 @@ fn setup_tracing(json: bool) -> anyhow::Result<()> {
             .compact()
             .init();
     };
-    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let args = Cli::parse();
-    setup_tracing(args.json_log)?;
+    setup_tracing(args.json_log);
 
     let datasets = Arc::new(DatasetsMapping::load(&args.config).await?);
 

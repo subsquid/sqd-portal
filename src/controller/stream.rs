@@ -295,7 +295,7 @@ impl StreamController {
     }
 
     fn try_fill_slots(&mut self, ctx: &mut Context<'_>) {
-        if self.buffer.back().is_some_and(|slot| slot.is_paused()) {
+        if self.buffer.back().is_some_and(Slot::is_paused) {
             // Either the amount of compute units is low or the network is overloaded.
             // Don't send new queries until the existing ones complete.
             return;
@@ -370,10 +370,10 @@ impl StreamController {
             Ok(request) => PendingRequests::new(
                 request,
                 self.timeouts.current_timeout(),
-                self.request.retries as u8,
+                self.request.retries,
             ),
             Err(SendQueryError::Backoff(until)) => {
-                let request = PendingRequests::paused(until, self.request.retries as u8);
+                let request = PendingRequests::paused(until, self.request.retries);
                 tracing::debug!(
                     "Pausing for {}ms before sending request",
                     request.timeout_duration.as_millis()
@@ -404,14 +404,15 @@ impl StreamController {
         range: &DataRange,
         ctx: &mut Context<'_>,
     ) -> Result<WorkerRequest, SendQueryError> {
-        let worker = match self
-            .network
-            .find_worker(&self.request.dataset_id, *range.range.start(), true)
-        {
-            Ok(worker) => worker,
-            Err(NoWorker::AllUnavailable) => return Err(SendQueryError::NoWorkers),
-            Err(NoWorker::Backoff(until)) => return Err(SendQueryError::Backoff(until)),
-        };
+        let worker =
+            match self
+                .network
+                .find_worker(&self.request.dataset_id, *range.range.start(), true)
+            {
+                Ok(worker) => worker,
+                Err(NoWorker::AllUnavailable) => return Err(SendQueryError::NoWorkers),
+                Err(NoWorker::Backoff(until)) => return Err(SendQueryError::Backoff(until)),
+            };
         tracing::debug!(
             "Sending query for chunk {} ({}-{}) to worker {}",
             range.chunk_index,
@@ -424,10 +425,10 @@ impl StreamController {
             .network
             .query_worker(
                 &worker,
-                ChunkId::new(self.request.dataset_id.clone(), range.chunk),
+                &ChunkId::new(self.request.dataset_id.clone(), range.chunk),
                 &range.range,
                 self.request.query.to_string(),
-                false
+                false,
             )
             .map_err(|_| SendQueryError::TransportQueueFull)?;
         assert!(receiver.poll_unpin(ctx).is_pending());

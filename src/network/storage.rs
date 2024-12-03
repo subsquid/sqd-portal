@@ -14,11 +14,11 @@ pub struct StorageClient {
 }
 
 impl StorageClient {
-    pub fn new(network_datasets: Arc<DatasetsMapping>) -> anyhow::Result<Self> {
-        Ok(Self {
-            datasets: Default::default(),
+    pub fn new(network_datasets: Arc<DatasetsMapping>) -> Self {
+        Self {
+            datasets: RwLock::default(),
             network_datasets,
-        })
+        }
     }
 
     pub fn update_datasets(&self, mut new_datasets: HashMap<DatasetId, Vec<DataChunk>>) {
@@ -33,9 +33,9 @@ impl StorageClient {
         let mut datasets = self.datasets.write();
         for (dataset, chunks) in new_datasets {
             let new_len = chunks.len();
-            let last_block = chunks.last().map(|r| r.last_block).unwrap_or(0);
+            let last_block = chunks.last().map_or(0, |r| r.last_block);
             let prev = datasets.insert(dataset.clone(), chunks);
-            let old_len = prev.map(|v| v.len()).unwrap_or(0);
+            let old_len = prev.map_or(0, |v| v.len());
             if old_len < new_len {
                 tracing::info!(
                     "Got {} new chunk(s) for dataset {}",

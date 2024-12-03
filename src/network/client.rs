@@ -99,7 +99,7 @@ impl NetworkClient {
         datasets: Arc<DatasetsMapping>,
     ) -> anyhow::Result<NetworkClient> {
         let network = args.rpc.network;
-        let dataset_storage = StorageClient::new(datasets.clone())?;
+        let dataset_storage = StorageClient::new(datasets.clone());
         let agent_into = get_agent_info!();
         let transport_builder = P2PTransportBuilder::from_cli(args, agent_into).await?;
         let contract_client = transport_builder.contract_client();
@@ -131,8 +131,8 @@ impl NetworkClient {
             dataset_storage,
             local_peer_id,
             network_state_url,
-            assignments: Default::default(),
-            heartbeat_buffer: Mutex::new(Default::default()),
+            assignments: RwLock::default(),
+            heartbeat_buffer: Mutex::default(),
         })
     }
 
@@ -209,7 +209,7 @@ impl NetworkClient {
             sqd_locked,
             epoch_length,
             uses_default_strategy,
-            active_workers,
+            &active_workers,
             epoch_started,
             compute_units_per_epoch,
         );
@@ -221,7 +221,7 @@ impl NetworkClient {
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
-                _ = cancellation_token.cancelled() => {
+                () = cancellation_token.cancelled() => {
                     break;
                 }
             }
@@ -247,7 +247,7 @@ impl NetworkClient {
                 sqd_locked,
                 epoch_length,
                 uses_default_strategy,
-                active_workers,
+                &active_workers,
                 epoch_started,
                 compute_units_per_epoch,
             );
@@ -341,7 +341,7 @@ impl NetworkClient {
                     query_id,
                     result,
                 } => {
-                    self.handle_query_result(peer_id, query_id, result)
+                    self.handle_query_result(peer_id, &query_id, result)
                         .unwrap_or_else(|e| {
                             tracing::error!("Error handling query result: {e:?}");
                         });
@@ -390,7 +390,7 @@ impl NetworkClient {
     pub fn query_worker(
         &self,
         worker: &PeerId,
-        chunk_id: ChunkId,
+        chunk_id: &ChunkId,
         block_range: &BlockRange,
         query: String,
         lease: bool,
@@ -493,7 +493,7 @@ impl NetworkClient {
         };
         drop(assignments);
 
-        let worker_state = match parse_heartbeat(peer_id, heartbeat, assignment) {
+        let worker_state = match parse_heartbeat(peer_id, &heartbeat, &assignment) {
             Ok(state) => state,
             Err(e) => {
                 tracing::warn!("Couldn't parse heartbeat from {peer_id}: {e}");
@@ -510,7 +510,7 @@ impl NetworkClient {
     fn handle_query_result(
         &self,
         peer_id: PeerId,
-        query_id: String,
+        query_id: &str,
         result: Result<sqd_messages::QueryResult, QueryFailure>,
     ) -> anyhow::Result<()> {
         use query_error::Err;
@@ -519,7 +519,7 @@ impl NetworkClient {
 
         let mut tasks = self.tasks.lock();
         let task = tasks
-            .remove(&query_id)
+            .remove(query_id)
             .ok_or_else(|| anyhow::anyhow!("Not expecting response for query {query_id}"))?;
         metrics::QUERIES_RUNNING.set(tasks.len() as i64);
         drop(tasks);
@@ -535,7 +535,7 @@ impl NetworkClient {
                 if let Some(backoff) = retry_after_ms {
                     self.network_state
                         .lock()
-                        .hint_backoff(peer_id, Duration::from_millis(backoff as u64));
+                        .hint_backoff(peer_id, Duration::from_millis(backoff.into()));
                     metrics::report_backoff(peer_id);
                 };
                 match result {
@@ -617,7 +617,7 @@ impl NetworkClient {
         Ok(())
     }
 
-    pub fn dataset_state(&self, dataset_id: DatasetId) -> Option<DatasetState> {
+    pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<DatasetState> {
         self.network_state.lock().dataset_state(dataset_id).cloned()
     }
 
@@ -684,7 +684,7 @@ fn parse_assignment(
     let peers = assignment.get_all_peer_ids();
     let mut worker_chunks = HashMap::new();
     for peer_id in peers {
-        let mut peer_chunks: Vec<ChunkId> = Default::default();
+        let mut peer_chunks = Vec::<ChunkId>::default();
         let Some(chunks) = assignment.dataset_chunks_for_peer_id(&peer_id) else {
             tracing::warn!("Couldn't get assigned chunks for {peer_id}");
             continue;
@@ -710,7 +710,7 @@ fn parse_assignment(
                     .into_iter()
                     .flat_map(|chunk| {
                         chunk.id.parse().map_err(|e| {
-                            tracing::warn!("Couldn't parse chunk id '{}': {e}", chunk.id)
+                            tracing::warn!("Couldn't parse chunk id '{}': {e}", chunk.id);
                         })
                     })
                     .collect(),
@@ -723,8 +723,8 @@ fn parse_assignment(
 
 fn parse_heartbeat(
     peer_id: PeerId,
-    heartbeat: Heartbeat,
-    assignment: Arc<AssignedChunks>,
+    heartbeat: &Heartbeat,
+    assignment: &AssignedChunks,
 ) -> anyhow::Result<HashMap<DatasetId, RangeSet>> {
     let Some(chunk_list) = assignment.get(&peer_id) else {
         anyhow::bail!(

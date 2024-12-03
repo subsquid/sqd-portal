@@ -104,7 +104,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
             status = %response.status(),
             ?latency,
             "HTTP request processed"
-        )
+        );
     });
 
     let endpoint = {
