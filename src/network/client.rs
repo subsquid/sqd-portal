@@ -148,7 +148,10 @@ impl NetworkClient {
         let assignments_loop_fut =
             tokio::spawn(async move { this.run_assignments_loop(token).await });
 
-        tokio::try_join!(events_fut, chain_updates_fut, assignments_loop_fut).unwrap();
+        let result = tokio::try_join!(events_fut, chain_updates_fut, assignments_loop_fut);
+        if let Err(e) = result {
+            tracing::error!("Task failed: {e:?}");
+        }
     }
 
     async fn fetch_blockchain_state(
@@ -682,7 +685,10 @@ fn parse_assignment(
     let mut worker_chunks = HashMap::new();
     for peer_id in peers {
         let mut peer_chunks: Vec<ChunkId> = Default::default();
-        let chunks = assignment.dataset_chunks_for_peer_id(&peer_id).unwrap();
+        let Some(chunks) = assignment.dataset_chunks_for_peer_id(&peer_id) else {
+            tracing::warn!("Couldn't get assigned chunks for {peer_id}");
+            continue;
+        };
         for dataset in chunks {
             let dataset_id = DatasetId::from_url(&dataset.id);
             for chunk in dataset.chunks {
@@ -722,7 +728,7 @@ fn parse_heartbeat(
 ) -> anyhow::Result<HashMap<DatasetId, RangeSet>> {
     let Some(chunk_list) = assignment.get(&peer_id) else {
         anyhow::bail!(
-            "PeerID {:?} not found in Assignment {:?}",
+            "PeerID {:?} not found in the assignment {:?}",
             peer_id,
             heartbeat.assignment_id
         );
