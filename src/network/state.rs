@@ -137,15 +137,14 @@ impl NetworkState {
     ) {
         self.last_pings.insert(worker_id, Instant::now());
         metrics::KNOWN_WORKERS.set(self.last_pings.len() as i64);
-        for dataset_id in self.datasets.read().dataset_ids() {
+        let datasets = self.datasets.read();
+        for dataset_id in datasets.dataset_ids() {
             let dataset_state = worker_state
                 .remove(dataset_id)
                 .unwrap_or_else(RangeSet::empty);
             let entry = self.dataset_states.entry(dataset_id.clone()).or_default();
             entry.update(worker_id, dataset_state);
-            let dataset_name = self
-                .datasets
-                .read()
+            let dataset_name = datasets
                 .dataset_default_name(dataset_id)
                 .map(ToOwned::to_owned);
             metrics::report_dataset_updated(
