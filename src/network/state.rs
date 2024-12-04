@@ -1,4 +1,5 @@
 use num_rational::Ratio;
+use parking_lot::RwLock;
 use serde::Serialize;
 use std::cmp::max;
 use std::collections::HashMap;
@@ -68,7 +69,7 @@ pub enum Status {
 
 pub struct NetworkState {
     config: Arc<Config>,
-    datasets: Arc<DatasetsMapping>,
+    datasets: Arc<RwLock<DatasetsMapping>>,
     dataset_states: HashMap<DatasetId, DatasetState>,
     last_pings: HashMap<PeerId, Instant>,
     pool: WorkersPool,
@@ -89,7 +90,7 @@ pub struct ContractsState {
 }
 
 impl NetworkState {
-    pub fn new(config: Arc<Config>, datasets: Arc<DatasetsMapping>) -> Self {
+    pub fn new(config: Arc<Config>, datasets: Arc<RwLock<DatasetsMapping>>) -> Self {
         Self {
             config,
             datasets,
@@ -136,13 +137,17 @@ impl NetworkState {
     ) {
         self.last_pings.insert(worker_id, Instant::now());
         metrics::KNOWN_WORKERS.set(self.last_pings.len() as i64);
-        for dataset_id in self.datasets.dataset_ids() {
+        for dataset_id in self.datasets.read().dataset_ids() {
             let dataset_state = worker_state
                 .remove(dataset_id)
                 .unwrap_or_else(RangeSet::empty);
             let entry = self.dataset_states.entry(dataset_id.clone()).or_default();
             entry.update(worker_id, dataset_state);
-            let dataset_name = self.datasets.dataset_default_name(dataset_id);
+            let dataset_name = self
+                .datasets
+                .read()
+                .dataset_default_name(dataset_id)
+                .map(ToOwned::to_owned);
             metrics::report_dataset_updated(
                 dataset_id,
                 dataset_name,

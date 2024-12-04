@@ -113,13 +113,13 @@ pub fn report_stream_completed(
 
 pub fn report_dataset_updated(
     dataset_id: &DatasetId,
-    dataset_name: Option<&str>,
+    dataset_name: Option<String>,
     highest_block: u64,
     first_gap: u64,
 ) {
     let mut labels = vec![("dataset_id".to_owned(), dataset_id.to_url().to_owned())];
     if let Some(name) = dataset_name {
-        labels.push(("dataset_name".to_owned(), name.to_owned()));
+        labels.push(("dataset_name".to_owned(), name));
     }
     HIGHEST_BLOCK
         .get_or_create(&labels)
@@ -129,13 +129,13 @@ pub fn report_dataset_updated(
 
 pub fn report_chunk_list_updated(
     dataset_id: &DatasetId,
-    dataset_name: Option<&str>,
+    dataset_name: Option<String>,
     total_chunks: usize,
     last_block: u64,
 ) {
     let mut labels = vec![("dataset_id".to_owned(), dataset_id.to_url().to_owned())];
     if let Some(name) = dataset_name {
-        labels.push(("dataset_name".to_owned(), name.to_owned()));
+        labels.push(("dataset_name".to_owned(), name));
     }
     KNOWN_CHUNKS.get_or_create(&labels).set(total_chunks as i64);
     LAST_STORAGE_BLOCK

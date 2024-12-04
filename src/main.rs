@@ -7,6 +7,7 @@ use cli::Cli;
 use controller::task_manager::TaskManager;
 use http_server::run_server;
 use network::NetworkClient;
+use parking_lot::RwLock;
 use prometheus_client::registry::Registry;
 use tokio_util::sync::CancellationToken;
 
@@ -48,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     setup_tracing(args.json_log);
 
-    let datasets = Arc::new(DatasetsMapping::load(&args.config).await?);
+    let datasets = Arc::new(RwLock::new(DatasetsMapping::load(&args.config).await?));
 
     let config = Arc::new(args.config);
     let network_client =
@@ -73,18 +74,23 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let cancellation_token = CancellationToken::new();
-    let (res, ()) = tokio::join!(
+    let (server_res, (), ()) = tokio::try_join!(
         tokio::spawn(run_server(
             task_manager,
             network_client.clone(),
             metrics_registry,
             args.http_listen,
-            config,
+            config.clone(),
+            datasets.clone(),
+        )),
+        tokio::spawn(DatasetsMapping::run_updates(
             datasets,
+            config.datasets_update_interval,
+            config,
         )),
         network_client.run(cancellation_token),
-    );
-    res??;
+    )?;
+    server_res?;
 
     Ok(())
 }

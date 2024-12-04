@@ -1,10 +1,13 @@
 use crate::cli::Config;
 use crate::types::DatasetId;
 use anyhow::Context;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::BufReader;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub struct DatasetsMapping {
     available: Vec<DatasetConfig>,
@@ -45,6 +48,21 @@ impl DatasetsMapping {
             result.available.len()
         );
         Ok(result)
+    }
+
+    pub async fn run_updates(handle: Arc<RwLock<Self>>, interval: Duration, config: Arc<Config>) {
+        loop {
+            tokio::time::sleep(interval).await;
+            tracing::info!("Updating datasets mapping");
+            match Self::load(&config).await {
+                Ok(mapping) => {
+                    *handle.write() = mapping;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to update datasets mapping: {e:?}");
+                }
+            }
+        }
     }
 
     fn parse(file: NetworkDatasets) -> anyhow::Result<Self> {

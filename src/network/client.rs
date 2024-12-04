@@ -10,6 +10,7 @@ use num_rational::Ratio;
 use num_traits::ToPrimitive;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
+use tokio::task::JoinError;
 use tokio::time::MissedTickBehavior;
 use tokio::{sync::oneshot, time::Instant};
 use tokio_stream::wrappers::IntervalStream;
@@ -96,7 +97,7 @@ impl NetworkClient {
     pub async fn new(
         args: TransportArgs,
         config: Arc<Config>,
-        datasets: Arc<DatasetsMapping>,
+        datasets: Arc<RwLock<DatasetsMapping>>,
     ) -> anyhow::Result<NetworkClient> {
         let network = args.rpc.network;
         let dataset_storage = StorageClient::new(datasets.clone());
@@ -136,7 +137,7 @@ impl NetworkClient {
         })
     }
 
-    pub async fn run(self: Arc<Self>, cancellation_token: CancellationToken) {
+    pub async fn run(self: Arc<Self>, cancellation_token: CancellationToken) -> Result<(), JoinError> {
         let this = Arc::clone(&self);
         let token = cancellation_token.child_token();
         let events_fut = tokio::spawn(async move { this.run_event_stream(token).await });
@@ -148,10 +149,8 @@ impl NetworkClient {
         let assignments_loop_fut =
             tokio::spawn(async move { this.run_assignments_loop(token).await });
 
-        let result = tokio::try_join!(events_fut, chain_updates_fut, assignments_loop_fut);
-        if let Err(e) = result {
-            tracing::error!("Task failed: {e:?}");
-        }
+        tokio::try_join!(events_fut, chain_updates_fut, assignments_loop_fut)?;
+        Ok(())
     }
 
     async fn fetch_blockchain_state(

@@ -62,6 +62,10 @@ fn default_assignments_update_interval() -> Duration {
     Duration::from_secs(60)
 }
 
+fn default_datasets_update_interval() -> Duration {
+    Duration::from_secs(10 * 60)
+}
+
 fn parse_hostname<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -136,6 +140,13 @@ pub struct Config {
         default = "default_assignments_update_interval"
     )]
     pub assignments_update_interval: Duration,
+
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(
+        rename = "datasets_update_interval_sec",
+        default = "default_datasets_update_interval"
+    )]
+    pub datasets_update_interval: Duration,
 
     pub sqd_network: SqdNetworkConfig,
 }

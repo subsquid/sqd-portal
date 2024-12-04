@@ -10,14 +10,14 @@ use crate::{
 
 pub struct StorageClient {
     datasets: RwLock<HashMap<DatasetId, Vec<DataChunk>>>,
-    network_datasets: Arc<DatasetsMapping>,
+    datasets_mapping: Arc<RwLock<DatasetsMapping>>,
 }
 
 impl StorageClient {
-    pub fn new(network_datasets: Arc<DatasetsMapping>) -> Self {
+    pub fn new(datasets_mapping: Arc<RwLock<DatasetsMapping>>) -> Self {
         Self {
             datasets: RwLock::default(),
-            network_datasets,
+            datasets_mapping,
         }
     }
 
@@ -43,7 +43,11 @@ impl StorageClient {
                     dataset
                 );
             }
-            let dataset_name = self.network_datasets.dataset_default_name(&dataset);
+            let dataset_name = self
+                .datasets_mapping
+                .read()
+                .dataset_default_name(&dataset)
+                .map(ToOwned::to_owned);
             metrics::report_chunk_list_updated(&dataset, dataset_name, new_len, last_block);
         }
 

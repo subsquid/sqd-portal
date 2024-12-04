@@ -12,6 +12,7 @@ use axum::{
 };
 use futures::StreamExt;
 use itertools::Itertools;
+use parking_lot::RwLock;
 use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
@@ -42,10 +43,10 @@ async fn get_height(
 async fn get_worker(
     Path((slug, start_block)): Path<(String, u64)>,
     Extension(client): Extension<Arc<NetworkClient>>,
-    Extension(datasets): Extension<Arc<DatasetsMapping>>,
+    Extension(datasets): Extension<Arc<RwLock<DatasetsMapping>>>,
     Extension(config): Extension<Arc<Config>>,
 ) -> Response {
-    let Some(dataset_id) = datasets.dataset_id(&slug) else {
+    let Some(dataset_id) = datasets.read().dataset_id(&slug) else {
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
@@ -187,8 +188,11 @@ async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl In
     axum::Json(res).into_response()
 }
 
-async fn get_datasets(Extension(datasets): Extension<Arc<DatasetsMapping>>) -> impl IntoResponse {
+async fn get_datasets(
+    Extension(datasets): Extension<Arc<RwLock<DatasetsMapping>>>,
+) -> impl IntoResponse {
     let res: Vec<AvailableDatasetApiResponse> = datasets
+        .read()
         .iter()
         .map(|d| AvailableDatasetApiResponse {
             slug: d.slug.clone(),
@@ -203,9 +207,9 @@ async fn get_datasets(Extension(datasets): Extension<Arc<DatasetsMapping>>) -> i
 async fn get_dataset_state(
     Path(slug): Path<String>,
     Extension(client): Extension<Arc<NetworkClient>>,
-    Extension(datasets): Extension<Arc<DatasetsMapping>>,
+    Extension(datasets): Extension<Arc<RwLock<DatasetsMapping>>>,
 ) -> impl IntoResponse {
-    let Some(dataset_id) = datasets.dataset_id(&slug) else {
+    let Some(dataset_id) = datasets.read().dataset_id(&slug) else {
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
@@ -214,8 +218,9 @@ async fn get_dataset_state(
 
 async fn get_dataset_metadata(
     Path(slug): Path<String>,
-    Extension(datasets): Extension<Arc<DatasetsMapping>>,
+    Extension(datasets): Extension<Arc<RwLock<DatasetsMapping>>>,
 ) -> impl IntoResponse {
+    let datasets = datasets.read();
     let Some(dataset) = datasets.find_dataset(&slug) else {
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
@@ -254,7 +259,7 @@ pub async fn run_server(
     metrics_registry: Registry,
     addr: SocketAddr,
     config: Arc<Config>,
-    datasets: Arc<DatasetsMapping>,
+    datasets: Arc<RwLock<DatasetsMapping>>,
 ) -> anyhow::Result<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
@@ -408,11 +413,11 @@ where
             .await
             .map_err(IntoResponse::into_response)?;
         let Extension(datasets) = parts
-            .extract::<Extension<Arc<DatasetsMapping>>>()
+            .extract::<Extension<Arc<RwLock<DatasetsMapping>>>>()
             .await
             .map_err(IntoResponse::into_response)?;
 
-        let Some(dataset_id) = datasets.dataset_id(&dataset) else {
+        let Some(dataset_id) = datasets.read().dataset_id(&dataset) else {
             return Err(
                 (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response(),
             );
