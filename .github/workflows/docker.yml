@@ -34,10 +34,7 @@ jobs:
           VERSION: ${{ steps.read_toml.outputs.value }}
         with:
           context: .
-          # Build only for Linux AMD64 now
-          # TODO: uncomment and re-build before public release
-          platforms: linux/amd64
-#          platforms: linux/amd64,linux/arm/v7,linux/arm64/v8,linux/386
+          platforms: linux/amd64,linux/arm/v7,linux/arm64/v8,linux/386
           push: true
           tags: |
             subsquid/sqd-portal:${{ env.VERSION }}
