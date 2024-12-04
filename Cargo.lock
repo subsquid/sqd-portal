@@ -5457,7 +5457,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.5.3-rc2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -6121,10 +6121,16 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8437150ab6bbc8c5f0f519e3d5ed4aa883a83dd4cdd3d1b21f9482936046cb97"
 dependencies = [
+ "async-compression",
  "bitflags 2.6.0",
  "bytes 1.7.1",
+ "futures-core",
  "http 1.1.0",
+ "http-body 1.0.0",
+ "http-body-util",
  "pin-project-lite",
+ "tokio 1.38.0",
+ "tokio-util",
  "tower-layer",
  "tower-service",
 ]

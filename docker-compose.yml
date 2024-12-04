@@ -1,6 +1,6 @@
 services:
   query_gateway:
-    image: subsquid/sqd-portal:0.5.2
+    image: subsquid/sqd-portal:0.5.3
     environment:
       KEY_PATH: /run/secrets/network_key
       CONFIG: /app/data/${NETWORK}.config.yml

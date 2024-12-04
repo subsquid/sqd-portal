@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::{
@@ -294,6 +295,7 @@ pub async fn run_server(
         .layer(axum::middleware::from_fn(logging::middleware))
         .route("/metrics", get(get_metrics))
         .route("/status", get(get_status))
+        .layer(RequestDecompressionLayer::new())
         .layer(cors)
         .layer(Extension(task_manager))
         .layer(Extension(network_state))
