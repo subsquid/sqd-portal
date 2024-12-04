@@ -40,7 +40,7 @@ lazy_static::lazy_static! {
     static ref SUPPORTED_VERSIONS: semver::VersionReq = "^2.0.0".parse().expect("Invalid version requirement");
 }
 const MAX_CONCURRENT_QUERIES: usize = 10_000;
-const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 5;
+const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 4;
 const MAX_WAITING_PINGS: usize = 2000;
 
 pub type QueryResult = Result<QueryOk, QueryError>;
