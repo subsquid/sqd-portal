@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 
 [dependencies]
@@ -36,6 +36,9 @@ tracing = { version = "0.1", features = ["async-await"] }
 tracing-futures = { version = "0.2.5", features = ["tokio", "futures-03"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.5", features = ["profiling"] }
 
 sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "82303b9", version = "1.2.1" }
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "82303b9", version = "2.0.0", features = ["semver", "bitstring", "assignment_reader"] }
