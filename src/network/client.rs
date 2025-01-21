@@ -137,7 +137,10 @@ impl NetworkClient {
         })
     }
 
-    pub async fn run(self: Arc<Self>, cancellation_token: CancellationToken) -> Result<(), JoinError> {
+    pub async fn run(
+        self: Arc<Self>,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), JoinError> {
         let this = Arc::clone(&self);
         let token = cancellation_token.child_token();
         let events_fut = tokio::spawn(async move { this.run_event_stream(token).await });

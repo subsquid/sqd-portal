@@ -45,6 +45,7 @@ impl DatasetState {
         }
     }
 
+    /// The last block such that every block from 0 to this one is owned by at least one worker
     pub fn highest_indexable_block(&self) -> u64 {
         let range_set: RangeSet = self
             .worker_ranges
@@ -56,6 +57,11 @@ impl DatasetState {
             Some(range) if range.begin == 0 => range.end,
             _ => 0,
         }
+    }
+
+    /// The last block known to be downloaded by at least one worker
+    pub fn highest_known_block(&self) -> u64 {
+        self.highest_seen_block
     }
 }
 
@@ -187,7 +193,7 @@ impl NetworkState {
     pub fn get_height(&self, dataset_id: &DatasetId) -> Option<u64> {
         self.dataset_states
             .get(dataset_id)
-            .map(|state| state.highest_indexable_block())
+            .map(|state| state.highest_known_block())
     }
 
     fn worker_active(
