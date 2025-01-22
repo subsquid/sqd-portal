@@ -47,7 +47,7 @@ impl From<QueryError> for RequestError {
 impl axum::response::IntoResponse for RequestError {
     fn into_response(self) -> axum::response::Response {
         use axum::http::header;
-        match self {
+        let mut response = match self {
             s @ Self::BadRequest(_) => (StatusCode::BAD_REQUEST, s.to_string()).into_response(),
             Self::NoData(_) => (StatusCode::NO_CONTENT, ()).into_response(),
             s @ Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, s.to_string()).into_response(),
@@ -59,7 +59,12 @@ impl axum::response::IntoResponse for RequestError {
             s @ Self::InternalError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, s.to_string()).into_response()
             }
-        }
+        };
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        response
     }
 }
 
