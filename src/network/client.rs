@@ -11,8 +11,8 @@ use num_traits::ToPrimitive;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tokio::task::JoinError;
+use tokio::time::Instant;
 use tokio::time::MissedTickBehavior;
-use tokio::{sync::oneshot, time::Instant};
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
 
@@ -20,8 +20,8 @@ use sqd_contract_client::{Client as ContractClient, ClientError, Network, PeerId
 use sqd_messages::assignments::Assignment;
 use sqd_messages::{query_error, query_result, Heartbeat, Query, QueryOk, RangeSet};
 use sqd_network_transport::{
-    get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransportHandle,
-    P2PTransportBuilder, QueryFailure, QueueFull, TransportArgs,
+    get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransport, Keypair,
+    P2PTransportBuilder, QueryFailure, TransportArgs,
 };
 
 use super::priorities::NoWorker;
@@ -32,14 +32,13 @@ use crate::types::{BlockRange, ChunkId, DataChunk};
 use crate::{
     cli::Config,
     metrics,
-    types::{generate_query_id, DatasetId, QueryError, QueryId},
+    types::{generate_query_id, DatasetId, QueryError},
     utils::UseOnce,
 };
 
 lazy_static::lazy_static! {
     static ref SUPPORTED_VERSIONS: semver::VersionReq = "^2.0.0".parse().expect("Invalid version requirement");
 }
-const MAX_CONCURRENT_QUERIES: usize = 10_000;
 const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 5;
 const MAX_WAITING_PINGS: usize = 2000;
 
@@ -73,25 +72,20 @@ pub struct NetworkClientStatus {
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
-    transport_handle: GatewayTransportHandle,
+    transport_handle: GatewayTransport,
     network_state: Mutex<NetworkState>,
     contract_client: Box<dyn ContractClient>,
-    tasks: Mutex<HashMap<QueryId, QueryTask>>,
     dataset_storage: StorageClient,
     chain_update_interval: Duration,
     assignment_update_interval: Duration,
     local_peer_id: PeerId,
+    keypair: Keypair,
     network_state_url: String,
     assignments: RwLock<BTreeMap<String, Arc<AssignedChunks>>>,
     heartbeat_buffer: Mutex<VecDeque<(PeerId, Heartbeat)>>,
 }
 
 type AssignedChunks = HashMap<PeerId, Vec<ChunkId>>;
-
-struct QueryTask {
-    result_tx: oneshot::Sender<QueryResult>,
-    worker_id: PeerId,
-}
 
 impl NetworkClient {
     pub async fn new(
@@ -105,11 +99,10 @@ impl NetworkClient {
         let transport_builder = P2PTransportBuilder::from_cli(args, agent_into).await?;
         let contract_client = transport_builder.contract_client();
         let local_peer_id = transport_builder.local_peer_id();
+        let keypair = transport_builder.keypair();
 
-        let mut gateway_config = GatewayConfig::new();
+        let mut gateway_config = GatewayConfig::default();
         gateway_config.query_config.request_timeout = config.transport_timeout;
-        gateway_config.query_config.max_buffered = MAX_CONCURRENT_QUERIES + 24;
-        gateway_config.queries_queue_size = 10000;
         gateway_config.events_queue_size = 10000;
         let (incoming_events, transport_handle) =
             transport_builder.build_gateway(gateway_config)?;
@@ -128,9 +121,9 @@ impl NetworkClient {
             incoming_events: UseOnce::new(Box::new(incoming_events)),
             network_state: Mutex::new(NetworkState::new(config, datasets)),
             contract_client,
-            tasks: Mutex::new(HashMap::new()),
             dataset_storage,
             local_peer_id,
+            keypair,
             network_state_url,
             assignments: RwLock::default(),
             heartbeat_buffer: Mutex::default(),
@@ -338,25 +331,6 @@ impl NetworkClient {
                 GatewayEvent::Heartbeat { peer_id, heartbeat } => {
                     self.handle_heartbeat(peer_id, heartbeat);
                 }
-                GatewayEvent::QueryResult {
-                    peer_id,
-                    query_id,
-                    result,
-                } => {
-                    self.handle_query_result(peer_id, &query_id, result)
-                        .unwrap_or_else(|e| {
-                            tracing::error!("Error handling query result: {e:?}");
-                        });
-                }
-                GatewayEvent::QueryDropped { query_id } => {
-                    if self.tasks.lock().remove(&query_id).is_some() {
-                        metrics::QUERIES_RUNNING.dec();
-                        tracing::trace!("Query dropped: {query_id}");
-                        // drop result_tx
-                    } else {
-                        tracing::error!("Not expecting response for query {query_id}");
-                    }
-                }
             }
         }
     }
@@ -389,75 +363,148 @@ impl NetworkClient {
         self.network_state.lock().get_height(dataset)
     }
 
-    pub fn query_worker(
-        &self,
-        worker: &PeerId,
-        chunk_id: &ChunkId,
-        block_range: &BlockRange,
+    pub async fn query_worker(
+        self: Arc<Self>,
+        worker: PeerId,
+        chunk_id: ChunkId,
+        block_range: BlockRange,
         query: String,
         lease: bool,
-    ) -> Result<oneshot::Receiver<QueryResult>, QueueFull> {
+    ) -> QueryResult {
         let query_id = generate_query_id();
         tracing::trace!("Sending query {query_id} to {worker}");
 
         if lease {
-            self.network_state.lock().lease_worker(*worker);
+            self.network_state.lock().lease_worker(worker);
         }
 
-        let (result_tx, result_rx) = oneshot::channel();
-
-        let task = QueryTask {
-            result_tx,
-            worker_id: *worker,
+        let mut query = Query {
+            dataset: chunk_id.dataset.to_url().to_owned(),
+            query_id: query_id.clone(),
+            query,
+            block_range: Some(sqd_messages::Range {
+                begin: *block_range.start(),
+                end: *block_range.end(),
+            }),
+            chunk_id: chunk_id.chunk.to_string(),
+            timestamp_ms: timestamp_now_ms(),
+            signature: Default::default(),
         };
-        let mut tasks = self.tasks.lock();
-        // TODO: find out the reason why there are hanging tasks
-        if tasks.len() >= MAX_CONCURRENT_QUERIES {
-            let mut num_dropped = 0;
-            tasks.retain(|_query_id, task| {
-                if task.result_tx.is_closed() {
-                    num_dropped += 1;
-                    false
-                } else {
-                    true
-                }
-            });
-            if num_dropped > 0 {
-                tracing::warn!("Dropped {num_dropped} hanging tasks");
-            }
-        }
-        if tasks.len() >= MAX_CONCURRENT_QUERIES {
-            metrics::QUERIES_RUNNING.set(tasks.len() as i64);
-            return Err(QueueFull);
-        }
-        tasks.insert(query_id.clone(), task);
-        metrics::QUERIES_RUNNING.set(tasks.len() as i64);
-        drop(tasks);
+        query
+            .sign(&self.keypair, worker)
+            .expect("Query should be valid to sign");
 
-        self.transport_handle
-            .send_query(
-                *worker,
-                Query {
-                    dataset: chunk_id.dataset.to_url().to_owned(),
-                    query_id: query_id.clone(),
-                    query,
-                    block_range: Some(sqd_messages::Range {
-                        begin: *block_range.start(),
-                        end: *block_range.end(),
-                    }),
-                    chunk_id: chunk_id.chunk.to_string(),
-                    timestamp_ms: timestamp_now_ms(),
-                    signature: Default::default(),
-                },
-            )
-            .inspect_err(|_| {
-                self.tasks.lock().remove(&query_id);
-            })?;
-
+        metrics::QUERIES_RUNNING.inc();
         metrics::QUERIES_SENT
             .get_or_create(&vec![("worker".to_string(), worker.to_string())])
             .inc();
-        Ok(result_rx)
+
+        let this = self.clone();
+        let guard = scopeguard::guard(worker, |worker: PeerId| {
+            // The result is no longer needed. Either another query has got the result first,
+            // or the stream has been dropped. In either case, consider the query outrun.
+            this.network_state.lock().report_query_outrun(worker);
+            metrics::QUERIES_RUNNING.dec();
+        });
+
+        let result = self.transport_handle.send_query(worker, query).await;
+        scopeguard::ScopeGuard::into_inner(guard);
+        metrics::QUERIES_RUNNING.dec();
+
+        self.parse_query_result(worker, result)
+    }
+
+    fn parse_query_result(
+        &self,
+        peer_id: PeerId,
+        result: Result<sqd_messages::QueryResult, QueryFailure>,
+    ) -> QueryResult {
+        use query_error::Err;
+
+        match result {
+            Ok(q) if !q.verify_signature(peer_id) => {
+                metrics::report_query_result(peer_id, "validation_error");
+                self.network_state.lock().report_query_failure(peer_id);
+                Err(QueryError::Retriable(format!("Invalid signature")))
+            }
+            Ok(sqd_messages::QueryResult {
+                result: Some(result),
+                retry_after_ms,
+                ..
+            }) => {
+                if let Some(backoff) = retry_after_ms {
+                    self.network_state
+                        .lock()
+                        .hint_backoff(peer_id, Duration::from_millis(backoff.into()));
+                    metrics::report_backoff(peer_id);
+                };
+                match result {
+                    query_result::Result::Ok(ok) => {
+                        metrics::report_query_result(peer_id, "ok");
+                        self.network_state.lock().report_query_success(peer_id);
+                        Ok(ok)
+                    }
+                    query_result::Result::Err(sqd_messages::QueryError { err: Some(err) }) => {
+                        match err {
+                            Err::BadRequest(s) => {
+                                metrics::report_query_result(peer_id, "bad_request");
+                                self.network_state.lock().report_query_success(peer_id);
+                                Err(QueryError::BadRequest(s))
+                            }
+                            Err::NotFound(s) => {
+                                metrics::report_query_result(peer_id, "not_found");
+                                self.network_state.lock().report_query_error(peer_id);
+                                Err(QueryError::Retriable(s))
+                            }
+                            Err::ServerError(s) => {
+                                metrics::report_query_result(peer_id, "server_error");
+                                self.network_state.lock().report_query_error(peer_id);
+                                Err(QueryError::Retriable(s))
+                            }
+                            Err::ServerOverloaded(()) => {
+                                metrics::report_query_result(peer_id, "server_overloaded");
+                                self.network_state.lock().report_query_error(peer_id);
+                                Err(QueryError::Retriable("Server overloaded".to_owned()))
+                            }
+                            Err::TooManyRequests(()) => {
+                                metrics::report_query_result(peer_id, "too_many_requests");
+                                self.network_state.lock().report_query_success(peer_id);
+                                Err(QueryError::Retriable("Too many requests".to_owned()))
+                            }
+                        }
+                    }
+                    query_result::Result::Err(sqd_messages::QueryError { err: None }) => {
+                        metrics::report_query_result(peer_id, "invalid");
+                        self.network_state.lock().report_query_error(peer_id);
+                        Err(QueryError::Retriable("Unknown error message".to_string()))
+                    }
+                }
+            }
+            Ok(sqd_messages::QueryResult { result: None, .. }) => {
+                metrics::report_query_result(peer_id, "invalid");
+                self.network_state.lock().report_query_error(peer_id);
+                Err(QueryError::Retriable("Unknown error message".to_string()))
+            }
+            Err(QueryFailure::InvalidRequest(e)) => {
+                metrics::report_query_result(peer_id, "bad_request");
+                Err(QueryError::BadRequest(format!("Invalid request: {e}")))
+            }
+            Err(QueryFailure::InvalidResponse(e)) => {
+                metrics::report_query_result(peer_id, "invalid");
+                self.network_state.lock().report_query_error(peer_id);
+                Err(QueryError::Retriable(format!("Response error: {e}")))
+            }
+            Err(QueryFailure::Timeout(t)) => {
+                metrics::report_query_result(peer_id, "timeout");
+                self.network_state.lock().report_query_failure(peer_id);
+                Err(QueryError::Retriable(t.to_string()))
+            }
+            Err(QueryFailure::TransportError(e)) => {
+                metrics::report_query_result(peer_id, "transport_error");
+                self.network_state.lock().report_query_failure(peer_id);
+                Err(QueryError::Retriable(format!("Transport error: {e}")))
+            }
+        }
     }
 
     fn handle_heartbeat(&self, peer_id: PeerId, heartbeat: Heartbeat) {
@@ -507,116 +554,6 @@ impl NetworkClient {
         self.network_state
             .lock()
             .update_dataset_states(peer_id, worker_state);
-    }
-
-    fn handle_query_result(
-        &self,
-        peer_id: PeerId,
-        query_id: &str,
-        result: Result<sqd_messages::QueryResult, QueryFailure>,
-    ) -> anyhow::Result<()> {
-        use query_error::Err;
-
-        tracing::trace!("Got result for query {query_id}");
-
-        let mut tasks = self.tasks.lock();
-        let task = tasks
-            .remove(query_id)
-            .ok_or_else(|| anyhow::anyhow!("Not expecting response for query {query_id}"))?;
-        metrics::QUERIES_RUNNING.set(tasks.len() as i64);
-        drop(tasks);
-
-        assert_eq!(peer_id, task.worker_id);
-
-        let query_result = match result {
-            Ok(sqd_messages::QueryResult {
-                result: Some(result),
-                retry_after_ms,
-                ..
-            }) => {
-                if let Some(backoff) = retry_after_ms {
-                    self.network_state
-                        .lock()
-                        .hint_backoff(peer_id, Duration::from_millis(backoff.into()));
-                    metrics::report_backoff(peer_id);
-                };
-                match result {
-                    query_result::Result::Ok(ok) => {
-                        metrics::report_query_result(peer_id, "ok");
-                        if task.result_tx.send(Ok(ok)).is_ok() {
-                            self.network_state.lock().report_query_success(peer_id);
-                        } else {
-                            // The result is no longer needed. Either another query has got the result first,
-                            // or the stream has been dropped. In either case, consider the query outrun.
-                            self.network_state.lock().report_query_outrun(peer_id);
-                        }
-                        return Ok(());
-                    }
-                    query_result::Result::Err(sqd_messages::QueryError { err: Some(err) }) => {
-                        match err {
-                            Err::BadRequest(s) => {
-                                metrics::report_query_result(peer_id, "bad_request");
-                                if task.result_tx.send(Err(QueryError::BadRequest(s))).is_ok() {
-                                    self.network_state.lock().report_query_success(peer_id);
-                                } else {
-                                    self.network_state.lock().report_query_outrun(peer_id);
-                                }
-                                return Ok(());
-                            }
-                            Err::NotFound(s) => {
-                                metrics::report_query_result(peer_id, "not_found");
-                                self.network_state.lock().report_query_error(peer_id);
-                                Err(QueryError::Retriable(s))
-                            }
-                            Err::ServerError(s) => {
-                                metrics::report_query_result(peer_id, "server_error");
-                                self.network_state.lock().report_query_error(peer_id);
-                                Err(QueryError::Retriable(s))
-                            }
-                            Err::ServerOverloaded(()) => {
-                                metrics::report_query_result(peer_id, "server_overloaded");
-                                self.network_state.lock().report_query_error(peer_id);
-                                Err(QueryError::Retriable("Server overloaded".to_owned()))
-                            }
-                            Err::TooManyRequests(()) => {
-                                metrics::report_query_result(peer_id, "too_many_requests");
-                                self.network_state.lock().report_query_success(peer_id);
-                                Err(QueryError::Retriable("Too many requests".to_owned()))
-                            }
-                        }
-                    }
-                    query_result::Result::Err(sqd_messages::QueryError { err: None }) => {
-                        metrics::report_query_result(peer_id, "invalid");
-                        self.network_state.lock().report_query_error(peer_id);
-                        anyhow::bail!("Unknown error message")
-                    }
-                }
-            }
-            Ok(sqd_messages::QueryResult { result: None, .. }) => {
-                metrics::report_query_result(peer_id, "invalid");
-                self.network_state.lock().report_query_error(peer_id);
-                anyhow::bail!("Unknown error message")
-            }
-            Err(QueryFailure::Timeout(t)) => {
-                metrics::report_query_result(peer_id, "timeout");
-                self.network_state.lock().report_query_failure(peer_id);
-                Err(QueryError::Retriable(t.to_string()))
-            }
-            Err(QueryFailure::TransportError(e)) => {
-                metrics::report_query_result(peer_id, "transport_error");
-                self.network_state.lock().report_query_failure(peer_id);
-                Err(QueryError::Retriable(format!("Transport error: {e}")))
-            }
-            Err(QueryFailure::ValidationError(e)) => {
-                metrics::report_query_result(peer_id, "validation_error");
-                self.network_state.lock().report_query_failure(peer_id);
-                Err(QueryError::Retriable(format!("Validation error: {e}")))
-            }
-        };
-
-        task.result_tx.send(query_result).ok();
-
-        Ok(())
     }
 
     pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<DatasetState> {

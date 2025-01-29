@@ -108,22 +108,16 @@ async fn execute_query(
     let range = query
         .intersect_with(&chunk.block_range())
         .expect("Found chunk should intersect with query");
-    let Ok(fut) = client.query_worker(
-        &worker_id,
-        &ChunkId::new(dataset_id, chunk),
-        &range,
+    let fut = client.query_worker(
+        worker_id,
+        ChunkId::new(dataset_id, chunk),
+        range,
         query.into_string(),
         true,
-    ) else {
-        return RequestError::Busy.into_response();
-    };
+    );
     let result = match fut.await {
-        Err(_) => {
-            return RequestError::InternalError("Receiving result failed".to_string())
-                .into_response()
-        }
-        Ok(Ok(result)) => result,
-        Ok(Err(err)) => return RequestError::from(err).into_response(),
+        Ok(result) => result,
+        Err(err) => return RequestError::from(err).into_response(),
     };
     match convert_response(&result.data) {
         Ok(data) => Response::builder()

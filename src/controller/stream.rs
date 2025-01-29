@@ -68,7 +68,7 @@ struct PartialResult {
 }
 
 struct WorkerRequest {
-    resp: tokio::sync::oneshot::Receiver<QueryResult>,
+    resp: Pin<Box<dyn Future<Output = QueryResult> + Send>>,
     start_time: tokio::time::Instant,
     worker: PeerId,
 }
@@ -150,9 +150,8 @@ impl StreamController {
         let mut result = None;
         let mut retry = false;
         pending.requests.retain_mut(|request| {
-            let response = match request.resp.poll_unpin(ctx) {
-                Poll::Pending => return true,
-                Poll::Ready(res) => res.expect("Query result sender dropped"),
+            let Poll::Ready(response) = request.resp.poll_unpin(ctx) else {
+                return true;
             };
             // This is intentionally measured when the result has been polled, not when it's ready.
             // If the stream is consumed slower than generated, this duration may get significantly higher than the response time.
@@ -421,20 +420,21 @@ impl StreamController {
             worker,
         );
         let start_time = tokio::time::Instant::now();
-        let mut receiver = self
+        let mut fut = self
             .network
+            .clone()
             .query_worker(
-                &worker,
-                &ChunkId::new(self.request.dataset_id.clone(), range.chunk),
-                &range.range,
+                worker,
+                ChunkId::new(self.request.dataset_id.clone(), range.chunk),
+                range.range.clone(),
                 self.request.query.to_string(),
                 false,
             )
-            .map_err(|_| SendQueryError::TransportQueueFull)?;
-        assert!(receiver.poll_unpin(ctx).is_pending());
+            .boxed();
+        assert!(fut.poll_unpin(ctx).is_pending());
         self.stats.query_sent();
         Ok(WorkerRequest {
-            resp: receiver,
+            resp: fut,
             start_time,
             worker,
         })

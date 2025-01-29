@@ -27,8 +27,6 @@ pub enum QueryError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum SendQueryError {
-    #[error("Transport queue full")]
-    TransportQueueFull,
     #[error("No workers available")]
     NoWorkers,
     #[error("Rate limited")]
