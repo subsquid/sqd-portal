@@ -91,11 +91,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         .map(|v| v.to_str().unwrap_or_default().to_owned())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let span = tracing::span!(
-        tracing::Level::INFO,
-        "http_request",
-        request_id
-    );
+    let span = tracing::span!(tracing::Level::INFO, "http_request", request_id);
 
     let response = next.run(req).instrument(span.clone()).await;
 

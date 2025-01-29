@@ -20,7 +20,7 @@ use crate::{
         BlockRange, ChunkId, ClientRequest, DataChunk, QueryError, RequestError, ResponseChunk,
         SendQueryError,
     },
-    utils::{logging::StreamStats, OptionExt, SlidingArray},
+    utils::{logging::StreamStats, SlidingArray},
 };
 
 const MAX_IDLE_TIME: Duration = Duration::from_millis(1000);
