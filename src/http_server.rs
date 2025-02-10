@@ -248,7 +248,7 @@ async fn get_dataset_state(
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
     };
 
-    axum::Json(client.dataset_state(&dataset_id)).into_response()
+    axum::Json(client.dataset_state(&dataset_id).unwrap()).into_response()
 }
 
 async fn get_dataset_metadata(

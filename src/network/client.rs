@@ -10,6 +10,7 @@ use num_rational::Ratio;
 use num_traits::ToPrimitive;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
+use sqd_node::Node as HotblocksServer;
 use tokio::task::JoinError;
 use tokio::time::Instant;
 use tokio::time::MissedTickBehavior;
@@ -27,7 +28,7 @@ use sqd_network_transport::{
 use super::priorities::NoWorker;
 use super::{NetworkState, StorageClient};
 use crate::datasets::DatasetsMapping;
-use crate::network::state::{DatasetState, Status};
+use crate::network::state::Status;
 use crate::types::{BlockRange, ChunkId, DataChunk};
 use crate::{
     cli::Config,
@@ -92,6 +93,7 @@ impl NetworkClient {
         args: TransportArgs,
         config: Arc<Config>,
         datasets: Arc<RwLock<DatasetsMapping>>,
+        hotblocks: Option<Arc<HotblocksServer>>,
     ) -> anyhow::Result<NetworkClient> {
         let network = args.rpc.network;
         let dataset_storage = StorageClient::new(datasets.clone());
@@ -114,12 +116,26 @@ impl NetworkClient {
         let network_state_url =
             format!("https://metadata.sqd-datasets.io/{network_state_filename}");
 
+        // FIXME
+        let mut state = NetworkState::new(config.clone(), datasets);
+        if let Some(hotblocks) = hotblocks {
+            state.subscribe_height_update(
+                &DatasetId::from_url("s3://solana-mainnet"),
+                Box::new(move |height| {
+                    hotblocks.retain(
+                        "solana".try_into().unwrap(),
+                        sqd_node::RetentionStrategy::FromBlock(height + 1),
+                    );
+                }),
+            );
+        }
+
         Ok(NetworkClient {
             chain_update_interval: config.chain_update_interval,
             assignment_update_interval: config.assignments_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
-            network_state: Mutex::new(NetworkState::new(config, datasets)),
+            network_state: Mutex::new(state),
             contract_client,
             dataset_storage,
             local_peer_id,
@@ -556,8 +572,10 @@ impl NetworkClient {
             .update_dataset_states(peer_id, worker_state);
     }
 
-    pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<DatasetState> {
-        self.network_state.lock().dataset_state(dataset_id).cloned()
+    pub fn dataset_state(&self, dataset_id: &DatasetId) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            self.network_state.lock().dataset_state(dataset_id),
+        )?)
     }
 
     pub fn get_peer_id(&self) -> PeerId {

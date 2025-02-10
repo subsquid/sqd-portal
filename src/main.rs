@@ -60,8 +60,16 @@ async fn main() -> anyhow::Result<()> {
     let datasets = Arc::new(RwLock::new(DatasetsMapping::load(&args.config).await?));
 
     let config = Arc::new(args.config);
-    let network_client =
-        Arc::new(NetworkClient::new(args.transport, config.clone(), datasets.clone()).await?);
+    let hotblocks = hotblocks::build_server(&config)?.map(Arc::new);
+    let network_client = Arc::new(
+        NetworkClient::new(
+            args.transport,
+            config.clone(),
+            datasets.clone(),
+            hotblocks.clone(),
+        )
+        .await?,
+    );
 
     let mut metrics_registry = Registry::with_labels(
         vec![(
@@ -80,7 +88,6 @@ async fn main() -> anyhow::Result<()> {
         network_client.clone(),
         config.max_parallel_streams,
     ));
-    let hotblocks = hotblocks::build_server(&config)?.map(Arc::new);
 
     let cancellation_token = CancellationToken::new();
     let (server_res, (), ()) = tokio::try_join!(
