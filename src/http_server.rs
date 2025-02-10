@@ -35,12 +35,49 @@ use crate::{
 
 async fn get_height(
     Extension(network_state): Extension<Arc<NetworkClient>>,
-    Path(slug): Path<String>,
+    Path(dataset): Path<String>,
     dataset_id: DatasetId,
 ) -> impl IntoResponse {
     match network_state.get_height(&dataset_id) {
         Some(height) => (StatusCode::OK, height.to_string()),
-        None => (StatusCode::NOT_FOUND, format!("No data for dataset {slug}")),
+        None => (
+            StatusCode::NOT_FOUND,
+            format!("No data for dataset {dataset}"),
+        ),
+    }
+}
+
+async fn get_finalized_head(
+    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Path(dataset): Path<String>,
+) -> Response {
+    let Some(hotblocks) = hotblocks else {
+        return (StatusCode::NOT_FOUND, "Hotblocks server is not available").into_response();
+    };
+    if dataset == "solana-mainnet" {
+        match hotblocks.get_finalized_head("solana".try_into().unwrap()) {
+            Ok(head) => (StatusCode::OK, axum::Json(head)).into_response(),
+            Err(err) => (StatusCode::NOT_FOUND, format!("{}", err)).into_response(),
+        }
+    } else {
+        (StatusCode::NOT_FOUND, format!("No real-time source for dataset {dataset}")).into_response()
+    }
+}
+
+async fn get_head(
+    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Path(dataset): Path<String>,
+) -> Response {
+    let Some(hotblocks) = hotblocks else {
+        return (StatusCode::NOT_FOUND, "Hotblocks server is not available").into_response();
+    };
+    if dataset == "solana-mainnet" {
+        match hotblocks.get_head("solana".try_into().unwrap()) {
+            Ok(head) => (StatusCode::OK, axum::Json(head)).into_response(),
+            Err(err) => (StatusCode::NOT_FOUND, format!("{}", err)).into_response(),
+        }
+    } else {
+        (StatusCode::NOT_FOUND, format!("No real-time source for dataset {dataset}")).into_response()
     }
 }
 
@@ -318,6 +355,8 @@ pub async fn run_server(
             post(run_finalized_stream),
         )
         .route("/datasets/:dataset/stream", post(run_stream))
+        .route("/datasets/:dataset/finalized-head", get(get_finalized_head))
+        .route("/datasets/:dataset/head", get(get_head))
         .route("/datasets/:dataset/state", get(get_dataset_state))
         .route("/datasets/:dataset/metadata", get(get_dataset_metadata))
         // backward compatibility routes
@@ -503,7 +542,9 @@ fn hotblocks_error_to_response(err: anyhow::Error) -> Response {
     }
 
     if let Some(fork) = err.downcast_ref::<sqd_node::error::UnexpectedBaseBlock>() {
-        return (StatusCode::CONFLICT, axum::Json(&fork.prev_blocks)).into_response();
+        return (StatusCode::CONFLICT, axum::Json(serde_json::json!({
+            "lastBlocks": &fork.prev_blocks
+        }))).into_response();
     }
 
     let status_code = if err.is::<sqd_node::error::UnknownDataset>() {
