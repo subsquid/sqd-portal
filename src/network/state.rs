@@ -1,7 +1,6 @@
 use num_rational::Ratio;
 use parking_lot::RwLock;
 use serde::Serialize;
-use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -17,11 +16,13 @@ use crate::types::DatasetId;
 
 use super::priorities::{NoWorker, WorkersPool};
 
-#[derive(Default, Debug, Clone, Serialize)]
+#[derive(Default, Serialize)]
 pub struct DatasetState {
     worker_ranges: HashMap<PeerId, RangeSet>,
     highest_seen_block: u64,
     first_gap: u64,
+    #[serde(skip)]
+    height_update_subscribers: Vec<Box<dyn FnMut(u64) + Send>>,
 }
 
 impl DatasetState {
@@ -34,7 +35,10 @@ impl DatasetState {
     pub fn update(&mut self, peer_id: PeerId, state: RangeSet) {
         let mut could_close_gap = false;
         if let Some(range) = state.ranges.last() {
-            self.highest_seen_block = max(self.highest_seen_block, range.end);
+            if range.end > self.highest_seen_block {
+                self.highest_seen_block = range.end;
+                self.notify_height_update();
+            }
             if range.end >= self.first_gap {
                 could_close_gap = true;
             }
@@ -62,6 +66,17 @@ impl DatasetState {
     /// The last block known to be downloaded by at least one worker
     pub fn highest_known_block(&self) -> u64 {
         self.highest_seen_block
+    }
+
+    pub fn subscribe_height_update(&mut self, subscriber: Box<dyn FnMut(u64) + Send>) {
+        self.height_update_subscribers.push(subscriber);
+    }
+
+    fn notify_height_update(&mut self) {
+        let height = self.highest_seen_block;
+        for subscriber in &mut self.height_update_subscribers {
+            subscriber(height);
+        }
     }
 }
 
@@ -206,6 +221,17 @@ impl NetworkState {
 
     pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<&DatasetState> {
         self.dataset_states.get(dataset_id)
+    }
+
+    pub fn subscribe_height_update(
+        &mut self,
+        dataset_id: &DatasetId,
+        subscriber: Box<dyn FnMut(u64) + Send>,
+    ) {
+        self.dataset_states
+            .entry(dataset_id.clone())
+            .or_default()
+            .subscribe_height_update(subscriber);
     }
 
     #[allow(clippy::too_many_arguments)]
