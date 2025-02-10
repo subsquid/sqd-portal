@@ -66,6 +66,10 @@ fn default_datasets_update_interval() -> Duration {
     Duration::from_secs(10 * 60)
 }
 
+fn default_hotblocks_data_cache_mb() -> usize {
+    4096
+}
+
 fn parse_hostname<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -149,6 +153,14 @@ pub struct Config {
     pub datasets_update_interval: Duration,
 
     pub sqd_network: SqdNetworkConfig,
+
+    // TODO: remove
+    pub solana_hotblocks_urls: Option<Vec<String>>,
+
+    pub hotblocks_db_path: Option<String>,
+
+    #[serde(default = "default_hotblocks_data_cache_mb")]
+    pub hotblocks_data_cache_mb: usize,
 }
 
 impl Config {

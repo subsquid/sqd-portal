@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 mod cli;
 mod controller;
 mod datasets;
+mod hotblocks;
 mod http_server;
 mod metrics;
 mod network;
@@ -79,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         network_client.clone(),
         config.max_parallel_streams,
     ));
+    let hotblocks = hotblocks::build_server(&config)?.map(Arc::new);
 
     let cancellation_token = CancellationToken::new();
     let (server_res, (), ()) = tokio::try_join!(
@@ -89,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
             args.http_listen,
             config.clone(),
             datasets.clone(),
+            hotblocks,
         )),
         tokio::spawn(DatasetsMapping::run_updates(
             datasets,
