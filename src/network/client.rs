@@ -120,7 +120,7 @@ impl NetworkClient {
         let mut state = NetworkState::new(config.clone(), datasets);
         if let Some(hotblocks) = hotblocks {
             state.subscribe_height_update(
-                &DatasetId::from_url("s3://solana-mainnet"),
+                &DatasetId::from_url("s3://solana-mainnet-0"),
                 Box::new(move |height| {
                     hotblocks.retain(
                         "solana".try_into().unwrap(),
