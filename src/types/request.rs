@@ -19,8 +19,7 @@ pub struct ParsedQuery {
 
 impl ParsedQuery {
     pub fn try_from(str: String) -> anyhow::Result<Self> {
-        let query =
-            sqd_node::Query::from_json_bytes(str.as_bytes())?;
+        let query = sqd_node::Query::from_json_bytes(str.as_bytes())?;
         query.validate()?;
         Ok(Self {
             raw: str,
@@ -44,6 +43,26 @@ impl ParsedQuery {
             *range.end()
         };
         (begin <= end).then_some(begin..=end)
+    }
+
+    // Network query format is incompatible with hotblock queries
+    // This should be removed once the network query format is updated
+    pub fn prepare_for_network(&mut self) {
+        match self.parsed {
+            sqd_node::Query::Eth(ref mut q) => {
+                q.parent_block_hash = None;
+            }
+            sqd_node::Query::Solana(ref mut q) => {
+                q.parent_block_hash = None;
+            }
+            sqd_node::Query::Substrate(ref mut q) => {
+                q.parent_block_hash = None;
+            }
+            sqd_node::Query::Fuel(ref mut q) => {
+                q.parent_block_hash = None;
+            }
+        }
+        self.raw = self.parsed.to_json_string()
     }
 
     #[allow(clippy::inherent_to_string)]

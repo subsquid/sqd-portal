@@ -16,6 +16,7 @@ pub struct DataChunk {
     pub first_block: BlockNumber,
     pub last_block: BlockNumber,
     pub top_dir: BlockNumber,
+    // TODO: use `SID` from the common library
     last_hash: [u8; HASH_MAX_LEN],
 }
 
@@ -29,6 +30,15 @@ impl DataChunk {
             begin: self.first_block,
             end: self.last_block,
         }
+    }
+
+    pub fn last_hash(&self) -> &str {
+        let hash_len = self
+            .last_hash
+            .iter()
+            .position(|&ch| ch == 0)
+            .unwrap_or(HASH_MAX_LEN);
+        str::from_utf8(&self.last_hash[..hash_len]).unwrap()
     }
 }
 
@@ -71,16 +81,13 @@ impl FromStr for DataChunk {
 
 impl Display for DataChunk {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        let hash_len = self
-            .last_hash
-            .iter()
-            .position(|&ch| ch == 0)
-            .unwrap_or(HASH_MAX_LEN);
-        let hash = str::from_utf8(&self.last_hash[..hash_len]).unwrap();
         write!(
             f,
             "{:010}/{:010}-{:010}-{}",
-            self.top_dir, self.first_block, self.last_block, hash
+            self.top_dir,
+            self.first_block,
+            self.last_block,
+            self.last_hash()
         )
     }
 }

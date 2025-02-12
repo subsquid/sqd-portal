@@ -69,4 +69,11 @@ impl StorageClient {
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
         self.find_chunk(dataset, chunk.last_block + 1)
     }
+
+    pub fn last_chunk(&self, dataset: &DatasetId) -> Option<DataChunk> {
+        self.datasets
+            .read()
+            .get(dataset)
+            .and_then(|chunks| chunks.last().cloned())
+    }
 }
