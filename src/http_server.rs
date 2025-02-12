@@ -49,35 +49,52 @@ async fn get_height(
 
 async fn get_finalized_head(
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
     Path(dataset): Path<String>,
+    dataset_id: DatasetId,
 ) -> Response {
-    let Some(hotblocks) = hotblocks else {
-        return (StatusCode::NOT_FOUND, "Hotblocks server is not available").into_response();
-    };
-    if dataset == "solana-mainnet" {
-        match hotblocks.get_finalized_head("solana".try_into().unwrap()) {
-            Ok(head) => (StatusCode::OK, axum::Json(head)).into_response(),
-            Err(err) => (StatusCode::NOT_FOUND, format!("{}", err)).into_response(),
+    match hotblocks {
+        Some(hotblocks) if dataset == "solana-mainnet" => {
+            match hotblocks.get_finalized_head("solana".try_into().unwrap()) {
+                Ok(head) => axum::Json(head).into_response(),
+                Err(err) => (StatusCode::NOT_FOUND, format!("{}", err)).into_response(),
+            }
+        },
+        _ => {
+            // TODO: return full hash instead of one extracted from chunk id
+            let head = network.last_chunk(&dataset_id).map(|chunk| {
+                json!({
+                    "number": chunk.last_block,
+                    "hash": chunk.last_hash(),
+                })
+            });
+            axum::Json(head).into_response()
         }
-    } else {
-        (StatusCode::NOT_FOUND, format!("No real-time source for dataset {dataset}")).into_response()
     }
 }
 
 async fn get_head(
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
     Path(dataset): Path<String>,
+    dataset_id: DatasetId,
 ) -> Response {
-    let Some(hotblocks) = hotblocks else {
-        return (StatusCode::NOT_FOUND, "Hotblocks server is not available").into_response();
-    };
-    if dataset == "solana-mainnet" {
-        match hotblocks.get_head("solana".try_into().unwrap()) {
-            Ok(head) => (StatusCode::OK, axum::Json(head)).into_response(),
-            Err(err) => (StatusCode::NOT_FOUND, format!("{}", err)).into_response(),
+    match hotblocks {
+        Some(hotblocks) if dataset == "solana-mainnet" => {
+            match hotblocks.get_head("solana".try_into().unwrap()) {
+                Ok(head) => axum::Json(head).into_response(),
+                Err(err) => (StatusCode::NOT_FOUND, format!("{}", err)).into_response(),
+            }
+        },
+        _ => {
+            let head = network.last_chunk(&dataset_id).map(|chunk| {
+                json!({
+                    "number": chunk.last_block,
+                    "hash": chunk.last_hash(),
+                })
+            });
+            axum::Json(head).into_response()
         }
-    } else {
-        (StatusCode::NOT_FOUND, format!("No real-time source for dataset {dataset}")).into_response()
     }
 }
 
@@ -198,25 +215,33 @@ async fn run_stream(
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
     request: ClientRequest,
 ) -> Response {
-    let request = restrict_request(&config, request);
+    let mut request = restrict_request(&config, request);
 
     let block = request.query.first_block();
     if client
         .get_height(&request.dataset_id)
         .is_some_and(|height| height > 0 && block <= height)
     {
+        request.query.prepare_for_network();
+        let last_chunk = client.last_chunk(&request.dataset_id);
+
         let stream = match task_manager.spawn_stream(request).await {
             Ok(stream) => stream,
             Err(e) => return e.into_response(),
         };
+
         let stream = stream.map(anyhow::Ok);
-        Response::builder()
+        let mut res = Response::builder()
             .header(header::CONTENT_TYPE, "application/jsonl")
-            .header(header::CONTENT_ENCODING, "gzip")
-            .body(Body::from_stream(stream))
-            .unwrap()
-        // TODO: set finalized head
-    } else if request.dataset_name == "solana-mainnet" && hotblocks.is_some() {  // FIXME
+            .header(header::CONTENT_ENCODING, "gzip");
+        if let Some(last_chunk) = last_chunk {
+            res = res
+                .header(FINALIZED_NUMBER_HEADER, last_chunk.last_block)
+                .header(FINALIZED_HASH_HEADER, last_chunk.last_hash());
+        }
+        res.body(Body::from_stream(stream)).unwrap()
+    } else if request.dataset_name == "solana-mainnet" && hotblocks.is_some() {
+        // FIXME
         let result = hotblocks
             .unwrap()
             .query("solana".try_into().unwrap(), request.query.into_parsed())
@@ -228,8 +253,8 @@ async fn run_stream(
                     .header(header::CONTENT_ENCODING, "gzip");
 
                 if let Some(head) = resp.finalized_head() {
-                    res = res.header("x-sqd-finalized-head-number", head.number);
-                    res = res.header("x-sqd-finalized-head-hash", head.hash.as_str());
+                    res = res.header(FINALIZED_NUMBER_HEADER, head.number);
+                    res = res.header(FINALIZED_HASH_HEADER, head.hash.as_str());
                 }
 
                 res.body(Body::from_stream(into_stream(resp))).unwrap()
@@ -535,16 +560,20 @@ fn hotblocks_error_to_response(err: anyhow::Error) -> Response {
     if let Some(above_the_head) = err.downcast_ref::<sqd_node::error::QueryIsAboveTheHead>() {
         let mut res = Response::builder().status(204);
         if let Some(head) = above_the_head.finalized_head.as_ref() {
-            res = res.header("x-sqd-finalized-head-number", head.number);
-            res = res.header("x-sqd-finalized-head-hash", head.hash.as_str());
+            res = res.header(FINALIZED_NUMBER_HEADER, head.number);
+            res = res.header(FINALIZED_HASH_HEADER, head.hash.as_str());
         }
         return res.body(Body::empty()).unwrap();
     }
 
     if let Some(fork) = err.downcast_ref::<sqd_node::error::UnexpectedBaseBlock>() {
-        return (StatusCode::CONFLICT, axum::Json(serde_json::json!({
-            "lastBlocks": &fork.prev_blocks
-        }))).into_response();
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "lastBlocks": &fork.prev_blocks
+            })),
+        )
+            .into_response();
     }
 
     let status_code = if err.is::<sqd_node::error::UnknownDataset>() {
@@ -576,3 +605,6 @@ fn convert_response(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     writer.write_all("]".as_bytes())?;
     Ok(writer.finish()?)
 }
+
+const FINALIZED_NUMBER_HEADER: &str = "X-Sqd-Finalized-Head-Number";
+const FINALIZED_HASH_HEADER: &str = "X-Sqd-Finalized-Head-Hash";

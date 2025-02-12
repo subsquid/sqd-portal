@@ -359,6 +359,10 @@ impl NetworkClient {
         self.dataset_storage.next_chunk(dataset, chunk)
     }
 
+    pub fn last_chunk(&self, dataset: &DatasetId) -> Option<DataChunk> {
+        self.dataset_storage.last_chunk(dataset)
+    }
+
     pub fn find_worker(
         &self,
         dataset: &DatasetId,
