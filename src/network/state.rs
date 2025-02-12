@@ -10,11 +10,11 @@ use sqd_messages::RangeSet;
 use sqd_network_transport::PeerId;
 
 use crate::cli::Config;
-use crate::datasets::DatasetsMapping;
 use crate::metrics;
 use crate::types::DatasetId;
 
 use super::priorities::{NoWorker, WorkersPool};
+use super::DatasetsMapping;
 
 #[derive(Default, Serialize)]
 pub struct DatasetState {
@@ -166,7 +166,7 @@ impl NetworkState {
             let entry = self.dataset_states.entry(dataset_id.clone()).or_default();
             entry.update(worker_id, dataset_state);
             let dataset_name = datasets
-                .dataset_default_name(dataset_id)
+                .default_name(dataset_id)
                 .map(ToOwned::to_owned);
             metrics::report_dataset_updated(
                 dataset_id,

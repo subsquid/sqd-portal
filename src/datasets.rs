@@ -1,160 +1,108 @@
-use crate::cli::Config;
-use crate::types::DatasetId;
-use anyhow::Context;
-use parking_lot::RwLock;
+use crate::types::{api_types::AvailableDatasetApiResponse, BlockNumber, DatasetRef};
 use serde::{Deserialize, Serialize};
+use sqd_node as sqd_hotblocks;
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::BufReader;
-use std::sync::Arc;
-use std::time::Duration;
+use url::Url;
 
-pub struct DatasetsMapping {
-    available: Vec<DatasetConfig>,
-    network_ids: BTreeMap<String, DatasetId>,
-    default_names: BTreeMap<DatasetId, String>,
+#[derive(Debug, Clone)]
+pub struct DatasetsConfig {
+    datasets: Vec<DatasetConfig>,
+    name_to_index: BTreeMap<String, usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct DatasetConfig {
-    pub slug: String,
-    #[serde(default)]
+    pub default_name: String,
     pub aliases: Vec<String>,
-    pub data_sources: Vec<DatasetSourceConfig>,
+    pub network_ref: Option<DatasetRef>,
+    pub hotblocks: Option<RealTimeConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatasetSourceConfig {
-    pub kind: DataSourceKind,
-    pub name_ref: String,
-
-    #[serde(skip_deserializing)]
-    pub id: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
-pub enum DataSourceKind {
-    #[default]
-    SqdNetwork,
+pub struct RealTimeConfig {
+    pub kind: sqd_hotblocks::DatasetKind,
+    pub data_sources: Vec<Url>,
+    pub first_block: BlockNumber,
 }
 
-impl DatasetsMapping {
-    pub async fn load(config: &Config) -> anyhow::Result<Self> {
-        let file = load_networks(config).await?;
-        let result = Self::parse(file)?;
-        tracing::debug!(
-            "Datasets file loaded, {} datasets found",
-            result.available.len()
-        );
-        Ok(result)
-    }
-
-    pub async fn run_updates(handle: Arc<RwLock<Self>>, interval: Duration, config: Arc<Config>) {
-        loop {
-            tokio::time::sleep(interval).await;
-            tracing::info!("Updating datasets mapping");
-            match Self::load(&config).await {
-                Ok(mapping) => {
-                    *handle.write() = mapping;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to update datasets mapping: {e:?}");
-                }
+impl DatasetsConfig {
+    fn from_model(model: DatasetsConfigModel) -> Self {
+        let mut datasets = Vec::with_capacity(model.len());
+        let mut name_to_index = BTreeMap::new();
+        for (name, dataset) in model {
+            let index = datasets.len();
+            name_to_index.insert(name.clone(), index);
+            for alias in &dataset.aliases {
+                name_to_index.insert(alias.clone(), index);
             }
+            if let Some(DatasetRef::Name(network_name)) = &dataset.sqd_network {
+                assert!(name == *network_name, "Dataset name must match SQD network name");
+            }
+            let config = DatasetConfig {
+                default_name: name.clone(),
+                aliases: dataset.aliases,
+                network_ref: dataset.sqd_network,
+                hotblocks: dataset.real_time,
+            };
+            datasets.push(config);
+        }
+
+        Self {
+            datasets,
+            name_to_index,
         }
     }
 
-    fn parse(file: NetworkDatasets) -> anyhow::Result<Self> {
-        let mut available = Vec::with_capacity(file.sqd_network_datasets.len());
-        let mut network_ids = BTreeMap::new();
-        let mut default_names = BTreeMap::new();
-        for dataset in file.sqd_network_datasets {
-            let dataset_id = DatasetId::from_url(&dataset.id);
-            network_ids.insert(dataset.name.clone(), dataset_id.clone());
-            default_names.insert(dataset_id, dataset.name.clone());
-            let config = DatasetConfig {
-                slug: dataset.name.clone(),
-                aliases: vec![],
-                data_sources: vec![DatasetSourceConfig {
-                    kind: DataSourceKind::SqdNetwork,
-                    name_ref: dataset.name,
-                    id: dataset.id,
-                }],
-            };
-            available.push(config);
-        }
+    pub fn get_by_name(&self, dataset: &str) -> Option<&DatasetConfig> {
+        self.name_to_index
+            .get(dataset)
+            .and_then(|&index| self.datasets.get(index))
+    }
 
-        Ok(Self {
-            available,
-            network_ids,
-            default_names,
-        })
+    pub fn network_ref(&self, dataset: &str) -> Option<&DatasetRef> {
+        self.get_by_name(dataset)
+            .and_then(|d| d.network_ref.as_ref())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &DatasetConfig> {
-        self.available.iter()
+        self.datasets.iter()
     }
 
-    pub fn find_dataset(&self, slug: &str) -> Option<&DatasetConfig> {
-        self.available.iter().find(|d| {
-            if d.slug == slug {
-                return true;
-            }
-
-            d.aliases.contains(&slug.to_string())
-        })
-    }
-
-    pub fn dataset_id(&self, slug: &str) -> Option<DatasetId> {
-        self.network_ids.get(slug).cloned()
-    }
-
-    pub fn dataset_ids(&self) -> impl Iterator<Item = &DatasetId> + '_ {
-        self.network_ids.values()
-    }
-
-    pub fn dataset_default_name(&self, id: &DatasetId) -> Option<&str> {
-        self.default_names.get(id).map(String::as_str)
+    pub fn len(&self) -> usize {
+        self.datasets.len()
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct NetworkDataset {
-    id: String,
-    name: String,
+impl From<DatasetConfig> for AvailableDatasetApiResponse {
+    fn from(dataset: DatasetConfig) -> Self {
+        Self {
+            dataset: dataset.default_name,
+            aliases: dataset.aliases,
+            real_time: dataset.hotblocks.is_some(),
+        }
+    }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+type DatasetsConfigModel = BTreeMap<String, DatasetConfigModel>;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
-struct NetworkDatasets {
-    sqd_network_datasets: Vec<NetworkDataset>,
+struct DatasetConfigModel {
+    #[serde(default)]
+    aliases: Vec<String>,
+    sqd_network: Option<DatasetRef>,
+    real_time: Option<RealTimeConfig>,
 }
 
-async fn load_networks(config: &Config) -> anyhow::Result<NetworkDatasets> {
-    let url = &config.sqd_network.datasets_url;
-
-    if let Some(path) = url.strip_prefix("file://") {
-        load_local_file(path)
-    } else {
-        fetch_remote_file(url).await
+impl<'de> Deserialize<'de> for DatasetsConfig {
+    fn deserialize<D>(
+        deserializer: D,
+    ) -> Result<DatasetsConfig, <D as serde::Deserializer<'de>>::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let model = DatasetsConfigModel::deserialize(deserializer)?;
+        Ok(DatasetsConfig::from_model(model))
     }
-}
-
-async fn fetch_remote_file(url: &str) -> anyhow::Result<NetworkDatasets> {
-    tracing::debug!("Fetching remote file from {}", url);
-
-    let response = reqwest::get(url).await?;
-    let text = response.text().await?;
-
-    serde_yaml::from_str(&text).with_context(|| format!("failed to parse dataset {url}"))
-}
-
-fn load_local_file(full_path: &str) -> anyhow::Result<NetworkDatasets> {
-    tracing::debug!("Loading local file from {}", full_path);
-
-    let file = File::open(full_path).with_context(|| format!("failed to open file {full_path}"))?;
-    let reader = BufReader::new(file);
-
-    serde_yaml::from_reader(reader).with_context(|| format!("failed to parse dataset {full_path}"))
 }

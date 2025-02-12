@@ -26,10 +26,9 @@ use sqd_network_transport::{
 };
 
 use super::priorities::NoWorker;
-use super::{NetworkState, StorageClient};
-use crate::datasets::DatasetsMapping;
+use super::{DatasetsMapping, NetworkState, StorageClient};
 use crate::network::state::Status;
-use crate::types::{BlockRange, ChunkId, DataChunk};
+use crate::types::{BlockRange, ChunkId, DataChunk, DatasetRef};
 use crate::{
     cli::Config,
     metrics,
@@ -74,6 +73,7 @@ pub struct NetworkClientStatus {
 pub struct NetworkClient {
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
     transport_handle: GatewayTransport,
+    datasets: Arc<RwLock<DatasetsMapping>>,
     network_state: Mutex<NetworkState>,
     contract_client: Box<dyn ContractClient>,
     dataset_storage: StorageClient,
@@ -109,6 +109,12 @@ impl NetworkClient {
         let (incoming_events, transport_handle) =
             transport_builder.build_gateway(gateway_config)?;
 
+        tokio::spawn(DatasetsMapping::run_updates(
+            datasets.clone(),
+            config.datasets_update_interval,
+            config.sqd_network.datasets_url.clone(),
+        ));
+
         let network_state_filename = match network {
             Network::Tethys => "network-state-tethys.json",
             Network::Mainnet => "network-state-mainnet.json",
@@ -117,7 +123,7 @@ impl NetworkClient {
             format!("https://metadata.sqd-datasets.io/{network_state_filename}");
 
         // FIXME
-        let mut state = NetworkState::new(config.clone(), datasets);
+        let mut state = NetworkState::new(config.clone(), datasets.clone());
         if let Some(hotblocks) = hotblocks {
             state.subscribe_height_update(
                 &DatasetId::from_url("s3://solana-mainnet-0"),
@@ -135,6 +141,7 @@ impl NetworkClient {
             assignment_update_interval: config.assignments_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
+            datasets,
             network_state: Mutex::new(state),
             contract_client,
             dataset_storage,
@@ -349,6 +356,14 @@ impl NetworkClient {
                 }
             }
         }
+    }
+
+    pub fn datasets(&self) -> &RwLock<DatasetsMapping> {
+        &self.datasets
+    }
+
+    pub fn resolve(&self, dataset: DatasetRef) -> Option<DatasetId> {
+        self.datasets.read().resolve(dataset)
     }
 
     pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
