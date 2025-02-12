@@ -6277,6 +6277,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "reqwest"
+version = "0.12.12"
+source = "git+https://github.com/subsquid/reqwest.git?rev=620aa86a#620aa86ab0f1607438bc7058e56be47f22c65d99"
+dependencies = [
+ "async-compression",
+ "base64 0.22.1",
+ "bytes 1.9.0",
+ "encoding_rs",
+ "futures-core",
+ "futures-util",
+ "h2 0.4.7",
+ "http 1.2.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.6.0",
+ "hyper-rustls 0.27.5",
+ "hyper-tls",
+ "hyper-util",
+ "ipnet",
+ "js-sys",
+ "log",
+ "mime",
+ "native-tls",
+ "once_cell",
+ "percent-encoding",
+ "pin-project-lite",
+ "rustls-pemfile 2.2.0",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper 1.0.2",
+ "system-configuration 0.6.1",
+ "tokio 1.43.0",
+ "tokio-native-tls",
+ "tokio-util",
+ "tower",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-streams",
+ "web-sys",
+ "windows-registry",
+]
+
+[[package]]
 name = "resolv-conf"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7015,7 +7061,7 @@ dependencies = [
 [[package]]
 name = "sqd-array"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=12aba5d#12aba5de7e4f1dc83d839419186a0e6ff4145a88"
+source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7046,7 +7092,7 @@ dependencies = [
 [[package]]
 name = "sqd-data"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=12aba5d#12aba5de7e4f1dc83d839419186a0e6ff4145a88"
+source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7062,12 +7108,12 @@ dependencies = [
 [[package]]
 name = "sqd-data-client"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=12aba5d#12aba5de7e4f1dc83d839419186a0e6ff4145a88"
+source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
  "futures 0.3.31",
- "reqwest 0.12.12",
+ "reqwest 0.12.12 (git+https://github.com/subsquid/reqwest.git?rev=620aa86a)",
  "serde",
  "serde_json",
  "sqd-primitives",
@@ -7076,7 +7122,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-core"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=12aba5d#12aba5de7e4f1dc83d839419186a0e6ff4145a88"
+source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7090,7 +7136,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-source"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=12aba5d#12aba5de7e4f1dc83d839419186a0e6ff4145a88"
+source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
 dependencies = [
  "anyhow",
  "futures 0.3.31",
@@ -7103,7 +7149,7 @@ dependencies = [
 [[package]]
 name = "sqd-dataset"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=12aba5d#12aba5de7e4f1dc83d839419186a0e6ff4145a88"
+source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
 
 [[package]]
 name = "sqd-messages"
@@ -7118,7 +7164,7 @@ dependencies = [
  "libp2p",
  "prost 0.13.4",
  "prost-build",
- "reqwest 0.12.12",
+ "reqwest 0.12.12 (registry+https://github.com/rust-lang/crates.io-index)",
  "semver 1.0.25",
  "serde",
  "serde_json",
@@ -7164,7 +7210,7 @@ dependencies = [
 [[package]]
 name = "sqd-node"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=12aba5d#12aba5de7e4f1dc83d839419186a0e6ff4145a88"
+source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7173,7 +7219,7 @@ dependencies = [
  "futures 0.3.31",
  "ouroboros",
  "parking_lot 0.12.3",
- "reqwest 0.12.12",
+ "reqwest 0.12.12 (git+https://github.com/subsquid/reqwest.git?rev=620aa86a)",
  "scopeguard",
  "serde",
  "serde_json",
@@ -7193,7 +7239,7 @@ dependencies = [
 [[package]]
 name = "sqd-polars"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=12aba5d#12aba5de7e4f1dc83d839419186a0e6ff4145a88"
+source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7204,7 +7250,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.6.0-rc1"
+version = "0.6.0-rc2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -7221,7 +7267,7 @@ dependencies = [
  "num-traits",
  "parking_lot 0.12.3",
  "prometheus-client",
- "reqwest 0.12.12",
+ "reqwest 0.12.12 (registry+https://github.com/rust-lang/crates.io-index)",
  "scopeguard",
  "semver 1.0.25",
  "serde",
@@ -7249,7 +7295,7 @@ dependencies = [
 [[package]]
 name = "sqd-primitives"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=12aba5d#12aba5de7e4f1dc83d839419186a0e6ff4145a88"
+source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
 dependencies = [
  "borsh",
  "serde",
@@ -7258,7 +7304,7 @@ dependencies = [
 [[package]]
 name = "sqd-query"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=12aba5d#12aba5de7e4f1dc83d839419186a0e6ff4145a88"
+source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7279,7 +7325,7 @@ dependencies = [
 [[package]]
 name = "sqd-storage"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=12aba5d#12aba5de7e4f1dc83d839419186a0e6ff4145a88"
+source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
 dependencies = [
  "anyhow",
  "arrow",
