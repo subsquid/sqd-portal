@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.6.0-rc1"
+version = "0.6.0-rc2"
 edition = "2021"
 
 [dependencies]
@@ -43,5 +43,5 @@ tikv-jemallocator = { version = "0.5", features = ["profiling"] }
 sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "ea97780", version = "1.2.1" }
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "ea97780", version = "2.0.0", features = ["semver", "bitstring", "assignment_reader"] }
 sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "ea97780", version = "3.0.0", features = ["gateway", "metrics"] }
-sqd-node = { git = "https://github.com/subsquid/data.git", rev = "12aba5d" }
-sqd-storage = { git = "https://github.com/subsquid/data.git", rev = "12aba5d" }
+sqd-node = { git = "https://github.com/subsquid/data.git", rev = "2ef9d80" }
+sqd-storage = { git = "https://github.com/subsquid/data.git", rev = "2ef9d80" }
