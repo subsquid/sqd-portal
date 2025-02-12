@@ -15,12 +15,6 @@ pub type BlockRange = std::ops::RangeInclusive<BlockNumber>;
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DatasetId(Arc<str>);
 
-impl Display for DatasetId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 impl DatasetId {
     pub fn from_url(url: impl AsRef<str>) -> Self {
         Self(intern_string(url.as_ref()))
@@ -37,5 +31,30 @@ impl DatasetId {
     pub fn from_base64(base64: impl AsRef<str>) -> anyhow::Result<Self> {
         let bytes = BASE64_URL_SAFE_NO_PAD.decode(base64.as_ref())?;
         Ok(Self(intern_string(str::from_utf8(&bytes)?)))
+    }
+}
+
+impl Display for DatasetId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl serde::Serialize for DatasetId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.to_url().serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DatasetId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let url = String::deserialize(deserializer)?;
+        Ok(Self::from_url(&url))
     }
 }

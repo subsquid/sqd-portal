@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.6.0-rc2"
+version = "0.6.0-rc3"
 edition = "2021"
 
 [dependencies]
@@ -8,6 +8,7 @@ anyhow = "1"
 async-stream = "0.3.5"
 axum = { version = "0.7", features = ["http2"] }
 base64 = "0.22"
+bimap = "0.6.3"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 dotenv = "0.15"
@@ -35,6 +36,7 @@ tower-http = { version = "0.6.1", features = ["cors", "decompression-gzip"] }
 tracing = { version = "0.1", features = ["async-await"] }
 tracing-futures = { version = "0.2.5", features = ["tokio", "futures-03"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
+url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

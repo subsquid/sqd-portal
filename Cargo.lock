@@ -7250,12 +7250,13 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.6.0-rc2"
+version = "0.6.0-rc3"
 dependencies = [
  "anyhow",
  "async-stream",
  "axum",
  "base64 0.22.1",
+ "bimap",
  "chrono",
  "clap",
  "dotenv",
@@ -7289,6 +7290,7 @@ dependencies = [
  "tracing",
  "tracing-futures",
  "tracing-subscriber",
+ "url",
  "uuid 1.12.1",
 ]
 
@@ -8335,6 +8337,7 @@ dependencies = [
  "form_urlencoded",
  "idna",
  "percent-encoding",
+ "serde",
 ]
 
 [[package]]
