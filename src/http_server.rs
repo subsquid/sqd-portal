@@ -17,11 +17,14 @@ use itertools::Itertools;
 use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
+use sqd_node::error::UnknownDataset;
 use sqd_node::Node as HotblocksServer;
+use sqd_primitives::BlockRef;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 
+use crate::datasets::DatasetMetadata;
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::{
     cli::Config,
@@ -46,19 +49,62 @@ async fn get_height(
 }
 
 async fn get_finalized_head(
+    Extension(config): Extension<Arc<Config>>,
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     Path(dataset): Path<String>,
-    dataset_id: DatasetId,
 ) -> Response {
-    match hotblocks {
-        Some(hotblocks) if dataset == "solana-mainnet" => {
-            match hotblocks.get_finalized_head("solana".try_into().unwrap()) {
+    get_head_impl(
+        Extension(config),
+        Extension(hotblocks),
+        Extension(network),
+        Path(dataset),
+        |hotblocks, ds| hotblocks.get_finalized_head(ds.try_into().unwrap()),
+    )
+    .await
+}
+
+async fn get_head(
+    Extension(config): Extension<Arc<Config>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Path(dataset): Path<String>,
+) -> Response {
+    get_head_impl(
+        Extension(config),
+        Extension(hotblocks),
+        Extension(network),
+        Path(dataset),
+        |hotblocks, ds| hotblocks.get_head(ds.try_into().unwrap()),
+    )
+    .await
+}
+
+async fn get_head_impl(
+    Extension(config): Extension<Arc<Config>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Path(dataset): Path<String>,
+    get_head_method: impl FnOnce(&HotblocksServer, &str) -> Result<Option<BlockRef>, UnknownDataset>,
+) -> Response {
+    let metadata = config.dataset_metadata(&dataset, &network.datasets().read());
+    match (hotblocks, metadata) {
+        (Some(hotblocks), Some(metadata)) if metadata.real_time => {
+            match get_head_method(&hotblocks, &metadata.default_name) {
                 Ok(head) => axum::Json(head).into_response(),
-                Err(err) => (StatusCode::NOT_FOUND, format!("{}", err)).into_response(),
+                Err(UnknownDataset { .. }) => {
+                    unreachable!("dataset should be known by the hotblocks service")
+                }
             }
         }
-        _ => {
+        (
+            _,
+            Some(DatasetMetadata {
+                dataset_id: Some(dataset_id),
+                ..
+            }),
+        ) => {
+            // Fall back to network data source
             // TODO: return full hash instead of one extracted from chunk id
             let head = network.last_chunk(&dataset_id).map(|chunk| {
                 json!({
@@ -68,30 +114,8 @@ async fn get_finalized_head(
             });
             axum::Json(head).into_response()
         }
-    }
-}
-
-async fn get_head(
-    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
-    Extension(network): Extension<Arc<NetworkClient>>,
-    Path(dataset): Path<String>,
-    dataset_id: DatasetId,
-) -> Response {
-    match hotblocks {
-        Some(hotblocks) if dataset == "solana-mainnet" => {
-            match hotblocks.get_head("solana".try_into().unwrap()) {
-                Ok(head) => axum::Json(head).into_response(),
-                Err(err) => (StatusCode::NOT_FOUND, format!("{}", err)).into_response(),
-            }
-        }
-        _ => {
-            let head = network.last_chunk(&dataset_id).map(|chunk| {
-                json!({
-                    "number": chunk.last_block,
-                    "hash": chunk.last_hash(),
-                })
-            });
-            axum::Json(head).into_response()
+        (_, _) => {
+            return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response()
         }
     }
 }
@@ -180,16 +204,20 @@ async fn execute_query(
 async fn run_finalized_stream_restricted(
     task_manager: Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
+    dataset_id: DatasetId,
     raw_request: ClientRequest,
 ) -> Response {
     let request = restrict_request(&config, raw_request);
-    run_finalized_stream(task_manager, request).await
+    run_finalized_stream(task_manager, dataset_id, request).await
 }
 
 async fn run_finalized_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
-    request: ClientRequest,
+    dataset_id: DatasetId,
+    mut request: ClientRequest,
 ) -> Response {
+    request.dataset_id = dataset_id;
+    request.query.prepare_for_network();
     let stream = match task_manager.spawn_stream(request).await {
         Ok(stream) => stream,
         Err(e) => return e.into_response(),
@@ -205,58 +233,74 @@ async fn run_finalized_stream(
 async fn run_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
-    Extension(client): Extension<Arc<NetworkClient>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Path(dataset): Path<String>,
     request: ClientRequest,
 ) -> Response {
     let mut request = restrict_request(&config, request);
 
-    let block = request.query.first_block();
-    if client
-        .get_height(&request.dataset_id)
-        .is_some_and(|height| height > 0 && block <= height)
-    {
-        request.query.prepare_for_network();
-        let last_chunk = client.last_chunk(&request.dataset_id);
+    let Some(ds_metadata) = config.dataset_metadata(&dataset, &network.datasets().read()) else {
+        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response();
+    };
+    match (ds_metadata.dataset_id, hotblocks) {
+        // Prefer data from the network
+        (Some(dataset_id), _)
+            if network
+                .get_height(&dataset_id)
+                .is_some_and(|height| request.query.first_block() <= height) =>
+        {
+            let last_chunk = network.last_chunk(&dataset_id);
+            request.dataset_id = dataset_id;
+            request.query.prepare_for_network();
 
-        let stream = match task_manager.spawn_stream(request).await {
-            Ok(stream) => stream,
-            Err(e) => return e.into_response(),
-        };
+            let stream = match task_manager.spawn_stream(request).await {
+                Ok(stream) => stream,
+                Err(e) => return e.into_response(),
+            };
 
-        let stream = stream.map(anyhow::Ok);
-        let mut res = Response::builder()
-            .header(header::CONTENT_TYPE, "application/jsonl")
-            .header(header::CONTENT_ENCODING, "gzip");
-        if let Some(last_chunk) = last_chunk {
-            res = res
-                .header(FINALIZED_NUMBER_HEADER, last_chunk.last_block)
-                .header(FINALIZED_HASH_HEADER, last_chunk.last_hash());
-        }
-        res.body(Body::from_stream(stream)).unwrap()
-    } else if request.dataset_name == "solana-mainnet" && hotblocks.is_some() {
-        // FIXME
-        let result = hotblocks
-            .unwrap()
-            .query("solana".try_into().unwrap(), request.query.into_parsed())
-            .await;
-        match result {
-            Ok(resp) => {
-                let mut res = Response::builder()
-                    .header(header::CONTENT_TYPE, "application/jsonl")
-                    .header(header::CONTENT_ENCODING, "gzip");
-
-                if let Some(head) = resp.finalized_head() {
-                    res = res.header(FINALIZED_NUMBER_HEADER, head.number);
-                    res = res.header(FINALIZED_HASH_HEADER, head.hash.as_str());
-                }
-
-                res.body(Body::from_stream(into_stream(resp))).unwrap()
+            let stream = stream.map(anyhow::Ok);
+            let mut res = Response::builder()
+                .header(header::CONTENT_TYPE, "application/jsonl")
+                .header(header::CONTENT_ENCODING, "gzip");
+            if let Some(last_chunk) = last_chunk {
+                res = res
+                    .header(FINALIZED_NUMBER_HEADER, last_chunk.last_block)
+                    .header(FINALIZED_HASH_HEADER, last_chunk.last_hash());
             }
-            Err(err) => hotblocks_error_to_response(err),
+            res.body(Body::from_stream(stream)).unwrap()
         }
-    } else {
-        RequestError::NoData.into_response()
+        // Then try hotblocks storage
+        (_, Some(hotblocks)) if ds_metadata.real_time => {
+            let result = hotblocks
+                .query(
+                    (*ds_metadata.default_name).try_into().unwrap(),
+                    request.query.into_parsed(),
+                )
+                .await;
+            match result {
+                Ok(resp) => {
+                    let mut res = Response::builder()
+                        .header(header::CONTENT_TYPE, "application/jsonl")
+                        .header(header::CONTENT_ENCODING, "gzip");
+
+                    if let Some(head) = resp.finalized_head() {
+                        res = res.header(FINALIZED_NUMBER_HEADER, head.number);
+                        res = res.header(FINALIZED_HASH_HEADER, head.hash.as_str());
+                    }
+
+                    res.body(Body::from_stream(into_stream(resp))).unwrap()
+                }
+                Err(err) => hotblocks_error_to_response(err),
+            }
+        }
+        // If requested block is above the network height and there is no hotblocks storage, return 204
+        (Some(_dataset_id), _) => RequestError::NoData.into_response(),
+        (None, _) => {
+            unreachable!(
+                "invalid dataset name should have been handled in the ClientRequest parser"
+            )
+        }
     }
 }
 
@@ -283,9 +327,10 @@ async fn get_datasets(
     Extension(config): Extension<Arc<Config>>,
     Extension(network): Extension<Arc<NetworkClient>>,
 ) -> impl IntoResponse {
+    let mapping = network.datasets().read();
     let res: Vec<AvailableDatasetApiResponse> = config
-        .all_datasets(&*network.datasets().read())
-        .map(From::from)
+        .all_datasets(&mapping)
+        .map(|name| config.dataset_metadata(&name, &mapping).unwrap().into())
         .collect();
 
     axum::Json(res)
@@ -303,7 +348,7 @@ async fn get_dataset_metadata(
     Extension(config): Extension<Arc<Config>>,
     Extension(network): Extension<Arc<NetworkClient>>,
 ) -> impl IntoResponse {
-    match config.dataset_metadata(&dataset, &*network.datasets().read()) {
+    match config.dataset_metadata(&dataset, &network.datasets().read()) {
         Some(metadata) => axum::Json(AvailableDatasetApiResponse::from(metadata)).into_response(),
         None => (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response(),
     }
@@ -396,18 +441,24 @@ where
     type Rejection = Response;
 
     async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let Extension(config) = req
+            .extract_parts::<Extension<Arc<Config>>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
         let Extension(network) = req
             .extract_parts::<Extension<Arc<NetworkClient>>>()
             .await
             .map_err(IntoResponse::into_response)?;
+        let Path(dataset) = req
+            .extract_parts::<Path<String>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
 
-        let dataset_id = req.extract_parts::<DatasetId>().await?;
-        let dataset_name = network
-            .datasets()
-            .read()
-            .default_name(&dataset_id)
-            .expect("dataset name should exist for resolved id")
-            .to_owned();
+        let Some(metadata) = config.dataset_metadata(&dataset, &network.datasets().read()) else {
+            return Err(
+                RequestError::BadRequest(format!("Unknown dataset: {dataset}")).into_response(),
+            );
+        };
 
         let Query(params) = req
             .extract_parts::<Query<HashMap<String, String>>>()
@@ -455,8 +506,8 @@ where
         };
 
         Ok(ClientRequest {
-            dataset_id,
-            dataset_name,
+            dataset_id: DatasetId::from_url("-"), // will be filled later
+            dataset_name: metadata.default_name.into_owned(),
             query,
             buffer_size,
             max_chunks: config.max_chunks_per_stream,

@@ -460,7 +460,7 @@ impl NetworkClient {
             Ok(q) if !q.verify_signature(peer_id) => {
                 metrics::report_query_result(peer_id, "validation_error");
                 self.network_state.lock().report_query_failure(peer_id);
-                Err(QueryError::Retriable(format!("Invalid signature")))
+                Err(QueryError::Retriable("Invalid signature".to_string()))
             }
             Ok(sqd_messages::QueryResult {
                 result: Some(result),

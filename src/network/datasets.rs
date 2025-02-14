@@ -23,6 +23,11 @@ impl DatasetsMapping {
         Ok(result)
     }
 
+    #[cfg(test)]
+    pub fn new(datasets: BiBTreeMap<String, DatasetId>) -> Self {
+        Self { datasets }
+    }
+
     pub async fn run_updates(handle: Arc<RwLock<Self>>, interval: Duration, url: String) {
         loop {
             tokio::time::sleep(interval).await;
