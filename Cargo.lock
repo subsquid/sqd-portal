@@ -7279,6 +7279,7 @@ dependencies = [
  "sqd-messages",
  "sqd-network-transport",
  "sqd-node",
+ "sqd-primitives",
  "sqd-storage",
  "static_assertions",
  "thiserror 1.0.69",

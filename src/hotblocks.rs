@@ -4,17 +4,21 @@ use anyhow::Context;
 
 use crate::cli;
 
-const SOLANA_FIRST_BLOCK: u64 = 250_000_000;
-
 pub fn build_server(config: &cli::Config) -> anyhow::Result<Option<sqd_node::Node>> {
-    let Some(path) = &config.hotblocks_db_path else {
+    let has_sources = config.datasets.iter().any(|d| d.hotblocks.is_some());
+    if !has_sources {
         return Ok(None);
-    };
+    }
 
+    tracing::info!("Initializing hotblocks storage");
+    let path = config
+        .hotblocks_db_path
+        .as_ref()
+        .expect("Hotblocks database path not specified");
     let db = Arc::new(
         sqd_storage::db::DatabaseSettings::default()
             .set_data_cache_size(config.hotblocks_data_cache_mb)
-            .open(&path)
+            .open(path)
             .context("failed to open hotblocks database")?,
     );
 
@@ -22,14 +26,20 @@ pub fn build_server(config: &cli::Config) -> anyhow::Result<Option<sqd_node::Nod
 
     let mut builder = sqd_node::NodeBuilder::new(db);
 
-    if let Some(urls) = &config.solana_hotblocks_urls {
-        let ds = builder.add_dataset(
-            sqd_node::DatasetKind::Solana,
-            "solana".try_into().unwrap(),
-            sqd_node::RetentionStrategy::FromBlock(SOLANA_FIRST_BLOCK),
-        );
-        for url in urls {
-            ds.add_data_source(url);
+    for dataset in config.datasets.iter() {
+        if let Some(hotblocks) = &dataset.hotblocks {
+            let ds = builder.add_dataset(
+                hotblocks.kind,
+                dataset
+                    .default_name
+                    .as_str()
+                    .try_into()
+                    .map_err(|s| anyhow::anyhow!("{}", s))?,
+                sqd_node::RetentionStrategy::FromBlock(hotblocks.first_block),
+            );
+            for url in &hotblocks.data_sources {
+                ds.add_data_source(url.clone());
+            }
         }
     }
 
