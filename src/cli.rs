@@ -142,6 +142,7 @@ pub struct Config {
 
     pub sqd_network: SqdNetworkConfig,
 
+    #[serde(default)]
     pub datasets: DatasetsConfig,
 
     pub hotblocks_db_path: Option<String>,
