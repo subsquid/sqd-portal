@@ -7,7 +7,7 @@ use sqd_node as sqd_hotblocks;
 use std::{borrow::Cow, collections::BTreeMap};
 use url::Url;
 
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct DatasetsConfig {
     datasets: Vec<DatasetConfig>,
     name_to_index: BTreeMap<String, usize>,
