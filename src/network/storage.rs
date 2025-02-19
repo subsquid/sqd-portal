@@ -3,10 +3,11 @@ use std::{collections::HashMap, sync::Arc};
 use parking_lot::RwLock;
 
 use crate::{
-    datasets::DatasetsMapping,
     metrics,
     types::{DataChunk, DatasetId},
 };
+
+use super::DatasetsMapping;
 
 pub struct StorageClient {
     datasets: RwLock<HashMap<DatasetId, Vec<DataChunk>>>,
@@ -46,7 +47,7 @@ impl StorageClient {
             let dataset_name = self
                 .datasets_mapping
                 .read()
-                .dataset_default_name(&dataset)
+                .default_name(&dataset)
                 .map(ToOwned::to_owned);
             metrics::report_chunk_list_updated(&dataset, dataset_name, new_len, last_block);
         }
@@ -68,5 +69,12 @@ impl StorageClient {
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
         self.find_chunk(dataset, chunk.last_block + 1)
+    }
+
+    pub fn last_chunk(&self, dataset: &DatasetId) -> Option<DataChunk> {
+        self.datasets
+            .read()
+            .get(dataset)
+            .and_then(|chunks| chunks.last().cloned())
     }
 }

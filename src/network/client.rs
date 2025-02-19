@@ -10,6 +10,7 @@ use num_rational::Ratio;
 use num_traits::ToPrimitive;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
+use sqd_node::Node as HotblocksServer;
 use tokio::task::JoinError;
 use tokio::time::Instant;
 use tokio::time::MissedTickBehavior;
@@ -25,10 +26,9 @@ use sqd_network_transport::{
 };
 
 use super::priorities::NoWorker;
-use super::{NetworkState, StorageClient};
-use crate::datasets::DatasetsMapping;
-use crate::network::state::{DatasetState, Status};
-use crate::types::{BlockRange, ChunkId, DataChunk};
+use super::{DatasetsMapping, NetworkState, StorageClient};
+use crate::network::state::Status;
+use crate::types::{BlockRange, ChunkId, DataChunk, DatasetRef};
 use crate::{
     cli::Config,
     metrics,
@@ -73,6 +73,7 @@ pub struct NetworkClientStatus {
 pub struct NetworkClient {
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
     transport_handle: GatewayTransport,
+    datasets: Arc<RwLock<DatasetsMapping>>,
     network_state: Mutex<NetworkState>,
     contract_client: Box<dyn ContractClient>,
     dataset_storage: StorageClient,
@@ -92,6 +93,7 @@ impl NetworkClient {
         args: TransportArgs,
         config: Arc<Config>,
         datasets: Arc<RwLock<DatasetsMapping>>,
+        hotblocks: Option<Arc<HotblocksServer>>,
     ) -> anyhow::Result<NetworkClient> {
         let network = args.rpc.network;
         let dataset_storage = StorageClient::new(datasets.clone());
@@ -107,6 +109,12 @@ impl NetworkClient {
         let (incoming_events, transport_handle) =
             transport_builder.build_gateway(gateway_config)?;
 
+        tokio::spawn(DatasetsMapping::run_updates(
+            datasets.clone(),
+            config.datasets_update_interval,
+            config.sqd_network.datasets_url.clone(),
+        ));
+
         let network_state_filename = match network {
             Network::Tethys => "network-state-tethys.json",
             Network::Mainnet => "network-state-mainnet.json",
@@ -114,12 +122,27 @@ impl NetworkClient {
         let network_state_url =
             format!("https://metadata.sqd-datasets.io/{network_state_filename}");
 
+        // FIXME
+        let mut state = NetworkState::new(config.clone(), datasets.clone());
+        if let Some(hotblocks) = hotblocks {
+            state.subscribe_height_update(
+                &DatasetId::from_url("s3://solana-mainnet-0"),
+                Box::new(move |height| {
+                    hotblocks.retain(
+                        "solana".try_into().unwrap(),
+                        sqd_node::RetentionStrategy::FromBlock(height + 1),
+                    );
+                }),
+            );
+        }
+
         Ok(NetworkClient {
             chain_update_interval: config.chain_update_interval,
             assignment_update_interval: config.assignments_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
-            network_state: Mutex::new(NetworkState::new(config, datasets)),
+            datasets,
+            network_state: Mutex::new(state),
             contract_client,
             dataset_storage,
             local_peer_id,
@@ -335,12 +358,24 @@ impl NetworkClient {
         }
     }
 
+    pub fn datasets(&self) -> &RwLock<DatasetsMapping> {
+        &self.datasets
+    }
+
+    pub fn resolve(&self, dataset: DatasetRef) -> Option<DatasetId> {
+        self.datasets.read().resolve(dataset)
+    }
+
     pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
         self.dataset_storage.find_chunk(dataset, block)
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
         self.dataset_storage.next_chunk(dataset, chunk)
+    }
+
+    pub fn last_chunk(&self, dataset: &DatasetId) -> Option<DataChunk> {
+        self.dataset_storage.last_chunk(dataset)
     }
 
     pub fn find_worker(
@@ -425,7 +460,7 @@ impl NetworkClient {
             Ok(q) if !q.verify_signature(peer_id) => {
                 metrics::report_query_result(peer_id, "validation_error");
                 self.network_state.lock().report_query_failure(peer_id);
-                Err(QueryError::Retriable(format!("Invalid signature")))
+                Err(QueryError::Retriable("Invalid signature".to_string()))
             }
             Ok(sqd_messages::QueryResult {
                 result: Some(result),
@@ -556,8 +591,10 @@ impl NetworkClient {
             .update_dataset_states(peer_id, worker_state);
     }
 
-    pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<DatasetState> {
-        self.network_state.lock().dataset_state(dataset_id).cloned()
+    pub fn dataset_state(&self, dataset_id: &DatasetId) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            self.network_state.lock().dataset_state(dataset_id),
+        )?)
     }
 
     pub fn get_peer_id(&self) -> PeerId {

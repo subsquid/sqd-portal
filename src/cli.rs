@@ -7,6 +7,10 @@ use std::time::Duration;
 
 use sqd_network_transport::TransportArgs;
 
+use crate::datasets::{DatasetConfig, DatasetMetadata, DatasetsConfig, ServeMode};
+use crate::network::DatasetsMapping;
+use crate::types::DatasetRef;
+
 #[derive(Parser)]
 #[command(version)]
 pub struct Cli {
@@ -66,6 +70,10 @@ fn default_datasets_update_interval() -> Duration {
     Duration::from_secs(10 * 60)
 }
 
+fn default_hotblocks_data_cache_mb() -> usize {
+    4096
+}
+
 fn parse_hostname<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -74,24 +82,8 @@ where
     Ok(s.trim_end_matches('/').to_owned())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SqdNetworkConfig {
-    #[serde(rename = "datasets")]
-    pub datasets_url: String,
-
-    #[serde(default)]
-    pub serve: ServeMode,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServeMode {
-    #[default]
-    All,
-}
-
 #[serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(deserialize_with = "parse_hostname")]
     pub hostname: String,
@@ -149,12 +141,59 @@ pub struct Config {
     pub datasets_update_interval: Duration,
 
     pub sqd_network: SqdNetworkConfig,
+
+    #[serde(default)]
+    pub datasets: DatasetsConfig,
+
+    pub hotblocks_db_path: Option<String>,
+
+    #[serde(default = "default_hotblocks_data_cache_mb")]
+    pub hotblocks_data_cache_mb: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqdNetworkConfig {
+    #[serde(rename = "datasets")]
+    pub datasets_url: String,
+
+    #[serde(default)]
+    pub serve: ServeMode,
 }
 
 impl Config {
     pub fn read(config_path: &str) -> anyhow::Result<Self> {
         let file = std::fs::File::open(config_path)?;
         let buf_reader = std::io::BufReader::new(file);
-        Ok(serde_yaml::from_reader(buf_reader)?)
+        let deser = serde_yaml::Deserializer::from_reader(buf_reader);
+        Ok(serde_yaml::with::singleton_map_recursive::deserialize(deser)?)
+    }
+
+    // Always returns some ref now, but should be wrapped in `Option` when more `ServeMode`s are added
+    pub fn network_ref(&self, dataset: &str) -> DatasetRef {
+        let default_name = match self.datasets.get_by_name(dataset) {
+            Some(DatasetConfig {
+                network_ref: Some(network_ref),
+                ..
+            }) => return network_ref.clone(),
+            Some(DatasetConfig { default_name, .. }) => default_name,
+            None => dataset,
+        };
+        match self.sqd_network.serve {
+            ServeMode::All => DatasetRef::Name(default_name.to_owned()),
+        }
+    }
+
+    pub fn dataset_metadata<'r, 's: 'r, 'd: 'r>(
+        &'s self,
+        dataset: &'d str,
+        network_mapping: &DatasetsMapping,
+    ) -> Option<DatasetMetadata<'r>> {
+        self.datasets
+            .metadata(dataset, network_mapping, &self.sqd_network.serve)
+    }
+
+    pub fn all_datasets(&self, network_mapping: &DatasetsMapping) -> impl Iterator<Item = String> {
+        self.datasets
+            .all_dataset_names(network_mapping, &self.sqd_network.serve)
     }
 }

@@ -1,6 +1,8 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+use axum::body::Bytes;
 use axum::http::Method;
+use axum::BoxError;
 use axum::{
     async_trait,
     body::Body,
@@ -10,53 +12,126 @@ use axum::{
     routing::{get, post},
     Extension, RequestExt, Router,
 };
-use futures::StreamExt;
+use futures::{StreamExt, TryStream};
 use itertools::Itertools;
-use parking_lot::RwLock;
 use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
+use sqd_node::error::UnknownDataset;
+use sqd_node::Node as HotblocksServer;
+use sqd_primitives::BlockRef;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 
+use crate::datasets::DatasetMetadata;
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::{
     cli::Config,
     controller::task_manager::TaskManager,
-    datasets::DatasetsMapping,
     network::{NetworkClient, NoWorker},
     types::{ChunkId, ClientRequest, DatasetId, ParsedQuery, RequestError},
     utils::logging,
 };
 
 async fn get_height(
-    Extension(network_state): Extension<Arc<NetworkClient>>,
-    Path(slug): Path<String>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Path(dataset): Path<String>,
     dataset_id: DatasetId,
 ) -> impl IntoResponse {
-    match network_state.get_height(&dataset_id) {
+    match network.get_height(&dataset_id) {
         Some(height) => (StatusCode::OK, height.to_string()),
-        None => (StatusCode::NOT_FOUND, format!("No data for dataset {slug}")),
+        None => (
+            StatusCode::NOT_FOUND,
+            format!("No data for dataset {dataset}"),
+        ),
+    }
+}
+
+async fn get_finalized_head(
+    Extension(config): Extension<Arc<Config>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Path(dataset): Path<String>,
+) -> Response {
+    get_head_impl(
+        Extension(config),
+        Extension(hotblocks),
+        Extension(network),
+        Path(dataset),
+        |hotblocks, ds| hotblocks.get_finalized_head(ds.try_into().unwrap()),
+    )
+    .await
+}
+
+async fn get_head(
+    Extension(config): Extension<Arc<Config>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Path(dataset): Path<String>,
+) -> Response {
+    get_head_impl(
+        Extension(config),
+        Extension(hotblocks),
+        Extension(network),
+        Path(dataset),
+        |hotblocks, ds| hotblocks.get_head(ds.try_into().unwrap()),
+    )
+    .await
+}
+
+async fn get_head_impl(
+    Extension(config): Extension<Arc<Config>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Path(dataset): Path<String>,
+    get_head_method: impl FnOnce(&HotblocksServer, &str) -> Result<Option<BlockRef>, UnknownDataset>,
+) -> Response {
+    let metadata = config.dataset_metadata(&dataset, &network.datasets().read());
+    match (hotblocks, metadata) {
+        (Some(hotblocks), Some(metadata)) if metadata.real_time => {
+            match get_head_method(&hotblocks, &metadata.default_name) {
+                Ok(head) => axum::Json(head).into_response(),
+                Err(UnknownDataset { .. }) => {
+                    unreachable!("dataset should be known by the hotblocks service")
+                }
+            }
+        }
+        (
+            _,
+            Some(DatasetMetadata {
+                dataset_id: Some(dataset_id),
+                ..
+            }),
+        ) => {
+            // Fall back to network data source
+            // TODO: return full hash instead of one extracted from chunk id
+            let head = network.last_chunk(&dataset_id).map(|chunk| {
+                json!({
+                    "number": chunk.last_block,
+                    "hash": chunk.last_hash(),
+                })
+            });
+            axum::Json(head).into_response()
+        }
+        (_, _) => {
+            return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response()
+        }
     }
 }
 
 async fn get_worker(
-    Path((slug, start_block)): Path<(String, u64)>,
+    Path((dataset, start_block)): Path<(String, u64)>,
+    dataset_id: DatasetId,
     Extension(client): Extension<Arc<NetworkClient>>,
-    Extension(datasets): Extension<Arc<RwLock<DatasetsMapping>>>,
     Extension(config): Extension<Arc<Config>>,
 ) -> Response {
-    let Some(dataset_id) = datasets.read().dataset_id(&slug) else {
-        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
-    };
-
     let worker_id = match client.find_worker(&dataset_id, start_block, false) {
         Ok(worker_id) => worker_id,
         Err(NoWorker::AllUnavailable) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("No available worker for dataset {slug} block {start_block}"),
+                format!("No available worker for dataset {dataset} block {start_block}"),
             )
                 .into_response();
         }
@@ -98,12 +173,7 @@ async fn execute_query(
     };
 
     let Some(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
-        return RequestError::NoData(format!(
-            "Block {} not found in dataset {}",
-            query.first_block(),
-            dataset_id
-        ))
-        .into_response();
+        return RequestError::NoData.into_response();
     };
     let range = query
         .intersect_with(&chunk.block_range())
@@ -131,27 +201,23 @@ async fn execute_query(
     }
 }
 
-async fn execute_stream_restricted(
-    Extension(task_manager): Extension<Arc<TaskManager>>,
+async fn run_finalized_stream_restricted(
+    task_manager: Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
+    dataset_id: DatasetId,
     raw_request: ClientRequest,
 ) -> Response {
-    let request = ClientRequest {
-        query: raw_request.query,
-        dataset_id: raw_request.dataset_id,
-        dataset_name: raw_request.dataset_name,
-        buffer_size: raw_request.buffer_size.min(config.max_buffer_size),
-        max_chunks: config.max_chunks_per_stream,
-        timeout_quantile: config.default_timeout_quantile,
-        retries: config.default_retries,
-    };
-    execute_stream(Extension(task_manager), request).await
+    let request = restrict_request(&config, raw_request);
+    run_finalized_stream(task_manager, dataset_id, request).await
 }
 
-async fn execute_stream(
+async fn run_finalized_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
-    request: ClientRequest,
+    dataset_id: DatasetId,
+    mut request: ClientRequest,
 ) -> Response {
+    request.dataset_id = dataset_id;
+    request.query.prepare_for_network();
     let stream = match task_manager.spawn_stream(request).await {
         Ok(stream) => stream,
         Err(e) => return e.into_response(),
@@ -162,6 +228,80 @@ async fn execute_stream(
         .header(header::CONTENT_ENCODING, "gzip")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+async fn run_stream(
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(config): Extension<Arc<Config>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Path(dataset): Path<String>,
+    request: ClientRequest,
+) -> Response {
+    let mut request = restrict_request(&config, request);
+
+    let Some(ds_metadata) = config.dataset_metadata(&dataset, &network.datasets().read()) else {
+        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response();
+    };
+    match (ds_metadata.dataset_id, hotblocks) {
+        // Prefer data from the network
+        (Some(dataset_id), _)
+            if network
+                .get_height(&dataset_id)
+                .is_some_and(|height| request.query.first_block() <= height) =>
+        {
+            let last_chunk = network.last_chunk(&dataset_id);
+            request.dataset_id = dataset_id;
+            request.query.prepare_for_network();
+
+            let stream = match task_manager.spawn_stream(request).await {
+                Ok(stream) => stream,
+                Err(e) => return e.into_response(),
+            };
+
+            let stream = stream.map(anyhow::Ok);
+            let mut res = Response::builder()
+                .header(header::CONTENT_TYPE, "application/jsonl")
+                .header(header::CONTENT_ENCODING, "gzip");
+            if let Some(last_chunk) = last_chunk {
+                res = res
+                    .header(FINALIZED_NUMBER_HEADER, last_chunk.last_block)
+                    .header(FINALIZED_HASH_HEADER, last_chunk.last_hash());
+            }
+            res.body(Body::from_stream(stream)).unwrap()
+        }
+        // Then try hotblocks storage
+        (_, Some(hotblocks)) if ds_metadata.real_time => {
+            let result = hotblocks
+                .query(
+                    (*ds_metadata.default_name).try_into().unwrap(),
+                    request.query.into_parsed(),
+                )
+                .await;
+            match result {
+                Ok(resp) => {
+                    let mut res = Response::builder()
+                        .header(header::CONTENT_TYPE, "application/jsonl")
+                        .header(header::CONTENT_ENCODING, "gzip");
+
+                    if let Some(head) = resp.finalized_head() {
+                        res = res.header(FINALIZED_NUMBER_HEADER, head.number);
+                        res = res.header(FINALIZED_HASH_HEADER, head.hash.as_str());
+                    }
+
+                    res.body(Body::from_stream(into_stream(resp))).unwrap()
+                }
+                Err(err) => hotblocks_error_to_response(err),
+            }
+        }
+        // If requested block is above the network height and there is no hotblocks storage, return 204
+        (Some(_dataset_id), _) => RequestError::NoData.into_response(),
+        (None, _) => {
+            unreachable!(
+                "invalid dataset name should have been handled in the ClientRequest parser"
+            )
+        }
+    }
 }
 
 async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
@@ -184,48 +324,34 @@ async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl In
 }
 
 async fn get_datasets(
-    Extension(datasets): Extension<Arc<RwLock<DatasetsMapping>>>,
+    Extension(config): Extension<Arc<Config>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
 ) -> impl IntoResponse {
-    let res: Vec<AvailableDatasetApiResponse> = datasets
-        .read()
-        .iter()
-        .map(|d| AvailableDatasetApiResponse {
-            slug: d.slug.clone(),
-            aliases: d.aliases.clone(),
-            real_time: false,
-        })
+    let mapping = network.datasets().read();
+    let res: Vec<AvailableDatasetApiResponse> = config
+        .all_datasets(&mapping)
+        .map(|name| config.dataset_metadata(&name, &mapping).unwrap().into())
         .collect();
 
     axum::Json(res)
 }
 
 async fn get_dataset_state(
-    Path(slug): Path<String>,
-    Extension(client): Extension<Arc<NetworkClient>>,
-    Extension(datasets): Extension<Arc<RwLock<DatasetsMapping>>>,
+    dataset_id: DatasetId,
+    Extension(network): Extension<Arc<NetworkClient>>,
 ) -> impl IntoResponse {
-    let Some(dataset_id) = datasets.read().dataset_id(&slug) else {
-        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
-    };
-
-    axum::Json(client.dataset_state(&dataset_id)).into_response()
+    axum::Json(network.dataset_state(&dataset_id).unwrap())
 }
 
 async fn get_dataset_metadata(
-    Path(slug): Path<String>,
-    Extension(datasets): Extension<Arc<RwLock<DatasetsMapping>>>,
+    Path(dataset): Path<String>,
+    Extension(config): Extension<Arc<Config>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
 ) -> impl IntoResponse {
-    let datasets = datasets.read();
-    let Some(dataset) = datasets.find_dataset(&slug) else {
-        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {slug}")).into_response();
-    };
-
-    axum::Json(AvailableDatasetApiResponse {
-        slug: dataset.slug.clone(),
-        aliases: dataset.aliases.clone(),
-        real_time: false,
-    })
-    .into_response()
+    match config.dataset_metadata(&dataset, &network.datasets().read()) {
+        Some(metadata) => axum::Json(AvailableDatasetApiResponse::from(metadata)).into_response(),
+        None => (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response(),
+    }
 }
 
 async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {
@@ -250,11 +376,11 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
 
 pub async fn run_server(
     task_manager: Arc<TaskManager>,
-    network_state: Arc<NetworkClient>,
+    network_client: Arc<NetworkClient>,
     metrics_registry: Registry,
     addr: SocketAddr,
     config: Arc<Config>,
-    datasets: Arc<RwLock<DatasetsMapping>>,
+    hotblocks: Option<Arc<HotblocksServer>>,
 ) -> anyhow::Result<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
@@ -270,12 +396,15 @@ pub async fn run_server(
         )
         .route(
             "/datasets/:dataset/finalized-stream",
-            post(execute_stream_restricted),
+            post(run_finalized_stream_restricted),
         )
         .route(
             "/datasets/:dataset/finalized-stream/debug",
-            post(execute_stream),
+            post(run_finalized_stream),
         )
+        .route("/datasets/:dataset/stream", post(run_stream))
+        .route("/datasets/:dataset/finalized-head", get(get_finalized_head))
+        .route("/datasets/:dataset/head", get(get_head))
         .route("/datasets/:dataset/state", get(get_dataset_state))
         .route("/datasets/:dataset/metadata", get(get_dataset_metadata))
         // backward compatibility routes
@@ -286,16 +415,16 @@ pub async fn run_server(
         .route("/datasets/:dataset/height", get(get_height))
         .route("/datasets/:dataset/:start_block/worker", get(get_worker))
         // end backward compatibility routes
+        .route("/status", get(get_status))
         .layer(axum::middleware::from_fn(logging::middleware))
         .route("/metrics", get(get_metrics))
-        .route("/status", get(get_status))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
         .layer(Extension(task_manager))
-        .layer(Extension(network_state))
+        .layer(Extension(network_client))
         .layer(Extension(config))
         .layer(Extension(Arc::new(metrics_registry)))
-        .layer(Extension(datasets));
+        .layer(Extension(hotblocks));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -312,11 +441,25 @@ where
     type Rejection = Response;
 
     async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let Path(dataset_name) = req
+        let Extension(config) = req
+            .extract_parts::<Extension<Arc<Config>>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Extension(network) = req
+            .extract_parts::<Extension<Arc<NetworkClient>>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Path(dataset) = req
             .extract_parts::<Path<String>>()
             .await
             .map_err(IntoResponse::into_response)?;
-        let dataset_id = req.extract_parts::<DatasetId>().await?;
+
+        let Some(metadata) = config.dataset_metadata(&dataset, &network.datasets().read()) else {
+            return Err(
+                RequestError::BadRequest(format!("Unknown dataset: {dataset}")).into_response(),
+            );
+        };
+
         let Query(params) = req
             .extract_parts::<Query<HashMap<String, String>>>()
             .await
@@ -363,8 +506,8 @@ where
         };
 
         Ok(ClientRequest {
-            dataset_id,
-            dataset_name,
+            dataset_id: DatasetId::from_url("-"), // will be filled later
+            dataset_name: metadata.default_name.into_owned(),
             query,
             buffer_size,
             max_chunks: config.max_chunks_per_stream,
@@ -382,15 +525,18 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let body: String = req.extract().await.map_err(IntoResponse::into_response)?;
+        let body: String = req
+            .with_limited_body()
+            .extract()
+            .await
+            .map_err(IntoResponse::into_response)?;
 
         if body.len() as u64 > sqd_network_transport::protocol::MAX_RAW_QUERY_SIZE {
             return Err(RequestError::BadRequest("Query is too large".to_string()).into_response());
         }
 
-        ParsedQuery::try_from(body).map_err(|e| {
-            RequestError::BadRequest(format!("Couldn't parse query: {e}")).into_response()
-        })
+        ParsedQuery::try_from(body)
+            .map_err(|e| RequestError::BadRequest(format!("{:#}", e)).into_response())
     }
 }
 
@@ -408,19 +554,80 @@ where
             .extract::<Path<String>>()
             .await
             .map_err(IntoResponse::into_response)?;
-        let Extension(datasets) = parts
-            .extract::<Extension<Arc<RwLock<DatasetsMapping>>>>()
+        let Extension(config) = parts
+            .extract::<Extension<Arc<Config>>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Extension(network) = parts
+            .extract::<Extension<Arc<NetworkClient>>>()
             .await
             .map_err(IntoResponse::into_response)?;
 
-        let Some(dataset_id) = datasets.read().dataset_id(&dataset) else {
-            return Err(
-                (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response(),
-            );
-        };
-
-        Ok(dataset_id)
+        match network.resolve(config.network_ref(&dataset)) {
+            Some(dataset_id) => Ok(dataset_id),
+            None => {
+                Err((StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response())
+            }
+        }
     }
+}
+
+fn restrict_request(config: &Config, request: ClientRequest) -> ClientRequest {
+    ClientRequest {
+        query: request.query,
+        dataset_id: request.dataset_id,
+        dataset_name: request.dataset_name,
+        buffer_size: request.buffer_size.min(config.max_buffer_size),
+        max_chunks: config.max_chunks_per_stream,
+        timeout_quantile: config.default_timeout_quantile,
+        retries: config.default_retries,
+    }
+}
+
+fn into_stream(resp: sqd_node::QueryResponse) -> impl TryStream<Ok = Bytes, Error = BoxError> {
+    futures::stream::try_unfold(resp, |mut resp| async {
+        if let Some(bytes) = resp.next_bytes().await? {
+            Ok(Some((bytes, resp)))
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+#[allow(clippy::if_same_then_else)]
+fn hotblocks_error_to_response(err: anyhow::Error) -> Response {
+    if let Some(above_the_head) = err.downcast_ref::<sqd_node::error::QueryIsAboveTheHead>() {
+        let mut res = Response::builder().status(204);
+        if let Some(head) = above_the_head.finalized_head.as_ref() {
+            res = res.header(FINALIZED_NUMBER_HEADER, head.number);
+            res = res.header(FINALIZED_HASH_HEADER, head.hash.as_str());
+        }
+        return res.body(Body::empty()).unwrap();
+    }
+
+    if let Some(fork) = err.downcast_ref::<sqd_node::error::UnexpectedBaseBlock>() {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "lastBlocks": &fork.prev_blocks
+            })),
+        )
+            .into_response();
+    }
+
+    let status_code = if err.is::<sqd_node::error::UnknownDataset>() {
+        StatusCode::NOT_FOUND
+    } else if err.is::<sqd_node::error::QueryKindMismatch>() {
+        StatusCode::BAD_REQUEST
+    } else if err.is::<sqd_node::error::BlockRangeMissing>() {
+        StatusCode::BAD_REQUEST
+    } else if err.is::<sqd_node::error::Busy>() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+
+    (status_code, format!("{:#}", err)).into_response()
 }
 
 #[allow(unstable_name_collisions)]
@@ -437,3 +644,6 @@ fn convert_response(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     writer.write_all("]".as_bytes())?;
     Ok(writer.finish()?)
 }
+
+const FINALIZED_NUMBER_HEADER: &str = "X-Sqd-Finalized-Head-Number";
+const FINALIZED_HASH_HEADER: &str = "X-Sqd-Finalized-Head-Hash";

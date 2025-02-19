@@ -5,6 +5,7 @@ mod dataset;
 mod errors;
 mod request;
 
+pub use api_types::DatasetRef;
 pub use chunk::*;
 pub use common::*;
 pub use dataset::*;
