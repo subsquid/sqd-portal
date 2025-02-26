@@ -22,7 +22,6 @@ pub struct DatasetConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "kebab-case")]
 pub struct RealTimeConfig {
     pub kind: sqd_hotblocks::DatasetKind,
     pub data_sources: Vec<Url>,
@@ -147,12 +146,10 @@ impl DatasetsConfig {
 
 type DatasetsConfigModel = BTreeMap<String, DatasetConfigModel>;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(default, deny_unknown_fields)]
 struct DatasetConfigModel {
-    #[serde(default)]
     aliases: Vec<String>,
-    #[serde(default)]
     sqd_network: Option<DatasetRef>,
     real_time: Option<RealTimeConfig>,
 }
@@ -195,25 +192,25 @@ mod tests {
             },
             "solana-mainnet": {
                 "aliases": ["solana"],
-                "sqd-network": {
-                    "dataset-name": "solana-mainnet"
+                "sqd_network": {
+                    "dataset_name": "solana-mainnet"
                 },
-                "real-time": {
+                "real_time": {
                     "kind": "solana",
-                    "data-sources": ["http://localhost:8080"],
-                    "first-block": 250000000
+                    "data_sources": ["http://localhost:8080"],
+                    "first_block": 250000000
                 }
             },
             "local": {
-                "real-time": {
+                "real_time": {
                     "kind": "evm",
-                    "data-sources": ["http://localhost:8081"],
-                    "first-block": 0
+                    "data_sources": ["http://localhost:8081"],
+                    "first_block": 0
                 }
             },
             "custom": {
-                "sqd-network": {
-                    "dataset-id": "s3://solana-mainnet"
+                "sqd_network": {
+                    "dataset_id": "s3://solana-mainnet"
                 }
             },
             "empty": {}

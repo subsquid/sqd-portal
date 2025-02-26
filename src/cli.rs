@@ -84,6 +84,7 @@ where
 
 #[serde_as]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(deserialize_with = "parse_hostname")]
     pub hostname: String,

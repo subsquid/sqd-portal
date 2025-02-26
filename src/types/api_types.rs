@@ -11,9 +11,9 @@ pub(crate) struct AvailableDatasetApiResponse {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub enum DatasetRef {
-    #[serde(rename = "dataset-name")]
+    #[serde(rename = "dataset_name")]
     Name(String),
-    #[serde(rename = "dataset-id")]
+    #[serde(rename = "dataset_id")]
     Id(DatasetId),
 }
 
