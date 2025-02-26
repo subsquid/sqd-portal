@@ -105,11 +105,10 @@ async fn get_head_impl(
             }),
         ) => {
             // Fall back to network data source
-            // TODO: return full hash instead of one extracted from chunk id
-            let head = network.last_chunk(&dataset_id).map(|chunk| {
+            let head = network.head(&dataset_id).map(|head| {
                 json!({
-                    "number": chunk.last_block,
-                    "hash": chunk.last_hash(),
+                    "number": head.number,
+                    "hash": head.hash,
                 })
             });
             axum::Json(head).into_response()
@@ -243,14 +242,14 @@ async fn run_stream(
     let Some(ds_metadata) = config.dataset_metadata(&dataset, &network.datasets().read()) else {
         return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response();
     };
-    match (ds_metadata.dataset_id, hotblocks) {
+    let (head, body) = match (ds_metadata.dataset_id, hotblocks) {
         // Prefer data from the network
         (Some(dataset_id), _)
             if network
                 .get_height(&dataset_id)
                 .is_some_and(|height| request.query.first_block() <= height) =>
         {
-            let last_chunk = network.last_chunk(&dataset_id);
+            let head = network.head(&dataset_id);
             request.dataset_id = dataset_id;
             request.query.prepare_for_network();
 
@@ -260,15 +259,7 @@ async fn run_stream(
             };
 
             let stream = stream.map(anyhow::Ok);
-            let mut res = Response::builder()
-                .header(header::CONTENT_TYPE, "application/jsonl")
-                .header(header::CONTENT_ENCODING, "gzip");
-            if let Some(last_chunk) = last_chunk {
-                res = res
-                    .header(FINALIZED_NUMBER_HEADER, last_chunk.last_block)
-                    .header(FINALIZED_HASH_HEADER, last_chunk.last_hash());
-            }
-            res.body(Body::from_stream(stream)).unwrap()
+            (head, Body::from_stream(stream))
         }
         // Then try hotblocks storage
         (_, Some(hotblocks)) if ds_metadata.real_time => {
@@ -279,29 +270,31 @@ async fn run_stream(
                 )
                 .await;
             match result {
-                Ok(resp) => {
-                    let mut res = Response::builder()
-                        .header(header::CONTENT_TYPE, "application/jsonl")
-                        .header(header::CONTENT_ENCODING, "gzip");
-
-                    if let Some(head) = resp.finalized_head() {
-                        res = res.header(FINALIZED_NUMBER_HEADER, head.number);
-                        res = res.header(FINALIZED_HASH_HEADER, head.hash.as_str());
-                    }
-
-                    res.body(Body::from_stream(into_stream(resp))).unwrap()
-                }
-                Err(err) => hotblocks_error_to_response(err),
+                Ok(resp) => (
+                    resp.finalized_head().cloned(),
+                    Body::from_stream(into_stream(resp)),
+                ),
+                Err(err) => return hotblocks_error_to_response(err),
             }
         }
         // If requested block is above the network height and there is no hotblocks storage, return 204
-        (Some(_dataset_id), _) => RequestError::NoData.into_response(),
+        (Some(_dataset_id), _) => return RequestError::NoData.into_response(),
         (None, _) => {
             unreachable!(
                 "invalid dataset name should have been handled in the ClientRequest parser"
             )
         }
+    };
+
+    let mut res = Response::builder()
+        .header(header::CONTENT_TYPE, "application/jsonl")
+        .header(header::CONTENT_ENCODING, "gzip");
+
+    if let Some(head) = head {
+        res = res.header(FINALIZED_NUMBER_HEADER, head.number);
+        res = res.header(FINALIZED_HASH_HEADER, head.hash);
     }
+    res.body(body).unwrap()
 }
 
 async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {

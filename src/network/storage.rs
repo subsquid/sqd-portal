@@ -1,6 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
+use sqd_messages::assignments;
+use sqd_primitives::BlockRef;
 
 use crate::{
     metrics,
@@ -9,8 +11,13 @@ use crate::{
 
 use super::DatasetsMapping;
 
+pub struct DatasetIndex {
+    pub chunks: Vec<DataChunk>,
+    pub summary: Option<assignments::ChunkSummary>,
+}
+
 pub struct StorageClient {
-    datasets: RwLock<HashMap<DatasetId, Vec<DataChunk>>>,
+    datasets: RwLock<HashMap<DatasetId, DatasetIndex>>,
     datasets_mapping: Arc<RwLock<DatasetsMapping>>,
 }
 
@@ -22,21 +29,21 @@ impl StorageClient {
         }
     }
 
-    pub fn update_datasets(&self, mut new_datasets: HashMap<DatasetId, Vec<DataChunk>>) {
+    pub fn update_datasets(&self, mut new_datasets: HashMap<DatasetId, DatasetIndex>) {
         tracing::info!("Saving known chunks");
 
         let timer = tokio::time::Instant::now();
 
-        for chunks in new_datasets.values_mut() {
-            chunks.sort_by_key(|r| r.first_block);
+        for index in new_datasets.values_mut() {
+            index.chunks.sort_by_key(|r| r.first_block);
         }
 
         let mut datasets = self.datasets.write();
-        for (dataset, chunks) in new_datasets {
-            let new_len = chunks.len();
-            let last_block = chunks.last().map_or(0, |r| r.last_block);
-            let prev = datasets.insert(dataset.clone(), chunks);
-            let old_len = prev.map_or(0, |v| v.len());
+        for (dataset, index) in new_datasets {
+            let new_len = index.chunks.len();
+            let last_block = index.chunks.last().map_or(0, |r| r.last_block);
+            let prev = datasets.insert(dataset.clone(), index);
+            let old_len = prev.map_or(0, |i| i.chunks.len());
             if old_len < new_len {
                 tracing::info!(
                     "Got {} new chunk(s) for dataset {}",
@@ -58,7 +65,7 @@ impl StorageClient {
 
     pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
         let datasets = self.datasets.read();
-        let chunks = datasets.get(dataset)?;
+        let chunks = &datasets.get(dataset)?.chunks;
         if block < chunks.first()?.first_block {
             return None;
         }
@@ -71,10 +78,16 @@ impl StorageClient {
         self.find_chunk(dataset, chunk.last_block + 1)
     }
 
-    pub fn last_chunk(&self, dataset: &DatasetId) -> Option<DataChunk> {
-        self.datasets
-            .read()
-            .get(dataset)
-            .and_then(|chunks| chunks.last().cloned())
+    pub fn head(&self, dataset: &DatasetId) -> Option<BlockRef> {
+        self.datasets.read().get(dataset).and_then(|index| {
+            let number = index.chunks.last().map(|c| c.last_block);
+            match (number, index.summary.as_ref()) {
+                (Some(number), Some(summary)) => Some(BlockRef {
+                    number: number,
+                    hash: summary.last_block_hash.clone(),
+                }),
+                _ => None,
+            }
+        })
     }
 }

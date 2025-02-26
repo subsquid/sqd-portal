@@ -11,6 +11,7 @@ use num_traits::ToPrimitive;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use sqd_node::Node as HotblocksServer;
+use sqd_primitives::BlockRef;
 use tokio::task::JoinError;
 use tokio::time::Instant;
 use tokio::time::MissedTickBehavior;
@@ -26,6 +27,7 @@ use sqd_network_transport::{
 };
 
 use super::priorities::NoWorker;
+use super::storage::DatasetIndex;
 use super::{DatasetsMapping, NetworkState, StorageClient};
 use crate::network::state::Status;
 use crate::types::{BlockRange, ChunkId, DataChunk, DatasetRef};
@@ -374,8 +376,8 @@ impl NetworkClient {
         self.dataset_storage.next_chunk(dataset, chunk)
     }
 
-    pub fn last_chunk(&self, dataset: &DatasetId) -> Option<DataChunk> {
-        self.dataset_storage.last_chunk(dataset)
+    pub fn head(&self, dataset: &DatasetId) -> Option<BlockRef> {
+        self.dataset_storage.head(dataset)
     }
 
     pub fn find_worker(
@@ -656,7 +658,7 @@ impl NetworkClient {
 #[tracing::instrument(skip_all)]
 fn parse_assignment(
     assignment: Assignment,
-) -> anyhow::Result<(AssignedChunks, HashMap<DatasetId, Vec<DataChunk>>)> {
+) -> anyhow::Result<(AssignedChunks, HashMap<DatasetId, DatasetIndex>)> {
     let peers = assignment.get_all_peer_ids();
     let mut worker_chunks = HashMap::new();
     for peer_id in peers {
@@ -679,17 +681,29 @@ fn parse_assignment(
         .datasets
         .into_iter()
         .map(|dataset| {
-            (
-                DatasetId::from_url(dataset.id),
-                dataset
-                    .chunks
-                    .into_iter()
-                    .flat_map(|chunk| {
-                        chunk.id.parse().map_err(|e| {
+            let mut parsed_chunks = dataset
+                .chunks
+                .into_iter()
+                .flat_map(|chunk| {
+                    chunk
+                        .id
+                        .parse::<DataChunk>()
+                        .map_err(|e| {
                             tracing::warn!("Couldn't parse chunk id '{}': {e}", chunk.id);
                         })
-                    })
-                    .collect(),
+                        .map(|id| (id, chunk.summary))
+                })
+                .collect_vec();
+            parsed_chunks.sort_by_key(|(chunk, _)| chunk.first_block);
+            let summary = parsed_chunks
+                .last_mut()
+                .and_then(|(_, summary)| summary.take());
+            (
+                DatasetId::from_url(dataset.id),
+                DatasetIndex {
+                    chunks: parsed_chunks.into_iter().map(|(chunk, _)| chunk).collect(),
+                    summary,
+                },
             )
         })
         .collect();
