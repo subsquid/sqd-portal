@@ -7061,7 +7061,7 @@ dependencies = [
 [[package]]
 name = "sqd-array"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
+source = "git+https://github.com/subsquid/data.git?rev=b285754#b285754ccdf8f49040ee1305f2c7c14d51fe4dd0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7092,7 +7092,7 @@ dependencies = [
 [[package]]
 name = "sqd-data"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
+source = "git+https://github.com/subsquid/data.git?rev=b285754#b285754ccdf8f49040ee1305f2c7c14d51fe4dd0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7108,7 +7108,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-client"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
+source = "git+https://github.com/subsquid/data.git?rev=b285754#b285754ccdf8f49040ee1305f2c7c14d51fe4dd0"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7122,7 +7122,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-core"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
+source = "git+https://github.com/subsquid/data.git?rev=b285754#b285754ccdf8f49040ee1305f2c7c14d51fe4dd0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7136,7 +7136,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-source"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
+source = "git+https://github.com/subsquid/data.git?rev=b285754#b285754ccdf8f49040ee1305f2c7c14d51fe4dd0"
 dependencies = [
  "anyhow",
  "futures 0.3.31",
@@ -7149,7 +7149,7 @@ dependencies = [
 [[package]]
 name = "sqd-dataset"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
+source = "git+https://github.com/subsquid/data.git?rev=b285754#b285754ccdf8f49040ee1305f2c7c14d51fe4dd0"
 
 [[package]]
 name = "sqd-messages"
@@ -7210,7 +7210,7 @@ dependencies = [
 [[package]]
 name = "sqd-node"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
+source = "git+https://github.com/subsquid/data.git?rev=b285754#b285754ccdf8f49040ee1305f2c7c14d51fe4dd0"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7239,7 +7239,7 @@ dependencies = [
 [[package]]
 name = "sqd-polars"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
+source = "git+https://github.com/subsquid/data.git?rev=b285754#b285754ccdf8f49040ee1305f2c7c14d51fe4dd0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7298,7 +7298,7 @@ dependencies = [
 [[package]]
 name = "sqd-primitives"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
+source = "git+https://github.com/subsquid/data.git?rev=b285754#b285754ccdf8f49040ee1305f2c7c14d51fe4dd0"
 dependencies = [
  "borsh",
  "serde",
@@ -7307,7 +7307,7 @@ dependencies = [
 [[package]]
 name = "sqd-query"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
+source = "git+https://github.com/subsquid/data.git?rev=b285754#b285754ccdf8f49040ee1305f2c7c14d51fe4dd0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7328,7 +7328,7 @@ dependencies = [
 [[package]]
 name = "sqd-storage"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ef9d80#2ef9d805e30213090d0319ae9b0b54a053245267"
+source = "git+https://github.com/subsquid/data.git?rev=b285754#b285754ccdf8f49040ee1305f2c7c14d51fe4dd0"
 dependencies = [
  "anyhow",
  "arrow",

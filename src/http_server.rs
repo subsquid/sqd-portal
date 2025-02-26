@@ -602,7 +602,7 @@ fn hotblocks_error_to_response(err: anyhow::Error) -> Response {
         return (
             StatusCode::CONFLICT,
             axum::Json(serde_json::json!({
-                "lastBlocks": &fork.prev_blocks
+                "previousBlocks": &fork.prev_blocks
             })),
         )
             .into_response();
