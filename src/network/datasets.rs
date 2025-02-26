@@ -5,8 +5,6 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::BufReader;
-use std::sync::Arc;
-use std::time::Duration;
 
 pub struct DatasetsMapping {
     datasets: BiBTreeMap<String, DatasetId>,
@@ -28,19 +26,11 @@ impl DatasetsMapping {
         Self { datasets }
     }
 
-    pub async fn run_updates(handle: Arc<RwLock<Self>>, interval: Duration, url: String) {
-        loop {
-            tokio::time::sleep(interval).await;
-            tracing::info!("Updating datasets mapping");
-            match Self::load(&url).await {
-                Ok(mapping) => {
-                    *handle.write() = mapping;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to update datasets mapping: {e:?}");
-                }
-            }
-        }
+    pub async fn update(handle: &RwLock<Self>, url: &str) -> anyhow::Result<()> {
+        tracing::info!("Updating datasets mapping");
+        let mapping = Self::load(url).await?;
+        *handle.write() = mapping;
+        Ok(())
     }
 
     pub fn resolve(&self, dataset_ref: DatasetRef) -> Option<DatasetId> {

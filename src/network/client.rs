@@ -73,10 +73,12 @@ pub struct NetworkClientStatus {
 
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
+    config: Arc<Config>,
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
     transport_handle: GatewayTransport,
-    datasets: Arc<RwLock<DatasetsMapping>>,
     network_state: Mutex<NetworkState>,
+    datasets: Arc<RwLock<DatasetsMapping>>,
+    hotblocks: Option<Arc<HotblocksServer>>,
     contract_client: Box<dyn ContractClient>,
     dataset_storage: StorageClient,
     chain_update_interval: Duration,
@@ -96,7 +98,7 @@ impl NetworkClient {
         config: Arc<Config>,
         datasets: Arc<RwLock<DatasetsMapping>>,
         hotblocks: Option<Arc<HotblocksServer>>,
-    ) -> anyhow::Result<NetworkClient> {
+    ) -> anyhow::Result<Arc<NetworkClient>> {
         let network = args.rpc.network;
         let dataset_storage = StorageClient::new(datasets.clone());
         let agent_into = get_agent_info!();
@@ -111,11 +113,9 @@ impl NetworkClient {
         let (incoming_events, transport_handle) =
             transport_builder.build_gateway(gateway_config)?;
 
-        tokio::spawn(DatasetsMapping::run_updates(
-            datasets.clone(),
-            config.datasets_update_interval,
-            config.sqd_network.datasets_url.clone(),
-        ));
+        let datasets_update_interval = config.datasets_update_interval;
+        let datasets_copy = datasets.clone();
+        let datasets_url = config.sqd_network.datasets_url.clone();
 
         let network_state_filename = match network {
             Network::Tethys => "network-state-tethys.json",
@@ -124,27 +124,17 @@ impl NetworkClient {
         let network_state_url =
             format!("https://metadata.sqd-datasets.io/{network_state_filename}");
 
-        // FIXME
-        let mut state = NetworkState::new(config.clone(), datasets.clone());
-        if let Some(hotblocks) = hotblocks {
-            state.subscribe_height_update(
-                &DatasetId::from_url("s3://solana-mainnet-0"),
-                Box::new(move |height| {
-                    hotblocks.retain(
-                        "solana".try_into().unwrap(),
-                        sqd_node::RetentionStrategy::FromBlock(height + 1),
-                    );
-                }),
-            );
-        }
+        let state = NetworkState::new(config.clone(), datasets.clone());
 
-        Ok(NetworkClient {
+        let this = Arc::new(NetworkClient {
             chain_update_interval: config.chain_update_interval,
             assignment_update_interval: config.assignments_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
-            datasets,
             network_state: Mutex::new(state),
+            config,
+            datasets,
+            hotblocks,
             contract_client,
             dataset_storage,
             local_peer_id,
@@ -152,7 +142,26 @@ impl NetworkClient {
             network_state_url,
             assignments: RwLock::default(),
             heartbeat_buffer: Mutex::default(),
-        })
+        });
+
+        this.reset_height_updates();
+
+        let client_handle = this.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(datasets_update_interval).await;
+                match DatasetsMapping::update(&datasets_copy, &datasets_url).await {
+                    Ok(_) => {
+                        client_handle.reset_height_updates();
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to update datasets mapping: {e:?}");
+                    }
+                }
+            }
+        });
+
+        Ok(this)
     }
 
     pub async fn run(
@@ -355,6 +364,31 @@ impl NetworkClient {
             match event {
                 GatewayEvent::Heartbeat { peer_id, heartbeat } => {
                     self.handle_heartbeat(peer_id, heartbeat);
+                }
+            }
+        }
+    }
+
+    pub fn reset_height_updates(&self) {
+        let Some(hotblocks) = self.hotblocks.as_ref() else {
+            return;
+        };
+        let mut state = self.network_state.lock();
+        let datasets = self.datasets.read();
+        state.unsubscribe_all_height_updates();
+        for dataset in self.config.datasets.iter() {
+            if let (Some(ds_ref), Some(_)) = (&dataset.network_ref, &dataset.hotblocks) {
+                if let Some(dataset_id) = datasets.resolve(ds_ref.clone()) {
+                    let hotblocks = hotblocks.clone();
+                    let name = dataset.default_name.parse().expect("Invalid dataset name");
+                    tracing::info!("Hotblocks storage for '{name}' set to track dataset height of '{dataset_id}'");
+                    state.subscribe_height_updates(
+                        &dataset_id,
+                        Box::new(move |height| {
+                            hotblocks
+                                .retain(name, sqd_node::RetentionStrategy::FromBlock(height + 1));
+                        }),
+                    );
                 }
             }
         }

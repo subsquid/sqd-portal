@@ -62,15 +62,13 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(args.config);
     let hotblocks = hotblocks::build_server(&config)?.map(Arc::new);
-    let network_client = Arc::new(
-        NetworkClient::new(
-            args.transport,
-            config.clone(),
-            datasets.clone(),
-            hotblocks.clone(),
-        )
-        .await?,
-    );
+    let network_client = NetworkClient::new(
+        args.transport,
+        config.clone(),
+        datasets.clone(),
+        hotblocks.clone(),
+    )
+    .await?;
 
     let mut metrics_registry = Registry::with_labels(
         vec![(

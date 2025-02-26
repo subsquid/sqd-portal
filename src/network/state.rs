@@ -68,8 +68,12 @@ impl DatasetState {
         self.highest_seen_block
     }
 
-    pub fn subscribe_height_update(&mut self, subscriber: Box<dyn FnMut(u64) + Send>) {
+    pub fn subscribe_height_updates(&mut self, subscriber: Box<dyn FnMut(u64) + Send>) {
         self.height_update_subscribers.push(subscriber);
+    }
+
+    pub fn unsubscribe_height_updates(&mut self) {
+        self.height_update_subscribers.clear();
     }
 
     fn notify_height_update(&mut self) {
@@ -223,7 +227,7 @@ impl NetworkState {
         self.dataset_states.get(dataset_id)
     }
 
-    pub fn subscribe_height_update(
+    pub fn subscribe_height_updates(
         &mut self,
         dataset_id: &DatasetId,
         subscriber: Box<dyn FnMut(u64) + Send>,
@@ -231,7 +235,13 @@ impl NetworkState {
         self.dataset_states
             .entry(dataset_id.clone())
             .or_default()
-            .subscribe_height_update(subscriber);
+            .subscribe_height_updates(subscriber);
+    }
+
+    pub fn unsubscribe_all_height_updates(&mut self) {
+        for state in self.dataset_states.values_mut() {
+            state.unsubscribe_height_updates();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -55,12 +55,6 @@ impl DatasetsConfig {
             for alias in &dataset.aliases {
                 name_to_index.insert(alias.clone(), index);
             }
-            if let Some(DatasetRef::Name(network_name)) = &dataset.sqd_network {
-                assert!(
-                    name == *network_name,
-                    "Dataset name must match SQD network name"
-                );
-            }
             let config = DatasetConfig {
                 default_name: name.clone(),
                 aliases: dataset.aliases,
