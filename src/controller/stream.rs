@@ -325,8 +325,13 @@ impl StreamController {
                         break;
                     }
                 }
-                Err((_slot, e)) => {
+                Err((slot, e)) => {
                     tracing::debug!("Couldn't schedule request: {e:?}");
+                    if self.buffer.len() == 0 {
+                        // Couldn't schedule a new request with no ongoing requests
+                        // Return the error immediately
+                        self.buffer.push_back(slot);
+                    }
                     self.last_error = Some(e.to_string());
                     self.next_chunk = Some(chunk);
                     break;
@@ -379,7 +384,7 @@ impl StreamController {
                 );
                 request
             }
-            Err(err) => {
+            Err(err @ SendQueryError::NoWorkers) => {
                 return Err((
                     Slot {
                         data_range: range,

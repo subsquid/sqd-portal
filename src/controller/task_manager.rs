@@ -49,8 +49,7 @@ impl TaskManager {
             metrics::COMPLETED_STREAMS.inc();
         });
 
-        let streamer = StreamController::new(request, self.network_client.clone());
-        let mut streamer = streamer?;
+        let mut streamer = StreamController::new(request, self.network_client.clone())?;
         let first_chunk = streamer
             .next()
             .in_current_span()
