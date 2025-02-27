@@ -1,12 +1,11 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::datasets::DatasetsMapping;
 use clap::Parser;
 use cli::Cli;
 use controller::task_manager::TaskManager;
 use http_server::run_server;
-use network::NetworkClient;
+use network::{DatasetsMapping, NetworkClient};
 use parking_lot::RwLock;
 use prometheus_client::registry::Registry;
 use tokio_util::sync::CancellationToken;
@@ -14,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 mod cli;
 mod controller;
 mod datasets;
+mod hotblocks;
 mod http_server;
 mod metrics;
 mod network;
@@ -56,11 +56,19 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     setup_tracing(args.json_log);
 
-    let datasets = Arc::new(RwLock::new(DatasetsMapping::load(&args.config).await?));
+    let datasets = Arc::new(RwLock::new(
+        DatasetsMapping::load(&args.config.sqd_network.datasets_url).await?,
+    ));
 
     let config = Arc::new(args.config);
-    let network_client =
-        Arc::new(NetworkClient::new(args.transport, config.clone(), datasets.clone()).await?);
+    let hotblocks = hotblocks::build_server(&config)?.map(Arc::new);
+    let network_client = NetworkClient::new(
+        args.transport,
+        config.clone(),
+        datasets.clone(),
+        hotblocks.clone(),
+    )
+    .await?;
 
     let mut metrics_registry = Registry::with_labels(
         vec![(
@@ -81,19 +89,14 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let cancellation_token = CancellationToken::new();
-    let (server_res, (), ()) = tokio::try_join!(
+    let (server_res, ()) = tokio::try_join!(
         tokio::spawn(run_server(
             task_manager,
             network_client.clone(),
             metrics_registry,
             args.http_listen,
             config.clone(),
-            datasets.clone(),
-        )),
-        tokio::spawn(DatasetsMapping::run_updates(
-            datasets,
-            config.datasets_update_interval,
-            config,
+            hotblocks,
         )),
         network_client.run(cancellation_token),
     )?;
