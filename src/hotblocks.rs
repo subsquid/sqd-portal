@@ -35,7 +35,7 @@ pub fn build_server(config: &cli::Config) -> anyhow::Result<Option<sqd_node::Nod
                     .as_str()
                     .try_into()
                     .map_err(|s| anyhow::anyhow!("{}", s))?,
-                sqd_node::RetentionStrategy::FromBlock(hotblocks.first_block),
+                hotblocks.retention.clone(),
             );
             for url in &hotblocks.data_sources {
                 ds.add_data_source(url.clone());

@@ -218,10 +218,9 @@ async fn run_finalized_stream(
     request.dataset_id = dataset_id;
     request.query.prepare_for_network();
     let stream = match task_manager.spawn_stream(request).await {
-        Ok(stream) => stream,
+        Ok(stream) => stream.map(anyhow::Ok),
         Err(e) => return e.into_response(),
     };
-    let stream = stream.map(anyhow::Ok);
     Response::builder()
         .header(header::CONTENT_TYPE, "application/jsonl")
         .header(header::CONTENT_ENCODING, "gzip")
@@ -254,11 +253,10 @@ async fn run_stream(
             request.query.prepare_for_network();
 
             let stream = match task_manager.spawn_stream(request).await {
-                Ok(stream) => stream,
+                Ok(stream) => stream.map(anyhow::Ok),
                 Err(e) => return e.into_response(),
             };
 
-            let stream = stream.map(anyhow::Ok);
             (head, Body::from_stream(stream))
         }
         // Then try hotblocks storage

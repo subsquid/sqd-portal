@@ -1,13 +1,15 @@
 use crate::{
     network::DatasetsMapping,
-    types::{BlockNumber, DatasetId, DatasetRef},
+    types::{DatasetId, DatasetRef},
 };
 use serde::{Deserialize, Serialize};
-use sqd_node as sqd_hotblocks;
+use sqd_node::{self as sqd_hotblocks, RetentionStrategy};
+use sqd_primitives::BlockNumber;
 use std::{borrow::Cow, collections::BTreeMap};
 use url::Url;
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Deserialize)]
+#[serde(from = "DatasetsConfigModel")]
 pub struct DatasetsConfig {
     datasets: Vec<DatasetConfig>,
     name_to_index: BTreeMap<String, usize>,
@@ -25,7 +27,8 @@ pub struct DatasetConfig {
 pub struct RealTimeConfig {
     pub kind: sqd_hotblocks::DatasetKind,
     pub data_sources: Vec<Url>,
-    pub first_block: BlockNumber,
+    #[serde(deserialize_with = "deserialize_retention")]
+    pub retention: RetentionStrategy,
 }
 
 /// Struct built from merging the static config with datasets mapping
@@ -44,8 +47,8 @@ pub enum ServeMode {
     All,
 }
 
-impl DatasetsConfig {
-    fn from_model(model: DatasetsConfigModel) -> Self {
+impl From<DatasetsConfigModel> for DatasetsConfig {
+    fn from(model: DatasetsConfigModel) -> Self {
         let mut datasets = Vec::with_capacity(model.len());
         let mut name_to_index = BTreeMap::new();
         for (name, dataset) in model {
@@ -68,7 +71,9 @@ impl DatasetsConfig {
             name_to_index,
         }
     }
+}
 
+impl DatasetsConfig {
     pub fn get_by_name(&self, dataset: &str) -> Option<&DatasetConfig> {
         self.name_to_index
             .get(dataset)
@@ -154,15 +159,21 @@ struct DatasetConfigModel {
     real_time: Option<RealTimeConfig>,
 }
 
-impl<'de> Deserialize<'de> for DatasetsConfig {
-    fn deserialize<D>(
-        deserializer: D,
-    ) -> Result<DatasetsConfig, <D as serde::Deserializer<'de>>::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let model = DatasetsConfigModel::deserialize(deserializer)?;
-        Ok(DatasetsConfig::from_model(model))
+fn deserialize_retention<'de, D>(de: D) -> Result<RetentionStrategy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Model {
+        FromBlock(BlockNumber),
+        Head(BlockNumber)
+    }
+
+    let model = Model::deserialize(de)?;
+    match model {
+        Model::FromBlock(block) => Ok(RetentionStrategy::FromBlock(block)),
+        Model::Head(block) => Ok(RetentionStrategy::Head(block)),
     }
 }
 
@@ -198,14 +209,18 @@ mod tests {
                 "real_time": {
                     "kind": "solana",
                     "data_sources": ["http://localhost:8080"],
-                    "first_block": 250000000
+                    "retention": {
+                        "from_block": 300000000
+                    }
                 }
             },
             "local": {
                 "real_time": {
                     "kind": "evm",
                     "data_sources": ["http://localhost:8081"],
-                    "first_block": 0
+                    "retention": {
+                        "from_block": 0
+                    }
                 }
             },
             "custom": {
@@ -215,8 +230,7 @@ mod tests {
             },
             "empty": {}
         });
-        let model = serde_json::from_value::<DatasetsConfigModel>(json).unwrap();
-        let config = DatasetsConfig::from_model(model);
+        let config = serde_json::from_value::<DatasetsConfig>(json).unwrap();
         let mapping = DatasetsMapping::new(
             [
                 (
