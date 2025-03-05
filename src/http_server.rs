@@ -166,30 +166,37 @@ async fn get_head_impl(
 
 async fn run_finalized_stream_restricted(
     task_manager: Extension<Arc<TaskManager>>,
+    network: Extension<Arc<NetworkClient>>,
     Extension(config): Extension<Arc<Config>>,
     dataset_id: DatasetId,
     raw_request: ClientRequest,
 ) -> Response {
     let request = restrict_request(&config, raw_request);
-    run_finalized_stream(task_manager, dataset_id, request).await
+    run_finalized_stream(task_manager, network, dataset_id, request).await
 }
 
 async fn run_finalized_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
     dataset_id: DatasetId,
     mut request: ClientRequest,
 ) -> Response {
+    let head = network.head(&dataset_id);
     request.dataset_id = dataset_id;
     request.query.prepare_for_network();
     let stream = match task_manager.spawn_stream(request).await {
         Ok(stream) => stream.map(anyhow::Ok),
         Err(e) => return e.into_response(),
     };
-    Response::builder()
+
+    let mut res = Response::builder()
         .header(header::CONTENT_TYPE, "application/jsonl")
-        .header(header::CONTENT_ENCODING, "gzip")
-        .body(Body::from_stream(stream))
-        .unwrap()
+        .header(header::CONTENT_ENCODING, "gzip");
+    if let Some(head) = head {
+        res = res.header(FINALIZED_NUMBER_HEADER, head.number);
+        res = res.header(FINALIZED_HASH_HEADER, head.hash);
+    }
+    res.body(Body::from_stream(stream)).unwrap()
 }
 
 async fn run_stream(
