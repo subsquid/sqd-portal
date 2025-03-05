@@ -24,10 +24,10 @@ use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 
-use crate::datasets::DatasetMetadata;
+use crate::datasets::DatasetConfig;
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::{
-    cli::Config,
+    config::Config,
     controller::task_manager::TaskManager,
     network::{NetworkClient, NoWorker},
     types::{ChunkId, ClientRequest, DatasetId, ParsedQuery, RequestError},
@@ -49,60 +49,55 @@ async fn get_height(
 }
 
 async fn get_finalized_head(
-    Extension(config): Extension<Arc<Config>>,
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
     Extension(network): Extension<Arc<NetworkClient>>,
-    Path(dataset): Path<String>,
+    Extension(dataset): Extension<DatasetConfig>,
 ) -> Response {
     get_head_impl(
-        Extension(config),
         Extension(hotblocks),
         Extension(network),
-        Path(dataset),
+        Extension(dataset),
         |hotblocks, ds| hotblocks.get_finalized_head(ds.try_into().unwrap()),
     )
     .await
 }
 
 async fn get_head(
-    Extension(config): Extension<Arc<Config>>,
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
     Extension(network): Extension<Arc<NetworkClient>>,
-    Path(dataset): Path<String>,
+    Extension(dataset): Extension<DatasetConfig>,
 ) -> Response {
     get_head_impl(
-        Extension(config),
         Extension(hotblocks),
         Extension(network),
-        Path(dataset),
+        Extension(dataset),
         |hotblocks, ds| hotblocks.get_head(ds.try_into().unwrap()),
     )
     .await
 }
 
 async fn get_head_impl(
-    Extension(config): Extension<Arc<Config>>,
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
     Extension(network): Extension<Arc<NetworkClient>>,
-    Path(dataset): Path<String>,
+    Extension(dataset): Extension<DatasetConfig>,
     get_head_method: impl FnOnce(&HotblocksServer, &str) -> Result<Option<BlockRef>, UnknownDataset>,
 ) -> Response {
-    let metadata = config.dataset_metadata(&dataset, &network.datasets().read());
-    match (hotblocks, metadata) {
-        (Some(hotblocks), Some(metadata)) if metadata.real_time => {
-            match get_head_method(&hotblocks, &metadata.default_name) {
+    match (hotblocks, dataset) {
+        (Some(hotblocks), dataset) if dataset.hotblocks.is_some() => {
+            match get_head_method(&hotblocks, &dataset.default_name) {
                 Ok(head) => axum::Json(head).into_response(),
                 Err(UnknownDataset { .. }) => {
                     unreachable!("dataset should be known by the hotblocks service")
                 }
             }
         }
+
         (
             _,
-            Some(DatasetMetadata {
-                dataset_id: Some(dataset_id),
+            DatasetConfig {
+                network_id: Some(dataset_id),
                 ..
-            }),
+            },
         ) => {
             // Fall back to network data source
             let head = network.head(&dataset_id).map(|head| {
@@ -113,8 +108,13 @@ async fn get_head_impl(
             });
             axum::Json(head).into_response()
         }
-        (_, _) => {
-            return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response()
+
+        (_, dataset) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("Dataset {} has no data sources", dataset.default_name),
+            )
+                .into_response()
         }
     }
 }
@@ -233,15 +233,12 @@ async fn run_stream(
     Extension(config): Extension<Arc<Config>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
-    Path(dataset): Path<String>,
+    Extension(dataset): Extension<DatasetConfig>,
     request: ClientRequest,
 ) -> Response {
     let mut request = restrict_request(&config, request);
 
-    let Some(ds_metadata) = config.dataset_metadata(&dataset, &network.datasets().read()) else {
-        return (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response();
-    };
-    let (head, body) = match (ds_metadata.dataset_id, hotblocks) {
+    let (head, body) = match (dataset.network_id, hotblocks) {
         // Prefer data from the network
         (Some(dataset_id), _)
             if network
@@ -260,10 +257,10 @@ async fn run_stream(
             (head, Body::from_stream(stream))
         }
         // Then try hotblocks storage
-        (_, Some(hotblocks)) if ds_metadata.real_time => {
+        (_, Some(hotblocks)) if dataset.hotblocks.is_some() => {
             let result = hotblocks
                 .query(
-                    (*ds_metadata.default_name).try_into().unwrap(),
+                    (*dataset.default_name).try_into().unwrap(),
                     request.query.into_parsed(),
                 )
                 .await;
@@ -314,14 +311,11 @@ async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl In
     axum::Json(res).into_response()
 }
 
-async fn get_datasets(
-    Extension(config): Extension<Arc<Config>>,
-    Extension(network): Extension<Arc<NetworkClient>>,
-) -> impl IntoResponse {
-    let mapping = network.datasets().read();
-    let res: Vec<AvailableDatasetApiResponse> = config
-        .all_datasets(&mapping)
-        .map(|name| config.dataset_metadata(&name, &mapping).unwrap().into())
+async fn get_datasets(Extension(network): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
+    let datasets = network.datasets().read();
+    let res: Vec<AvailableDatasetApiResponse> = datasets
+        .iter()
+        .map(|metadata| metadata.clone().into())
         .collect();
 
     axum::Json(res)
@@ -334,15 +328,8 @@ async fn get_dataset_state(
     axum::Json(network.dataset_state(&dataset_id).unwrap())
 }
 
-async fn get_dataset_metadata(
-    Path(dataset): Path<String>,
-    Extension(config): Extension<Arc<Config>>,
-    Extension(network): Extension<Arc<NetworkClient>>,
-) -> impl IntoResponse {
-    match config.dataset_metadata(&dataset, &network.datasets().read()) {
-        Some(metadata) => axum::Json(AvailableDatasetApiResponse::from(metadata)).into_response(),
-        None => (StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response(),
-    }
+async fn get_dataset_metadata(Extension(metadata): Extension<DatasetConfig>) -> impl IntoResponse {
+    axum::Json(AvailableDatasetApiResponse::from(metadata))
 }
 
 async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {
@@ -425,6 +412,34 @@ pub async fn run_server(
 }
 
 #[async_trait]
+impl<S> FromRequestParts<S> for DatasetConfig
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        use axum::RequestPartsExt;
+
+        let Path(alias) = parts
+            .extract::<Path<String>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Extension(network) = parts
+            .extract::<Extension<Arc<NetworkClient>>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+
+        match network.dataset(&alias) {
+            Some(config) => Ok(config.clone()),
+            None => {
+                Err((StatusCode::NOT_FOUND, format!("Unknown dataset: {alias}")).into_response())
+            }
+        }
+    }
+}
+
+#[async_trait]
 impl<S> FromRequest<S> for ClientRequest
 where
     S: Send + Sync,
@@ -432,24 +447,10 @@ where
     type Rejection = Response;
 
     async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let Extension(config) = req
-            .extract_parts::<Extension<Arc<Config>>>()
+        let Extension(dataset) = req
+            .extract_parts::<Extension<DatasetConfig>>()
             .await
             .map_err(IntoResponse::into_response)?;
-        let Extension(network) = req
-            .extract_parts::<Extension<Arc<NetworkClient>>>()
-            .await
-            .map_err(IntoResponse::into_response)?;
-        let Path(dataset) = req
-            .extract_parts::<Path<String>>()
-            .await
-            .map_err(IntoResponse::into_response)?;
-
-        let Some(metadata) = config.dataset_metadata(&dataset, &network.datasets().read()) else {
-            return Err(
-                RequestError::BadRequest(format!("Unknown dataset: {dataset}")).into_response(),
-            );
-        };
 
         let Query(params) = req
             .extract_parts::<Query<HashMap<String, String>>>()
@@ -497,8 +498,8 @@ where
         };
 
         Ok(ClientRequest {
-            dataset_id: DatasetId::from_url("-"), // will be filled later
-            dataset_name: metadata.default_name.into_owned(),
+            dataset_id: DatasetId::from_url("-"), // will be filled later, if the request goes to the network
+            dataset_name: dataset.default_name,
             query,
             buffer_size,
             max_chunks: config.max_chunks_per_stream,
@@ -531,6 +532,7 @@ where
     }
 }
 
+// Used with network-only endpoints
 #[async_trait]
 impl<S> FromRequestParts<S> for DatasetId
 where
@@ -541,24 +543,21 @@ where
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         use axum::RequestPartsExt;
 
-        let Path(dataset) = parts
-            .extract::<Path<String>>()
-            .await
-            .map_err(IntoResponse::into_response)?;
-        let Extension(config) = parts
-            .extract::<Extension<Arc<Config>>>()
-            .await
-            .map_err(IntoResponse::into_response)?;
-        let Extension(network) = parts
-            .extract::<Extension<Arc<NetworkClient>>>()
+        let Extension(metadata) = parts
+            .extract::<Extension<DatasetConfig>>()
             .await
             .map_err(IntoResponse::into_response)?;
 
-        match network.resolve(config.network_ref(&dataset)) {
+        match metadata.network_id {
             Some(dataset_id) => Ok(dataset_id),
-            None => {
-                Err((StatusCode::NOT_FOUND, format!("Unknown dataset: {dataset}")).into_response())
-            }
+            None => Err((
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Dataset {} doesn't have archival data",
+                    metadata.default_name
+                ),
+            )
+                .into_response()),
         }
     }
 }

@@ -28,11 +28,12 @@ use sqd_network_transport::{
 
 use super::priorities::NoWorker;
 use super::storage::DatasetIndex;
-use super::{DatasetsMapping, NetworkState, StorageClient};
+use super::{NetworkState, StorageClient};
+use crate::datasets::{DatasetConfig, Datasets};
 use crate::network::state::Status;
-use crate::types::{BlockRange, ChunkId, DataChunk, DatasetRef};
+use crate::types::{BlockRange, ChunkId, DataChunk};
 use crate::{
-    cli::Config,
+    config::Config,
     metrics,
     types::{generate_query_id, DatasetId, QueryError},
     utils::UseOnce,
@@ -73,11 +74,10 @@ pub struct NetworkClientStatus {
 
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
-    config: Arc<Config>,
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
     transport_handle: GatewayTransport,
     network_state: Mutex<NetworkState>,
-    datasets: Arc<RwLock<DatasetsMapping>>,
+    datasets: Arc<RwLock<Datasets>>,
     hotblocks: Option<Arc<HotblocksServer>>,
     contract_client: Box<dyn ContractClient>,
     dataset_storage: StorageClient,
@@ -96,7 +96,7 @@ impl NetworkClient {
     pub async fn new(
         args: TransportArgs,
         config: Arc<Config>,
-        datasets: Arc<RwLock<DatasetsMapping>>,
+        datasets: Arc<RwLock<Datasets>>,
         hotblocks: Option<Arc<HotblocksServer>>,
     ) -> anyhow::Result<Arc<NetworkClient>> {
         let network = args.rpc.network;
@@ -115,7 +115,6 @@ impl NetworkClient {
 
         let datasets_update_interval = config.datasets_update_interval;
         let datasets_copy = datasets.clone();
-        let datasets_url = config.sqd_network.datasets_url.clone();
 
         let network_state_filename = match network {
             Network::Tethys => "network-state-tethys.json",
@@ -132,7 +131,6 @@ impl NetworkClient {
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
             network_state: Mutex::new(state),
-            config,
             datasets,
             hotblocks,
             contract_client,
@@ -150,7 +148,7 @@ impl NetworkClient {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(datasets_update_interval).await;
-                match DatasetsMapping::update(&datasets_copy, &datasets_url).await {
+                match Datasets::update(&datasets_copy, &config).await {
                     Ok(_) => {
                         client_handle.reset_height_updates();
                     }
@@ -376,30 +374,32 @@ impl NetworkClient {
         let mut state = self.network_state.lock();
         let datasets = self.datasets.read();
         state.unsubscribe_all_height_updates();
-        for dataset in self.config.datasets.iter() {
-            if let (Some(ds_ref), Some(_)) = (&dataset.network_ref, &dataset.hotblocks) {
-                if let Some(dataset_id) = datasets.resolve(ds_ref.clone()) {
-                    let hotblocks = hotblocks.clone();
-                    let name = dataset.default_name.parse().expect("Invalid dataset name");
-                    tracing::info!("Hotblocks storage for '{name}' set to track dataset height of '{dataset_id}'");
-                    state.subscribe_height_updates(
-                        &dataset_id,
-                        Box::new(move |height| {
-                            hotblocks
-                                .retain(name, sqd_node::RetentionStrategy::FromBlock(height + 1));
-                        }),
-                    );
-                }
+        for dataset in datasets.iter() {
+            if let (Some(dataset_id), Some(_)) = (&dataset.network_id, &dataset.hotblocks) {
+                let hotblocks = hotblocks.clone();
+                let name = dataset.default_name.parse().expect("Invalid dataset name");
+                tracing::info!(
+                    "Hotblocks storage for '{name}' set to track dataset height of '{dataset_id}'"
+                );
+                state.subscribe_height_updates(
+                    dataset_id,
+                    Box::new(move |height| {
+                        tracing::info!(
+                            "Cleaning hotblocks storage for '{name}' up to block {height}"
+                        );
+                        hotblocks.retain(name, sqd_node::RetentionStrategy::FromBlock(height + 1));
+                    }),
+                );
             }
         }
     }
 
-    pub fn datasets(&self) -> &RwLock<DatasetsMapping> {
-        &self.datasets
+    pub fn dataset(&self, alias: &str) -> Option<DatasetConfig> {
+        self.datasets.read().get(alias).cloned()
     }
 
-    pub fn resolve(&self, dataset: DatasetRef) -> Option<DatasetId> {
-        self.datasets.read().resolve(dataset)
+    pub fn datasets(&self) -> &RwLock<Datasets> {
+        &self.datasets
     }
 
     pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {

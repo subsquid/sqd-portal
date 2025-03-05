@@ -1,4 +1,4 @@
-use crate::datasets::DatasetMetadata;
+use crate::datasets::DatasetConfig;
 
 use super::DatasetId;
 
@@ -17,12 +17,12 @@ pub enum DatasetRef {
     Id(DatasetId),
 }
 
-impl<'l> From<DatasetMetadata<'l>> for AvailableDatasetApiResponse {
-    fn from(metadata: DatasetMetadata) -> Self {
+impl From<DatasetConfig> for AvailableDatasetApiResponse {
+    fn from(metadata: DatasetConfig) -> Self {
         Self {
-            dataset: metadata.default_name.into_owned(),
-            aliases: metadata.aliases.into_owned(),
-            real_time: metadata.real_time,
+            dataset: metadata.default_name,
+            aliases: metadata.aliases,
+            real_time: metadata.hotblocks.is_some(),
         }
     }
 }

@@ -5,11 +5,8 @@ use sqd_messages::assignments;
 use sqd_primitives::BlockRef;
 
 use crate::{
-    metrics,
-    types::{DataChunk, DatasetId},
+    datasets::Datasets, metrics, types::{DataChunk, DatasetId}
 };
-
-use super::DatasetsMapping;
 
 pub struct DatasetIndex {
     pub chunks: Vec<DataChunk>,
@@ -18,14 +15,14 @@ pub struct DatasetIndex {
 
 pub struct StorageClient {
     datasets: RwLock<HashMap<DatasetId, DatasetIndex>>,
-    datasets_mapping: Arc<RwLock<DatasetsMapping>>,
+    datasets_config: Arc<RwLock<Datasets>>,
 }
 
 impl StorageClient {
-    pub fn new(datasets_mapping: Arc<RwLock<DatasetsMapping>>) -> Self {
+    pub fn new(datasets_config: Arc<RwLock<Datasets>>) -> Self {
         Self {
             datasets: RwLock::default(),
-            datasets_mapping,
+            datasets_config,
         }
     }
 
@@ -52,7 +49,7 @@ impl StorageClient {
                 );
             }
             let dataset_name = self
-                .datasets_mapping
+                .datasets_config
                 .read()
                 .default_name(&dataset)
                 .map(ToOwned::to_owned);

@@ -9,12 +9,12 @@ use sqd_contract_client::Worker;
 use sqd_messages::RangeSet;
 use sqd_network_transport::PeerId;
 
-use crate::cli::Config;
+use crate::config::Config;
+use crate::datasets::Datasets;
 use crate::metrics;
 use crate::types::DatasetId;
 
 use super::priorities::{NoWorker, WorkersPool};
-use super::DatasetsMapping;
 
 #[derive(Default, Serialize)]
 pub struct DatasetState {
@@ -94,7 +94,7 @@ pub enum Status {
 
 pub struct NetworkState {
     config: Arc<Config>,
-    datasets: Arc<RwLock<DatasetsMapping>>,
+    datasets: Arc<RwLock<Datasets>>,
     dataset_states: HashMap<DatasetId, DatasetState>,
     last_pings: HashMap<PeerId, Instant>,
     pool: WorkersPool,
@@ -115,7 +115,7 @@ pub struct ContractsState {
 }
 
 impl NetworkState {
-    pub fn new(config: Arc<Config>, datasets: Arc<RwLock<DatasetsMapping>>) -> Self {
+    pub fn new(config: Arc<Config>, datasets: Arc<RwLock<Datasets>>) -> Self {
         Self {
             config,
             datasets,
@@ -163,18 +163,15 @@ impl NetworkState {
         self.last_pings.insert(worker_id, Instant::now());
         metrics::KNOWN_WORKERS.set(self.last_pings.len() as i64);
         let datasets = self.datasets.read();
-        for dataset_id in datasets.dataset_ids() {
+        for (dataset_id, default_name) in datasets.network_datasets() {
             let dataset_state = worker_state
                 .remove(dataset_id)
                 .unwrap_or_else(RangeSet::empty);
             let entry = self.dataset_states.entry(dataset_id.clone()).or_default();
             entry.update(worker_id, dataset_state);
-            let dataset_name = datasets
-                .default_name(dataset_id)
-                .map(ToOwned::to_owned);
             metrics::report_dataset_updated(
                 dataset_id,
-                dataset_name,
+                Some(default_name.to_owned()),
                 entry.highest_seen_block,
                 entry.first_gap,
             );

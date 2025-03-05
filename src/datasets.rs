@@ -1,191 +1,187 @@
 use crate::{
-    network::DatasetsMapping,
+    config::{Config, RealTimeConfig, ServeMode},
     types::{DatasetId, DatasetRef},
 };
+use anyhow::Context;
+use bimap::BiBTreeMap;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sqd_node::{self as sqd_hotblocks, RetentionStrategy};
-use sqd_primitives::BlockNumber;
-use std::{borrow::Cow, collections::BTreeMap};
-use url::Url;
+use std::{
+    collections::{btree_map::Entry, BTreeMap},
+    fs::File,
+    io::BufReader,
+};
 
-#[derive(Default, Debug, Clone, Deserialize)]
-#[serde(from = "DatasetsConfigModel")]
-pub struct DatasetsConfig {
+pub struct Datasets {
     datasets: Vec<DatasetConfig>,
-    name_to_index: BTreeMap<String, usize>,
+    alias_to_index: BTreeMap<String, usize>,
+    id_to_default_name: BTreeMap<DatasetId, String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DatasetConfig {
     pub default_name: String,
     pub aliases: Vec<String>,
-    pub network_ref: Option<DatasetRef>,
+    pub network_id: Option<DatasetId>,
     pub hotblocks: Option<RealTimeConfig>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct RealTimeConfig {
-    pub kind: sqd_hotblocks::DatasetKind,
-    pub data_sources: Vec<Url>,
-    #[serde(deserialize_with = "deserialize_retention")]
-    pub retention: RetentionStrategy,
-}
+type DatasetsMapping = BiBTreeMap<String, DatasetId>;
 
-/// Struct built from merging the static config with datasets mapping
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DatasetMetadata<'c> {
-    pub default_name: Cow<'c, str>,
-    pub aliases: Cow<'c, [String]>,
-    pub real_time: bool,
-    pub dataset_id: Option<DatasetId>,
-}
+impl Datasets {
+    pub async fn load(config: &Config) -> anyhow::Result<Self> {
+        let mapping = load_mapping(&config.sqd_network.datasets_url).await?;
+        Self::parse(config, mapping)
+    }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ServeMode {
-    #[default]
-    All,
-}
-
-impl From<DatasetsConfigModel> for DatasetsConfig {
-    fn from(model: DatasetsConfigModel) -> Self {
-        let mut datasets = Vec::with_capacity(model.len());
-        let mut name_to_index = BTreeMap::new();
-        for (name, dataset) in model {
-            let index = datasets.len();
-            name_to_index.insert(name.clone(), index);
-            for alias in &dataset.aliases {
-                name_to_index.insert(alias.clone(), index);
-            }
-            let config = DatasetConfig {
-                default_name: name.clone(),
-                aliases: dataset.aliases,
-                network_ref: dataset.sqd_network,
-                hotblocks: dataset.real_time,
+    fn parse(config: &Config, mapping: BiBTreeMap<String, DatasetId>) -> anyhow::Result<Self> {
+        let mut datasets: Vec<DatasetConfig> = Vec::new();
+        let mut alias_to_index = BTreeMap::new();
+        let mut id_to_default_name = BTreeMap::new();
+        for (default_name, ds) in config.datasets.clone() {
+            let network_id = match ds.sqd_network {
+                Some(DatasetRef::Name(name)) => mapping.get_by_left(&name).cloned(),
+                Some(DatasetRef::Id(id)) => Some(id),
+                None => mapping.get_by_left(&default_name).cloned(),
             };
-            datasets.push(config);
-        }
 
-        Self {
-            datasets,
-            name_to_index,
-        }
-    }
-}
-
-impl DatasetsConfig {
-    pub fn get_by_name(&self, dataset: &str) -> Option<&DatasetConfig> {
-        self.name_to_index
-            .get(dataset)
-            .and_then(|&index| self.datasets.get(index))
-    }
-
-    pub fn metadata<'r, 's: 'r, 'd: 'r>(
-        &'s self,
-        dataset: &'d str,
-        network_mapping: &DatasetsMapping,
-        serve: &ServeMode,
-    ) -> Option<DatasetMetadata<'r>> {
-        let config = self.get_by_name(dataset);
-        let ds_ref = match serve {
-            ServeMode::All => match config {
-                Some(DatasetConfig {
-                    network_ref: Some(ds_ref),
-                    ..
-                }) => ds_ref.clone(),
-                Some(DatasetConfig { default_name, .. }) => DatasetRef::Name(default_name.clone()),
-                None => DatasetRef::Name(dataset.to_owned()),
-            },
-        };
-        match (config, network_mapping.resolve(ds_ref)) {
-            (Some(config), dataset_id) => Some(DatasetMetadata {
-                default_name: Cow::Borrowed(&config.default_name),
-                aliases: Cow::Borrowed(&config.aliases),
-                real_time: config.hotblocks.is_some(),
-                dataset_id,
-            }),
-            (None, Some(dataset_id)) => Some(DatasetMetadata {
-                default_name: Cow::Borrowed(dataset),
-                aliases: Vec::new().into(),
-                real_time: false,
-                dataset_id: Some(dataset_id),
-            }),
-            (None, None) => None,
-        }
-    }
-
-    pub fn all_dataset_names(
-        &self,
-        network_mapping: &DatasetsMapping,
-        serve: &ServeMode,
-    ) -> impl Iterator<Item = String> {
-        match serve {
-            ServeMode::All => (),
-            // Other modes require different implementation
-        };
-        let mut network_datasets = network_mapping.inner().clone();
-        let mut from_config = Vec::with_capacity(network_datasets.len() + self.datasets.len());
-        for ds in self.datasets.iter() {
-            match ds.network_ref {
-                Some(DatasetRef::Name(ref name)) => {
-                    network_datasets.remove_by_left(name);
-                }
-                Some(DatasetRef::Id(ref id)) => {
-                    network_datasets.remove_by_right(id);
-                }
-                None => {
-                    network_datasets.remove_by_left(&ds.default_name);
+            let index = datasets.len();
+            for alias in ds.aliases.iter().chain(Some(&default_name)) {
+                let prev = alias_to_index.insert(alias.clone(), index);
+                if let Some(prev) = prev {
+                    anyhow::bail!(
+                        "Alias {} is already used by dataset {}",
+                        alias,
+                        datasets[prev].default_name
+                    );
                 }
             }
-            from_config.push(ds.default_name.clone());
+
+            if let Some(id) = &network_id {
+                id_to_default_name
+                    .insert(id.clone(), default_name.clone())
+                    .inspect(|prev| {
+                        tracing::warn!(
+                            "Datasets '{}' and '{}' point to the same network ID '{}'",
+                            default_name,
+                            prev,
+                            id.to_string()
+                        );
+                    });
+            }
+
+            datasets.push(DatasetConfig {
+                default_name,
+                aliases: ds.aliases,
+                network_id,
+                hotblocks: ds.real_time,
+            });
         }
-        from_config
-            .into_iter()
-            .chain(network_datasets.into_iter().map(|(name, _)| name))
+
+        let ServeMode::All = config.sqd_network.serve;
+        for (name, id) in mapping {
+            if let Entry::Vacant(entry) = alias_to_index.entry(name.clone()) {
+                entry.insert(datasets.len());
+                datasets.push(DatasetConfig {
+                    default_name: name.clone(),
+                    aliases: Vec::new(),
+                    network_id: Some(id.clone()),
+                    hotblocks: None,
+                });
+                if let Entry::Vacant(entry) = id_to_default_name.entry(id) {
+                    entry.insert(name);
+                }
+            }
+        }
+
+        datasets.shrink_to_fit();
+        Ok(Self {
+            datasets,
+            alias_to_index,
+            id_to_default_name,
+        })
+    }
+
+    pub fn get(&self, alias: &str) -> Option<&DatasetConfig> {
+        self.alias_to_index
+            .get(alias)
+            .and_then(|&index| self.datasets.get(index))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &DatasetConfig> {
         self.datasets.iter()
     }
-}
 
-type DatasetsConfigModel = BTreeMap<String, DatasetConfigModel>;
-
-#[derive(Serialize, Deserialize, Default, Debug, Clone)]
-#[serde(default, deny_unknown_fields)]
-struct DatasetConfigModel {
-    aliases: Vec<String>,
-    sqd_network: Option<DatasetRef>,
-    real_time: Option<RealTimeConfig>,
-}
-
-fn deserialize_retention<'de, D>(de: D) -> Result<RetentionStrategy, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    enum Model {
-        FromBlock(BlockNumber),
-        Head(BlockNumber)
+    pub fn network_datasets(&self) -> impl Iterator<Item = (&DatasetId, &str)> {
+        self.id_to_default_name
+            .iter()
+            .map(|(id, name)| (id, name.as_str()))
     }
 
-    let model = Model::deserialize(de)?;
-    match model {
-        Model::FromBlock(block) => Ok(RetentionStrategy::FromBlock(block)),
-        Model::Head(block) => Ok(RetentionStrategy::Head(block)),
+    pub fn default_name(&self, id: &DatasetId) -> Option<&str> {
+        self.id_to_default_name.get(id).map(String::as_str)
+    }
+
+    pub async fn update(handle: &RwLock<Self>, config: &Config) -> anyhow::Result<()> {
+        tracing::info!("Updating datasets mapping");
+        let datasets = Self::load(config).await?;
+        *handle.write() = datasets;
+        Ok(())
     }
 }
 
-impl<'c> From<&'c DatasetConfig> for DatasetMetadata<'c> {
-    fn from(config: &'c DatasetConfig) -> Self {
-        Self {
-            default_name: Cow::Borrowed(&config.default_name),
-            aliases: Cow::Borrowed(&config.aliases),
-            real_time: config.hotblocks.is_some(),
-            dataset_id: None,
-        }
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "kebab-case")]
+struct NetworkDatasets {
+    sqd_network_datasets: Vec<NetworkDataset>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct NetworkDataset {
+    id: String,
+    name: String,
+}
+
+async fn load_mapping(url: &str) -> anyhow::Result<DatasetsMapping> {
+    let file = load_networks(url).await?;
+    let result = parse_mapping(file)?;
+    tracing::debug!("Datasets file loaded, {} datasets found", result.len());
+    Ok(result)
+}
+
+fn parse_mapping(file: NetworkDatasets) -> anyhow::Result<DatasetsMapping> {
+    let mut datasets = BiBTreeMap::new();
+    for dataset in file.sqd_network_datasets {
+        let dataset_id = DatasetId::from_url(&dataset.id);
+        datasets.insert(dataset.name, dataset_id);
     }
+    Ok(datasets)
+}
+
+async fn load_networks(url: &str) -> anyhow::Result<NetworkDatasets> {
+    if let Some(path) = url.strip_prefix("file://") {
+        load_local_file(path)
+    } else {
+        fetch_remote_file(url).await
+    }
+}
+
+async fn fetch_remote_file(url: &str) -> anyhow::Result<NetworkDatasets> {
+    tracing::debug!("Fetching remote file from {}", url);
+
+    let response = reqwest::get(url).await?;
+    let text = response.text().await?;
+
+    serde_yaml::from_str(&text).with_context(|| format!("failed to parse dataset {url}"))
+}
+
+fn load_local_file(full_path: &str) -> anyhow::Result<NetworkDatasets> {
+    tracing::debug!("Loading local file from {}", full_path);
+
+    let file = File::open(full_path).with_context(|| format!("failed to open file {full_path}"))?;
+    let reader = BufReader::new(file);
+
+    serde_yaml::from_reader(reader).with_context(|| format!("failed to parse dataset {full_path}"))
 }
 
 #[cfg(test)]
@@ -193,132 +189,165 @@ mod tests {
     use bimap::BiBTreeMap;
 
     use super::*;
-    use crate::network::DatasetsMapping;
+
+    impl PartialEq for DatasetConfig {
+        fn eq(&self, other: &Self) -> bool {
+            self.default_name == other.default_name
+                && self.aliases == other.aliases
+                && self.hotblocks.is_some() == other.hotblocks.is_some()
+                && self.network_id == other.network_id
+        }
+    }
+    impl Eq for DatasetConfig {}
 
     #[test]
     fn test_datasets_config() {
         let json = serde_json::json!({
-            "ethereum-mainnet": {
-                "aliases": ["eth-main"],
+            "hostname": "http://localhost:8000",
+            "sqd_network": {
+                "datasets": "file://datasets.yaml",
+                "serve": "all"
             },
-            "solana-mainnet": {
-                "aliases": ["solana"],
-                "sqd_network": {
-                    "dataset_name": "solana-mainnet"
+            "datasets": {
+                "ethereum-mainnet": {
+                    "aliases": ["eth-main"],
                 },
-                "real_time": {
-                    "kind": "solana",
-                    "data_sources": ["http://localhost:8080"],
-                    "retention": {
-                        "from_block": 300000000
+                "solana-mainnet": {
+                    "aliases": ["solana"],
+                    "sqd_network": {
+                        "dataset_name": "solana-mainnet"
+                    },
+                    "real_time": {
+                        "kind": "solana",
+                        "data_sources": ["http://localhost:8080"],
+                        "retention": {
+                            "from_block": 300000000
+                        }
                     }
-                }
-            },
-            "local": {
-                "real_time": {
-                    "kind": "evm",
-                    "data_sources": ["http://localhost:8081"],
-                    "retention": {
-                        "from_block": 0
+                },
+                "local": {
+                    "real_time": {
+                        "kind": "evm",
+                        "data_sources": ["http://localhost:8081"],
+                        "retention": {
+                            "from_block": 0
+                        }
                     }
-                }
-            },
-            "custom": {
-                "sqd_network": {
-                    "dataset_id": "s3://solana-mainnet"
-                }
-            },
-            "empty": {}
+                },
+                "custom": {
+                    "sqd_network": {
+                        "dataset_id": "s3://solana-mainnet"
+                    }
+                },
+                "beta": {
+                    "sqd_network": {
+                        "dataset_id": "s3://solana-mainnet-2" // not in mapping
+                    }
+                },
+                "empty": {}
+            }
         });
-        let config = serde_json::from_value::<DatasetsConfig>(json).unwrap();
-        let mapping = DatasetsMapping::new(
-            [
-                (
-                    "ethereum-mainnet".to_owned(),
-                    DatasetId::from_url("s3://ethereum-mainnet-1"),
-                ),
-                (
-                    "solana-mainnet".to_owned(),
-                    DatasetId::from_url("s3://solana-mainnet"),
-                ),
-                (
-                    "arbitrum-one".to_owned(),
-                    DatasetId::from_url("s3://arbitrum-one"),
-                ),
-            ]
-            .into_iter()
-            .collect::<BiBTreeMap<_, _>>(),
-        );
-        let serve = ServeMode::All;
+        let config = serde_json::from_value::<Config>(json).unwrap();
+        let mapping = [
+            (
+                "ethereum-mainnet".to_owned(),
+                DatasetId::from_url("s3://ethereum-mainnet-1"),
+            ),
+            (
+                "eth-main".to_owned(),
+                DatasetId::from_url("s3://ethereum-mainnet-2"),
+            ),
+            (
+                "solana-mainnet".to_owned(),
+                DatasetId::from_url("s3://solana-mainnet"),
+            ),
+            (
+                "arbitrum-one".to_owned(),
+                DatasetId::from_url("s3://arbitrum-one"),
+            ),
+        ]
+        .into_iter()
+        .collect::<BiBTreeMap<_, _>>();
+        let datasets = Datasets::parse(&config, mapping).unwrap();
 
-        let sol_meta = config.metadata("solana", &mapping, &serve).unwrap();
-        let eth_meta = config
-            .metadata("ethereum-mainnet", &mapping, &serve)
-            .unwrap();
+        let beta_meta = datasets.get("beta").unwrap();
+        let sol_meta = datasets.get("solana").unwrap();
+        let eth_meta = datasets.get("ethereum-mainnet").unwrap();
+        assert_eq!(datasets.get("eth-main"), Some(eth_meta));
+        let local_meta = datasets.get("local").unwrap();
+        let custom_meta = datasets.get("custom").unwrap();
+        let empty_meta = datasets.get("empty").unwrap();
+        assert!(datasets.get("unknown").is_none());
+
+        let hotblocks_config = sol_meta.hotblocks.clone().unwrap();
+
         assert_eq!(
-            config.metadata("eth-main", &mapping, &serve).as_ref(),
-            Some(&eth_meta)
+            beta_meta,
+            &DatasetConfig {
+                default_name: "beta".into(),
+                aliases: vec![],
+                hotblocks: None,
+                network_id: Some(DatasetId::from_url("s3://solana-mainnet-2")),
+            }
         );
-        let local_meta = config.metadata("local", &mapping, &serve).unwrap();
-        let custom_meta = config.metadata("custom", &mapping, &serve).unwrap();
-        let empty_meta = config.metadata("empty", &mapping, &serve).unwrap();
-        assert_eq!(config.metadata("unknown", &mapping, &serve), None);
 
         assert_eq!(
             sol_meta,
-            DatasetMetadata {
+            &DatasetConfig {
                 default_name: "solana-mainnet".into(),
-                aliases: (&["solana".to_owned()]).into(),
-                real_time: true,
-                dataset_id: Some(DatasetId::from_url("s3://solana-mainnet")),
+                aliases: vec!["solana".to_owned()],
+                hotblocks: Some(hotblocks_config.clone()),
+                network_id: Some(DatasetId::from_url("s3://solana-mainnet")),
             }
         );
 
         assert_eq!(
             eth_meta,
-            DatasetMetadata {
+            &DatasetConfig {
                 default_name: "ethereum-mainnet".into(),
-                aliases: (&["eth-main".to_owned()]).into(),
-                real_time: false,
-                dataset_id: Some(DatasetId::from_url("s3://ethereum-mainnet-1")),
+                aliases: vec!["eth-main".to_owned()],
+                hotblocks: None,
+                network_id: Some(DatasetId::from_url("s3://ethereum-mainnet-1")),
             }
         );
 
         assert_eq!(
             local_meta,
-            DatasetMetadata {
+            &DatasetConfig {
                 default_name: "local".into(),
-                aliases: (&[]).into(),
-                real_time: true,
-                dataset_id: None,
+                aliases: vec![],
+                hotblocks: Some(hotblocks_config),
+                network_id: None,
             }
         );
 
         assert_eq!(
             custom_meta,
-            DatasetMetadata {
+            &DatasetConfig {
                 default_name: "custom".into(),
-                aliases: (&[]).into(),
-                real_time: false,
-                dataset_id: Some(DatasetId::from_url("s3://solana-mainnet")),
+                aliases: vec![],
+                hotblocks: None,
+                network_id: Some(DatasetId::from_url("s3://solana-mainnet")),
             }
         );
 
         assert_eq!(
             empty_meta,
-            DatasetMetadata {
+            &DatasetConfig {
                 default_name: "empty".into(),
-                aliases: (&[]).into(),
-                real_time: false,
-                dataset_id: None,
+                aliases: vec![],
+                hotblocks: None,
+                network_id: None,
             }
         );
 
         assert_eq!(
-            config
-                .all_dataset_names(&mapping, &serve)
+            datasets
+                .iter()
+                .map(|d| d.default_name.clone())
                 .collect::<Vec<_>>(),
             vec![
+                "beta",
                 "custom",
                 "empty",
                 "ethereum-mainnet",
@@ -326,6 +355,23 @@ mod tests {
                 "solana-mainnet",
                 "arbitrum-one"
             ]
-        )
+        );
+
+        assert_eq!(
+            datasets.network_datasets().collect::<Vec<_>>(),
+            vec![
+                (&DatasetId::from_url("s3://arbitrum-one"), "arbitrum-one"),
+                (
+                    &DatasetId::from_url("s3://ethereum-mainnet-1"),
+                    "ethereum-mainnet"
+                ),
+                (
+                    &DatasetId::from_url("s3://solana-mainnet"),
+                    "solana-mainnet"
+                ),
+                (&DatasetId::from_url("s3://solana-mainnet-2"), "beta"),
+                // ethereum-mainnet-2 has been overwritten by eth-main alias
+            ]
+        );
     }
 }

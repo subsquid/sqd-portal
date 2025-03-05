@@ -2,10 +2,10 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 
-use crate::cli;
+use crate::config::Config;
 
-pub fn build_server(config: &cli::Config) -> anyhow::Result<Option<sqd_node::Node>> {
-    let has_sources = config.datasets.iter().any(|d| d.hotblocks.is_some());
+pub fn build_server(config: &Config) -> anyhow::Result<Option<sqd_node::Node>> {
+    let has_sources = config.datasets.iter().any(|(_, d)| d.real_time.is_some());
     if !has_sources {
         return Ok(None);
     }
@@ -26,15 +26,11 @@ pub fn build_server(config: &cli::Config) -> anyhow::Result<Option<sqd_node::Nod
 
     let mut builder = sqd_node::NodeBuilder::new(db);
 
-    for dataset in config.datasets.iter() {
-        if let Some(hotblocks) = &dataset.hotblocks {
+    for (default_name, dataset) in config.datasets.iter() {
+        if let Some(hotblocks) = &dataset.real_time {
             let ds = builder.add_dataset(
                 hotblocks.kind,
-                dataset
-                    .default_name
-                    .as_str()
-                    .try_into()
-                    .map_err(|s| anyhow::anyhow!("{}", s))?,
+                default_name.parse().map_err(|s| anyhow::anyhow!("{}", s))?,
                 hotblocks.retention.clone(),
             );
             for url in &hotblocks.data_sources {
