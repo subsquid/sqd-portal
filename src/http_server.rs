@@ -19,7 +19,6 @@ use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
 use sqd_node::error::UnknownDataset;
 use sqd_node::Node as HotblocksServer;
-use sqd_primitives::BlockRef;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
@@ -98,13 +97,41 @@ async fn get_finalized_head(
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(dataset): Extension<DatasetConfig>,
 ) -> Response {
-    get_head_impl(
-        Extension(hotblocks),
-        Extension(network),
-        Extension(dataset),
-        |hotblocks, ds| hotblocks.get_finalized_head(ds.try_into().unwrap()),
-    )
-    .await
+    match (hotblocks, dataset) {
+        (
+            _,
+            DatasetConfig {
+                network_id: Some(dataset_id),
+                ..
+            },
+        ) => {
+            // Prefer network data source to correspond to the /finalized-stream behaviour
+            let head = network.head(&dataset_id).map(|head| {
+                json!({
+                    "number": head.number,
+                    "hash": head.hash,
+                })
+            });
+            axum::Json(head).into_response()
+        }
+
+        (Some(hotblocks), dataset) if dataset.hotblocks.is_some() => {
+            match hotblocks.get_finalized_head(dataset.default_name.parse().unwrap()) {
+                Ok(head) => axum::Json(head).into_response(),
+                Err(UnknownDataset { .. }) => {
+                    unreachable!("dataset should be known by the hotblocks service")
+                }
+            }
+        }
+
+        (_, dataset) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("Dataset {} has no data sources", dataset.default_name),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn get_head(
@@ -112,24 +139,9 @@ async fn get_head(
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(dataset): Extension<DatasetConfig>,
 ) -> Response {
-    get_head_impl(
-        Extension(hotblocks),
-        Extension(network),
-        Extension(dataset),
-        |hotblocks, ds| hotblocks.get_head(ds.try_into().unwrap()),
-    )
-    .await
-}
-
-async fn get_head_impl(
-    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
-    Extension(network): Extension<Arc<NetworkClient>>,
-    Extension(dataset): Extension<DatasetConfig>,
-    get_head_method: impl FnOnce(&HotblocksServer, &str) -> Result<Option<BlockRef>, UnknownDataset>,
-) -> Response {
     match (hotblocks, dataset) {
         (Some(hotblocks), dataset) if dataset.hotblocks.is_some() => {
-            match get_head_method(&hotblocks, &dataset.default_name) {
+            match hotblocks.get_head(dataset.default_name.parse().unwrap()) {
                 Ok(head) => axum::Json(head).into_response(),
                 Err(UnknownDataset { .. }) => {
                     unreachable!("dataset should be known by the hotblocks service")
