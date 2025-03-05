@@ -34,18 +34,63 @@ use crate::{
     utils::logging,
 };
 
-async fn get_height(
-    Extension(network): Extension<Arc<NetworkClient>>,
-    Path(dataset): Path<String>,
-    dataset_id: DatasetId,
-) -> impl IntoResponse {
-    match network.get_height(&dataset_id) {
-        Some(height) => (StatusCode::OK, height.to_string()),
-        None => (
-            StatusCode::NOT_FOUND,
-            format!("No data for dataset {dataset}"),
-        ),
-    }
+pub async fn run_server(
+    task_manager: Arc<TaskManager>,
+    network_client: Arc<NetworkClient>,
+    metrics_registry: Registry,
+    addr: SocketAddr,
+    config: Arc<Config>,
+    hotblocks: Option<Arc<HotblocksServer>>,
+) -> anyhow::Result<()> {
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
+        .allow_headers(Any)
+        .allow_origin(Any);
+
+    tracing::info!("Starting HTTP server listening on {addr}");
+    let app = Router::new()
+        .route("/datasets", get(get_datasets))
+        .route(
+            "/datasets/:dataset/finalized-stream",
+            post(run_finalized_stream_restricted),
+        )
+        .route(
+            "/datasets/:dataset/finalized-stream/debug",
+            post(run_finalized_stream),
+        )
+        .route("/datasets/:dataset/stream", post(run_stream))
+        .route("/datasets/:dataset/finalized-head", get(get_finalized_head))
+        .route("/datasets/:dataset/head", get(get_head))
+        .route("/datasets/:dataset/state", get(get_dataset_state))
+        .route("/datasets/:dataset/metadata", get(get_dataset_metadata))
+        // backward compatibility routes
+        .route(
+            "/datasets/:dataset/finalized-stream/height",
+            get(get_height),
+        )
+        .route(
+            "/datasets/:dataset_id/query/:worker_id",
+            post(execute_query),
+        )
+        .route("/datasets/:dataset/height", get(get_height))
+        .route("/datasets/:dataset/:start_block/worker", get(get_worker))
+        // end backward compatibility routes
+        .route("/status", get(get_status))
+        .layer(axum::middleware::from_fn(logging::middleware))
+        .route("/metrics", get(get_metrics))
+        .layer(RequestDecompressionLayer::new())
+        .layer(cors)
+        .layer(Extension(task_manager))
+        .layer(Extension(network_client))
+        .layer(Extension(config))
+        .layer(Extension(Arc::new(metrics_registry)))
+        .layer(Extension(hotblocks));
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    tracing::info!("HTTP server stopped");
+    Ok(())
 }
 
 async fn get_finalized_head(
@@ -115,87 +160,6 @@ async fn get_head_impl(
                 format!("Dataset {} has no data sources", dataset.default_name),
             )
                 .into_response()
-        }
-    }
-}
-
-async fn get_worker(
-    Path((dataset, start_block)): Path<(String, u64)>,
-    dataset_id: DatasetId,
-    Extension(client): Extension<Arc<NetworkClient>>,
-    Extension(config): Extension<Arc<Config>>,
-) -> Response {
-    let worker_id = match client.find_worker(&dataset_id, start_block, false) {
-        Ok(worker_id) => worker_id,
-        Err(NoWorker::AllUnavailable) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("No available worker for dataset {dataset} block {start_block}"),
-            )
-                .into_response();
-        }
-        Err(NoWorker::Backoff(retry_at)) => {
-            let seconds = retry_at.duration_since(Instant::now()).as_secs() + 1; // +1 for rounding up
-            return Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header(header::RETRY_AFTER, seconds)
-                .body(Body::from("Too many requests"))
-                .unwrap();
-        }
-    };
-
-    (
-        StatusCode::OK,
-        format!(
-            "{}/datasets/{}/query/{worker_id}",
-            config.hostname,
-            dataset_id.to_base64(),
-        ),
-    )
-        .into_response()
-}
-
-async fn execute_query(
-    Path((dataset_id_encoded, worker_id)): Path<(String, PeerId)>,
-    Extension(client): Extension<Arc<NetworkClient>>,
-    query: ParsedQuery, // request body
-) -> Response {
-    let dataset_id = match DatasetId::from_base64(&dataset_id_encoded) {
-        Ok(dataset_id) => dataset_id,
-        Err(e) => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("Couldn't parse dataset id: {e}"),
-            )
-                .into_response()
-        }
-    };
-
-    let Some(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
-        return RequestError::NoData.into_response();
-    };
-    let range = query
-        .intersect_with(&chunk.block_range())
-        .expect("Found chunk should intersect with query");
-    let fut = client.query_worker(
-        worker_id,
-        ChunkId::new(dataset_id, chunk),
-        range,
-        query.into_string(),
-        true,
-    );
-    let result = match fut.await {
-        Ok(result) => result,
-        Err(err) => return RequestError::from(err).into_response(),
-    };
-    match convert_response(&result.data) {
-        Ok(data) => Response::builder()
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CONTENT_ENCODING, "gzip")
-            .body(Body::from(data))
-            .unwrap(),
-        Err(e) => {
-            RequestError::InternalError(format!("Couldn't convert response: {e}")).into_response()
         }
     }
 }
@@ -352,63 +316,102 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
     (HEADERS.clone(), buffer)
 }
 
-pub async fn run_server(
-    task_manager: Arc<TaskManager>,
-    network_client: Arc<NetworkClient>,
-    metrics_registry: Registry,
-    addr: SocketAddr,
-    config: Arc<Config>,
-    hotblocks: Option<Arc<HotblocksServer>>,
-) -> anyhow::Result<()> {
-    let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
-        .allow_headers(Any)
-        .allow_origin(Any);
+// Deprecated
+async fn get_height(
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Path(dataset): Path<String>,
+    dataset_id: DatasetId,
+) -> impl IntoResponse {
+    match network.get_height(&dataset_id) {
+        Some(height) => (StatusCode::OK, height.to_string()),
+        None => (
+            StatusCode::NOT_FOUND,
+            format!("No data for dataset {dataset}"),
+        ),
+    }
+}
 
-    tracing::info!("Starting HTTP server listening on {addr}");
-    let app = Router::new()
-        .route("/datasets", get(get_datasets))
-        .route(
-            "/datasets/:dataset/finalized-stream/height",
-            get(get_height),
-        )
-        .route(
-            "/datasets/:dataset/finalized-stream",
-            post(run_finalized_stream_restricted),
-        )
-        .route(
-            "/datasets/:dataset/finalized-stream/debug",
-            post(run_finalized_stream),
-        )
-        .route("/datasets/:dataset/stream", post(run_stream))
-        .route("/datasets/:dataset/finalized-head", get(get_finalized_head))
-        .route("/datasets/:dataset/head", get(get_head))
-        .route("/datasets/:dataset/state", get(get_dataset_state))
-        .route("/datasets/:dataset/metadata", get(get_dataset_metadata))
-        // backward compatibility routes
-        .route(
-            "/datasets/:dataset_id/query/:worker_id",
-            post(execute_query),
-        )
-        .route("/datasets/:dataset/height", get(get_height))
-        .route("/datasets/:dataset/:start_block/worker", get(get_worker))
-        // end backward compatibility routes
-        .route("/status", get(get_status))
-        .layer(axum::middleware::from_fn(logging::middleware))
-        .route("/metrics", get(get_metrics))
-        .layer(RequestDecompressionLayer::new())
-        .layer(cors)
-        .layer(Extension(task_manager))
-        .layer(Extension(network_client))
-        .layer(Extension(config))
-        .layer(Extension(Arc::new(metrics_registry)))
-        .layer(Extension(hotblocks));
+// Deprecated
+async fn get_worker(
+    Path((dataset, start_block)): Path<(String, u64)>,
+    dataset_id: DatasetId,
+    Extension(client): Extension<Arc<NetworkClient>>,
+    Extension(config): Extension<Arc<Config>>,
+) -> Response {
+    let worker_id = match client.find_worker(&dataset_id, start_block, false) {
+        Ok(worker_id) => worker_id,
+        Err(NoWorker::AllUnavailable) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("No available worker for dataset {dataset} block {start_block}"),
+            )
+                .into_response();
+        }
+        Err(NoWorker::Backoff(retry_at)) => {
+            let seconds = retry_at.duration_since(Instant::now()).as_secs() + 1; // +1 for rounding up
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(header::RETRY_AFTER, seconds)
+                .body(Body::from("Too many requests"))
+                .unwrap();
+        }
+    };
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    (
+        StatusCode::OK,
+        format!(
+            "{}/datasets/{}/query/{worker_id}",
+            config.hostname,
+            dataset_id.to_base64(),
+        ),
+    )
+        .into_response()
+}
 
-    tracing::info!("HTTP server stopped");
-    Ok(())
+// Deprecated
+async fn execute_query(
+    Path((dataset_id_encoded, worker_id)): Path<(String, PeerId)>,
+    Extension(client): Extension<Arc<NetworkClient>>,
+    query: ParsedQuery, // request body
+) -> Response {
+    let dataset_id = match DatasetId::from_base64(&dataset_id_encoded) {
+        Ok(dataset_id) => dataset_id,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("Couldn't parse dataset id: {e}"),
+            )
+                .into_response()
+        }
+    };
+
+    let Some(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
+        return RequestError::NoData.into_response();
+    };
+    let range = query
+        .intersect_with(&chunk.block_range())
+        .expect("Found chunk should intersect with query");
+    let fut = client.query_worker(
+        worker_id,
+        ChunkId::new(dataset_id, chunk),
+        range,
+        query.into_string(),
+        true,
+    );
+    let result = match fut.await {
+        Ok(result) => result,
+        Err(err) => return RequestError::from(err).into_response(),
+    };
+    match convert_response(&result.data) {
+        Ok(data) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(Body::from(data))
+            .unwrap(),
+        Err(e) => {
+            RequestError::InternalError(format!("Couldn't convert response: {e}")).into_response()
+        }
+    }
 }
 
 #[async_trait]
