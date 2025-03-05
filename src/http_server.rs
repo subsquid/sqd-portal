@@ -95,7 +95,7 @@ pub async fn run_server(
 async fn get_finalized_head(
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
     Extension(network): Extension<Arc<NetworkClient>>,
-    Extension(dataset): Extension<DatasetConfig>,
+    dataset: DatasetConfig,
 ) -> Response {
     match (hotblocks, dataset) {
         (
@@ -137,7 +137,7 @@ async fn get_finalized_head(
 async fn get_head(
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
     Extension(network): Extension<Arc<NetworkClient>>,
-    Extension(dataset): Extension<DatasetConfig>,
+    dataset: DatasetConfig,
 ) -> Response {
     match (hotblocks, dataset) {
         (Some(hotblocks), dataset) if dataset.hotblocks.is_some() => {
@@ -216,7 +216,7 @@ async fn run_stream(
     Extension(config): Extension<Arc<Config>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
-    Extension(dataset): Extension<DatasetConfig>,
+    dataset: DatasetConfig,
     request: ClientRequest,
 ) -> Response {
     let mut request = restrict_request(&config, request);
@@ -311,7 +311,7 @@ async fn get_dataset_state(
     axum::Json(network.dataset_state(&dataset_id).unwrap())
 }
 
-async fn get_dataset_metadata(Extension(metadata): Extension<DatasetConfig>) -> impl IntoResponse {
+async fn get_dataset_metadata(metadata: DatasetConfig) -> impl IntoResponse {
     axum::Json(AvailableDatasetApiResponse::from(metadata))
 }
 
@@ -469,8 +469,8 @@ where
     type Rejection = Response;
 
     async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let Extension(dataset) = req
-            .extract_parts::<Extension<DatasetConfig>>()
+        let dataset = req
+            .extract_parts::<DatasetConfig>()
             .await
             .map_err(IntoResponse::into_response)?;
 
@@ -565,18 +565,18 @@ where
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         use axum::RequestPartsExt;
 
-        let Extension(metadata) = parts
-            .extract::<Extension<DatasetConfig>>()
+        let dataset = parts
+            .extract::<DatasetConfig>()
             .await
             .map_err(IntoResponse::into_response)?;
 
-        match metadata.network_id {
+        match dataset.network_id {
             Some(dataset_id) => Ok(dataset_id),
             None => Err((
                 StatusCode::NOT_FOUND,
                 format!(
                     "Dataset {} doesn't have archival data",
-                    metadata.default_name
+                    dataset.default_name
                 ),
             )
                 .into_response()),
