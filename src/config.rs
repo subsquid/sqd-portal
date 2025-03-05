@@ -18,6 +18,9 @@ pub struct Config {
     #[serde(deserialize_with = "parse_hostname")]
     pub hostname: String,
 
+    #[serde(default = "default_worker_versions")]
+    pub worker_versions: semver::VersionReq,
+
     #[serde(default = "default_max_parallel_streams")]
     pub max_parallel_streams: usize,
 
@@ -127,6 +130,10 @@ impl Config {
     }
 }
 
+
+fn default_worker_versions() -> semver::VersionReq {
+    semver::VersionReq::parse("^2.0.0").unwrap()
+}
 
 fn default_max_parallel_streams() -> usize {
     1024

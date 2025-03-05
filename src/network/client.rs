@@ -9,6 +9,7 @@ use itertools::Itertools;
 use num_rational::Ratio;
 use num_traits::ToPrimitive;
 use parking_lot::{Mutex, RwLock};
+use semver::VersionReq;
 use serde::Serialize;
 use sqd_node::Node as HotblocksServer;
 use sqd_primitives::BlockRef;
@@ -39,9 +40,6 @@ use crate::{
     utils::UseOnce,
 };
 
-lazy_static::lazy_static! {
-    static ref SUPPORTED_VERSIONS: semver::VersionReq = ">=2.1.0-rc1".parse().expect("Invalid version requirement");
-}
 const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 5;
 const MAX_WAITING_PINGS: usize = 2000;
 
@@ -88,6 +86,7 @@ pub struct NetworkClient {
     network_state_url: String,
     assignments: RwLock<BTreeMap<String, Arc<AssignedChunks>>>,
     heartbeat_buffer: Mutex<VecDeque<(PeerId, Heartbeat)>>,
+    supported_versions: VersionReq,
 }
 
 type AssignedChunks = HashMap<PeerId, Vec<ChunkId>>;
@@ -140,6 +139,7 @@ impl NetworkClient {
             network_state_url,
             assignments: RwLock::default(),
             heartbeat_buffer: Mutex::default(),
+            supported_versions: config.worker_versions.clone(),
         });
 
         this.reset_height_updates();
@@ -579,7 +579,7 @@ impl NetworkClient {
     }
 
     fn handle_heartbeat(&self, peer_id: PeerId, heartbeat: Heartbeat) {
-        if !heartbeat.version_matches(&SUPPORTED_VERSIONS) {
+        if !heartbeat.version_matches(&self.supported_versions) {
             metrics::IGNORED_PINGS.inc();
             return;
         }
