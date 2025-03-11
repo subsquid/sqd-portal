@@ -15,7 +15,7 @@ use tracing::instrument;
 
 use crate::{
     controller::timeouts::TimeoutManager,
-    network::{NetworkClient, NoWorker, QueryResult},
+    network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult},
     types::{
         BlockRange, ChunkId, ClientRequest, DataChunk, QueryError, RequestError, ResponseChunk,
         SendQueryError,
@@ -75,14 +75,25 @@ struct WorkerRequest {
 
 impl StreamController {
     pub fn new(request: ClientRequest, network: Arc<NetworkClient>) -> Result<Self, RequestError> {
-        let first_chunk = network.find_chunk(&request.dataset_id, request.query.first_block());
-        let Some(first_chunk) = first_chunk else {
-            tracing::info!(
-                "No chunk found for block {}, dataset {}",
-                request.query.first_block(),
-                request.dataset_id
-            );
-            return Err(RequestError::NoData);
+        let first_block = request.query.first_block();
+
+        let first_chunk = match network.find_chunk(&request.dataset_id, first_block) {
+            Ok(first_chunk) => first_chunk,
+            Err(ChunkNotFound::BeforeFirst(err)) => {
+                return Err(RequestError::BadRequest(format!(
+                    "Dataset starts from block {}",
+                    err.first_block
+                )))
+            }
+            Err(ChunkNotFound::AfterLast) => {
+                return Err(RequestError::NoData);
+            }
+            Err(ChunkNotFound::Gap) | Err(ChunkNotFound::UnknownDataset) => {
+                // Should not be the case under normal operation
+                return Err(RequestError::InternalError(
+                    "Chunk could not be found in the index".to_owned(),
+                ));
+            }
         };
 
         Ok(Self {
@@ -385,9 +396,7 @@ impl StreamController {
                 return Err((
                     Slot {
                         data_range: range,
-                        state: RequestState::Done(Err(RequestError::InternalError(
-                            err.to_string(),
-                        ))),
+                        state: RequestState::Done(Err(RequestError::Unavailable)),
                     },
                     err,
                 ))

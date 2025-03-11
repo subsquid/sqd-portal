@@ -404,7 +404,7 @@ async fn execute_query(
         }
     };
 
-    let Some(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
+    let Ok(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
         return RequestError::NoData.into_response();
     };
     let range = query

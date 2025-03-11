@@ -49,7 +49,7 @@ impl DatasetState {
         }
     }
 
-    /// The last block such that every block from 0 to this one is owned by at least one worker
+    /// The last block such that every block from the beginning to this one is owned by at least one worker
     pub fn highest_indexable_block(&self) -> u64 {
         let range_set: RangeSet = self
             .worker_ranges
@@ -58,7 +58,7 @@ impl DatasetState {
             .flat_map(|r| r.ranges)
             .into();
         match range_set.ranges.first() {
-            Some(range) if range.begin == 0 => range.end,
+            Some(range) => range.end,
             _ => 0,
         }
     }

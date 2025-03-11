@@ -5,7 +5,9 @@ use sqd_messages::assignments;
 use sqd_primitives::BlockRef;
 
 use crate::{
-    datasets::Datasets, metrics, types::{DataChunk, DatasetId}
+    datasets::Datasets,
+    metrics,
+    types::{BlockNumber, DataChunk, DatasetId},
 };
 
 pub struct DatasetIndex {
@@ -16,6 +18,17 @@ pub struct DatasetIndex {
 pub struct StorageClient {
     datasets: RwLock<HashMap<DatasetId, DatasetIndex>>,
     datasets_config: Arc<RwLock<Datasets>>,
+}
+
+pub enum ChunkNotFound {
+    UnknownDataset,
+    BeforeFirst(BeforeFirstError),
+    Gap,
+    AfterLast,
+}
+
+pub struct BeforeFirstError {
+    pub first_block: BlockNumber,
 }
 
 impl StorageClient {
@@ -60,19 +73,29 @@ impl StorageClient {
         tracing::debug!("Chunks parsed in {elapsed} ms");
     }
 
-    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
+    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound> {
         let datasets = self.datasets.read();
-        let chunks = &datasets.get(dataset)?.chunks;
-        if block < chunks.first()?.first_block {
-            return None;
+        let chunks = &datasets
+            .get(dataset)
+            .ok_or(ChunkNotFound::UnknownDataset)?
+            .chunks;
+        let first_block = chunks.first().ok_or(ChunkNotFound::Gap)?.first_block;
+        if block < first_block {
+            return Err(ChunkNotFound::BeforeFirst(BeforeFirstError { first_block }));
         }
-        let first_suspect = chunks.partition_point(|chunk| (chunk.last_block) < block);
-        (first_suspect < chunks.len() && chunks[first_suspect].first_block <= block)
-            .then(|| chunks[first_suspect])
+        let first_suspect = chunks.partition_point(|chunk: &DataChunk| (chunk.last_block) < block);
+        if first_suspect >= chunks.len() {
+            return Err(ChunkNotFound::AfterLast);
+        }
+        if chunks[first_suspect].first_block <= block {
+            Ok(chunks[first_suspect])
+        } else {
+            Err(ChunkNotFound::Gap)
+        }
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
-        self.find_chunk(dataset, chunk.last_block + 1)
+        self.find_chunk(dataset, chunk.last_block + 1).ok()
     }
 
     pub fn head(&self, dataset: &DatasetId) -> Option<BlockRef> {

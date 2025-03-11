@@ -29,7 +29,7 @@ use sqd_network_transport::{
 
 use super::priorities::NoWorker;
 use super::storage::DatasetIndex;
-use super::{NetworkState, StorageClient};
+use super::{ChunkNotFound, NetworkState, StorageClient};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::network::state::Status;
 use crate::types::{BlockRange, ChunkId, DataChunk};
@@ -402,7 +402,7 @@ impl NetworkClient {
         &self.datasets
     }
 
-    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
+    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound> {
         self.dataset_storage.find_chunk(dataset, block)
     }
 

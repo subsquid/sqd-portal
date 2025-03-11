@@ -7259,7 +7259,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.6.0-rc5"
+version = "0.6.0-rc6"
 dependencies = [
  "anyhow",
  "async-stream",

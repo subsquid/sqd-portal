@@ -6,4 +6,4 @@ mod storage;
 pub use client::{NetworkClient, QueryResult};
 pub use priorities::NoWorker;
 pub use state::NetworkState;
-pub use storage::StorageClient;
+pub use storage::{StorageClient, ChunkNotFound};
