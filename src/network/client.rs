@@ -32,7 +32,7 @@ use super::storage::DatasetIndex;
 use super::{ChunkNotFound, NetworkState, StorageClient};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::network::state::Status;
-use crate::types::{BlockRange, ChunkId, DataChunk};
+use crate::types::{BlockNumber, BlockRange, ChunkId, DataChunk};
 use crate::{
     config::Config,
     metrics,
@@ -400,6 +400,10 @@ impl NetworkClient {
 
     pub fn datasets(&self) -> &RwLock<Datasets> {
         &self.datasets
+    }
+
+    pub fn first_existing_block(&self, dataset: &DatasetId) -> Option<BlockNumber> {
+        self.dataset_storage.first_block(dataset)
     }
 
     pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound> {

@@ -311,8 +311,15 @@ async fn get_dataset_state(
     axum::Json(network.dataset_state(&dataset_id).unwrap())
 }
 
-async fn get_dataset_metadata(metadata: DatasetConfig) -> impl IntoResponse {
-    axum::Json(AvailableDatasetApiResponse::from(metadata))
+async fn get_dataset_metadata(
+    Extension(network): Extension<Arc<NetworkClient>>,
+    metadata: DatasetConfig,
+) -> impl IntoResponse {
+    let first_block = metadata
+        .network_id
+        .as_ref()
+        .and_then(|dataset| network.first_existing_block(dataset));
+    axum::Json(AvailableDatasetApiResponse::new(metadata, first_block))
 }
 
 async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {

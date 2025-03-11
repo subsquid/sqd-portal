@@ -98,6 +98,13 @@ impl StorageClient {
         self.find_chunk(dataset, chunk.last_block + 1).ok()
     }
 
+    pub fn first_block(&self, dataset: &DatasetId) -> Option<BlockNumber> {
+        self.datasets
+            .read()
+            .get(dataset)
+            .and_then(|index| index.chunks.first().map(|chunk| chunk.first_block))
+    }
+
     pub fn head(&self, dataset: &DatasetId) -> Option<BlockRef> {
         self.datasets.read().get(dataset).and_then(|index| {
             let number = index.chunks.last().map(|c| c.last_block);
