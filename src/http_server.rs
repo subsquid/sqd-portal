@@ -12,8 +12,7 @@ use axum::{
     routing::{get, post},
     Extension, RequestExt, Router,
 };
-use futures::{StreamExt, TryStream};
-use itertools::Itertools;
+use futures::TryStream;
 use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
@@ -25,6 +24,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::datasets::DatasetConfig;
 use crate::types::api_types::AvailableDatasetApiResponse;
+use crate::utils::conversion::{json_lines_to_json, recompress_gzip};
 use crate::{
     config::Config,
     controller::task_manager::TaskManager,
@@ -197,7 +197,7 @@ async fn run_finalized_stream(
     request.dataset_id = dataset_id;
     request.query.prepare_for_network();
     let stream = match task_manager.spawn_stream(request).await {
-        Ok(stream) => stream.map(anyhow::Ok),
+        Ok(stream) => stream,
         Err(e) => return e.into_response(),
     };
 
@@ -208,7 +208,8 @@ async fn run_finalized_stream(
         res = res.header(FINALIZED_NUMBER_HEADER, head.number);
         res = res.header(FINALIZED_HASH_HEADER, head.hash);
     }
-    res.body(Body::from_stream(stream)).unwrap()
+    res.body(Body::from_stream(recompress_gzip(stream)))
+        .unwrap()
 }
 
 async fn run_stream(
@@ -233,11 +234,11 @@ async fn run_stream(
             request.query.prepare_for_network();
 
             let stream = match task_manager.spawn_stream(request).await {
-                Ok(stream) => stream.map(anyhow::Ok),
+                Ok(stream) => stream,
                 Err(e) => return e.into_response(),
             };
 
-            (head, Body::from_stream(stream))
+            (head, Body::from_stream(recompress_gzip(stream)))
         }
         // Then try hotblocks storage
         (_, Some(hotblocks)) if dataset.hotblocks.is_some() => {
@@ -428,7 +429,7 @@ async fn execute_query(
         Ok(result) => result,
         Err(err) => return RequestError::from(err).into_response(),
     };
-    match convert_response(&result.data) {
+    match json_lines_to_json(&result.data) {
         Ok(data) => Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::CONTENT_ENCODING, "gzip")
@@ -647,21 +648,6 @@ fn hotblocks_error_to_response(err: anyhow::Error) -> Response {
     };
 
     (status_code, format!("{:#}", err)).into_response()
-}
-
-#[allow(unstable_name_collisions)]
-fn convert_response(data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    use std::io::{Read, Write};
-    let mut reader = flate2::bufread::GzDecoder::new(data);
-    let mut json_lines = String::new();
-    reader.read_to_string(&mut json_lines)?;
-    let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    writer.write_all("[".as_bytes())?;
-    for chunk in json_lines.trim_end().lines().intersperse(",") {
-        writer.write_all(chunk.as_bytes())?;
-    }
-    writer.write_all("]".as_bytes())?;
-    Ok(writer.finish()?)
 }
 
 const FINALIZED_NUMBER_HEADER: &str = "X-Sqd-Finalized-Head-Number";
