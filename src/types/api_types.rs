@@ -7,6 +7,7 @@ pub(crate) struct AvailableDatasetApiResponse {
     pub dataset: String,
     pub aliases: Vec<String>,
     pub real_time: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub start_block: Option<BlockNumber>,
 }
 
