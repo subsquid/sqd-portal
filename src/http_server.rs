@@ -620,7 +620,7 @@ fn restrict_request(config: &Config, request: ClientRequest) -> ClientRequest {
         dataset_id: request.dataset_id,
         dataset_name: request.dataset_name,
         buffer_size: request.buffer_size.min(config.max_buffer_size),
-        max_chunks: config.max_chunks_per_stream,
+        max_chunks: request.max_chunks.min(config.max_chunks_per_stream),
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
     }
