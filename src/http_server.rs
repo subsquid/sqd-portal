@@ -16,8 +16,8 @@ use futures::TryStream;
 use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
-use sqd_node::error::UnknownDataset;
-use sqd_node::Node as HotblocksServer;
+use sqd_hotblocks::error::UnknownDataset;
+use sqd_hotblocks::HotblocksServer;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
@@ -604,7 +604,7 @@ fn restrict_request(config: &Config, request: ClientRequest) -> ClientRequest {
     }
 }
 
-fn into_stream(resp: sqd_node::QueryResponse) -> impl TryStream<Ok = Bytes, Error = BoxError> {
+fn into_stream(resp: sqd_hotblocks::QueryResponse) -> impl TryStream<Ok = Bytes, Error = BoxError> {
     futures::stream::try_unfold(resp, |mut resp| async {
         if let Some(bytes) = resp.next_bytes().await? {
             Ok(Some((bytes, resp)))
@@ -616,7 +616,7 @@ fn into_stream(resp: sqd_node::QueryResponse) -> impl TryStream<Ok = Bytes, Erro
 
 #[allow(clippy::if_same_then_else)]
 fn hotblocks_error_to_response(err: anyhow::Error) -> Response {
-    if let Some(above_the_head) = err.downcast_ref::<sqd_node::error::QueryIsAboveTheHead>() {
+    if let Some(above_the_head) = err.downcast_ref::<sqd_hotblocks::error::QueryIsAboveTheHead>() {
         let mut res = Response::builder().status(204);
         if let Some(head) = above_the_head.finalized_head.as_ref() {
             res = res.header(FINALIZED_NUMBER_HEADER, head.number);
@@ -625,7 +625,7 @@ fn hotblocks_error_to_response(err: anyhow::Error) -> Response {
         return res.body(Body::empty()).unwrap();
     }
 
-    if let Some(fork) = err.downcast_ref::<sqd_node::error::UnexpectedBaseBlock>() {
+    if let Some(fork) = err.downcast_ref::<sqd_hotblocks::error::UnexpectedBaseBlock>() {
         return (
             StatusCode::CONFLICT,
             axum::Json(serde_json::json!({
@@ -635,13 +635,13 @@ fn hotblocks_error_to_response(err: anyhow::Error) -> Response {
             .into_response();
     }
 
-    let status_code = if err.is::<sqd_node::error::UnknownDataset>() {
+    let status_code = if err.is::<sqd_hotblocks::error::UnknownDataset>() {
         StatusCode::NOT_FOUND
-    } else if err.is::<sqd_node::error::QueryKindMismatch>() {
+    } else if err.is::<sqd_hotblocks::error::QueryKindMismatch>() {
         StatusCode::BAD_REQUEST
-    } else if err.is::<sqd_node::error::BlockRangeMissing>() {
+    } else if err.is::<sqd_hotblocks::error::BlockRangeMissing>() {
         StatusCode::BAD_REQUEST
-    } else if err.is::<sqd_node::error::Busy>() {
+    } else if err.is::<sqd_hotblocks::error::Busy>() {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::INTERNAL_SERVER_ERROR

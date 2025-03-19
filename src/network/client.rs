@@ -11,7 +11,7 @@ use num_traits::ToPrimitive;
 use parking_lot::{Mutex, RwLock};
 use semver::VersionReq;
 use serde::Serialize;
-use sqd_node::Node as HotblocksServer;
+use sqd_hotblocks::HotblocksServer;
 use sqd_primitives::BlockRef;
 use tokio::task::JoinError;
 use tokio::time::Instant;
@@ -387,7 +387,10 @@ impl NetworkClient {
                         tracing::info!(
                             "Cleaning hotblocks storage for '{name}' up to block {height}"
                         );
-                        hotblocks.retain(name, sqd_node::RetentionStrategy::FromBlock(height + 1));
+                        hotblocks.retain(
+                            name,
+                            sqd_hotblocks::RetentionStrategy::FromBlock(height + 1),
+                        );
                     }),
                 );
             }

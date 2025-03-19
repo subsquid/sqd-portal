@@ -1,10 +1,11 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
+use sqd_hotblocks::{DatabaseSettings, HotblocksServer};
 
 use crate::config::Config;
 
-pub fn build_server(config: &Config) -> anyhow::Result<Option<sqd_node::Node>> {
+pub fn build_server(config: &Config) -> anyhow::Result<Option<HotblocksServer>> {
     let has_sources = config.datasets.iter().any(|(_, d)| d.real_time.is_some());
     if !has_sources {
         return Ok(None);
@@ -16,7 +17,7 @@ pub fn build_server(config: &Config) -> anyhow::Result<Option<sqd_node::Node>> {
         .as_ref()
         .expect("Hotblocks database path not specified");
     let db = Arc::new(
-        sqd_storage::db::DatabaseSettings::default()
+        DatabaseSettings::default()
             .set_data_cache_size(config.hotblocks_data_cache_mb)
             .open(path)
             .context("failed to open hotblocks database")?,
@@ -24,7 +25,7 @@ pub fn build_server(config: &Config) -> anyhow::Result<Option<sqd_node::Node>> {
 
     tokio::spawn(run_db_cleanup(db.clone()));
 
-    let mut builder = sqd_node::NodeBuilder::new(db);
+    let mut builder = sqd_hotblocks::HotblocksServerBuilder::new(db);
 
     for (default_name, dataset) in config.datasets.iter() {
         if let Some(hotblocks) = &dataset.real_time {
@@ -42,7 +43,7 @@ pub fn build_server(config: &Config) -> anyhow::Result<Option<sqd_node::Node>> {
     Ok(Some(builder.build()))
 }
 
-async fn run_db_cleanup(db: sqd_node::DBRef) {
+async fn run_db_cleanup(db: sqd_hotblocks::DBRef) {
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
         let db = db.clone();

@@ -711,7 +711,7 @@ dependencies = [
  "bitflags 2.8.0",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.11.0",
  "lazy_static",
  "lazycell",
  "proc-macro2",
@@ -3625,7 +3625,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if 1.0.0",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -5835,7 +5835,7 @@ checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes 1.9.0",
  "heck 0.5.0",
- "itertools 0.12.1",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "once_cell",
@@ -5855,7 +5855,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.96",
@@ -7061,7 +7061,7 @@ dependencies = [
 [[package]]
 name = "sqd-array"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7073,7 +7073,7 @@ dependencies = [
 [[package]]
 name = "sqd-bloom-filter"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
 dependencies = [
  "xxhash-rust",
 ]
@@ -7100,7 +7100,7 @@ dependencies = [
 [[package]]
 name = "sqd-data"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7117,7 +7117,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-client"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7131,7 +7131,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-core"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7145,7 +7145,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-source"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
 dependencies = [
  "anyhow",
  "futures 0.3.31",
@@ -7158,7 +7158,36 @@ dependencies = [
 [[package]]
 name = "sqd-dataset"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+
+[[package]]
+name = "sqd-hotblocks"
+version = "0.1.0"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+dependencies = [
+ "anyhow",
+ "bytes 1.9.0",
+ "either",
+ "flate2",
+ "futures 0.3.31",
+ "ouroboros",
+ "parking_lot 0.12.3",
+ "reqwest 0.12.12 (git+https://github.com/subsquid/reqwest.git?rev=620aa86a)",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "sqd-data",
+ "sqd-data-client",
+ "sqd-data-core",
+ "sqd-data-source",
+ "sqd-dataset",
+ "sqd-polars",
+ "sqd-primitives",
+ "sqd-query",
+ "sqd-storage",
+ "tokio 1.43.0",
+ "tracing",
+]
 
 [[package]]
 name = "sqd-messages"
@@ -7217,38 +7246,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqd-node"
-version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
-dependencies = [
- "anyhow",
- "bytes 1.9.0",
- "either",
- "flate2",
- "futures 0.3.31",
- "ouroboros",
- "parking_lot 0.12.3",
- "reqwest 0.12.12 (git+https://github.com/subsquid/reqwest.git?rev=620aa86a)",
- "scopeguard",
- "serde",
- "serde_json",
- "sqd-data",
- "sqd-data-client",
- "sqd-data-core",
- "sqd-data-source",
- "sqd-dataset",
- "sqd-polars",
- "sqd-primitives",
- "sqd-query",
- "sqd-storage",
- "tokio 1.43.0",
- "tracing",
-]
-
-[[package]]
 name = "sqd-polars"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7286,11 +7286,10 @@ dependencies = [
  "serde_with",
  "serde_yaml",
  "sqd-contract-client",
+ "sqd-hotblocks",
  "sqd-messages",
  "sqd-network-transport",
- "sqd-node",
  "sqd-primitives",
- "sqd-storage",
  "static_assertions",
  "thiserror 1.0.69",
  "tikv-jemallocator",
@@ -7308,7 +7307,7 @@ dependencies = [
 [[package]]
 name = "sqd-primitives"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
 dependencies = [
  "borsh",
  "serde",
@@ -7317,7 +7316,7 @@ dependencies = [
 [[package]]
 name = "sqd-query"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7339,7 +7338,7 @@ dependencies = [
 [[package]]
 name = "sqd-storage"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=18b67a2#18b67a2ad1b95beb8643a9b96012da9036d830a9"
+source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
 dependencies = [
  "anyhow",
  "arrow",
@@ -8612,7 +8611,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

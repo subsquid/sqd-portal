@@ -46,6 +46,5 @@ tikv-jemallocator = { version = "0.5", features = ["profiling"] }
 sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "4b4c3c5", version = "1.2.1" }
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "4b4c3c5", version = "2.0.1", features = ["semver", "bitstring", "assignment_reader"] }
 sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "4b4c3c5", version = "3.0.0", features = ["gateway", "metrics"] }
-sqd-node = { git = "https://github.com/subsquid/data.git", rev = "18b67a2" }
-sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "18b67a2" }
-sqd-storage = { git = "https://github.com/subsquid/data.git", rev = "18b67a2" }
+sqd-hotblocks = { git = "https://github.com/subsquid/data.git", rev = "2ae913f" }
+sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "2ae913f" }

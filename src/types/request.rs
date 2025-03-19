@@ -1,3 +1,5 @@
+use sqd_hotblocks::Query;
+
 use super::{BlockRange, DatasetId};
 
 #[derive(Debug, Clone)]
@@ -14,12 +16,12 @@ pub struct ClientRequest {
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
     raw: String,
-    parsed: sqd_node::Query,
+    parsed: Query,
 }
 
 impl ParsedQuery {
     pub fn try_from(str: String) -> anyhow::Result<Self> {
-        let query = sqd_node::Query::from_json_bytes(str.as_bytes())?;
+        let query = Query::from_json_bytes(str.as_bytes())?;
         query.validate()?;
         Ok(Self {
             raw: str,
@@ -49,16 +51,16 @@ impl ParsedQuery {
     // This should be removed once the network query format is updated
     pub fn prepare_for_network(&mut self) {
         match self.parsed {
-            sqd_node::Query::Eth(ref mut q) => {
+            Query::Eth(ref mut q) => {
                 q.parent_block_hash = None;
             }
-            sqd_node::Query::Solana(ref mut q) => {
+            Query::Solana(ref mut q) => {
                 q.parent_block_hash = None;
             }
-            sqd_node::Query::Substrate(ref mut q) => {
+            Query::Substrate(ref mut q) => {
                 q.parent_block_hash = None;
             }
-            sqd_node::Query::Fuel(ref mut q) => {
+            Query::Fuel(ref mut q) => {
                 q.parent_block_hash = None;
             }
         }
@@ -74,7 +76,7 @@ impl ParsedQuery {
         self.raw
     }
 
-    pub fn into_parsed(self) -> sqd_node::Query {
+    pub fn into_parsed(self) -> Query {
         self.parsed
     }
 }

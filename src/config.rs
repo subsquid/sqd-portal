@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use url::Url;
 
-use sqd_node::{self as sqd_hotblocks, RetentionStrategy};
+use sqd_hotblocks::{self, RetentionStrategy};
 use sqd_primitives::BlockNumber;
 
 use crate::types::DatasetRef;
