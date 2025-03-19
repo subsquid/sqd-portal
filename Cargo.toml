@@ -1,12 +1,13 @@
 [package]
 name = "sqd-portal"
-version = "0.6.0-rc7"
+version = "0.6.0-rc8"
 edition = "2021"
 
 [dependencies]
 anyhow = "1"
 async-stream = "0.3.5"
 async-compression = { version = "0.4.20", features = ["tokio", "gzip"] }
+atomic_enum = { version = "0.3.0", features = ["cas"] }
 axum = { version = "0.7", features = ["http2"] }
 base64 = "0.22"
 bimap = "0.6.3"

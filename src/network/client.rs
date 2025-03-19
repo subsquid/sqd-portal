@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::iter::zip;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use atomic_enum::atomic_enum;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{Stream, StreamExt};
 use itertools::Itertools;
@@ -14,8 +16,8 @@ use serde::Serialize;
 use sqd_hotblocks::HotblocksServer;
 use sqd_primitives::BlockRef;
 use tokio::task::JoinError;
-use tokio::time::Instant;
 use tokio::time::MissedTickBehavior;
+use tokio::time::{sleep, Instant};
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
 
@@ -70,6 +72,14 @@ pub struct NetworkClientStatus {
     pub workers: Option<Workers>,
 }
 
+#[atomic_enum]
+#[derive(PartialEq)]
+enum ReadinessState {
+    FirstHeartbeatMissing = 0,
+    Delaying = 1,
+    Ready = 2,
+}
+
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
@@ -87,6 +97,7 @@ pub struct NetworkClient {
     assignments: RwLock<BTreeMap<String, Arc<AssignedChunks>>>,
     heartbeat_buffer: Mutex<VecDeque<(PeerId, Heartbeat)>>,
     supported_versions: VersionReq,
+    readiness: Arc<AtomicReadinessState>,
 }
 
 type AssignedChunks = HashMap<PeerId, Vec<ChunkId>>;
@@ -140,6 +151,9 @@ impl NetworkClient {
             assignments: RwLock::default(),
             heartbeat_buffer: Mutex::default(),
             supported_versions: config.worker_versions.clone(),
+            readiness: Arc::new(AtomicReadinessState::new(
+                ReadinessState::FirstHeartbeatMissing,
+            )),
         });
 
         this.reset_height_updates();
@@ -596,6 +610,8 @@ impl NetworkClient {
             heartbeat.assignment_id
         );
 
+        self.wait_readiness();
+
         let assignments = self.assignments.read();
         let Some(assignment) = assignments.get(&heartbeat.assignment_id).cloned() else {
             tracing::trace!("Assignment {:?} not found", heartbeat.assignment_id);
@@ -693,6 +709,37 @@ impl NetworkClient {
                 }),
             }
         }
+    }
+
+    fn wait_readiness(&self) {
+        if self
+            .readiness
+            .compare_exchange(
+                ReadinessState::FirstHeartbeatMissing,
+                ReadinessState::Delaying,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        tracing::info!(
+            "Got the first worker heartbeat, waiting 60 seconds for portal readiness..."
+        );
+
+        let readiness = Arc::clone(&self.readiness);
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(60)).await;
+
+            readiness.store(ReadinessState::Ready, Ordering::SeqCst);
+            tracing::info!("Portal is ready to serve traffic");
+        });
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.readiness.load(Ordering::SeqCst) == ReadinessState::Ready
     }
 }
 
