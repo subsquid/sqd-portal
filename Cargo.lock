@@ -7061,7 +7061,7 @@ dependencies = [
 [[package]]
 name = "sqd-array"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7073,7 +7073,7 @@ dependencies = [
 [[package]]
 name = "sqd-bloom-filter"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 dependencies = [
  "xxhash-rust",
 ]
@@ -7100,7 +7100,7 @@ dependencies = [
 [[package]]
 name = "sqd-data"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7117,7 +7117,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-client"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7131,7 +7131,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-core"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7145,7 +7145,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-source"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 dependencies = [
  "anyhow",
  "futures 0.3.31",
@@ -7158,12 +7158,12 @@ dependencies = [
 [[package]]
 name = "sqd-dataset"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 
 [[package]]
 name = "sqd-hotblocks"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7248,7 +7248,7 @@ dependencies = [
 [[package]]
 name = "sqd-polars"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7307,7 +7307,7 @@ dependencies = [
 [[package]]
 name = "sqd-primitives"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 dependencies = [
  "borsh",
  "serde",
@@ -7316,7 +7316,7 @@ dependencies = [
 [[package]]
 name = "sqd-query"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7338,7 +7338,7 @@ dependencies = [
 [[package]]
 name = "sqd-storage"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=2ae913f#2ae913f885112bf9da1e41ea533b9fb538bb304c"
+source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
 dependencies = [
  "anyhow",
  "arrow",

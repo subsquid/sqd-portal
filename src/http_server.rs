@@ -75,6 +75,7 @@ pub async fn run_server(
         .route("/datasets/:dataset/:start_block/worker", get(get_worker))
         // end backward compatibility routes
         .route("/status", get(get_status))
+        .route("/debug/db_stats", get(get_db_stats))
         .layer(axum::middleware::from_fn(logging::middleware))
         .route("/metrics", get(get_metrics))
         .layer(RequestDecompressionLayer::new())
@@ -321,6 +322,27 @@ async fn get_dataset_metadata(
         .as_ref()
         .and_then(|dataset| network.first_existing_block(dataset));
     axum::Json(AvailableDatasetApiResponse::new(metadata, first_block))
+}
+
+async fn get_db_stats(
+    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+) -> impl IntoResponse {
+    let Some(hotblocks) = hotblocks else {
+        return (
+            StatusCode::NOT_FOUND,
+            "Hotblocks storage is not enabled".to_string(),
+        )
+            .into_response();
+    };
+
+    match hotblocks.get_db_statistics() {
+        Some(stats) => stats.into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            "Failed to get hotblocks database statistics".to_string(),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {
