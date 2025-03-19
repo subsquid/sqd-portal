@@ -22,13 +22,9 @@ pub struct StorageClient {
 
 pub enum ChunkNotFound {
     UnknownDataset,
-    BeforeFirst(BeforeFirstError),
+    BeforeFirst { first_block: BlockNumber },
     Gap,
     AfterLast,
-}
-
-pub struct BeforeFirstError {
-    pub first_block: BlockNumber,
 }
 
 impl StorageClient {
@@ -81,7 +77,7 @@ impl StorageClient {
             .chunks;
         let first_block = chunks.first().ok_or(ChunkNotFound::Gap)?.first_block;
         if block < first_block {
-            return Err(ChunkNotFound::BeforeFirst(BeforeFirstError { first_block }));
+            return Err(ChunkNotFound::BeforeFirst { first_block });
         }
         let first_suspect = chunks.partition_point(|chunk: &DataChunk| (chunk.last_block) < block);
         if first_suspect >= chunks.len() {

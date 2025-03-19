@@ -79,10 +79,10 @@ impl StreamController {
 
         let first_chunk = match network.find_chunk(&request.dataset_id, first_block) {
             Ok(first_chunk) => first_chunk,
-            Err(ChunkNotFound::BeforeFirst(err)) => {
+            Err(ChunkNotFound::BeforeFirst { first_block }) => {
                 return Err(RequestError::BadRequest(format!(
                     "Dataset starts from block {}",
-                    err.first_block
+                    first_block
                 )))
             }
             Err(ChunkNotFound::AfterLast) => {
