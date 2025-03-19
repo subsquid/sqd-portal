@@ -473,10 +473,13 @@ where
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         use axum::RequestPartsExt;
 
-        let Path(alias) = parts
-            .extract::<Path<String>>()
+        let Path(args) = parts
+            .extract::<Path<Vec<(String, String)>>>()
             .await
             .map_err(IntoResponse::into_response)?;
+        let (_, alias) = args
+            .first()
+            .ok_or((StatusCode::NOT_FOUND, format!("not enough arguments")).into_response())?;
         let Extension(network) = parts
             .extract::<Extension<Arc<NetworkClient>>>()
             .await
