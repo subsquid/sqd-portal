@@ -78,6 +78,7 @@ pub async fn run_server(
         .route("/debug/db_stats", get(get_db_stats))
         .layer(axum::middleware::from_fn(logging::middleware))
         .route("/metrics", get(get_metrics))
+        .route("/ready", get(get_readiness))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
         .layer(Extension(task_manager))
@@ -363,6 +364,14 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
     prometheus_client::encoding::text::encode(&mut buffer, &registry).unwrap();
 
     (HEADERS.clone(), buffer)
+}
+
+async fn get_readiness(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
+    if client.is_ready() {
+        return (StatusCode::OK, "Ready").into_response();
+    }
+
+    (StatusCode::SERVICE_UNAVAILABLE, "Not ready").into_response()
 }
 
 // Deprecated
