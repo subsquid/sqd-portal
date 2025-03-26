@@ -6,6 +6,8 @@ use sqd_contract_client::PeerId;
 
 pub type Priority = (PriorityGroup, u8, i64);
 
+const MAX_QUERIES_PER_WORKER: u8 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum PriorityGroup {
     Best = 0,
@@ -59,7 +61,10 @@ fn priority(worker: &WorkerStats, now: Instant) -> (PriorityGroup, u8, Instant) 
             return (PriorityGroup::Backoff, worker.running_queries, paused_until);
         }
     }
-    let penalty = if worker.server_errors.observed(now) || worker.timeouts.observed(now) {
+    let penalty = if worker.server_errors.observed(now)
+        || worker.timeouts.observed(now)
+        || worker.running_queries >= MAX_QUERIES_PER_WORKER
+    {
         PriorityGroup::Unavailable
     } else if worker.slow.estimate(now) > worker.ok.estimate(now) {
         PriorityGroup::Slow
