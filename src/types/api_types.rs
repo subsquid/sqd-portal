@@ -1,4 +1,7 @@
-use crate::datasets::DatasetConfig;
+use serde::Serialize;
+use sqd_contract_client::PeerId;
+
+use crate::{datasets::DatasetConfig, network};
 
 use super::{BlockNumber, DatasetId};
 
@@ -31,6 +34,13 @@ impl From<DatasetConfig> for AvailableDatasetApiResponse {
             start_block: None,
         }
     }
+}
+
+#[derive(Serialize)]
+pub struct WorkerDebugInfo {
+    pub peer_id: PeerId,
+    pub priority: network::Priority,
+    pub since_last_heartbeat: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]

@@ -1,21 +1,31 @@
+use serde::Serialize;
 use std::{collections::HashMap, time::Duration};
 use tokio::time::Instant;
 
 use sqd_contract_client::PeerId;
 
-const UNAVAILABLE_PENALTY: u8 = 3;
-const BACKOFF_PENALTY: u8 = 2;
+pub type Priority = (PriorityGroup, u8, i64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum PriorityGroup {
+    Best = 0,
+    Slow = 1,
+    Backoff = 2,
+    Unavailable = 3,
+}
+
+#[derive(Debug)]
 pub enum NoWorker {
     AllUnavailable,
     Backoff(Instant),
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 pub struct WorkersPool {
     workers: HashMap<PeerId, WorkerStats>,
 }
 
+#[derive(Debug, Clone)]
 struct WorkerStats {
     last_query: Instant,
     running_queries: u8,
@@ -43,24 +53,29 @@ impl Default for WorkerStats {
 }
 
 // Less is better
-fn priority(worker: &WorkerStats, now: Instant) -> (u8, u8, Instant) {
+fn priority(worker: &WorkerStats, now: Instant) -> (PriorityGroup, u8, Instant) {
     if let Some(paused_until) = worker.paused_until {
         if now < paused_until {
-            return (BACKOFF_PENALTY, worker.running_queries, paused_until);
+            return (PriorityGroup::Backoff, worker.running_queries, paused_until);
         }
     }
     let penalty = if worker.server_errors.observed(now) || worker.timeouts.observed(now) {
-        UNAVAILABLE_PENALTY
+        PriorityGroup::Unavailable
     } else if worker.slow.estimate(now) > worker.ok.estimate(now) {
-        1
+        PriorityGroup::Slow
     } else {
-        0
+        PriorityGroup::Best
     };
     (penalty, worker.running_queries, worker.last_query)
 }
 
+fn serializable_priority(worker: &WorkerStats, now: Instant) -> Priority {
+    let (group, queries, time) = priority(worker, now);
+    (group, queries, -((now - time).as_secs() as i64))
+}
+
 impl WorkersPool {
-    pub fn pick(&mut self, workers: impl IntoIterator<Item = PeerId>) -> Result<PeerId, NoWorker> {
+    pub fn pick(&self, workers: impl IntoIterator<Item = PeerId>) -> Result<PeerId, NoWorker> {
         let now = Instant::now();
         let default_priority = WorkerStats::default();
         let (best, best_priority) = workers
@@ -75,10 +90,32 @@ impl WorkersPool {
             .ok_or(NoWorker::AllUnavailable)?;
         tracing::trace!("Picked worker {:?} with priority {:?}", best, best_priority);
         match best_priority.0 {
-            UNAVAILABLE_PENALTY => Err(NoWorker::AllUnavailable),
-            BACKOFF_PENALTY => Err(NoWorker::Backoff(best_priority.2)),
+            PriorityGroup::Unavailable => Err(NoWorker::AllUnavailable),
+            PriorityGroup::Backoff => Err(NoWorker::Backoff(best_priority.2)),
             _ => Ok(best),
         }
+    }
+
+    pub fn get_priorities(
+        &self,
+        workers: impl IntoIterator<Item = PeerId>,
+    ) -> Vec<(PeerId, Priority)> {
+        let now = Instant::now();
+        let default_priority = WorkerStats::default();
+        let mut v: Vec<_> = workers
+            .into_iter()
+            .map(|peer_id| {
+                (
+                    peer_id,
+                    serializable_priority(
+                        self.workers.get(&peer_id).unwrap_or(&default_priority),
+                        now,
+                    ),
+                )
+            })
+            .collect();
+        v.sort();
+        v
     }
 
     pub fn lease(&mut self, worker: PeerId) {
@@ -131,7 +168,7 @@ impl WorkersPool {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 struct Cooldown<const S: u64> {
     last_observed: Option<Instant>,
 }
@@ -150,6 +187,7 @@ impl<const S: u64> Cooldown<S> {
 /// A counter for the approximate number of events in the last `window` with constant memory usage.
 /// If `estimate` returned `n`, then the number of events observed in
 /// the last `2 * S` seconds is not more than `2 * n`.
+#[derive(Debug, Clone)]
 struct EventCounter<const S: u64> {
     last_time: Instant,
     count: u32,

@@ -76,6 +76,8 @@ pub async fn run_server(
         // end backward compatibility routes
         .route("/status", get(get_status))
         .route("/debug/db_stats", get(get_db_stats))
+        .route("/debug/workers", get(get_all_workers))
+        .route("/datasets/:dataset/:block/debug", get(get_debug_block))
         .layer(axum::middleware::from_fn(logging::middleware))
         .route("/metrics", get(get_metrics))
         .route("/ready", get(get_readiness))
@@ -344,6 +346,24 @@ async fn get_db_stats(
         )
             .into_response(),
     }
+}
+
+async fn get_debug_block(
+    Path((_dataset, block)): Path<(String, u64)>,
+    dataset_id: DatasetId,
+    Extension(client): Extension<Arc<NetworkClient>>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(json!({
+        "workers": client.get_workers(&dataset_id, block),
+    }))
+}
+
+async fn get_all_workers(
+    Extension(client): Extension<Arc<NetworkClient>>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(json!({
+        "workers": client.get_all_workers(),
+    }))
 }
 
 async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {

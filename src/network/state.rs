@@ -12,6 +12,7 @@ use sqd_network_transport::PeerId;
 use crate::config::Config;
 use crate::datasets::Datasets;
 use crate::metrics;
+use crate::types::api_types::WorkerDebugInfo;
 use crate::types::DatasetId;
 
 use super::priorities::{NoWorker, WorkersPool};
@@ -138,7 +139,7 @@ impl NetworkState {
 
     // TODO: return a guard object that will automatically release the worker when dropped
     pub fn find_worker(
-        &mut self,
+        &self,
         dataset_id: &DatasetId,
         start_block: u64,
     ) -> Result<PeerId, NoWorker> {
@@ -153,6 +154,37 @@ impl NetworkState {
             .get_workers_with_block(start_block)
             .filter(|peer_id| Self::worker_active(&self.last_pings, peer_id, deadline));
         self.pool.pick(available)
+    }
+
+    pub fn get_workers(&self, dataset_id: &DatasetId, start_block: u64) -> Vec<WorkerDebugInfo> {
+        let Some(dataset_state) = self.dataset_states.get(dataset_id) else {
+            return vec![];
+        };
+
+        let workers = dataset_state.get_workers_with_block(start_block);
+        let now = Instant::now();
+        self.pool
+            .get_priorities(workers)
+            .into_iter()
+            .map(|(peer_id, priority)| WorkerDebugInfo {
+                peer_id,
+                priority,
+                since_last_heartbeat: self.last_pings.get(&peer_id).map(|t| (now - *t).as_secs()),
+            })
+            .collect()
+    }
+
+    pub fn get_all_workers(&self) -> Vec<WorkerDebugInfo> {
+        let now = Instant::now();
+        self.pool
+            .get_priorities(self.last_pings.keys().copied())
+            .into_iter()
+            .map(|(peer_id, priority)| WorkerDebugInfo {
+                peer_id,
+                priority,
+                since_last_heartbeat: self.last_pings.get(&peer_id).map(|t| (now - *t).as_secs()),
+            })
+            .collect()
     }
 
     pub fn update_dataset_states(

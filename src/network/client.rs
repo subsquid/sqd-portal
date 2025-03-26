@@ -34,6 +34,7 @@ use super::storage::DatasetIndex;
 use super::{ChunkNotFound, NetworkState, StorageClient};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::network::state::Status;
+use crate::types::api_types::WorkerDebugInfo;
 use crate::types::{BlockNumber, BlockRange, ChunkId, DataChunk};
 use crate::{
     config::Config,
@@ -449,6 +450,16 @@ impl NetworkClient {
             };
         }
         worker
+    }
+
+    pub fn get_workers(&self, dataset: &DatasetId, block: u64) -> Vec<WorkerDebugInfo> {
+        let state = self.network_state.lock();
+        state.get_workers(dataset, block)
+    }
+
+    pub fn get_all_workers(&self) -> Vec<WorkerDebugInfo> {
+        let state = self.network_state.lock();
+        state.get_all_workers()
     }
 
     pub fn get_height(&self, dataset: &DatasetId) -> Option<u64> {
