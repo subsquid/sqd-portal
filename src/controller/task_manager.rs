@@ -38,7 +38,7 @@ impl TaskManager {
         let running_tasks = self.running_tasks.fetch_add(1, Ordering::Relaxed);
         if running_tasks >= self.max_tasks {
             self.running_tasks.fetch_sub(1, Ordering::Relaxed);
-            return Err(RequestError::Busy);
+            return Err(RequestError::Unavailable);
         }
         metrics::ACTIVE_STREAMS.set(running_tasks as i64 + 1);
 

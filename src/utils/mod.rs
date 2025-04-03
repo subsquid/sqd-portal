@@ -1,3 +1,4 @@
+pub mod conversion;
 pub mod logging;
 mod once;
 mod sliding_array;

@@ -1,41 +1,55 @@
 use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
+use sqd_messages::assignments;
+use sqd_primitives::BlockRef;
 
 use crate::{
-    datasets::DatasetsMapping,
+    datasets::Datasets,
     metrics,
-    types::{DataChunk, DatasetId},
+    types::{BlockNumber, DataChunk, DatasetId},
 };
 
+pub struct DatasetIndex {
+    pub chunks: Vec<DataChunk>,
+    pub summary: Option<assignments::ChunkSummary>,
+}
+
 pub struct StorageClient {
-    datasets: RwLock<HashMap<DatasetId, Vec<DataChunk>>>,
-    datasets_mapping: Arc<RwLock<DatasetsMapping>>,
+    datasets: RwLock<HashMap<DatasetId, DatasetIndex>>,
+    datasets_config: Arc<RwLock<Datasets>>,
+}
+
+pub enum ChunkNotFound {
+    UnknownDataset,
+    BeforeFirst { first_block: BlockNumber },
+    Gap,
+    AfterLast,
 }
 
 impl StorageClient {
-    pub fn new(datasets_mapping: Arc<RwLock<DatasetsMapping>>) -> Self {
+    pub fn new(datasets_config: Arc<RwLock<Datasets>>) -> Self {
         Self {
             datasets: RwLock::default(),
-            datasets_mapping,
+            datasets_config,
         }
     }
 
-    pub fn update_datasets(&self, mut new_datasets: HashMap<DatasetId, Vec<DataChunk>>) {
+    pub fn update_datasets(&self, mut new_datasets: HashMap<DatasetId, DatasetIndex>) {
         tracing::info!("Saving known chunks");
 
         let timer = tokio::time::Instant::now();
 
-        for chunks in new_datasets.values_mut() {
-            chunks.sort_by_key(|r| r.first_block);
+        for index in new_datasets.values_mut() {
+            index.chunks.sort_by_key(|r| r.first_block);
         }
 
         let mut datasets = self.datasets.write();
-        for (dataset, chunks) in new_datasets {
-            let new_len = chunks.len();
-            let last_block = chunks.last().map_or(0, |r| r.last_block);
-            let prev = datasets.insert(dataset.clone(), chunks);
-            let old_len = prev.map_or(0, |v| v.len());
+        for (dataset, index) in new_datasets {
+            let new_len = index.chunks.len();
+            let last_block = index.chunks.last().map_or(0, |r| r.last_block);
+            let prev = datasets.insert(dataset.clone(), index);
+            let old_len = prev.map_or(0, |i| i.chunks.len());
             if old_len < new_len {
                 tracing::info!(
                     "Got {} new chunk(s) for dataset {}",
@@ -44,9 +58,9 @@ impl StorageClient {
                 );
             }
             let dataset_name = self
-                .datasets_mapping
+                .datasets_config
                 .read()
-                .dataset_default_name(&dataset)
+                .default_name(&dataset)
                 .map(ToOwned::to_owned);
             metrics::report_chunk_list_updated(&dataset, dataset_name, new_len, last_block);
         }
@@ -55,18 +69,48 @@ impl StorageClient {
         tracing::debug!("Chunks parsed in {elapsed} ms");
     }
 
-    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
+    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound> {
         let datasets = self.datasets.read();
-        let chunks = datasets.get(dataset)?;
-        if block < chunks.first()?.first_block {
-            return None;
+        let chunks = &datasets
+            .get(dataset)
+            .ok_or(ChunkNotFound::UnknownDataset)?
+            .chunks;
+        let first_block = chunks.first().ok_or(ChunkNotFound::Gap)?.first_block;
+        if block < first_block {
+            return Err(ChunkNotFound::BeforeFirst { first_block });
         }
-        let first_suspect = chunks.partition_point(|chunk| (chunk.last_block) < block);
-        (first_suspect < chunks.len() && chunks[first_suspect].first_block <= block)
-            .then(|| chunks[first_suspect])
+        let first_suspect = chunks.partition_point(|chunk: &DataChunk| (chunk.last_block) < block);
+        if first_suspect >= chunks.len() {
+            return Err(ChunkNotFound::AfterLast);
+        }
+        if chunks[first_suspect].first_block <= block {
+            Ok(chunks[first_suspect])
+        } else {
+            Err(ChunkNotFound::Gap)
+        }
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
-        self.find_chunk(dataset, chunk.last_block + 1)
+        self.find_chunk(dataset, chunk.last_block + 1).ok()
+    }
+
+    pub fn first_block(&self, dataset: &DatasetId) -> Option<BlockNumber> {
+        self.datasets
+            .read()
+            .get(dataset)
+            .and_then(|index| index.chunks.first().map(|chunk| chunk.first_block))
+    }
+
+    pub fn head(&self, dataset: &DatasetId) -> Option<BlockRef> {
+        self.datasets.read().get(dataset).and_then(|index| {
+            let number = index.chunks.last().map(|c| c.last_block);
+            match (number, index.summary.as_ref()) {
+                (Some(number), Some(summary)) => Some(BlockRef {
+                    number: number,
+                    hash: summary.last_block_hash.clone(),
+                }),
+                _ => None,
+            }
+        })
     }
 }

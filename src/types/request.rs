@@ -1,3 +1,5 @@
+use sqd_hotblocks::Query;
+
 use super::{BlockRange, DatasetId};
 
 #[derive(Debug, Clone)]
@@ -14,45 +16,55 @@ pub struct ClientRequest {
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
     raw: String,
-    first_block: u64,
-    last_block: Option<u64>,
+    parsed: Query,
 }
 
 impl ParsedQuery {
-    pub fn try_from(query: String) -> Result<Self, anyhow::Error> {
-        let json: serde_json::Value = serde_json::from_str(&query)?;
-        let first_block = json
-            .get("fromBlock")
-            .and_then(|v| v.as_u64())
-            .ok_or(anyhow::anyhow!("fromBlock is required"))?;
-        let last_block = json.get("toBlock").and_then(|v| v.as_u64());
-        anyhow::ensure!(
-            last_block.is_none() || last_block >= Some(first_block),
-            "toBlock must be greater or equal to fromBlock"
-        );
+    pub fn try_from(str: String) -> anyhow::Result<Self> {
+        let query = Query::from_json_bytes(str.as_bytes())?;
+        query.validate()?;
         Ok(Self {
-            raw: query,
-            first_block,
-            last_block,
+            raw: str,
+            parsed: query,
         })
     }
 
     pub fn first_block(&self) -> u64 {
-        self.first_block
+        self.parsed.first_block()
     }
 
     pub fn last_block(&self) -> Option<u64> {
-        self.last_block
+        self.parsed.last_block()
     }
 
     pub fn intersect_with(&self, range: &BlockRange) -> Option<BlockRange> {
-        let begin = std::cmp::max(*range.start(), self.first_block);
-        let end = if let Some(last_block) = self.last_block {
+        let begin = std::cmp::max(*range.start(), self.first_block());
+        let end = if let Some(last_block) = self.last_block() {
             std::cmp::min(*range.end(), last_block)
         } else {
             *range.end()
         };
         (begin <= end).then_some(begin..=end)
+    }
+
+    // Network query format is incompatible with hotblock queries
+    // This should be removed once the network query format is updated
+    pub fn prepare_for_network(&mut self) {
+        match self.parsed {
+            Query::Eth(ref mut q) => {
+                q.parent_block_hash = None;
+            }
+            Query::Solana(ref mut q) => {
+                q.parent_block_hash = None;
+            }
+            Query::Substrate(ref mut q) => {
+                q.parent_block_hash = None;
+            }
+            Query::Fuel(ref mut q) => {
+                q.parent_block_hash = None;
+            }
+        }
+        self.raw = self.parsed.to_json_string()
     }
 
     #[allow(clippy::inherent_to_string)]
@@ -62,5 +74,9 @@ impl ParsedQuery {
 
     pub fn into_string(self) -> String {
         self.raw
+    }
+
+    pub fn into_parsed(self) -> Query {
+        self.parsed
     }
 }

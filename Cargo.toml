@@ -1,13 +1,16 @@
 [package]
 name = "sqd-portal"
-version = "0.5.6"
+version = "0.6.0-rc8"
 edition = "2021"
 
 [dependencies]
 anyhow = "1"
 async-stream = "0.3.5"
+async-compression = { version = "0.4.20", features = ["tokio", "gzip"] }
+atomic_enum = { version = "0.3.0", features = ["cas"] }
 axum = { version = "0.7", features = ["http2"] }
 base64 = "0.22"
+bimap = "0.6.3"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 dotenv = "0.15"
@@ -35,11 +38,14 @@ tower-http = { version = "0.6.1", features = ["cors", "decompression-gzip"] }
 tracing = { version = "0.1", features = ["async-await"] }
 tracing-futures = { version = "0.2.5", features = ["tokio", "futures-03"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
+url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.5", features = ["profiling"] }
 
-sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "ea97780", version = "1.2.1" }
-sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "ea97780", version = "2.0.0", features = ["semver", "bitstring", "assignment_reader"] }
-sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "ea97780", version = "3.0.0", features = ["gateway", "metrics"] }
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "4b4c3c5", version = "1.2.1" }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "4b4c3c5", version = "2.0.1", features = ["semver", "bitstring", "assignment_reader"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "4b4c3c5", version = "3.0.0", features = ["gateway", "metrics"] }
+sqd-hotblocks = { git = "https://github.com/subsquid/data.git", rev = "7ea3778" }
+sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "7ea3778" }

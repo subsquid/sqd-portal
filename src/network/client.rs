@@ -1,18 +1,23 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::iter::zip;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use atomic_enum::atomic_enum;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{Stream, StreamExt};
 use itertools::Itertools;
 use num_rational::Ratio;
 use num_traits::ToPrimitive;
 use parking_lot::{Mutex, RwLock};
+use semver::VersionReq;
 use serde::Serialize;
+use sqd_hotblocks::HotblocksServer;
+use sqd_primitives::BlockRef;
 use tokio::task::JoinError;
-use tokio::time::Instant;
 use tokio::time::MissedTickBehavior;
+use tokio::time::{sleep, Instant};
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
 
@@ -25,20 +30,18 @@ use sqd_network_transport::{
 };
 
 use super::priorities::NoWorker;
-use super::{NetworkState, StorageClient};
-use crate::datasets::DatasetsMapping;
-use crate::network::state::{DatasetState, Status};
-use crate::types::{BlockRange, ChunkId, DataChunk};
+use super::storage::DatasetIndex;
+use super::{ChunkNotFound, NetworkState, StorageClient};
+use crate::datasets::{DatasetConfig, Datasets};
+use crate::network::state::Status;
+use crate::types::{BlockNumber, BlockRange, ChunkId, DataChunk};
 use crate::{
-    cli::Config,
+    config::Config,
     metrics,
     types::{generate_query_id, DatasetId, QueryError},
     utils::UseOnce,
 };
 
-lazy_static::lazy_static! {
-    static ref SUPPORTED_VERSIONS: semver::VersionReq = "^2.0.0".parse().expect("Invalid version requirement");
-}
 const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 5;
 const MAX_WAITING_PINGS: usize = 2000;
 
@@ -69,11 +72,21 @@ pub struct NetworkClientStatus {
     pub workers: Option<Workers>,
 }
 
+#[atomic_enum]
+#[derive(PartialEq)]
+enum ReadinessState {
+    FirstHeartbeatMissing = 0,
+    Delaying = 1,
+    Ready = 2,
+}
+
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
     transport_handle: GatewayTransport,
     network_state: Mutex<NetworkState>,
+    datasets: Arc<RwLock<Datasets>>,
+    hotblocks: Option<Arc<HotblocksServer>>,
     contract_client: Box<dyn ContractClient>,
     dataset_storage: StorageClient,
     chain_update_interval: Duration,
@@ -83,6 +96,8 @@ pub struct NetworkClient {
     network_state_url: String,
     assignments: RwLock<BTreeMap<String, Arc<AssignedChunks>>>,
     heartbeat_buffer: Mutex<VecDeque<(PeerId, Heartbeat)>>,
+    supported_versions: VersionReq,
+    readiness: Arc<AtomicReadinessState>,
 }
 
 type AssignedChunks = HashMap<PeerId, Vec<ChunkId>>;
@@ -91,8 +106,9 @@ impl NetworkClient {
     pub async fn new(
         args: TransportArgs,
         config: Arc<Config>,
-        datasets: Arc<RwLock<DatasetsMapping>>,
-    ) -> anyhow::Result<NetworkClient> {
+        datasets: Arc<RwLock<Datasets>>,
+        hotblocks: Option<Arc<HotblocksServer>>,
+    ) -> anyhow::Result<Arc<NetworkClient>> {
         let network = args.rpc.network;
         let dataset_storage = StorageClient::new(datasets.clone());
         let agent_into = get_agent_info!();
@@ -107,6 +123,9 @@ impl NetworkClient {
         let (incoming_events, transport_handle) =
             transport_builder.build_gateway(gateway_config)?;
 
+        let datasets_update_interval = config.datasets_update_interval;
+        let datasets_copy = datasets.clone();
+
         let network_state_filename = match network {
             Network::Tethys => "network-state-tethys.json",
             Network::Mainnet => "network-state-mainnet.json",
@@ -114,12 +133,16 @@ impl NetworkClient {
         let network_state_url =
             format!("https://metadata.sqd-datasets.io/{network_state_filename}");
 
-        Ok(NetworkClient {
+        let state = NetworkState::new(config.clone(), datasets.clone());
+
+        let this = Arc::new(NetworkClient {
             chain_update_interval: config.chain_update_interval,
             assignment_update_interval: config.assignments_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
-            network_state: Mutex::new(NetworkState::new(config, datasets)),
+            network_state: Mutex::new(state),
+            datasets,
+            hotblocks,
             contract_client,
             dataset_storage,
             local_peer_id,
@@ -127,7 +150,30 @@ impl NetworkClient {
             network_state_url,
             assignments: RwLock::default(),
             heartbeat_buffer: Mutex::default(),
-        })
+            supported_versions: config.worker_versions.clone(),
+            readiness: Arc::new(AtomicReadinessState::new(
+                ReadinessState::FirstHeartbeatMissing,
+            )),
+        });
+
+        this.reset_height_updates();
+
+        let client_handle = this.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(datasets_update_interval).await;
+                match Datasets::update(&datasets_copy, &config).await {
+                    Ok(_) => {
+                        client_handle.reset_height_updates();
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to update datasets mapping: {e:?}");
+                    }
+                }
+            }
+        });
+
+        Ok(this)
     }
 
     pub async fn run(
@@ -335,12 +381,58 @@ impl NetworkClient {
         }
     }
 
-    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Option<DataChunk> {
+    pub fn reset_height_updates(&self) {
+        let Some(hotblocks) = self.hotblocks.as_ref() else {
+            return;
+        };
+        let mut state = self.network_state.lock();
+        let datasets = self.datasets.read();
+        state.unsubscribe_all_height_updates();
+        for dataset in datasets.iter() {
+            if let (Some(dataset_id), Some(_)) = (&dataset.network_id, &dataset.hotblocks) {
+                let hotblocks = hotblocks.clone();
+                let name = dataset.default_name.parse().expect("Invalid dataset name");
+                tracing::info!(
+                    "Hotblocks storage for '{name}' set to track dataset height of '{dataset_id}'"
+                );
+                state.subscribe_height_updates(
+                    dataset_id,
+                    Box::new(move |height| {
+                        tracing::info!(
+                            "Cleaning hotblocks storage for '{name}' up to block {height}"
+                        );
+                        hotblocks.retain(
+                            name,
+                            sqd_hotblocks::RetentionStrategy::FromBlock(height + 1),
+                        );
+                    }),
+                );
+            }
+        }
+    }
+
+    pub fn dataset(&self, alias: &str) -> Option<DatasetConfig> {
+        self.datasets.read().get(alias).cloned()
+    }
+
+    pub fn datasets(&self) -> &RwLock<Datasets> {
+        &self.datasets
+    }
+
+    pub fn first_existing_block(&self, dataset: &DatasetId) -> Option<BlockNumber> {
+        self.dataset_storage.first_block(dataset)
+    }
+
+    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound> {
         self.dataset_storage.find_chunk(dataset, block)
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
         self.dataset_storage.next_chunk(dataset, chunk)
+    }
+
+    pub fn head(&self, dataset: &DatasetId) -> Option<BlockRef> {
+        self.dataset_storage.head(dataset)
     }
 
     pub fn find_worker(
@@ -425,7 +517,7 @@ impl NetworkClient {
             Ok(q) if !q.verify_signature(peer_id) => {
                 metrics::report_query_result(peer_id, "validation_error");
                 self.network_state.lock().report_query_failure(peer_id);
-                Err(QueryError::Retriable(format!("Invalid signature")))
+                Err(QueryError::Retriable("Invalid signature".to_string()))
             }
             Ok(sqd_messages::QueryResult {
                 result: Some(result),
@@ -508,7 +600,7 @@ impl NetworkClient {
     }
 
     fn handle_heartbeat(&self, peer_id: PeerId, heartbeat: Heartbeat) {
-        if !heartbeat.version_matches(&SUPPORTED_VERSIONS) {
+        if !heartbeat.version_matches(&self.supported_versions) {
             metrics::IGNORED_PINGS.inc();
             return;
         }
@@ -517,6 +609,8 @@ impl NetworkClient {
             "Heartbeat from {peer_id}, assignment: {:?}",
             heartbeat.assignment_id
         );
+
+        self.wait_readiness();
 
         let assignments = self.assignments.read();
         let Some(assignment) = assignments.get(&heartbeat.assignment_id).cloned() else {
@@ -556,8 +650,10 @@ impl NetworkClient {
             .update_dataset_states(peer_id, worker_state);
     }
 
-    pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<DatasetState> {
-        self.network_state.lock().dataset_state(dataset_id).cloned()
+    pub fn dataset_state(&self, dataset_id: &DatasetId) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            self.network_state.lock().dataset_state(dataset_id),
+        )?)
     }
 
     pub fn get_peer_id(&self) -> PeerId {
@@ -614,12 +710,43 @@ impl NetworkClient {
             }
         }
     }
+
+    fn wait_readiness(&self) {
+        if self
+            .readiness
+            .compare_exchange(
+                ReadinessState::FirstHeartbeatMissing,
+                ReadinessState::Delaying,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        tracing::info!(
+            "Got the first worker heartbeat, waiting 60 seconds for portal readiness..."
+        );
+
+        let readiness = Arc::clone(&self.readiness);
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(60)).await;
+
+            readiness.store(ReadinessState::Ready, Ordering::SeqCst);
+            tracing::info!("Portal is ready to serve traffic");
+        });
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.readiness.load(Ordering::SeqCst) == ReadinessState::Ready
+    }
 }
 
 #[tracing::instrument(skip_all)]
 fn parse_assignment(
     assignment: Assignment,
-) -> anyhow::Result<(AssignedChunks, HashMap<DatasetId, Vec<DataChunk>>)> {
+) -> anyhow::Result<(AssignedChunks, HashMap<DatasetId, DatasetIndex>)> {
     let peers = assignment.get_all_peer_ids();
     let mut worker_chunks = HashMap::new();
     for peer_id in peers {
@@ -642,17 +769,29 @@ fn parse_assignment(
         .datasets
         .into_iter()
         .map(|dataset| {
-            (
-                DatasetId::from_url(dataset.id),
-                dataset
-                    .chunks
-                    .into_iter()
-                    .flat_map(|chunk| {
-                        chunk.id.parse().map_err(|e| {
+            let mut parsed_chunks = dataset
+                .chunks
+                .into_iter()
+                .flat_map(|chunk| {
+                    chunk
+                        .id
+                        .parse::<DataChunk>()
+                        .map_err(|e| {
                             tracing::warn!("Couldn't parse chunk id '{}': {e}", chunk.id);
                         })
-                    })
-                    .collect(),
+                        .map(|id| (id, chunk.summary))
+                })
+                .collect_vec();
+            parsed_chunks.sort_by_key(|(chunk, _)| chunk.first_block);
+            let summary = parsed_chunks
+                .last_mut()
+                .and_then(|(_, summary)| summary.take());
+            (
+                DatasetId::from_url(dataset.id),
+                DatasetIndex {
+                    chunks: parsed_chunks.into_iter().map(|(chunk, _)| chunk).collect(),
+                    summary,
+                },
             )
         })
         .collect();

@@ -7,12 +7,12 @@ use tokio::time::Instant;
 pub enum RequestError {
     #[error("{0}")]
     BadRequest(String),
-    #[error("{0}")]
-    NoData(String),
+    #[error("No data")]
+    NoData,
     #[error("{0}")]
     InternalError(String),
-    #[error("Service is overloaded")]
-    Busy,
+    #[error("Service is unavailable")]
+    Unavailable,
     #[error("Service is overloaded")]
     BusyFor(Duration),
 }
@@ -47,8 +47,8 @@ impl axum::response::IntoResponse for RequestError {
         use axum::http::header;
         let mut response = match self {
             s @ Self::BadRequest(_) => (StatusCode::BAD_REQUEST, s.to_string()).into_response(),
-            Self::NoData(_) => (StatusCode::NO_CONTENT, ()).into_response(),
-            s @ Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, s.to_string()).into_response(),
+            Self::NoData => (StatusCode::NO_CONTENT, ()).into_response(),
+            s @ Self::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, s.to_string()).into_response(),
             s @ Self::BusyFor(duration) => axum::http::Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header(header::RETRY_AFTER, duration.as_secs() + 1)
@@ -70,9 +70,9 @@ impl RequestError {
     pub fn short_code(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => "bad_request",
-            Self::NoData(_) => "no_data",
+            Self::NoData => "no_data",
             Self::InternalError(_) => "internal_error",
-            Self::Busy | Self::BusyFor(_) => "overloaded",
+            Self::Unavailable | Self::BusyFor(_) => "overloaded",
         }
     }
 }

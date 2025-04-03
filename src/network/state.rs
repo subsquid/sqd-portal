@@ -1,7 +1,6 @@
 use num_rational::Ratio;
 use parking_lot::RwLock;
 use serde::Serialize;
-use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -10,18 +9,20 @@ use sqd_contract_client::Worker;
 use sqd_messages::RangeSet;
 use sqd_network_transport::PeerId;
 
-use crate::cli::Config;
-use crate::datasets::DatasetsMapping;
+use crate::config::Config;
+use crate::datasets::Datasets;
 use crate::metrics;
 use crate::types::DatasetId;
 
 use super::priorities::{NoWorker, WorkersPool};
 
-#[derive(Default, Debug, Clone, Serialize)]
+#[derive(Default, Serialize)]
 pub struct DatasetState {
     worker_ranges: HashMap<PeerId, RangeSet>,
     highest_seen_block: u64,
     first_gap: u64,
+    #[serde(skip)]
+    height_update_subscribers: Vec<Box<dyn FnMut(u64) + Send>>,
 }
 
 impl DatasetState {
@@ -34,7 +35,10 @@ impl DatasetState {
     pub fn update(&mut self, peer_id: PeerId, state: RangeSet) {
         let mut could_close_gap = false;
         if let Some(range) = state.ranges.last() {
-            self.highest_seen_block = max(self.highest_seen_block, range.end);
+            if range.end > self.highest_seen_block {
+                self.highest_seen_block = range.end;
+                self.notify_height_update();
+            }
             if range.end >= self.first_gap {
                 could_close_gap = true;
             }
@@ -45,7 +49,7 @@ impl DatasetState {
         }
     }
 
-    /// The last block such that every block from 0 to this one is owned by at least one worker
+    /// The last block such that every block from the beginning to this one is owned by at least one worker
     pub fn highest_indexable_block(&self) -> u64 {
         let range_set: RangeSet = self
             .worker_ranges
@@ -54,7 +58,7 @@ impl DatasetState {
             .flat_map(|r| r.ranges)
             .into();
         match range_set.ranges.first() {
-            Some(range) if range.begin == 0 => range.end,
+            Some(range) => range.end,
             _ => 0,
         }
     }
@@ -62,6 +66,21 @@ impl DatasetState {
     /// The last block known to be downloaded by at least one worker
     pub fn highest_known_block(&self) -> u64 {
         self.highest_seen_block
+    }
+
+    pub fn subscribe_height_updates(&mut self, subscriber: Box<dyn FnMut(u64) + Send>) {
+        self.height_update_subscribers.push(subscriber);
+    }
+
+    pub fn unsubscribe_height_updates(&mut self) {
+        self.height_update_subscribers.clear();
+    }
+
+    fn notify_height_update(&mut self) {
+        let height = self.highest_seen_block;
+        for subscriber in &mut self.height_update_subscribers {
+            subscriber(height);
+        }
     }
 }
 
@@ -75,7 +94,7 @@ pub enum Status {
 
 pub struct NetworkState {
     config: Arc<Config>,
-    datasets: Arc<RwLock<DatasetsMapping>>,
+    datasets: Arc<RwLock<Datasets>>,
     dataset_states: HashMap<DatasetId, DatasetState>,
     last_pings: HashMap<PeerId, Instant>,
     pool: WorkersPool,
@@ -96,7 +115,7 @@ pub struct ContractsState {
 }
 
 impl NetworkState {
-    pub fn new(config: Arc<Config>, datasets: Arc<RwLock<DatasetsMapping>>) -> Self {
+    pub fn new(config: Arc<Config>, datasets: Arc<RwLock<Datasets>>) -> Self {
         Self {
             config,
             datasets,
@@ -144,18 +163,15 @@ impl NetworkState {
         self.last_pings.insert(worker_id, Instant::now());
         metrics::KNOWN_WORKERS.set(self.last_pings.len() as i64);
         let datasets = self.datasets.read();
-        for dataset_id in datasets.dataset_ids() {
+        for (dataset_id, default_name) in datasets.network_datasets() {
             let dataset_state = worker_state
                 .remove(dataset_id)
                 .unwrap_or_else(RangeSet::empty);
             let entry = self.dataset_states.entry(dataset_id.clone()).or_default();
             entry.update(worker_id, dataset_state);
-            let dataset_name = datasets
-                .dataset_default_name(dataset_id)
-                .map(ToOwned::to_owned);
             metrics::report_dataset_updated(
                 dataset_id,
-                dataset_name,
+                Some(default_name.to_owned()),
                 entry.highest_seen_block,
                 entry.first_gap,
             );
@@ -206,6 +222,23 @@ impl NetworkState {
 
     pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<&DatasetState> {
         self.dataset_states.get(dataset_id)
+    }
+
+    pub fn subscribe_height_updates(
+        &mut self,
+        dataset_id: &DatasetId,
+        subscriber: Box<dyn FnMut(u64) + Send>,
+    ) {
+        self.dataset_states
+            .entry(dataset_id.clone())
+            .or_default()
+            .subscribe_height_updates(subscriber);
+    }
+
+    pub fn unsubscribe_all_height_updates(&mut self) {
+        for state in self.dataset_states.values_mut() {
+            state.unsubscribe_height_updates();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
