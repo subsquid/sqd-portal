@@ -43,7 +43,6 @@ use crate::{
     utils::UseOnce,
 };
 
-const MAX_ASSIGNMENT_BUFFER_SIZE: usize = 5;
 const MAX_WAITING_PINGS: usize = 2000;
 
 pub type QueryResult = Result<QueryOk, QueryError>;
@@ -96,6 +95,7 @@ pub struct NetworkClient {
     keypair: Keypair,
     network_state_url: String,
     assignments: RwLock<BTreeMap<String, Arc<AssignedChunks>>>,
+    assignments_stored: usize,
     heartbeat_buffer: Mutex<VecDeque<(PeerId, Heartbeat)>>,
     supported_versions: VersionReq,
     readiness: Arc<AtomicReadinessState>,
@@ -150,6 +150,7 @@ impl NetworkClient {
             keypair,
             network_state_url,
             assignments: RwLock::default(),
+            assignments_stored: config.assignments_stored,
             heartbeat_buffer: Mutex::default(),
             supported_versions: config.worker_versions.clone(),
             readiness: Arc::new(AtomicReadinessState::new(
@@ -341,7 +342,7 @@ impl NetworkClient {
                 {
                     let mut local_assignments = self.assignments.write();
                     local_assignments.insert(assignment_id.clone(), Arc::new(worker_chunks));
-                    if local_assignments.len() > MAX_ASSIGNMENT_BUFFER_SIZE {
+                    if local_assignments.len() > self.assignments_stored {
                         local_assignments.pop_first();
                     }
                 }

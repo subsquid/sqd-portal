@@ -66,6 +66,9 @@ pub struct Config {
     )]
     pub assignments_update_interval: Duration,
 
+    #[serde(default = "default_assignments_stored")]
+    pub assignments_stored: usize,
+
     #[serde_as(as = "DurationSeconds")]
     #[serde(
         rename = "datasets_update_interval_sec",
@@ -169,6 +172,10 @@ fn default_chain_update_interval() -> Duration {
 
 fn default_assignments_update_interval() -> Duration {
     Duration::from_secs(60)
+}
+
+fn default_assignments_stored() -> usize {
+    5
 }
 
 fn default_datasets_update_interval() -> Duration {
