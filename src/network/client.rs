@@ -324,7 +324,7 @@ impl NetworkClient {
                 {
                     Ok(Some(assignment)) => assignment,
                     Ok(None) => {
-                        tracing::info!("Assignment has not been changed");
+                        tracing::debug!("Assignment has not been changed");
                         return;
                     }
                     Err(err) => {
