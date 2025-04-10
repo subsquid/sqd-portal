@@ -7109,7 +7109,7 @@ dependencies = [
 [[package]]
 name = "sqd-contract-client"
 version = "1.2.1"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=4b4c3c5#4b4c3c559490ab72f625e14e05e27aa93306609d"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=8067609#80676090913f20176947306b6b95c296aaf32ae7"
 dependencies = [
  "async-trait",
  "clap",
@@ -7220,7 +7220,7 @@ dependencies = [
 [[package]]
 name = "sqd-messages"
 version = "2.0.1"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=4b4c3c5#4b4c3c559490ab72f625e14e05e27aa93306609d"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=8067609#80676090913f20176947306b6b95c296aaf32ae7"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -7243,7 +7243,7 @@ dependencies = [
 [[package]]
 name = "sqd-network-transport"
 version = "3.0.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=4b4c3c5#4b4c3c559490ab72f625e14e05e27aa93306609d"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=8067609#80676090913f20176947306b6b95c296aaf32ae7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7270,6 +7270,7 @@ dependencies = [
  "sqd-messages",
  "thiserror 1.0.69",
  "tokio 1.43.0",
+ "tokio-stream",
  "tokio-util",
 ]
 
@@ -7287,7 +7288,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.6.0-rc10"
+version = "0.6.0-rc11"
 dependencies = [
  "anyhow",
  "async-compression",

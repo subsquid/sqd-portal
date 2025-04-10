@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.6.0-rc10"
+version = "0.6.0-rc11"
 edition = "2021"
 
 [dependencies]
@@ -44,8 +44,8 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.5", features = ["profiling"] }
 
-sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "4b4c3c5", version = "1.2.1" }
-sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "4b4c3c5", version = "2.0.1", features = ["semver", "bitstring", "assignment_reader"] }
-sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "4b4c3c5", version = "3.0.0", features = ["gateway", "metrics"] }
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "8067609", version = "1.2.1" }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "8067609", version = "2.0.1", features = ["semver", "bitstring", "assignment_reader"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "8067609", version = "3.0.0", features = ["gateway", "metrics"] }
 sqd-hotblocks = { git = "https://github.com/subsquid/data.git", rev = "7ea3778" }
 sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "7ea3778" }

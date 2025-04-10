@@ -319,6 +319,7 @@ impl NetworkClient {
                 let assignment = match Assignment::try_download(
                     self.network_state_url.clone(),
                     latest_assignment,
+                    Duration::from_secs(60),
                 )
                 .await
                 {
