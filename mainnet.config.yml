@@ -1,5 +1,6 @@
 hostname: http://0.0.0.0:8000
 max_buffer_size: 1000
+assignments_stored: 2
 sqd_network:
   datasets: https://cdn.subsquid.io/sqd-network/datasets.yml
   serve: "all"
