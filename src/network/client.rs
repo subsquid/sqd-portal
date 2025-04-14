@@ -121,6 +121,7 @@ impl NetworkClient {
         let mut gateway_config = GatewayConfig::default();
         gateway_config.query_config.request_timeout = config.transport_timeout;
         gateway_config.events_queue_size = 10000;
+        gateway_config.worker_status_via_gossipsub = config.worker_status_via_gossipsub;
         let (incoming_events, transport_handle) =
             transport_builder.build_gateway(gateway_config)?;
 

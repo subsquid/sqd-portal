@@ -10,7 +10,6 @@ use sqd_primitives::BlockNumber;
 
 use crate::types::DatasetRef;
 
-
 #[serde_as]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,8 +84,10 @@ pub struct Config {
 
     #[serde(default = "default_hotblocks_data_cache_mb")]
     pub hotblocks_data_cache_mb: usize,
-}
 
+    #[serde(default)]
+    pub worker_status_via_gossipsub: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqdNetworkConfig {
@@ -132,7 +133,6 @@ impl Config {
         )?)
     }
 }
-
 
 fn default_worker_versions() -> semver::VersionReq {
     semver::VersionReq::parse("^2.0.0").unwrap()
@@ -185,7 +185,6 @@ fn default_datasets_update_interval() -> Duration {
 fn default_hotblocks_data_cache_mb() -> usize {
     4096
 }
-
 
 fn parse_hostname<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
