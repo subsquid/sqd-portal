@@ -1,3 +1,4 @@
+use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::body::Bytes;
@@ -261,7 +262,12 @@ async fn run_stream(
             }
         }
         // If requested block is above the network height and there is no hotblocks storage, return 204
-        (Some(_dataset_id), _) => return RequestError::NoData.into_response(),
+        (Some(_dataset_id), _) => {
+            // Delay request from this client for 5 seconds to avoid unnecessary retries
+            // TODO: actually wait for data arrival
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            return RequestError::NoData.into_response()
+        }
         (None, _) => {
             unreachable!(
                 "invalid dataset name should have been handled in the ClientRequest parser"
