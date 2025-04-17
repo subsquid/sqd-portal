@@ -533,7 +533,7 @@ impl NetworkClient {
             Ok(q) if !q.verify_signature(peer_id) => {
                 metrics::report_query_result(peer_id, "validation_error");
                 self.network_state.lock().report_query_failure(peer_id);
-                Err(QueryError::Retriable("Invalid signature".to_string()))
+                Err(QueryError::Retriable(format!("invalid worker signature from {peer_id}, result: {q:?}")))
             }
             Ok(sqd_messages::QueryResult {
                 result: Some(result),
@@ -557,7 +557,7 @@ impl NetworkClient {
                             Err::BadRequest(s) => {
                                 metrics::report_query_result(peer_id, "bad_request");
                                 self.network_state.lock().report_query_success(peer_id);
-                                Err(QueryError::BadRequest(s))
+                                Err(QueryError::BadRequest(format!("couldn't parse request: {s}")))
                             }
                             Err::NotFound(s) => {
                                 metrics::report_query_result(peer_id, "not_found");
@@ -567,50 +567,54 @@ impl NetworkClient {
                             Err::ServerError(s) => {
                                 metrics::report_query_result(peer_id, "server_error");
                                 self.network_state.lock().report_query_error(peer_id);
-                                Err(QueryError::Retriable(s))
+                                Err(QueryError::Retriable(format!("internal error: {s}")))
                             }
                             Err::ServerOverloaded(()) => {
                                 metrics::report_query_result(peer_id, "server_overloaded");
                                 self.network_state.lock().report_query_error(peer_id);
-                                Err(QueryError::Retriable("Server overloaded".to_owned()))
+                                Err(QueryError::Retriable("worker overloaded".to_owned()))
                             }
                             Err::TooManyRequests(()) => {
                                 metrics::report_query_result(peer_id, "too_many_requests");
                                 self.network_state.lock().report_query_success(peer_id);
-                                Err(QueryError::Retriable("Too many requests".to_owned()))
+                                Err(QueryError::Retriable("rate limit exceeded".to_owned()))
                             }
                         }
                     }
                     query_result::Result::Err(sqd_messages::QueryError { err: None }) => {
                         metrics::report_query_result(peer_id, "invalid");
                         self.network_state.lock().report_query_error(peer_id);
-                        Err(QueryError::Retriable("Unknown error message".to_string()))
+                        Err(QueryError::Retriable("unknown error message".to_string()))
                     }
                 }
             }
             Ok(sqd_messages::QueryResult { result: None, .. }) => {
                 metrics::report_query_result(peer_id, "invalid");
                 self.network_state.lock().report_query_error(peer_id);
-                Err(QueryError::Retriable("Unknown error message".to_string()))
+                Err(QueryError::Retriable("unknown error message".to_string()))
             }
             Err(QueryFailure::InvalidRequest(e)) => {
                 metrics::report_query_result(peer_id, "bad_request");
-                Err(QueryError::BadRequest(format!("Invalid request: {e}")))
+                Err(QueryError::BadRequest(format!("couldn't send request: {e}")))
             }
             Err(QueryFailure::InvalidResponse(e)) => {
                 metrics::report_query_result(peer_id, "invalid");
                 self.network_state.lock().report_query_error(peer_id);
-                Err(QueryError::Retriable(format!("Response error: {e}")))
+                Err(QueryError::Retriable(format!("couldn't decode response: {e}")))
             }
             Err(QueryFailure::Timeout(t)) => {
                 metrics::report_query_result(peer_id, "timeout");
                 self.network_state.lock().report_query_failure(peer_id);
-                Err(QueryError::Retriable(t.to_string()))
+                let msg = match t {
+                    sqd_network_transport::StreamClientTimeout::Connect => "timed out connecting to the peer",
+                    sqd_network_transport::StreamClientTimeout::Request => "timed out reading response"
+                };
+                Err(QueryError::Retriable(msg.to_owned()))
             }
             Err(QueryFailure::TransportError(e)) => {
                 metrics::report_query_result(peer_id, "transport_error");
                 self.network_state.lock().report_query_failure(peer_id);
-                Err(QueryError::Retriable(format!("Transport error: {e}")))
+                Err(QueryError::Retriable(format!("transport error: {e}")))
             }
         }
     }

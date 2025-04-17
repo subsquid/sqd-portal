@@ -81,7 +81,7 @@ impl StreamController {
             Ok(first_chunk) => first_chunk,
             Err(ChunkNotFound::BeforeFirst { first_block }) => {
                 return Err(RequestError::BadRequest(format!(
-                    "Dataset starts from block {}",
+                    "dataset starts from block {}",
                     first_block
                 )))
             }
@@ -90,9 +90,10 @@ impl StreamController {
             }
             Err(ChunkNotFound::Gap) | Err(ChunkNotFound::UnknownDataset) => {
                 // Should not be the case under normal operation
-                return Err(RequestError::InternalError(
-                    "Chunk could not be found in the index".to_owned(),
-                ));
+                return Err(RequestError::InternalError(format!(
+                    "block {} could not be found in dataset {}, please report this to the developers",
+                    first_block, request.dataset_id
+                )));
             }
         };
 
@@ -172,24 +173,25 @@ impl StreamController {
             false
         });
 
-        if result
-            .as_ref()
-            .is_some_and(|(response, _, _)| retriable(response) && pending.tries_left > 0)
-        {
-            let (response, _, _) = result.as_ref().unwrap();
-            pending.last_error = Some(response.as_ref().unwrap_err().to_string());
-            tracing::debug!("Retrying request: {:?}", response);
-            retry = true;
-        } else if let Some((response, duration, worker)) = result {
-            self.timeouts.observe(duration);
-            slot.state = parse_response(response, &slot.data_range.range);
-            tracing::debug!(
-                "Got result ({}) in {}ms from {}",
-                short_code(&slot.state),
-                duration.as_millis(),
-                worker
-            );
-            return true;
+        if let Some((response, duration, worker)) = result {
+            if retriable(&response) && pending.tries_left > 0 {
+                pending.last_error = Some(
+                    RequestError::from_query_error(response.clone().unwrap_err(), worker)
+                        .to_string(),
+                );
+                tracing::debug!("Retrying request: {:?}", response);
+                retry = true;
+            } else {
+                self.timeouts.observe(duration);
+                slot.state = parse_response(response, &slot.data_range.range, worker);
+                tracing::debug!(
+                    "Got result ({}) in {}ms from {}",
+                    short_code(&slot.state),
+                    duration.as_millis(),
+                    worker
+                );
+                return true;
+            }
         }
 
         #[allow(clippy::collapsible_else_if)]
@@ -204,8 +206,9 @@ impl StreamController {
                 }
             } else {
                 if pending.requests.is_empty() {
-                    slot.state =
-                        RequestState::Done(Err(RequestError::InternalError("Timeout".to_string())));
+                    slot.state = RequestState::Done(Err(RequestError::InternalError(
+                        "soft timeout exceeded".to_string(),
+                    )));
                     return true;
                 } else {
                     // wait for other requests to complete
@@ -232,7 +235,8 @@ impl StreamController {
                     // wait for other requests to complete
                     tracing::debug!("Couldn't schedule retry: {e:?}");
                     if pending.last_error.is_none() {
-                        pending.last_error = Some(e.to_string());
+                        pending.last_error =
+                            Some(format!("couldn't retry query after soft timeout: {e}"));
                     }
                     pending.set_timeout(self.timeouts.current_timeout());
                 }
@@ -540,10 +544,10 @@ impl PendingRequests {
     }
 }
 
-fn parse_response(response: QueryResult, range: &BlockRange) -> RequestState {
+fn parse_response(response: QueryResult, range: &BlockRange, worker: PeerId) -> RequestState {
     let result = match response {
         Ok(result) => result,
-        Err(e) => return RequestState::Done(Err(RequestError::from(e))),
+        Err(e) => return RequestState::Done(Err(RequestError::from_query_error(e, worker))),
     };
 
     let last_block = result.last_block;
@@ -555,9 +559,12 @@ fn parse_response(response: QueryResult, range: &BlockRange) -> RequestState {
             range.start(),
             range.end()
         );
-        RequestState::Done(Err(RequestError::InternalError(
-            "Got empty response".to_string(),
-        )))
+        RequestState::Done(Err(RequestError::InternalError(format!(
+            "the last returned block is {} which is below the first queried block {} from {}",
+            last_block,
+            range.start(),
+            worker,
+        ))))
     } else {
         RequestState::Partial(PartialResult {
             data: result.data,

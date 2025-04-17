@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use axum::http::StatusCode;
+use sqd_contract_client::PeerId;
 use tokio::time::Instant;
 
 #[derive(thiserror::Error, Debug)]
@@ -11,13 +12,13 @@ pub enum RequestError {
     NoData,
     #[error("{0}")]
     InternalError(String),
-    #[error("Service is unavailable")]
+    #[error("No available workers to serve the request")]
     Unavailable,
-    #[error("Service is overloaded")]
+    #[error("Service is overloaded, please try again later")]
     BusyFor(Duration),
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum QueryError {
     #[error("{0}")]
     BadRequest(String),
@@ -25,19 +26,21 @@ pub enum QueryError {
     Retriable(String),
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum SendQueryError {
-    #[error("No workers available")]
+    #[error("no workers for the given block are available")]
     NoWorkers,
-    #[error("Rate limited")]
+    #[error("the rate limit has been exceeded for all workers")]
     Backoff(Instant),
 }
 
-impl From<QueryError> for RequestError {
-    fn from(value: QueryError) -> Self {
+impl RequestError {
+    pub fn from_query_error(value: QueryError, worker: PeerId) -> Self {
         match value {
             QueryError::BadRequest(s) => RequestError::BadRequest(s),
-            QueryError::Retriable(s) => RequestError::InternalError(s),
+            QueryError::Retriable(s) => {
+                RequestError::InternalError(format!("failed query to worker {worker}: {s}"))
+            }
         }
     }
 }
@@ -46,17 +49,27 @@ impl axum::response::IntoResponse for RequestError {
     fn into_response(self) -> axum::response::Response {
         use axum::http::header;
         let mut response = match self {
-            s @ Self::BadRequest(_) => (StatusCode::BAD_REQUEST, s.to_string()).into_response(),
+            Self::BadRequest(e) => {
+                (StatusCode::BAD_REQUEST, format!("Bad request: {e}")).into_response()
+            }
+
             Self::NoData => (StatusCode::NO_CONTENT, ()).into_response(),
-            s @ Self::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, s.to_string()).into_response(),
+
+            s @ Self::Unavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, s.to_string()).into_response()
+            }
+
             s @ Self::BusyFor(duration) => axum::http::Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header(header::RETRY_AFTER, duration.as_secs() + 1)
                 .body(axum::body::Body::from(s.to_string()))
                 .unwrap(),
-            s @ Self::InternalError(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, s.to_string()).into_response()
-            }
+
+            Self::InternalError(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("All query attempts failed, last error: {e}"),
+            )
+                .into_response(),
         };
         response.headers_mut().insert(
             header::CONTENT_TYPE,
