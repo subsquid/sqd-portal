@@ -1,4 +1,5 @@
 mod client;
+mod contracts_state;
 mod priorities;
 mod state;
 mod storage;

@@ -29,11 +29,11 @@ use sqd_network_transport::{
     P2PTransportBuilder, QueryFailure, TransportArgs,
 };
 
+use super::contracts_state::{self, ContractsState};
 use super::priorities::NoWorker;
 use super::storage::DatasetIndex;
 use super::{ChunkNotFound, NetworkState, StorageClient};
 use crate::datasets::{DatasetConfig, Datasets};
-use crate::network::state::Status;
 use crate::types::api_types::WorkerDebugInfo;
 use crate::types::{BlockNumber, BlockRange, ChunkId, DataChunk};
 use crate::{
@@ -64,7 +64,7 @@ pub struct Workers {
 #[derive(Debug, Clone, Serialize)]
 pub struct NetworkClientStatus {
     pub peer_id: PeerId,
-    pub status: Status,
+    pub status: contracts_state::Status,
     pub operator: Option<String>,
     pub current_epoch: Option<CurrentEpoch>,
     pub sqd_locked: Option<String>,
@@ -99,6 +99,7 @@ pub struct NetworkClient {
     heartbeat_buffer: Mutex<VecDeque<(PeerId, Heartbeat)>>,
     supported_versions: VersionReq,
     readiness: Arc<AtomicReadinessState>,
+    contracts_state: RwLock<ContractsState>,
 }
 
 type AssignedChunks = HashMap<PeerId, Vec<ChunkId>>;
@@ -157,6 +158,7 @@ impl NetworkClient {
             readiness: Arc::new(AtomicReadinessState::new(
                 ReadinessState::FirstHeartbeatMissing,
             )),
+            contracts_state: Default::default(),
         });
 
         this.reset_height_updates();
@@ -248,7 +250,7 @@ impl NetworkClient {
             current_epoch
         );
 
-        self.network_state.lock().set_contracts_state(
+        self.contracts_state.write().set(
             current_epoch,
             sqd_locked,
             epoch_length,
@@ -286,7 +288,7 @@ impl NetworkClient {
                 }
             };
 
-            self.network_state.lock().set_contracts_state(
+            self.contracts_state.write().set(
                 current_epoch,
                 sqd_locked,
                 epoch_length,
@@ -675,13 +677,13 @@ impl NetworkClient {
     }
 
     pub fn get_status(&self) -> NetworkClientStatus {
-        let state = self.network_state.lock().get_contracts_state();
+        let state = self.contracts_state.read().clone();
 
         let epoch_secs = state.epoch_length.as_secs();
         let started_at: DateTime<Utc> = state.current_epoch_started.into();
         let ended_at = started_at + ChronoDuration::seconds(epoch_secs as i64);
 
-        if state.status == Status::DataLoading {
+        if state.status == contracts_state::Status::DataLoading {
             NetworkClientStatus {
                 peer_id: self.local_peer_id,
                 status: state.status,
