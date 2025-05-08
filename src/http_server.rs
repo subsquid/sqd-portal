@@ -266,7 +266,7 @@ async fn run_stream(
             // Delay request from this client for 5 seconds to avoid unnecessary retries
             // TODO: actually wait for data arrival
             tokio::time::sleep(Duration::from_secs(5)).await;
-            return RequestError::NoData.into_response()
+            return RequestError::NoData.into_response();
         }
         (None, _) => {
             unreachable!(
@@ -477,6 +477,7 @@ async fn execute_query(
         .expect("Found chunk should intersect with query");
     let fut = client.query_worker(
         worker_id,
+        "".to_string(), // assuming this function is deprecated
         ChunkId::new(dataset_id, chunk),
         range,
         query.into_string(),
@@ -542,6 +543,12 @@ where
             .await
             .map_err(IntoResponse::into_response)?;
 
+        let req_id = req
+            .headers()
+            .get("x-request-id")
+            .map(|v| v.to_str().unwrap_or_default().to_owned())
+            .unwrap_or_else(|| uuid::Uuid::nil().to_string());
+
         let Query(params) = req
             .extract_parts::<Query<HashMap<String, String>>>()
             .await
@@ -591,6 +598,7 @@ where
             dataset_id: DatasetId::from_url("-"), // will be filled later, if the request goes to the network
             dataset_name: dataset.default_name,
             query,
+            request_id: req_id,
             buffer_size,
             max_chunks: config.max_chunks_per_stream,
             timeout_quantile,
@@ -657,6 +665,7 @@ fn restrict_request(config: &Config, request: ClientRequest) -> ClientRequest {
         query: request.query,
         dataset_id: request.dataset_id,
         dataset_name: request.dataset_name,
+        request_id: request.request_id,
         buffer_size: request.buffer_size.min(config.max_buffer_size),
         max_chunks: request.max_chunks.min(config.max_chunks_per_stream),
         timeout_quantile: config.default_timeout_quantile,
