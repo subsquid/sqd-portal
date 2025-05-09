@@ -1,6 +1,3 @@
 /target
 .env
 gateway.key
-
-swp
-**/*.*.swp
