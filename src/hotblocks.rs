@@ -6,11 +6,14 @@ use prometheus_client::{
     metrics::{family::Family, gauge::Gauge},
     registry::{Registry, Unit},
 };
-use sqd_hotblocks::{DatabaseSettings, HotblocksServer};
+use sqd_data_client::reqwest::ReqwestDataClient;
+use sqd_hotblocks::{
+    DatabaseSettings, Node as HotblocksServer, NodeBuilder as HotblocksServerBuilder,
+};
 
 use crate::config::Config;
 
-pub fn build_server(config: &Config) -> anyhow::Result<Option<HotblocksServer>> {
+pub async fn build_server(config: &Config) -> anyhow::Result<Option<HotblocksServer>> {
     let has_sources = config.datasets.iter().any(|(_, d)| d.real_time.is_some());
     if !has_sources {
         return Ok(None);
@@ -23,7 +26,7 @@ pub fn build_server(config: &Config) -> anyhow::Result<Option<HotblocksServer>> 
         .expect("Hotblocks database path not specified");
     let db = Arc::new(
         DatabaseSettings::default()
-            .set_data_cache_size(config.hotblocks_data_cache_mb)
+            .with_data_cache_size(config.hotblocks_data_cache_mb)
             .with_rocksdb_stats(true)
             .open(path)
             .context("failed to open hotblocks database")?,
@@ -31,22 +34,26 @@ pub fn build_server(config: &Config) -> anyhow::Result<Option<HotblocksServer>> 
 
     tokio::spawn(run_db_cleanup(db.clone()));
 
-    let mut builder = sqd_hotblocks::HotblocksServerBuilder::new(db);
+    let mut builder = HotblocksServerBuilder::new(db);
 
     for (default_name, dataset) in config.datasets.iter() {
         if let Some(hotblocks) = &dataset.real_time {
-            let ds = builder.add_dataset(
-                hotblocks.kind,
+            let http_client = sqd_data_client::reqwest::default_http_client();
+            let data_sources = hotblocks
+                .data_sources
+                .iter()
+                .map(|url| ReqwestDataClient::new(http_client.clone(), url.clone()))
+                .collect();
+            builder.add_dataset(
                 default_name.parse().map_err(|s| anyhow::anyhow!("{}", s))?,
+                hotblocks.kind,
+                data_sources,
                 hotblocks.retention.clone(),
             );
-            for url in &hotblocks.data_sources {
-                ds.add_data_source(url.clone());
-            }
         }
     }
 
-    Ok(Some(builder.build()))
+    Ok(Some(builder.build().await?))
 }
 
 async fn run_db_cleanup(db: sqd_hotblocks::DBRef) {
@@ -55,7 +62,7 @@ async fn run_db_cleanup(db: sqd_hotblocks::DBRef) {
         let db = db.clone();
         let result = tokio::task::spawn_blocking(move || db.cleanup()).await;
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(err)) => tracing::error!(error =? err, "database cleanup task failed"),
             Err(_) => tracing::error!("database cleanup task panicked"),
         }
@@ -108,7 +115,10 @@ impl MetricsCollector {
 
             let head = self.hotblocks.get_head(id).unwrap();
             let finalized_head = self.hotblocks.get_finalized_head(id).unwrap();
-            let first_block = self.hotblocks.get_first_block(id).unwrap();
+            let first_block = self
+                .hotblocks
+                .get_first_block(id)
+                .expect("First block should be read successfully from the hotblocks storage");
 
             if let Some(head) = head {
                 metrics.head.get_or_create(&labels).set(head.number as i64);
@@ -119,10 +129,12 @@ impl MetricsCollector {
                     .get_or_create(&labels)
                     .set(finalized_head.number as i64);
             }
-            metrics
-                .first_block
-                .get_or_create(&labels)
-                .set(first_block as i64);
+            if let Some(first_block) = first_block {
+                metrics
+                    .first_block
+                    .get_or_create(&labels)
+                    .set(first_block as i64);
+            }
         }
 
         metrics

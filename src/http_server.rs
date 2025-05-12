@@ -18,7 +18,7 @@ use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
 use sqd_hotblocks::error::UnknownDataset;
-use sqd_hotblocks::HotblocksServer;
+use sqd_hotblocks::Node as HotblocksServer;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;

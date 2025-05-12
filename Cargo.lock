@@ -7089,7 +7089,7 @@ dependencies = [
 [[package]]
 name = "sqd-array"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7101,7 +7101,7 @@ dependencies = [
 [[package]]
 name = "sqd-bloom-filter"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
 dependencies = [
  "xxhash-rust",
 ]
@@ -7128,7 +7128,7 @@ dependencies = [
 [[package]]
 name = "sqd-data"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7145,7 +7145,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-client"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7159,7 +7159,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-core"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7173,7 +7173,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-source"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
 dependencies = [
  "anyhow",
  "futures 0.3.31",
@@ -7186,36 +7186,7 @@ dependencies = [
 [[package]]
 name = "sqd-dataset"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
-
-[[package]]
-name = "sqd-hotblocks"
-version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
-dependencies = [
- "anyhow",
- "bytes 1.9.0",
- "either",
- "flate2",
- "futures 0.3.31",
- "ouroboros",
- "parking_lot 0.12.3",
- "reqwest 0.12.12 (git+https://github.com/subsquid/reqwest.git?rev=620aa86a)",
- "scopeguard",
- "serde",
- "serde_json",
- "sqd-data",
- "sqd-data-client",
- "sqd-data-core",
- "sqd-data-source",
- "sqd-dataset",
- "sqd-polars",
- "sqd-primitives",
- "sqd-query",
- "sqd-storage",
- "tokio 1.43.0",
- "tracing",
-]
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
 
 [[package]]
 name = "sqd-messages"
@@ -7275,9 +7246,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqd-node"
+version = "0.1.0"
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
+dependencies = [
+ "anyhow",
+ "bytes 1.9.0",
+ "chrono",
+ "either",
+ "flate2",
+ "futures 0.3.31",
+ "ouroboros",
+ "parking_lot 0.12.3",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "sqd-data",
+ "sqd-data-client",
+ "sqd-data-core",
+ "sqd-data-source",
+ "sqd-dataset",
+ "sqd-polars",
+ "sqd-primitives",
+ "sqd-query",
+ "sqd-storage",
+ "tokio 1.43.0",
+ "tracing",
+]
+
+[[package]]
 name = "sqd-polars"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7288,7 +7288,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.6.0-rc13"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -7316,9 +7316,10 @@ dependencies = [
  "serde_with",
  "serde_yaml",
  "sqd-contract-client",
- "sqd-hotblocks",
+ "sqd-data-client",
  "sqd-messages",
  "sqd-network-transport",
+ "sqd-node",
  "sqd-primitives",
  "static_assertions",
  "thiserror 1.0.69",
@@ -7337,16 +7338,17 @@ dependencies = [
 [[package]]
 name = "sqd-primitives"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
 dependencies = [
  "borsh",
  "serde",
+ "valuable",
 ]
 
 [[package]]
 name = "sqd-query"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7368,7 +7370,7 @@ dependencies = [
 [[package]]
 name = "sqd-storage"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=7ea3778#7ea377869f8e47d39e56ef20371890990a822b38"
+source = "git+https://github.com/subsquid/data.git?rev=4dfae72#4dfae724b3b55b1974b6e741f40fd2758d7d1194"
 dependencies = [
  "anyhow",
  "arrow",
@@ -8432,6 +8434,20 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+dependencies = [
+ "valuable-derive",
+]
+
+[[package]]
+name = "valuable-derive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e3a32a9bcc0f6c6ccfd5b27bcf298c58e753bcc9eeff268157a303393183a6d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.96",
+]
 
 [[package]]
 name = "value-trait"

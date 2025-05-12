@@ -207,7 +207,10 @@ where
 
     let model = Model::deserialize(de)?;
     match model {
-        Model::FromBlock(block) => Ok(RetentionStrategy::FromBlock(block)),
-        Model::Head(block) => Ok(RetentionStrategy::Head(block)),
+        Model::FromBlock(block) => Ok(RetentionStrategy::FromBlock {
+            number: block,
+            parent_hash: None,
+        }),
+        Model::Head(blocks) => Ok(RetentionStrategy::Head(blocks)),
     }
 }

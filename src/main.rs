@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?));
 
     let config = Arc::new(args.config);
-    let hotblocks = hotblocks::build_server(&config)?.map(Arc::new);
+    let hotblocks = hotblocks::build_server(&config).await?.map(Arc::new);
     let network_client = NetworkClient::new(
         args.transport,
         config.clone(),
