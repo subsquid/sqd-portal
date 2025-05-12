@@ -63,6 +63,9 @@ impl ParsedQuery {
             Query::Fuel(ref mut q) => {
                 q.parent_block_hash = None;
             }
+            Query::Hyperliquid(ref mut q) => {
+                q.parent_block_hash = None;
+            }
         }
         self.raw = self.parsed.to_json_string()
     }

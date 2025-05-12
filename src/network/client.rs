@@ -13,7 +13,7 @@ use num_traits::ToPrimitive;
 use parking_lot::{Mutex, RwLock};
 use semver::VersionReq;
 use serde::Serialize;
-use sqd_hotblocks::HotblocksServer;
+use sqd_hotblocks::Node as HotblocksServer;
 use sqd_primitives::BlockRef;
 use tokio::task::JoinError;
 use tokio::time::MissedTickBehavior;
@@ -410,7 +410,10 @@ impl NetworkClient {
                         );
                         hotblocks.retain(
                             name,
-                            sqd_hotblocks::RetentionStrategy::FromBlock(height + 1),
+                            sqd_hotblocks::RetentionStrategy::FromBlock {
+                                number: height + 1,
+                                parent_hash: None,
+                            },
                         );
                     }),
                 );
@@ -534,7 +537,9 @@ impl NetworkClient {
             Ok(q) if !q.verify_signature(peer_id) => {
                 metrics::report_query_result(peer_id, "validation_error");
                 self.network_state.lock().report_query_failure(peer_id);
-                Err(QueryError::Retriable(format!("invalid worker signature from {peer_id}, result: {q:?}")))
+                Err(QueryError::Retriable(format!(
+                    "invalid worker signature from {peer_id}, result: {q:?}"
+                )))
             }
             Ok(sqd_messages::QueryResult {
                 result: Some(result),
@@ -558,7 +563,9 @@ impl NetworkClient {
                             Err::BadRequest(s) => {
                                 metrics::report_query_result(peer_id, "bad_request");
                                 self.network_state.lock().report_query_success(peer_id);
-                                Err(QueryError::BadRequest(format!("couldn't parse request: {s}")))
+                                Err(QueryError::BadRequest(format!(
+                                    "couldn't parse request: {s}"
+                                )))
                             }
                             Err::NotFound(s) => {
                                 metrics::report_query_result(peer_id, "not_found");
@@ -596,19 +603,27 @@ impl NetworkClient {
             }
             Err(QueryFailure::InvalidRequest(e)) => {
                 metrics::report_query_result(peer_id, "bad_request");
-                Err(QueryError::BadRequest(format!("couldn't send request: {e}")))
+                Err(QueryError::BadRequest(format!(
+                    "couldn't send request: {e}"
+                )))
             }
             Err(QueryFailure::InvalidResponse(e)) => {
                 metrics::report_query_result(peer_id, "invalid");
                 self.network_state.lock().report_query_error(peer_id);
-                Err(QueryError::Retriable(format!("couldn't decode response: {e}")))
+                Err(QueryError::Retriable(format!(
+                    "couldn't decode response: {e}"
+                )))
             }
             Err(QueryFailure::Timeout(t)) => {
                 metrics::report_query_result(peer_id, "timeout");
                 self.network_state.lock().report_query_failure(peer_id);
                 let msg = match t {
-                    sqd_network_transport::StreamClientTimeout::Connect => "timed out connecting to the peer",
-                    sqd_network_transport::StreamClientTimeout::Request => "timed out reading response"
+                    sqd_network_transport::StreamClientTimeout::Connect => {
+                        "timed out connecting to the peer"
+                    }
+                    sqd_network_transport::StreamClientTimeout::Request => {
+                        "timed out reading response"
+                    }
                 };
                 Err(QueryError::Retriable(msg.to_owned()))
             }
