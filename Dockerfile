@@ -6,6 +6,7 @@ FROM --platform=$BUILDPLATFORM chef AS planner
 COPY Cargo.toml .
 COPY Cargo.lock .
 COPY src ./src
+COPY .cargo/ ./.cargo
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -24,6 +25,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY Cargo.toml .
 COPY Cargo.lock .
 COPY src ./src
+COPY .cargo/ ./.cargo
 
 RUN cargo build --release --workspace
 
