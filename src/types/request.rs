@@ -14,6 +14,9 @@ pub struct ClientRequest {
     pub retries: u8,
 }
 
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
     raw: String,

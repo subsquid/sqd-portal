@@ -2,7 +2,10 @@ use axum::{extract::Request, response::IntoResponse};
 use tokio::time::{Duration, Instant};
 use tracing::Instrument;
 
-use crate::{metrics, types::ClientRequest};
+use crate::{
+    metrics,
+    types::{ClientRequest, RequestId},
+};
 
 const LOG_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -93,7 +96,7 @@ pub async fn middleware(mut req: Request, next: axum::middleware::Next) -> impl 
 
     let span = tracing::span!(tracing::Level::INFO, "http_request", request_id);
 
-    req.extensions_mut().insert(request_id);
+    req.extensions_mut().insert(RequestId(request_id));
     let response = next.run(req).instrument(span.clone()).await;
 
     let latency = start.elapsed();

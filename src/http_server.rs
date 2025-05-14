@@ -30,7 +30,7 @@ use crate::{
     config::Config,
     controller::task_manager::TaskManager,
     network::{NetworkClient, NoWorker},
-    types::{ChunkId, ClientRequest, DatasetId, ParsedQuery, RequestError},
+    types::{ChunkId, ClientRequest, DatasetId, ParsedQuery, RequestError, RequestId},
     utils::logging,
 };
 
@@ -543,10 +543,11 @@ where
             .await
             .map_err(IntoResponse::into_response)?;
 
-        let Extension(req_id) = req
-            .extract_parts::<Extension<String>>()
+        let Extension(RequestId(req_id)) = req
+            .extract_parts::<Extension<RequestId>>()
             .await
-            .unwrap_or(Extension(uuid::Uuid::nil().to_string()));
+            .unwrap_or(Extension(RequestId(uuid::Uuid::nil().to_string())));
+
         let Query(params) = req
             .extract_parts::<Query<HashMap<String, String>>>()
             .await
