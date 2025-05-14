@@ -543,12 +543,10 @@ where
             .await
             .map_err(IntoResponse::into_response)?;
 
-        let req_id = req
-            .headers()
-            .get("x-request-id")
-            .map(|v| v.to_str().unwrap_or_default().to_owned())
-            .unwrap_or_else(|| uuid::Uuid::nil().to_string());
-
+        let Extension(req_id) = req
+            .extract_parts::<Extension<String>>()
+            .await
+            .unwrap_or(Extension(uuid::Uuid::nil().to_string()));
         let Query(params) = req
             .extract_parts::<Query<HashMap<String, String>>>()
             .await

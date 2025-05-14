@@ -80,7 +80,7 @@ impl StreamStats {
     }
 }
 
-pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl IntoResponse {
+pub async fn middleware(mut req: Request, next: axum::middleware::Next) -> impl IntoResponse {
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let version = req.version();
@@ -93,6 +93,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
 
     let span = tracing::span!(tracing::Level::INFO, "http_request", request_id);
 
+    req.extensions_mut().insert(request_id);
     let response = next.run(req).instrument(span.clone()).await;
 
     let latency = start.elapsed();
