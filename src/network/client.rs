@@ -478,6 +478,7 @@ impl NetworkClient {
     pub async fn query_worker(
         self: Arc<Self>,
         worker: PeerId,
+        request_id: String,
         chunk_id: ChunkId,
         block_range: BlockRange,
         query: String,
@@ -493,6 +494,7 @@ impl NetworkClient {
         let mut query = Query {
             dataset: chunk_id.dataset.to_url().to_owned(),
             query_id: query_id.clone(),
+            request_id: request_id,
             query,
             block_range: Some(sqd_messages::Range {
                 begin: *block_range.start(),

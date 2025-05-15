@@ -440,6 +440,7 @@ impl StreamController {
             .clone()
             .query_worker(
                 worker,
+                self.request.request_id.to_string(),
                 ChunkId::new(self.request.dataset_id.clone(), range.chunk),
                 range.range.clone(),
                 self.request.query.to_string(),
