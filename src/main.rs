@@ -103,8 +103,7 @@ async fn main() -> anyhow::Result<()> {
     );
     if let Some(hotblocks) = &hotblocks {
         hotblocks::register_metrics(
-            metrics_registry.sub_registry_with_prefix("portal_hotblocks"),
-            hotblocks.clone(),
+            metrics_registry.sub_registry_with_prefix("portal_hotblocks")
         );
     }
 

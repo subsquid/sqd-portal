@@ -24,6 +24,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::datasets::DatasetConfig;
+use crate::hotblocks::HOTBLOCKS_MONITOR;
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::utils::conversion::{json_lines_to_json, recompress_gzip};
 use crate::{
@@ -372,7 +373,8 @@ async fn get_all_workers(
     }))
 }
 
-async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {
+async fn get_metrics(Extension(registry): Extension<Arc<Registry>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>) -> impl IntoResponse {
     lazy_static::lazy_static! {
         static ref HEADERS: HeaderMap = {
             let mut headers = HeaderMap::new();
@@ -387,6 +389,7 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
     }
 
     let mut buffer = String::new();
+    HOTBLOCKS_MONITOR.collect(hotblocks).await;
     prometheus_client::encoding::text::encode(&mut buffer, &registry).unwrap();
 
     (HEADERS.clone(), buffer)
