@@ -1,8 +1,9 @@
-use std::{io::Read, sync::Arc, time::{Duration, Instant}};
+use std::{sync::Arc, time::{Duration, Instant}};
 
 use anyhow::Context;
 use flate2::bufread::GzDecoder;
 use serde::Deserialize;
+use tokio_util::bytes::Buf;
 use sqd_primitives::{sid::SID, BlockRef};
 use parking_lot::Mutex;
 use prometheus_client::{
@@ -192,11 +193,8 @@ impl HotblocksMonitor {
         let mut result = hotblocks.query(id, query).await?;
 
         let bytes = result.next_bytes().await?.unwrap_or_default();
-        let qqq = bytes.to_vec();
-        let mut d = GzDecoder::new(qqq.as_slice());
-        let mut s = String::new();
-        d.read_to_string(&mut s).unwrap();
-        let res = serde_json::from_str::<TSResponse>(&s)?;
+        let decoder = GzDecoder::new(bytes.chunk());
+        let res = serde_json::from_reader::<GzDecoder<&[u8]>, TSResponse>(decoder)?;
         Ok(res.header.timestamp)
     }
 

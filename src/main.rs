@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     sqd_network_transport::metrics::register_metrics(
         metrics_registry.sub_registry_with_prefix("transport"),
     );
-    if let Some(hotblocks) = &hotblocks {
+    if let Some(_) = &hotblocks {
         hotblocks::register_metrics(
             metrics_registry.sub_registry_with_prefix("portal_hotblocks")
         );
