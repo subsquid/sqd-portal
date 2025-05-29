@@ -373,8 +373,10 @@ async fn get_all_workers(
     }))
 }
 
-async fn get_metrics(Extension(registry): Extension<Arc<Registry>>,
-    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>) -> impl IntoResponse {
+async fn get_metrics(
+    Extension(registry): Extension<Arc<Registry>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+) -> impl IntoResponse {
     lazy_static::lazy_static! {
         static ref HEADERS: HeaderMap = {
             let mut headers = HeaderMap::new();

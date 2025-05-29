@@ -1,10 +1,9 @@
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
-use flate2::bufread::GzDecoder;
-use serde::Deserialize;
-use tokio_util::bytes::Buf;
-use sqd_primitives::{sid::SID, BlockRef};
 use parking_lot::Mutex;
 use prometheus_client::{
     encoding::{DescriptorEncoder, EncodeMetric},
@@ -13,7 +12,7 @@ use prometheus_client::{
 };
 use sqd_data_client::reqwest::ReqwestDataClient;
 use sqd_hotblocks::{
-    DatabaseSettings, Node as HotblocksServer, NodeBuilder as HotblocksServerBuilder, Query,
+    DatabaseSettings, Node as HotblocksServer, NodeBuilder as HotblocksServerBuilder,
 };
 
 use crate::config::Config;
@@ -75,12 +74,11 @@ async fn run_db_cleanup(db: sqd_hotblocks::DBRef) {
 }
 
 pub fn register_metrics(registry: &mut Registry) {
-    let collector = Box::new(MetricsCollector { });
+    let collector = Box::new(MetricsCollector {});
     registry.register_collector(collector);
 }
 
-struct MetricsCollector {
-}
+struct MetricsCollector {}
 
 impl prometheus_client::collector::Collector for MetricsCollector {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
@@ -168,34 +166,14 @@ impl std::fmt::Debug for MetricsCollector {
 }
 
 pub struct HotblocksMonitor {
-    metrics: Mutex<Option<Metrics>>
-}
-
-#[derive(Deserialize)]
-struct TSHeader {
-    timestamp: u64,
-}
-
-#[derive(Deserialize)]
-struct TSResponse {
-    header: TSHeader
+    metrics: Mutex<Option<Metrics>>,
 }
 
 impl HotblocksMonitor {
     pub fn new() -> Self {
-        HotblocksMonitor { metrics: Mutex::new(None) }
-    }
-
-    async fn extract_timestamp(hotblocks: &Arc<HotblocksServer>, id: SID<48>, head: &BlockRef) -> Result<u64, anyhow::Error> {
-        let num = head.number;
-        let str_query = format!("{{\"fromBlock\":{num},\"toBlock\":{num},\"type\":\"solana\",\"fields\":{{\"block\":{{\"timestamp\":true}} }} }}");
-        let query = Query::from_json_bytes(str_query.as_bytes()).unwrap();
-        let mut result = hotblocks.query(id, query).await?;
-
-        let bytes = result.next_bytes().await?.unwrap_or_default();
-        let decoder = GzDecoder::new(bytes.chunk());
-        let res = serde_json::from_reader::<GzDecoder<&[u8]>, TSResponse>(decoder)?;
-        Ok(res.header.timestamp)
+        HotblocksMonitor {
+            metrics: Mutex::new(None),
+        }
     }
 
     pub async fn collect(&self, hotblocks: Option<Arc<HotblocksServer>>) {
@@ -230,21 +208,25 @@ impl HotblocksMonitor {
                     tracing::error!(error = ?err, "failed to get hotblocks database metrics");
                 }
             }
-    
+
             for id in hotblocks.get_all_datasets() {
                 let labels = [("dataset_name", id.as_str().to_owned())];
-    
+
                 let head = hotblocks.get_head(id).unwrap();
+                let timestamp = hotblocks.get_timestamp(id).unwrap();
                 let finalized_head = hotblocks.get_finalized_head(id).unwrap();
                 let first_block = hotblocks
                     .get_first_block(id)
                     .expect("First block should be read successfully from the hotblocks storage");
-    
+
                 if let Some(head) = head {
-                    if let Ok(timestamp) = Self::extract_timestamp(&hotblocks, id, &head).await {
-                        metrics.head_timestamp.get_or_create(&labels).set(timestamp as i64);
-                    }
                     metrics.head.get_or_create(&labels).set(head.number as i64);
+                }
+                if let Some(timestamp) = timestamp {
+                    metrics
+                        .head_timestamp
+                        .get_or_create(&labels)
+                        .set(timestamp as i64);
                 }
                 if let Some(finalized_head) = finalized_head {
                     metrics
@@ -252,12 +234,10 @@ impl HotblocksMonitor {
                         .get_or_create(&labels)
                         .set(finalized_head.number as i64);
                 }
-                if let Some(first_block) = first_block {
-                    metrics
-                        .first_block
-                        .get_or_create(&labels)
-                        .set(first_block as i64);
-                }
+                metrics
+                    .first_block
+                    .get_or_create(&labels)
+                    .set(first_block as i64);
             }
             let duration = start.elapsed();
             metrics.time_spent.set(duration.subsec_millis().into());

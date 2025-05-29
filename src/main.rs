@@ -102,9 +102,7 @@ async fn main() -> anyhow::Result<()> {
         metrics_registry.sub_registry_with_prefix("transport"),
     );
     if let Some(_) = &hotblocks {
-        hotblocks::register_metrics(
-            metrics_registry.sub_registry_with_prefix("portal_hotblocks")
-        );
+        hotblocks::register_metrics(metrics_registry.sub_registry_with_prefix("portal_hotblocks"));
     }
 
     tracing::info!("Network client initialized");
