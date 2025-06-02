@@ -13,7 +13,6 @@ use num_traits::ToPrimitive;
 use parking_lot::{Mutex, RwLock};
 use semver::VersionReq;
 use serde::Serialize;
-use sqd_hotblocks::Node as HotblocksServer;
 use sqd_primitives::BlockRef;
 use tokio::task::JoinError;
 use tokio::time::MissedTickBehavior;
@@ -34,6 +33,7 @@ use super::priorities::NoWorker;
 use super::storage::DatasetIndex;
 use super::{ChunkNotFound, NetworkState, StorageClient};
 use crate::datasets::{DatasetConfig, Datasets};
+use crate::hotblocks::HotblocksHandle;
 use crate::types::api_types::WorkerDebugInfo;
 use crate::types::{BlockNumber, BlockRange, ChunkId, DataChunk};
 use crate::{
@@ -86,7 +86,7 @@ pub struct NetworkClient {
     transport_handle: GatewayTransport,
     network_state: Mutex<NetworkState>,
     datasets: Arc<RwLock<Datasets>>,
-    hotblocks: Option<Arc<HotblocksServer>>,
+    hotblocks: Option<Arc<HotblocksHandle>>,
     contract_client: Box<dyn ContractClient>,
     dataset_storage: StorageClient,
     chain_update_interval: Duration,
@@ -109,7 +109,7 @@ impl NetworkClient {
         args: TransportArgs,
         config: Arc<Config>,
         datasets: Arc<RwLock<Datasets>>,
-        hotblocks: Option<Arc<HotblocksServer>>,
+        hotblocks: Option<Arc<HotblocksHandle>>,
     ) -> anyhow::Result<Arc<NetworkClient>> {
         let network = args.rpc.network;
         let dataset_storage = StorageClient::new(datasets.clone());
@@ -408,7 +408,7 @@ impl NetworkClient {
                         tracing::info!(
                             "Cleaning hotblocks storage for '{name}' up to block {height}"
                         );
-                        hotblocks.retain(
+                        hotblocks.server.retain(
                             name,
                             sqd_hotblocks::RetentionStrategy::FromBlock {
                                 number: height + 1,

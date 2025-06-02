@@ -2,7 +2,8 @@ hostname: http://0.0.0.0:8000
 sqd_network:
   datasets: https://cdn.subsquid.io/sqd-network/datasets-testnet.yml
   serve: "all"
-hotblocks_db_path: ./db
+hotblocks:
+  db: ./db
 datasets:
   "solana-beta":
     sqd_network:

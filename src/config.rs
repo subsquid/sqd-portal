@@ -2,6 +2,7 @@ use serde::Deserialize;
 use serde_with::serde_derive::Serialize;
 use serde_with::{serde_as, DurationSeconds};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 
@@ -77,16 +78,28 @@ pub struct Config {
 
     pub sqd_network: SqdNetworkConfig,
 
+    pub hotblocks: Option<HotblocksConfig>,
+
     #[serde(default)]
     pub datasets: DatasetsConfig,
 
-    pub hotblocks_db_path: Option<String>,
-
-    #[serde(default = "default_hotblocks_data_cache_mb")]
-    pub hotblocks_data_cache_mb: usize,
-
     #[serde(default)]
     pub worker_status_via_gossipsub: bool,
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HotblocksConfig {
+    pub db: PathBuf,
+
+    #[serde(default = "default_hotblocks_data_cache_mb")]
+    pub data_cache_mb: usize,
+
+    pub chunk_cache_mb: Option<usize>,
+
+    #[serde(default)]
+    pub direct_io: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

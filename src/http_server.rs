@@ -18,7 +18,6 @@ use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
 use sqd_hotblocks::error::UnknownDataset;
-use sqd_hotblocks::Node as HotblocksServer;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
@@ -29,6 +28,7 @@ use crate::utils::conversion::{json_lines_to_json, recompress_gzip};
 use crate::{
     config::Config,
     controller::task_manager::TaskManager,
+    hotblocks::HotblocksHandle,
     network::{NetworkClient, NoWorker},
     types::{ChunkId, ClientRequest, DatasetId, ParsedQuery, RequestError, RequestId},
     utils::logging,
@@ -40,7 +40,7 @@ pub async fn run_server(
     metrics_registry: Registry,
     addr: SocketAddr,
     config: Arc<Config>,
-    hotblocks: Option<Arc<HotblocksServer>>,
+    hotblocks: Option<Arc<HotblocksHandle>>,
 ) -> anyhow::Result<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
@@ -77,6 +77,7 @@ pub async fn run_server(
         // end backward compatibility routes
         .route("/status", get(get_status))
         .route("/debug/db_stats", get(get_db_stats))
+        .route("/debug/db_property/:cf/:name", get(get_db_property))
         .route("/debug/workers", get(get_all_workers))
         .route("/datasets/:dataset/:block/debug", get(get_debug_block))
         .layer(axum::middleware::from_fn(logging::middleware))
@@ -98,7 +99,7 @@ pub async fn run_server(
 }
 
 async fn get_finalized_head(
-    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksHandle>>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     dataset: DatasetConfig,
 ) -> Response {
@@ -121,7 +122,10 @@ async fn get_finalized_head(
         }
 
         (Some(hotblocks), dataset) if dataset.hotblocks.is_some() => {
-            match hotblocks.get_finalized_head(dataset.default_name.parse().unwrap()) {
+            match hotblocks
+                .server
+                .get_finalized_head(dataset.default_name.parse().unwrap())
+            {
                 Ok(head) => axum::Json(head).into_response(),
                 Err(UnknownDataset { .. }) => {
                     unreachable!("dataset should be known by the hotblocks service")
@@ -140,13 +144,16 @@ async fn get_finalized_head(
 }
 
 async fn get_head(
-    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksHandle>>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     dataset: DatasetConfig,
 ) -> Response {
     match (hotblocks, dataset) {
         (Some(hotblocks), dataset) if dataset.hotblocks.is_some() => {
-            match hotblocks.get_head(dataset.default_name.parse().unwrap()) {
+            match hotblocks
+                .server
+                .get_head(dataset.default_name.parse().unwrap())
+            {
                 Ok(head) => axum::Json(head).into_response(),
                 Err(UnknownDataset { .. }) => {
                     unreachable!("dataset should be known by the hotblocks service")
@@ -221,7 +228,7 @@ async fn run_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
     Extension(network): Extension<Arc<NetworkClient>>,
-    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksHandle>>>,
     dataset: DatasetConfig,
     request: ClientRequest,
 ) -> Response {
@@ -248,6 +255,7 @@ async fn run_stream(
         // Then try hotblocks storage
         (_, Some(hotblocks)) if dataset.hotblocks.is_some() => {
             let result = hotblocks
+                .server
                 .query(
                     (*dataset.default_name).try_into().unwrap(),
                     request.query.into_parsed(),
@@ -334,7 +342,7 @@ async fn get_dataset_metadata(
 }
 
 async fn get_db_stats(
-    Extension(hotblocks): Extension<Option<Arc<HotblocksServer>>>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksHandle>>>,
 ) -> impl IntoResponse {
     let Some(hotblocks) = hotblocks else {
         return (
@@ -344,13 +352,35 @@ async fn get_db_stats(
             .into_response();
     };
 
-    match hotblocks.get_db_statistics() {
+    match hotblocks.db.get_statistics() {
         Some(stats) => stats.into_response(),
         None => (
             StatusCode::NOT_FOUND,
             "Failed to get hotblocks database statistics".to_string(),
         )
             .into_response(),
+    }
+}
+
+async fn get_db_property(
+    Path((cf, property)): Path<(String, String)>,
+    Extension(hotblocks): Extension<Option<Arc<HotblocksHandle>>>,
+) -> Response {
+    let Some(hotblocks) = hotblocks else {
+        return (
+            StatusCode::NOT_FOUND,
+            "Hotblocks storage is not enabled".to_string(),
+        )
+            .into_response();
+    };
+
+    match hotblocks.db.get_property(&cf, &property) {
+        Ok(Some(stats)) => stats.into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Not found".to_string()).into_response(),
+        Err(e) => {
+            tracing::error!("Failed to get hotblocks database property: {e:?}");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
