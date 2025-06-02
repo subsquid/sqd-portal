@@ -105,15 +105,25 @@ impl MetricsCollector {
             let head = self.hotblocks.server.get_head(*dataset).unwrap();
             let finalized_head = self.hotblocks.server.get_finalized_head(*dataset).unwrap();
 
-            let first_block = self
-                .hotblocks
-                .db
-                .snapshot()
+            let snapshot = self.hotblocks.db.snapshot();
+            let first_chunk = snapshot
                 .get_first_chunk(*dataset)
-                .inspect_err(|e| tracing::warn!(error = ?e, dataset = %dataset, "failed to get first chunk from hotblocks DB"))
+                .inspect_err(|e| {
+                    tracing::warn!(error = ?e, dataset = %dataset, "failed to get first chunk from hotblocks DB")
+                })
                 .ok()
-                .flatten()
-                .map(|chunk| chunk.first_block());
+                .flatten();
+            let first_block = first_chunk.as_ref().map(|chunk| chunk.first_block());
+            let first_block_timestamp = first_chunk.and_then(|chunk| chunk.first_block_time());
+
+            let last_chunk = snapshot
+                .get_last_chunk(*dataset)
+                .inspect_err(|e| {
+                    tracing::warn!(error = ?e, dataset = %dataset, "failed to get last chunk from hotblocks DB")
+                })
+                .ok()
+                .flatten();
+            let last_block_timestamp = last_chunk.and_then(|chunk| chunk.last_block_time());
 
             if let Some(head) = head {
                 metrics.head.get_or_create(&labels).set(head.number as i64);
@@ -129,6 +139,18 @@ impl MetricsCollector {
                     .first_block
                     .get_or_create(&labels)
                     .set(first_block as i64);
+            }
+            if let Some(timestamp) = first_block_timestamp {
+                metrics
+                    .first_block_timestamp
+                    .get_or_create(&labels)
+                    .set(timestamp as i64);
+            }
+            if let Some(timestamp) = last_block_timestamp {
+                metrics
+                    .last_block_timestamp
+                    .get_or_create(&labels)
+                    .set(timestamp as i64);
             }
         }
 
@@ -158,6 +180,22 @@ impl prometheus_client::collector::Collector for MetricsCollector {
             None,
             metrics.first_block.metric_type(),
         )?)?;
+        metrics
+            .first_block_timestamp
+            .encode(encoder.encode_descriptor(
+                "first_block_timestamp",
+                "The timestamp of the first block in the hotblocks storage",
+                None,
+                metrics.first_block_timestamp.metric_type(),
+            )?)?;
+        metrics
+            .last_block_timestamp
+            .encode(encoder.encode_descriptor(
+                "last_block_timestamp",
+                "The timestamp of the last block in the hotblocks storage",
+                None,
+                metrics.last_block_timestamp.metric_type(),
+            )?)?;
 
         Ok(())
     }
@@ -170,6 +208,8 @@ struct Metrics {
     head: Family<Labels, Gauge>,
     finalized_head: Family<Labels, Gauge>,
     first_block: Family<Labels, Gauge>,
+    first_block_timestamp: Family<Labels, Gauge>,
+    last_block_timestamp: Family<Labels, Gauge>,
 }
 
 impl std::fmt::Debug for MetricsCollector {
