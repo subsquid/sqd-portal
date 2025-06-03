@@ -1,6 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
 
-use parking_lot::RwLock;
 use sqd_messages::assignments;
 use sqd_primitives::BlockRef;
 
@@ -8,6 +7,7 @@ use crate::{
     datasets::Datasets,
     metrics,
     types::{BlockNumber, DataChunk, DatasetId},
+    utils::RwLock,
 };
 
 pub struct DatasetIndex {
@@ -30,7 +30,7 @@ pub enum ChunkNotFound {
 impl StorageClient {
     pub fn new(datasets_config: Arc<RwLock<Datasets>>) -> Self {
         Self {
-            datasets: RwLock::default(),
+            datasets: RwLock::new(Default::default(), "StorageClient::datasets"),
             datasets_config,
         }
     }

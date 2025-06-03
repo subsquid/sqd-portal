@@ -1,4 +1,3 @@
-use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,6 +11,7 @@ use crate::datasets::Datasets;
 use crate::metrics;
 use crate::types::api_types::WorkerDebugInfo;
 use crate::types::DatasetId;
+use crate::utils::RwLock;
 
 use super::priorities::{NoWorker, WorkersPool};
 

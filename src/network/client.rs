@@ -10,7 +10,6 @@ use futures::{Stream, StreamExt};
 use itertools::Itertools;
 use num_rational::Ratio;
 use num_traits::ToPrimitive;
-use parking_lot::{Mutex, RwLock};
 use semver::VersionReq;
 use serde::Serialize;
 use sqd_primitives::BlockRef;
@@ -36,6 +35,7 @@ use crate::datasets::{DatasetConfig, Datasets};
 use crate::hotblocks::HotblocksHandle;
 use crate::types::api_types::WorkerDebugInfo;
 use crate::types::{BlockNumber, BlockRange, ChunkId, DataChunk};
+use crate::utils::{Mutex, RwLock};
 use crate::{
     config::Config,
     metrics,
@@ -144,7 +144,7 @@ impl NetworkClient {
             assignment_update_interval: config.assignments_update_interval,
             transport_handle,
             incoming_events: UseOnce::new(Box::new(incoming_events)),
-            network_state: Mutex::new(state),
+            network_state: Mutex::new(state, "NetworkClient::network_state"),
             datasets,
             hotblocks,
             contract_client,
@@ -152,14 +152,14 @@ impl NetworkClient {
             local_peer_id,
             keypair,
             network_state_url,
-            assignments: RwLock::default(),
+            assignments: RwLock::new(BTreeMap::new(), "NetworkClient::assignments"),
             assignments_stored: config.assignments_stored,
-            heartbeat_buffer: Mutex::default(),
+            heartbeat_buffer: Mutex::new(Default::default(), "NetworkClient::heartbeat_buffer"),
             supported_versions: config.worker_versions.clone(),
             readiness: Arc::new(AtomicReadinessState::new(
                 ReadinessState::FirstHeartbeatMissing,
             )),
-            contracts_state: Default::default(),
+            contracts_state: RwLock::new(Default::default(), "NetworkClient::contracts_state"),
         });
 
         this.reset_height_updates();

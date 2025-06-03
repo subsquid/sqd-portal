@@ -14,6 +14,20 @@ use sqd_contract_client::PeerId;
 
 use crate::{types::DatasetId, utils::logging::StreamStats};
 
+pub enum MutexLockMode {
+    Read,
+    Write,
+}
+
+impl ToString for MutexLockMode {
+    fn to_string(&self) -> String {
+        match self {
+            MutexLockMode::Read => "read".to_owned(),
+            MutexLockMode::Write => "write".to_owned(),
+        }
+    }
+}
+
 type Labels = Vec<(String, String)>;
 
 fn buckets(start: f64, count: usize) -> impl Iterator<Item = f64> {
@@ -57,6 +71,8 @@ lazy_static::lazy_static! {
     static ref LAST_STORAGE_BLOCK: Family<Labels, Gauge> = Default::default();
 
     // TODO: add metrics for procedure durations
+    static ref MUTEX_HELD_NANOS: Family<Labels, Counter> = Default::default();
+    static ref MUTEXES_EXISTING: Family<Labels, Gauge> = Default::default();
 }
 
 pub fn report_query_result(worker: PeerId, status: &str) {
@@ -141,6 +157,31 @@ pub fn report_chunk_list_updated(
     LAST_STORAGE_BLOCK
         .get_or_create(&labels)
         .set(last_block as i64);
+}
+
+pub fn report_mutex_created(name: &'static str) {
+    MUTEXES_EXISTING
+        .get_or_create(&vec![("name".to_owned(), name.to_owned())])
+        .inc();
+}
+
+pub fn report_mutex_destroyed(name: &'static str) {
+    MUTEXES_EXISTING
+        .get_or_create(&vec![("name".to_owned(), name.to_owned())])
+        .dec();
+}
+
+pub fn report_mutex_held_duration(
+    name: &'static str,
+    duration: std::time::Duration,
+    mode: MutexLockMode,
+) {
+    MUTEX_HELD_NANOS
+        .get_or_create(&vec![
+            ("name".to_owned(), name.to_owned()),
+            ("mode".to_owned(), mode.to_string()),
+        ])
+        .inc_by(duration.as_nanos() as u64);
 }
 
 pub fn register_metrics(registry: &mut Registry) {
@@ -254,5 +295,15 @@ pub fn register_metrics(registry: &mut Registry) {
         "dataset_storage_highest_block",
         "The highest block existing in the persistent storage",
         LAST_STORAGE_BLOCK.clone(),
+    );
+    registry.register(
+        "mutex_held_nanos",
+        "Time spent holding the mutex",
+        MUTEX_HELD_NANOS.clone(),
+    );
+    registry.register(
+        "mutexes_existing",
+        "Number of existing mutexes",
+        MUTEXES_EXISTING.clone(),
     );
 }

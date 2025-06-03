@@ -1,10 +1,11 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use lazy_static::lazy_static;
-use parking_lot::RwLock;
+
+use crate::utils::RwLock;
 
 lazy_static! {
-    static ref POOL: RwLock<BTreeSet<Arc<str>>> = RwLock::default();
+    static ref POOL: RwLock<BTreeSet<Arc<str>>> = RwLock::new(Default::default(), "StringPool");
 }
 
 pub fn intern_string(s: &str) -> Arc<str> {

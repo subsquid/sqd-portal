@@ -1,10 +1,10 @@
 use crate::{
     config::{Config, RealTimeConfig, ServeMode},
     types::{DatasetId, DatasetRef},
+    utils::RwLock,
 };
 use anyhow::Context;
 use bimap::BiBTreeMap;
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{btree_map::Entry, BTreeMap},

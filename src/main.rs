@@ -8,7 +8,6 @@ use controller::task_manager::TaskManager;
 use datasets::Datasets;
 use http_server::run_server;
 use network::NetworkClient;
-use parking_lot::RwLock;
 use prometheus_client::registry::Registry;
 use sqd_network_transport::TransportArgs;
 use tokio_util::sync::CancellationToken;
@@ -45,6 +44,8 @@ pub struct Cli {
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
 
+use crate::utils::RwLock;
+
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -78,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     setup_tracing(args.json_log);
 
-    let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?));
+    let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
 
     let config = Arc::new(args.config);
     let hotblocks = hotblocks::build_server(&config).await?.map(Arc::new);

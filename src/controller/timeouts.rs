@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, time::Duration};
 
-use parking_lot::Mutex;
+use crate::utils::Mutex;
 
 const WINDOW_SIZE: usize = 20;
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -15,7 +15,10 @@ impl TimeoutManager {
     pub fn new(quantile: f32) -> Self {
         Self {
             quantile,
-            durations: Mutex::new(VecDeque::with_capacity(WINDOW_SIZE)),
+            durations: Mutex::new(
+                VecDeque::with_capacity(WINDOW_SIZE),
+                "TimeoutManager::durations",
+            ),
         }
     }
 

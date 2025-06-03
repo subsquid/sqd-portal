@@ -97,6 +97,7 @@ pub async fn middleware(mut req: Request, next: axum::middleware::Next) -> impl 
     let span = tracing::span!(tracing::Level::INFO, "http_request", request_id);
 
     req.extensions_mut().insert(RequestId(request_id));
+
     let response = next.run(req).instrument(span.clone()).await;
 
     let latency = start.elapsed();
