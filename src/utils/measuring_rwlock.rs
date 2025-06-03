@@ -25,19 +25,17 @@ impl<T> MeasuringRwLock<T> {
     }
 
     pub fn read(&self) -> MeasuringRwLockReadGuard<'_, T> {
-        let start = std::time::Instant::now();
         MeasuringRwLockReadGuard {
             guard: self.rwlock.read().unwrap(),
-            start,
+            start: std::time::Instant::now(),
             name: self.name,
         }
     }
 
     pub fn write(&self) -> MeasuringRwLockWriteGuard<'_, T> {
-        let start = std::time::Instant::now();
         MeasuringRwLockWriteGuard {
             guard: self.rwlock.write().unwrap(),
-            start,
+            start: std::time::Instant::now(),
             name: self.name,
         }
     }

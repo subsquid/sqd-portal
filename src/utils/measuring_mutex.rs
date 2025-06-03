@@ -19,10 +19,9 @@ impl<T> MeasuringMutex<T> {
     }
 
     pub fn lock(&self) -> MeasuringMutexGuard<'_, T> {
-        let start = std::time::Instant::now();
         MeasuringMutexGuard {
             guard: self.mutex.lock().unwrap(),
-            start,
+            start: std::time::Instant::now(),
             name: self.name,
         }
     }
