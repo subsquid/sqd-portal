@@ -7288,7 +7288,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -7306,7 +7306,6 @@ dependencies = [
  "lazy_static",
  "num-rational",
  "num-traits",
- "parking_lot 0.12.3",
  "prometheus-client",
  "reqwest 0.12.12 (registry+https://github.com/rust-lang/crates.io-index)",
  "scopeguard",

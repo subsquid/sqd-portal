@@ -1,16 +1,16 @@
 pub struct MeasuringRwLock<T> {
-    rwlock: parking_lot::RwLock<T>,
+    rwlock: std::sync::RwLock<T>,
     name: &'static str,
 }
 
 pub struct MeasuringRwLockReadGuard<'a, T> {
-    guard: parking_lot::RwLockReadGuard<'a, T>,
+    guard: std::sync::RwLockReadGuard<'a, T>,
     start: std::time::Instant,
     name: &'static str,
 }
 
 pub struct MeasuringRwLockWriteGuard<'a, T> {
-    guard: parking_lot::RwLockWriteGuard<'a, T>,
+    guard: std::sync::RwLockWriteGuard<'a, T>,
     start: std::time::Instant,
     name: &'static str,
 }
@@ -19,7 +19,7 @@ impl<T> MeasuringRwLock<T> {
     pub fn new(data: T, name: &'static str) -> Self {
         crate::metrics::report_mutex_created(name);
         MeasuringRwLock {
-            rwlock: parking_lot::RwLock::new(data),
+            rwlock: std::sync::RwLock::new(data),
             name,
         }
     }
@@ -27,7 +27,7 @@ impl<T> MeasuringRwLock<T> {
     pub fn read(&self) -> MeasuringRwLockReadGuard<'_, T> {
         let start = std::time::Instant::now();
         MeasuringRwLockReadGuard {
-            guard: self.rwlock.read(),
+            guard: self.rwlock.read().unwrap(),
             start,
             name: self.name,
         }
@@ -36,7 +36,7 @@ impl<T> MeasuringRwLock<T> {
     pub fn write(&self) -> MeasuringRwLockWriteGuard<'_, T> {
         let start = std::time::Instant::now();
         MeasuringRwLockWriteGuard {
-            guard: self.rwlock.write(),
+            guard: self.rwlock.write().unwrap(),
             start,
             name: self.name,
         }

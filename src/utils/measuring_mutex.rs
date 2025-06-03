@@ -1,10 +1,10 @@
 pub struct MeasuringMutex<T> {
-    mutex: parking_lot::Mutex<T>,
+    mutex: std::sync::Mutex<T>,
     name: &'static str,
 }
 
 pub struct MeasuringMutexGuard<'a, T> {
-    guard: parking_lot::MutexGuard<'a, T>,
+    guard: std::sync::MutexGuard<'a, T>,
     start: std::time::Instant,
     name: &'static str,
 }
@@ -13,7 +13,7 @@ impl<T> MeasuringMutex<T> {
     pub fn new(data: T, name: &'static str) -> Self {
         crate::metrics::report_mutex_created(name);
         MeasuringMutex {
-            mutex: parking_lot::Mutex::new(data),
+            mutex: std::sync::Mutex::new(data),
             name,
         }
     }
@@ -21,7 +21,7 @@ impl<T> MeasuringMutex<T> {
     pub fn lock(&self) -> MeasuringMutexGuard<'_, T> {
         let start = std::time::Instant::now();
         MeasuringMutexGuard {
-            guard: self.mutex.lock(),
+            guard: self.mutex.lock().unwrap(),
             start,
             name: self.name,
         }
@@ -29,12 +29,15 @@ impl<T> MeasuringMutex<T> {
 
     pub fn try_lock(&self) -> Option<MeasuringMutexGuard<'_, T>> {
         match self.mutex.try_lock() {
-            Some(guard) => Some(MeasuringMutexGuard {
+            Ok(guard) => Some(MeasuringMutexGuard {
                 guard,
                 start: std::time::Instant::now(),
                 name: self.name,
             }),
-            None => None,
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(e @ std::sync::TryLockError::Poisoned(_)) => {
+                Err(e).unwrap()
+            }
         }
     }
 }
