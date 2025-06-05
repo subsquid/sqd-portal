@@ -1,6 +1,10 @@
 [package]
 name = "sqd-portal"
+<<<<<<< HEAD
 version = "0.7.2"
+=======
+version = "0.7.1"
+>>>>>>> 6144df2 (Deal with absence of common mutex)
 edition = "2021"
 
 [dependencies]
