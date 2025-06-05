@@ -235,6 +235,7 @@ async fn run_stream(
     let mut request = restrict_request(&config, request);
 
     let (head, body) = match (dataset.network_id, hotblocks) {
+        // TODO: prefer hotblocks storage
         // Prefer data from the network
         (Some(dataset_id), _)
             if network
@@ -327,7 +328,7 @@ async fn get_dataset_state(
     dataset_id: DatasetId,
     Extension(network): Extension<Arc<NetworkClient>>,
 ) -> impl IntoResponse {
-    axum::Json(network.dataset_state(&dataset_id).unwrap())
+    axum::Json(network.dataset_state(&dataset_id))
 }
 
 async fn get_dataset_metadata(

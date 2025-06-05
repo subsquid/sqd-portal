@@ -112,6 +112,7 @@ impl Datasets {
         self.datasets.iter()
     }
 
+    #[cfg(test)]
     pub fn network_datasets(&self) -> impl Iterator<Item = (&DatasetId, &str)> {
         self.id_to_default_name
             .iter()

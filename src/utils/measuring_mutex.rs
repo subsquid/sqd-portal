@@ -25,18 +25,6 @@ impl<T> MeasuringMutex<T> {
             name: self.name,
         }
     }
-
-    pub fn try_lock(&self) -> Option<MeasuringMutexGuard<'_, T>> {
-        match self.mutex.try_lock() {
-            Ok(guard) => Some(MeasuringMutexGuard {
-                guard,
-                start: std::time::Instant::now(),
-                name: self.name,
-            }),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-            Err(e @ std::sync::TryLockError::Poisoned(_)) => Err(e).unwrap(),
-        }
-    }
 }
 
 impl<T> Drop for MeasuringMutex<T> {
