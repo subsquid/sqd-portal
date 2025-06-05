@@ -279,12 +279,7 @@ impl NetworkClient {
         block: u64,
         lease: bool,
     ) -> Result<PeerId, NoWorker> {
-        let worker = self.network_state.find_worker(dataset, block);
-        if lease {
-            if let Ok(worker) = worker.as_ref() {
-                self.network_state.lease_worker(*worker);
-            };
-        }
+        let worker = self.network_state.find_worker(dataset, block, lease);
         worker
     }
 
@@ -411,6 +406,12 @@ impl NetworkClient {
                             Err::TooManyRequests(()) => {
                                 metrics::report_query_result(peer_id, "too_many_requests");
                                 self.network_state.report_query_success(peer_id);
+                                if retry_after_ms.is_none() {
+                                    self.network_state.hint_backoff(
+                                        peer_id,
+                                        Duration::from_millis(100),
+                                    );
+                                }
                                 Err(QueryError::Retriable("rate limit exceeded".to_owned()))
                             }
                         }
