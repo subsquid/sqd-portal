@@ -328,7 +328,7 @@ async fn get_dataset_state(
     dataset_id: DatasetId,
     Extension(network): Extension<Arc<NetworkClient>>,
 ) -> impl IntoResponse {
-    axum::Json(network.dataset_state(&dataset_id).unwrap())
+    axum::Json(network.dataset_state(&dataset_id))
 }
 
 async fn get_dataset_metadata(

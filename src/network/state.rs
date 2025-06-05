@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use sqd_network_transport::PeerId;
 
-use crate::datasets::Datasets;
 use crate::network::StorageClient;
 use crate::types::api_types::WorkerDebugInfo;
 use crate::types::DatasetId;
 use crate::utils::RwLock;
+use crate::{datasets::Datasets, types::api_types::DatasetState};
 
 use super::priorities::{NoWorker, WorkersPool};
 
@@ -107,5 +107,9 @@ impl NetworkState {
         self.dataset_storage
             .head(dataset_id)
             .map(|block| block.number)
+    }
+
+    pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<DatasetState> {
+        self.dataset_storage.get_dataset_state(dataset_id)
     }
 }

@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use serde::Serialize;
 use sqd_contract_client::PeerId;
+use sqd_messages::RangeSet;
 
 use crate::{datasets::DatasetConfig, network};
 
@@ -48,4 +51,9 @@ pub enum DatasetRef {
     Name(String),
     #[serde(rename = "dataset_id")]
     Id(DatasetId),
+}
+
+#[derive(Default, Serialize)]
+pub struct DatasetState {
+    pub worker_ranges: HashMap<PeerId, RangeSet>,
 }

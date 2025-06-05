@@ -24,7 +24,7 @@ use super::contracts_state::{self, ContractsState};
 use super::priorities::NoWorker;
 use super::{ChunkNotFound, NetworkState};
 use crate::datasets::{DatasetConfig, Datasets};
-use crate::types::api_types::WorkerDebugInfo;
+use crate::types::api_types::{DatasetState, WorkerDebugInfo};
 use crate::types::{BlockNumber, BlockRange, ChunkId, DataChunk};
 use crate::utils::RwLock;
 use crate::{
@@ -471,8 +471,8 @@ impl NetworkClient {
         }
     }
 
-    pub fn dataset_state(&self, _dataset_id: &DatasetId) -> anyhow::Result<serde_json::Value> {
-        unimplemented!();
+    pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<DatasetState> {
+        self.network_state.dataset_state(dataset_id)
     }
 
     pub fn get_peer_id(&self) -> PeerId {
