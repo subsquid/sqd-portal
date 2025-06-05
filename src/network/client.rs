@@ -229,49 +229,26 @@ impl NetworkClient {
     }
 
     async fn run_chain_updates(&self, cancellation_token: CancellationToken) {
-        let (
-            epoch,
-            sqd_locked,
-            epoch_length,
-            uses_default_strategy,
-            active_workers,
-            epoch_started,
-            compute_units_per_epoch,
-        ) = self
-            .fetch_blockchain_state()
-            .await
-            .unwrap_or_else(|e| panic!("Couldn't get blockchain data: {e}"));
-
-        let mut current_epoch: u32 = epoch;
-
-        let operator = sqd_locked.clone().map(|s| s.0);
-        tracing::info!(
-            "Portal operator {}, current epoch: {}",
-            operator.unwrap_or_else(|| "unknown".to_string()),
-            current_epoch
-        );
-
-        self.contracts_state.write().set(
-            current_epoch,
-            sqd_locked,
-            epoch_length,
-            uses_default_strategy,
-            &active_workers,
-            epoch_started,
-            compute_units_per_epoch,
-        );
-
         let mut interval = tokio::time::interval_at(
             Instant::now() + self.chain_update_interval,
             self.chain_update_interval,
         );
+
+        let mut first_iteration = true; // don't wait on the first term
+        let mut first_fetch = true;
+        let mut current_epoch: u32 = 0;
+        let mut operator;
         loop {
-            tokio::select! {
-                _ = interval.tick() => {}
-                () = cancellation_token.cancelled() => {
-                    break;
+            if !first_iteration {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    () = cancellation_token.cancelled() => {
+                        break;
+                    }
                 }
             }
+
+            first_iteration = false;
 
             let (
                 epoch,
@@ -284,10 +261,23 @@ impl NetworkClient {
             ) = match self.fetch_blockchain_state().await {
                 Ok(data) => data,
                 Err(e) => {
-                    tracing::warn!("Couldn't get current epoch: {e}");
+                    tracing::warn!("Couldn't get blockchain data: {e}");
                     continue;
                 }
             };
+
+            if first_fetch {
+                first_fetch = false;
+
+                current_epoch = epoch;
+                operator = sqd_locked.clone().map(|s| s.0);
+
+                tracing::info!(
+                    "Portal operator {}, current epoch: {}",
+                    operator.unwrap_or_else(|| "unknown".to_string()),
+                    current_epoch
+                )
+            }
 
             self.contracts_state.write().set(
                 current_epoch,

@@ -34,9 +34,7 @@ impl<T> MeasuringMutex<T> {
                 name: self.name,
             }),
             Err(std::sync::TryLockError::WouldBlock) => None,
-            Err(e @ std::sync::TryLockError::Poisoned(_)) => {
-                Err(e).unwrap()
-            }
+            Err(e @ std::sync::TryLockError::Poisoned(_)) => Err(e).unwrap(),
         }
     }
 }
