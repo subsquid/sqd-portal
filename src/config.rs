@@ -140,15 +140,15 @@ fn default_transport_timeout() -> Duration {
 }
 
 fn default_default_buffer_size() -> usize {
-    10
+    50
 }
 
 fn default_max_buffer_size() -> usize {
-    100
+    1000
 }
 
 fn default_default_retries() -> u8 {
-    3
+    7
 }
 
 fn default_default_timeout_quantile() -> f32 {

@@ -235,6 +235,7 @@ async fn run_stream(
     let mut request = restrict_request(&config, request);
 
     let (head, body) = match (dataset.network_id, hotblocks) {
+        // TODO: prefer hotblocks storage
         // Prefer data from the network
         (Some(dataset_id), _)
             if network
