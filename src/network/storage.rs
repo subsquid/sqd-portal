@@ -86,6 +86,8 @@ impl StorageClient {
             }
         };
 
+        // TODO: use assignment.effective_from
+
         let assignment_id = assignment.id.clone();
         tracing::debug!("Got assignment {:?}", assignment_id);
         *self.latest_assignment.write() = Some(assignment_id.clone());
