@@ -80,7 +80,11 @@ fn serializable_priority(worker: &WorkerStats, now: Instant) -> Priority {
 }
 
 impl WorkersPool {
-    pub fn pick(&self, workers: impl IntoIterator<Item = PeerId>) -> Result<PeerId, NoWorker> {
+    pub fn pick(
+        &mut self,
+        workers: impl IntoIterator<Item = PeerId>,
+        lease: bool,
+    ) -> Result<PeerId, NoWorker> {
         let now = Instant::now();
         let default_priority = WorkerStats::default();
         let (best, best_priority) = workers
@@ -94,11 +98,16 @@ impl WorkersPool {
             .min_by_key(|&(_, priority)| priority)
             .ok_or(NoWorker::AllUnavailable)?;
         tracing::trace!("Picked worker {:?} with priority {:?}", best, best_priority);
-        match best_priority.0 {
-            PriorityGroup::Unavailable => Err(NoWorker::AllUnavailable),
-            PriorityGroup::Backoff => Err(NoWorker::Backoff(best_priority.2)),
-            _ => Ok(best),
+        let worker = match best_priority.0 {
+            PriorityGroup::Unavailable => return Err(NoWorker::AllUnavailable),
+            PriorityGroup::Backoff => return Err(NoWorker::Backoff(best_priority.2)),
+            _ => best,
+        };
+
+        if lease {
+            self.lease(worker);
         }
+        Ok(worker)
     }
 
     pub fn get_priorities(

@@ -37,8 +37,6 @@ fn buckets(start: f64, count: usize) -> impl Iterator<Item = f64> {
 }
 
 lazy_static::lazy_static! {
-    pub static ref VALID_PINGS: Counter = Default::default();
-    pub static ref IGNORED_PINGS: Counter = Default::default();
     pub static ref KNOWN_WORKERS: Gauge = Default::default();
 
     pub static ref HTTP_STATUS: Family<Labels, Counter> = Default::default();
@@ -65,8 +63,6 @@ lazy_static::lazy_static! {
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 3.0, 20)));
     pub static ref STREAM_THROTTLED_RATIO: Histogram = Histogram::new(iter::empty());
 
-    static ref HIGHEST_BLOCK: Family<Labels, Gauge> = Default::default();
-    static ref FIRST_GAP: Family<Labels, Gauge> = Default::default();
     static ref KNOWN_CHUNKS: Family<Labels, Gauge> = Default::default();
     static ref LAST_STORAGE_BLOCK: Family<Labels, Gauge> = Default::default();
 
@@ -127,22 +123,6 @@ pub fn report_stream_completed(
     STREAM_THROTTLED_RATIO.observe(throttled / duration);
 }
 
-pub fn report_dataset_updated(
-    dataset_id: &DatasetId,
-    dataset_name: Option<String>,
-    highest_block: u64,
-    first_gap: u64,
-) {
-    let mut labels = vec![("dataset_id".to_owned(), dataset_id.to_url().to_owned())];
-    if let Some(name) = dataset_name {
-        labels.push(("dataset_name".to_owned(), name));
-    }
-    HIGHEST_BLOCK
-        .get_or_create(&labels)
-        .set(highest_block as i64);
-    FIRST_GAP.get_or_create(&labels).set(first_gap as i64);
-}
-
 pub fn report_chunk_list_updated(
     dataset_id: &DatasetId,
     dataset_name: Option<String>,
@@ -185,16 +165,6 @@ pub fn report_mutex_held_duration(
 }
 
 pub fn register_metrics(registry: &mut Registry) {
-    registry.register(
-        "pings",
-        "Number of received valid pings",
-        VALID_PINGS.clone(),
-    );
-    registry.register(
-        "ignored_pings",
-        "Number of pings from unsupported workers",
-        IGNORED_PINGS.clone(),
-    );
     registry.register(
         "http_status",
         "Number of sent HTTP responses",
@@ -276,16 +246,6 @@ pub fn register_metrics(registry: &mut Registry) {
         STREAM_THROTTLED_RATIO.clone(),
     );
 
-    registry.register(
-        "dataset_highest_block",
-        "Highest seen block",
-        HIGHEST_BLOCK.clone(),
-    );
-    registry.register(
-        "dataset_first_gap",
-        "First block not owned by any worker",
-        FIRST_GAP.clone(),
-    );
     registry.register(
         "dataset_storage_known_chunks",
         "The total chunks number in the persistent storage",
