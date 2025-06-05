@@ -25,6 +25,7 @@ impl DataChunk {
         self.first_block..=self.last_block
     }
 
+    #[allow(dead_code)]
     pub fn range_msg(&self) -> sqd_messages::Range {
         sqd_messages::Range {
             begin: self.first_block,

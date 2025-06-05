@@ -18,20 +18,10 @@ pub struct Config {
     #[serde(deserialize_with = "parse_hostname")]
     pub hostname: String,
 
-    #[serde(default = "default_worker_versions")]
-    pub worker_versions: semver::VersionReq,
-
     #[serde(default = "default_max_parallel_streams")]
     pub max_parallel_streams: usize,
 
     pub max_chunks_per_stream: Option<usize>,
-
-    #[serde_as(as = "DurationSeconds")]
-    #[serde(
-        rename = "worker_inactive_threshold_sec",
-        default = "default_worker_inactive_threshold"
-    )]
-    pub worker_inactive_threshold: Duration,
 
     #[serde_as(as = "DurationSeconds")]
     #[serde(
@@ -66,9 +56,6 @@ pub struct Config {
     )]
     pub assignments_update_interval: Duration,
 
-    #[serde(default = "default_assignments_stored")]
-    pub assignments_stored: usize,
-
     #[serde_as(as = "DurationSeconds")]
     #[serde(
         rename = "datasets_update_interval_sec",
@@ -82,9 +69,6 @@ pub struct Config {
 
     #[serde(default)]
     pub datasets: DatasetsConfig,
-
-    #[serde(default)]
-    pub worker_status_via_gossipsub: bool,
 }
 
 #[serde_as]
@@ -147,16 +131,8 @@ impl Config {
     }
 }
 
-fn default_worker_versions() -> semver::VersionReq {
-    semver::VersionReq::parse("^2.0.0").unwrap()
-}
-
 fn default_max_parallel_streams() -> usize {
     1024
-}
-
-fn default_worker_inactive_threshold() -> Duration {
-    Duration::from_secs(120)
 }
 
 fn default_transport_timeout() -> Duration {
@@ -185,10 +161,6 @@ fn default_chain_update_interval() -> Duration {
 
 fn default_assignments_update_interval() -> Duration {
     Duration::from_secs(60)
-}
-
-fn default_assignments_stored() -> usize {
-    5
 }
 
 fn default_datasets_update_interval() -> Duration {

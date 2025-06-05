@@ -7109,7 +7109,7 @@ dependencies = [
 [[package]]
 name = "sqd-contract-client"
 version = "1.2.1"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=d69f018#d69f01821df55fe4ccd9c344e6d49c581e85e0e5"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=e4723af#e4723afe53c85f0b724f889efad7e01958924328"
 dependencies = [
  "async-trait",
  "clap",
@@ -7191,7 +7191,7 @@ source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bf
 [[package]]
 name = "sqd-messages"
 version = "2.0.2"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=d69f018#d69f01821df55fe4ccd9c344e6d49c581e85e0e5"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=e4723af#e4723afe53c85f0b724f889efad7e01958924328"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -7199,6 +7199,7 @@ dependencies = [
  "flate2",
  "hex",
  "libp2p",
+ "libp2p-identity",
  "prost 0.13.4",
  "prost-build",
  "reqwest 0.12.12 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -7214,7 +7215,7 @@ dependencies = [
 [[package]]
 name = "sqd-network-transport"
 version = "3.0.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=d69f018#d69f01821df55fe4ccd9c344e6d49c581e85e0e5"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=e4723af#e4723afe53c85f0b724f889efad7e01958924328"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8134,6 +8135,7 @@ dependencies = [
  "tokio-util",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

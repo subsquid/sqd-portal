@@ -40,7 +40,6 @@ impl From<DatasetConfig> for AvailableDatasetApiResponse {
 pub struct WorkerDebugInfo {
     pub peer_id: PeerId,
     pub priority: network::Priority,
-    pub since_last_heartbeat: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
