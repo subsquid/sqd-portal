@@ -199,6 +199,21 @@ impl StorageClient {
     pub fn get_all_workers(&self) -> Vec<PeerId> {
         self.workers.read().clone()
     }
+
+    pub fn get_dataset_state(&self, dataset: &DatasetId) -> Option<DatasetState> {
+        let mut ranges: HashMap<_, Vec<_>> = HashMap::new();
+        for c in &self.datasets.read().get(dataset)?.chunks {
+            for &worker in c.workers.iter() {
+                ranges.entry(worker).or_default().push(c.chunk.range_msg())
+            }
+        }
+        Some(DatasetState {
+            worker_ranges: ranges
+                .into_iter()
+                .map(|(peer_id, ranges)| (peer_id, sqd_messages::RangeSet::from(ranges)))
+                .collect(),
+        })
+    }
 }
 
 #[tracing::instrument(skip_all)]

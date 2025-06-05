@@ -109,4 +109,8 @@ impl NetworkState {
             .head(dataset_id)
             .map(|block| block.number)
     }
+
+    pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<DatasetState> {
+        self.dataset_storage.get_dataset_state(dataset_id)
+    }
 }
