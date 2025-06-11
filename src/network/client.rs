@@ -239,7 +239,9 @@ impl NetworkClient {
         let mut current_epoch: u32 = 0;
         let mut operator;
         loop {
-            if !first_iteration {
+            if first_iteration {
+                first_iteration = false;
+            } else {
                 tokio::select! {
                     _ = interval.tick() => {}
                     () = cancellation_token.cancelled() => {
@@ -247,8 +249,6 @@ impl NetworkClient {
                     }
                 }
             }
-
-            first_iteration = false;
 
             let (
                 epoch,
