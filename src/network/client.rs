@@ -14,9 +14,9 @@ use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
 
 use sqd_contract_client::{Client as ContractClient, ClientError, PeerId, Worker};
-use sqd_messages::{query_error, query_result, Query, QueryOk};
+use sqd_messages::{query_error, query_result, Query, QueryFinished, QueryOk};
 use sqd_network_transport::{
-    get_agent_info, AgentInfo, GatewayConfig, GatewayTransport, Keypair, P2PTransportBuilder,
+    get_agent_info, AgentInfo, GatewayConfig, GatewayTransportHandle, Keypair, P2PTransportBuilder,
     QueryFailure, TransportArgs,
 };
 
@@ -62,7 +62,7 @@ pub struct NetworkClientStatus {
 
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
-    transport_handle: GatewayTransport,
+    transport_handle: GatewayTransportHandle,
     network_state: NetworkState,
     datasets: Arc<RwLock<Datasets>>,
     contract_client: Box<dyn ContractClient>,
@@ -304,6 +304,7 @@ impl NetworkClient {
         query: String,
         lease: bool,
     ) -> QueryResult {
+        let query_start_time = Instant::now();
         let query_id = generate_query_id();
         tracing::trace!("Sending query {query_id} to {worker}");
 
@@ -344,7 +345,14 @@ impl NetworkClient {
         let result = self.transport_handle.send_query(worker, query).await;
         scopeguard::ScopeGuard::into_inner(guard);
         metrics::QUERIES_RUNNING.dec();
-
+        let query_time_micros = query_start_time.elapsed().as_micros();
+        if let Ok(result) = result.clone() {
+            let handle = self.transport_handle.clone();
+            let log = QueryFinished::new(&result, worker.to_string(), query_time_micros as u32);
+            tokio::spawn(async move {
+                handle.send_log(&log).await;
+            });
+        }
         self.parse_query_result(worker, result)
     }
 
@@ -407,10 +415,8 @@ impl NetworkClient {
                                 metrics::report_query_result(peer_id, "too_many_requests");
                                 self.network_state.report_query_success(peer_id);
                                 if retry_after_ms.is_none() {
-                                    self.network_state.hint_backoff(
-                                        peer_id,
-                                        Duration::from_millis(100),
-                                    );
+                                    self.network_state
+                                        .hint_backoff(peer_id, Duration::from_millis(100));
                                 }
                                 Err(QueryError::Retriable("rate limit exceeded".to_owned()))
                             }
