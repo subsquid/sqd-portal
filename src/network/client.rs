@@ -21,9 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 use sqd_contract_client::{Client as ContractClient, ClientError, Network, PeerId, Worker};
 use sqd_messages::assignments::Assignment;
-use sqd_messages::{query_error, query_result, Heartbeat, Query, QueryOk, RangeSet};
+use sqd_messages::{query_error, query_result, Heartbeat, Query, QueryFinished, QueryOk, RangeSet};
 use sqd_network_transport::{
-    get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransport, Keypair,
+    get_agent_info, AgentInfo, GatewayConfig, GatewayEvent, GatewayTransportHandle, Keypair,
     P2PTransportBuilder, QueryFailure, TransportArgs,
 };
 
@@ -83,7 +83,7 @@ enum ReadinessState {
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
     incoming_events: UseOnce<Box<dyn Stream<Item = GatewayEvent> + Send + Unpin + 'static>>,
-    transport_handle: GatewayTransport,
+    transport_handle: GatewayTransportHandle,
     network_state: Mutex<NetworkState>,
     datasets: Arc<RwLock<Datasets>>,
     hotblocks: Option<Arc<HotblocksHandle>>,
@@ -474,6 +474,7 @@ impl NetworkClient {
         query: String,
         lease: bool,
     ) -> QueryResult {
+        let query_start_time = Instant::now();
         let query_id = generate_query_id();
         tracing::trace!("Sending query {query_id} to {worker}");
 
@@ -514,6 +515,13 @@ impl NetworkClient {
         let result = self.transport_handle.send_query(worker, query).await;
         scopeguard::ScopeGuard::into_inner(guard);
         metrics::QUERIES_RUNNING.dec();
+        let query_time_micros = query_start_time.elapsed().as_micros();
+        if let Ok(result) = &result {
+            let log_result = self.transport_handle.send_logs(QueryFinished::new(result, worker.to_string(), query_time_micros as u32));
+            if let Err(err) = log_result {
+                tracing::error!("Failed to send log: {err:?}");
+            }
+        }
 
         self.parse_query_result(worker, result)
     }
