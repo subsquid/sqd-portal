@@ -69,6 +69,9 @@ lazy_static::lazy_static! {
     // TODO: add metrics for procedure durations
     static ref MUTEX_HELD_NANOS: Family<Labels, Counter> = Default::default();
     static ref MUTEXES_EXISTING: Family<Labels, Gauge> = Default::default();
+
+    // New metrics for block processing latency measurement
+    pub static ref BLOCK_AVAILABLE_TIMESTAMP: Family<Labels, Gauge> = Default::default();
 }
 
 pub fn report_query_result(worker: PeerId, status: &str) {
@@ -162,6 +165,31 @@ pub fn report_mutex_held_duration(
             ("mode".to_owned(), mode.to_string()),
         ])
         .inc_by(duration.as_nanos() as u64);
+}
+
+pub fn report_block_available(
+    dataset_id_str: &str,
+    dataset_name: Option<&str>,
+    block_height: u64,
+    block_hash: &str,
+) {
+    let mut labels = vec![
+        ("dataset_id".to_owned(), dataset_id_str.to_owned()),
+        ("block_height".to_owned(), block_height.to_string()),
+        ("block_hash".to_owned(), block_hash.to_string()),
+    ];
+    if let Some(name) = dataset_name {
+        labels.push(("dataset_name".to_owned(), name.to_owned()));
+    }
+    
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    
+    BLOCK_AVAILABLE_TIMESTAMP
+        .get_or_create(&labels)
+        .set(timestamp_ms);
 }
 
 pub fn register_metrics(registry: &mut Registry) {
@@ -265,5 +293,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "mutexes_existing",
         "Number of existing mutexes",
         MUTEXES_EXISTING.clone(),
+    );
+
+    registry.register(
+        "block_available_timestamp",
+        "Timestamp (ms since epoch) when a block became available in the portal",
+        BLOCK_AVAILABLE_TIMESTAMP.clone(),
     );
 }
