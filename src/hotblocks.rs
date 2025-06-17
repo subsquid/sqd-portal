@@ -11,6 +11,7 @@ use sqd_hotblocks::{DBRef, Node as HotblocksServer, NodeBuilder as HotblocksServ
 use sqd_storage::db::DatabaseSettings;
 
 use crate::config::Config;
+use crate::metrics;
 
 pub struct HotblocksHandle {
     pub server: HotblocksServer,
@@ -127,7 +128,16 @@ impl MetricsCollector {
 
             if let Some(head) = head {
                 metrics.head.get_or_create(&labels).set(head.number as i64);
+                
+                let dataset_str = dataset.as_str();
+                metrics::report_block_available(
+                    dataset_str,
+                    Some(dataset_str),
+                    head.number,
+                    &head.hash,
+                );
             }
+            
             if let Some(finalized_head) = finalized_head {
                 metrics
                     .finalized_head
