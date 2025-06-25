@@ -11,7 +11,7 @@ use sqd_hotblocks::{DBRef, Node as HotblocksServer, NodeBuilder as HotblocksServ
 use sqd_storage::db::DatabaseSettings;
 
 use crate::config::Config;
-use crate::metrics;
+use crate::metrics::IngestionTimestampClient;
 
 pub struct HotblocksHandle {
     pub server: HotblocksServer,
@@ -87,13 +87,40 @@ async fn run_db_cleanup(db: sqd_hotblocks::DBRef) {
     }
 }
 
-pub fn register_metrics(registry: &mut Registry, hotblocks: Arc<HotblocksHandle>) {
-    let collector = Box::new(MetricsCollector { hotblocks });
+pub fn register_metrics(registry: &mut Registry, hotblocks: Arc<HotblocksHandle>, config: Arc<Config>) {
+    let mut timestamp_clients = Vec::new();
+    
+    for dataset_id in &hotblocks.datasets {
+        let dataset_name = dataset_id.as_str();
+
+        if let Some(dataset_config) = config.datasets.get(dataset_name) {
+            if let Some(real_time) = &dataset_config.real_time {
+                if let Some(url) = real_time.data_sources.first() {
+                    tracing::info!(
+                        dataset = %dataset_name,
+                        url = %url,
+                        "Using data source for metrics collection"
+                    );
+                    
+                    let timestamp_client = Arc::new(IngestionTimestampClient::new(url.to_string()));
+                    timestamp_clients.push((*dataset_id, timestamp_client));
+                    continue;
+                }
+            }
+        }
+    }
+    
+    let collector = Box::new(MetricsCollector { 
+        hotblocks,
+        timestamp_clients,
+    });
+    
     registry.register_collector(collector);
 }
 
 struct MetricsCollector {
     hotblocks: Arc<HotblocksHandle>,
+    timestamp_clients: Vec<(sqd_storage::db::DatasetId, Arc<IngestionTimestampClient>)>,
 }
 
 impl MetricsCollector {
@@ -105,6 +132,10 @@ impl MetricsCollector {
 
             let head = self.hotblocks.server.get_head(*dataset).unwrap();
             let finalized_head = self.hotblocks.server.get_finalized_head(*dataset).unwrap();
+            
+            let timestamp_client = self.timestamp_clients.iter()
+                .find(|(ds, _)| ds == dataset)
+                .map(|(_, client)| client.clone());
 
             let snapshot = self.hotblocks.db.snapshot();
             let first_chunk = snapshot
@@ -129,13 +160,27 @@ impl MetricsCollector {
             if let Some(head) = head {
                 metrics.head.get_or_create(&labels).set(head.number as i64);
                 
-                let dataset_str = dataset.as_str();
-                metrics::report_block_available(
-                    dataset_str,
-                    Some(dataset_str),
-                    head.number,
-                    &head.hash,
-                );
+                if let Some(timestamp_client) = timestamp_client {
+                    let dataset_str = dataset.as_str().to_string();
+                    let network = "mainnet".to_string();
+                    let block_number = head.number;
+                    let block_hash = head.hash.clone();
+                    
+                    tokio::spawn(async move {
+                        crate::metrics::report_block_available(
+                            &timestamp_client,
+                            &dataset_str,
+                            &network, 
+                            block_number,
+                            &block_hash,
+                        ).await;
+                    });
+                } else {
+                    tracing::warn!(
+                        dataset = %dataset, 
+                        "No timestamp client found for dataset - metrics won't be collected"
+                    );
+                }
             }
             
             if let Some(finalized_head) = finalized_head {
