@@ -250,6 +250,7 @@ pub async fn report_block_available(
             let labels = vec![
                 ("dataset".to_owned(), dataset_name.to_owned()),
                 ("network".to_owned(), network.to_owned()),
+                ("source".to_owned(), timestamp_client.base_url.clone()),
             ];
             
             BLOCK_PROCESSING_TIME
