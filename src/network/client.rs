@@ -517,10 +517,7 @@ impl NetworkClient {
         metrics::QUERIES_RUNNING.dec();
         let query_time_micros = query_start_time.elapsed().as_micros();
         if let Ok(result) = &result {
-            let log_result = self.transport_handle.send_logs(QueryFinished::new(result, worker.to_string(), query_time_micros as u32));
-            if let Err(err) = log_result {
-                tracing::error!("Failed to send log: {err:?}");
-            }
+            self.transport_handle.send_logs(QueryFinished::new(result, worker.to_string(), query_time_micros as u32)).await;
         }
 
         self.parse_query_result(worker, result)
