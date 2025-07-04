@@ -109,9 +109,53 @@ pub fn register_metrics(registry: &mut Registry, hotblocks: Arc<HotblocksHandle>
         }
     }
     
+    for (dataset, url, client) in &timestamp_clients {
+        let dataset_str = dataset.as_str().to_string();
+        let network = "mainnet".to_string();
+        let client = client.clone();
+        let url = url.clone();
+        let hotblocks = Arc::clone(&hotblocks);
+        let dataset_id = *dataset;
+        
+        tracing::info!(
+            dataset = %dataset_str,
+            source = %url,
+            "Starting periodic block processing time measurement task"
+        );
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            
+            loop {
+                interval.tick().await;
+                
+                if let Ok(head) = hotblocks.server.get_head(dataset_id) {
+                    if let Some(head) = head {
+                        let block_number = head.number;
+                        let block_hash = head.hash.clone();
+                        
+                        tracing::debug!(
+                            dataset = %dataset_str,
+                            source = %url,
+                            block = %block_number,
+                            "Measuring block processing time"
+                        );
+                        
+                        crate::metrics::report_block_available(
+                            &client,
+                            &dataset_str,
+                            &network, 
+                            block_number,
+                            &block_hash,
+                        ).await;
+                    }
+                }
+            }
+        });
+    }
+    
     let collector = Box::new(MetricsCollector { 
         hotblocks,
-        timestamp_clients,
     });
     
     registry.register_collector(collector);
@@ -119,7 +163,6 @@ pub fn register_metrics(registry: &mut Registry, hotblocks: Arc<HotblocksHandle>
 
 struct MetricsCollector {
     hotblocks: Arc<HotblocksHandle>,
-    timestamp_clients: Vec<(sqd_storage::db::DatasetId, String, Arc<IngestionTimestampClient>)>,
 }
 
 impl MetricsCollector {
@@ -131,47 +174,6 @@ impl MetricsCollector {
 
             let head = self.hotblocks.server.get_head(*dataset).unwrap();
             let finalized_head = self.hotblocks.server.get_finalized_head(*dataset).unwrap();
-            
-            let timestamp_clients = self.timestamp_clients.iter()
-                .filter(|(ds, _, _)| ds == dataset)
-                .collect::<Vec<_>>();
-            
-            if !timestamp_clients.is_empty() {
-                for (_, url, client) in &timestamp_clients {
-                    if let Some(head) = &head {
-                        let dataset_str = dataset.as_str().to_string();
-                        let network = "mainnet".to_string(); // To be made more configurable in the future
-                        let block_number = head.number;
-                        let block_hash = head.hash.clone();
-                        let client = client.clone();
-                        let url = url.clone();
-                        
-                        tracing::debug!(
-                            dataset = %dataset_str,
-                            source = %url,
-                            block = %block_number,
-                            "Spawning block processing time measurement task"
-                        );
-                        
-                        tokio::spawn(async move {
-                            crate::metrics::report_block_available(
-                                &client,
-                                &dataset_str,
-                                &network, 
-                                block_number,
-                                &block_hash,
-                            ).await;
-                        });
-                    }
-                }
-            } else {
-                if head.is_some() {
-                    tracing::warn!(
-                        dataset = %dataset, 
-                        "No timestamp clients found for dataset - metrics won't be collected"
-                    );
-                }
-            }
             
             if let Some(head) = head {
                 metrics.head.get_or_create(&labels).set(head.number as i64);
