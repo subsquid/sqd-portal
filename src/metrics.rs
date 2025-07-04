@@ -186,7 +186,7 @@ impl IngestionTimestampClient {
         }
     }
 
-    pub async fn get_ingestion_timestamp(
+    pub async fn fetch_ingestion_timestamp(
         &self,
         block_height: u64,
     ) -> Result<Option<u64>, reqwest::Error> {
@@ -198,7 +198,10 @@ impl IngestionTimestampClient {
 
         tracing::debug!(url = %url, "Requesting ingestion timestamp");
         
-        let response = self.client.get(&url).send().await?;
+        let response = self.client.get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await?;
         
         if response.status().is_success() {
             let timestamp_str = response.text().await?;
@@ -219,7 +222,7 @@ impl IngestionTimestampClient {
                 status = %response.status(), 
                 "Non-success status code from ingestion service"
             );
-            return Ok(None);
+            return Err(response.error_for_status().unwrap_err());
         }
     }
 }
@@ -238,7 +241,7 @@ pub async fn report_block_available(
         "Querying ingestion timestamp for block"
     );
 
-    match timestamp_client.get_ingestion_timestamp(block_height).await {
+    match timestamp_client.fetch_ingestion_timestamp(block_height).await {
         Ok(Some(ingestion_timestamp)) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -248,7 +251,7 @@ pub async fn report_block_available(
             let processing_time_ms = now - ingestion_timestamp;
             
             let labels = vec![
-                ("dataset".to_owned(), dataset_name.to_owned()),
+                ("dataset_name".to_owned(), dataset_name.to_owned()),
                 ("network".to_owned(), network.to_owned()),
                 ("source".to_owned(), timestamp_client.base_url.clone()),
             ];
@@ -280,7 +283,7 @@ pub async fn report_block_available(
             );
         },
         Err(err) => {
-            tracing::error!(
+            tracing::warn!(
                 dataset = %dataset_name,
                 block_height = %block_height,
                 block_hash = %block_hash,
