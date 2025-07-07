@@ -50,7 +50,7 @@ impl NetworkState {
             })?;
 
         // Choose a worker having the requested start_block with the top priority
-        self.pool.write().pick(dataset_state.workers.iter().copied(), lease)
+        self.pool.read().pick(dataset_state.workers.iter().copied())
     }
 
     pub fn get_workers(&self, dataset_id: &DatasetId, start_block: u64) -> Vec<WorkerDebugInfo> {
@@ -108,9 +108,5 @@ impl NetworkState {
         self.dataset_storage
             .head(dataset_id)
             .map(|block| block.number)
-    }
-
-    pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<DatasetState> {
-        self.dataset_storage.get_dataset_state(dataset_id)
     }
 }
