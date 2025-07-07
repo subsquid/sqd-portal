@@ -279,7 +279,12 @@ impl NetworkClient {
         block: u64,
         lease: bool,
     ) -> Result<PeerId, NoWorker> {
-        let worker = self.network_state.find_worker(dataset, block, lease);
+        let worker = self.network_state.find_worker(dataset, block);
+        if lease {
+            if let Ok(worker) = worker.as_ref() {
+                self.network_state.lease_worker(*worker);
+            };
+        }
         worker
     }
 
@@ -406,12 +411,6 @@ impl NetworkClient {
                             Err::TooManyRequests(()) => {
                                 metrics::report_query_result(peer_id, "too_many_requests");
                                 self.network_state.report_query_success(peer_id);
-                                if retry_after_ms.is_none() {
-                                    self.network_state.hint_backoff(
-                                        peer_id,
-                                        Duration::from_millis(100),
-                                    );
-                                }
                                 Err(QueryError::Retriable("rate limit exceeded".to_owned()))
                             }
                         }
@@ -462,8 +461,8 @@ impl NetworkClient {
         }
     }
 
-    pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<DatasetState> {
-        self.network_state.dataset_state(dataset_id)
+    pub fn dataset_state(&self, _dataset_id: &DatasetId) -> anyhow::Result<serde_json::Value> {
+        unimplemented!();
     }
 
     pub fn get_peer_id(&self) -> PeerId {
