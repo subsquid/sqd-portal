@@ -516,10 +516,13 @@ impl NetworkClient {
         scopeguard::ScopeGuard::into_inner(guard);
         metrics::QUERIES_RUNNING.dec();
         let query_time_micros = query_start_time.elapsed().as_micros();
-        if let Ok(result) = &result {
-            self.transport_handle.send_logs(QueryFinished::new(result, worker.to_string(), query_time_micros as u32)).await;
+        if let Ok(result) = result.clone() {
+            let handle = self.transport_handle.clone();
+            let log = QueryFinished::new(&result, worker.to_string(), query_time_micros as u32);
+            tokio::spawn(async move {
+                handle.send_log(&log).await;
+            });
         }
-
         self.parse_query_result(worker, result)
     }
 
