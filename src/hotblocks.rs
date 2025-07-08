@@ -120,38 +120,105 @@ pub fn register_metrics(registry: &mut Registry, hotblocks: Arc<HotblocksHandle>
         tracing::info!(
             dataset = %dataset_str,
             source = %url,
-            "Starting periodic block processing time measurement task"
+            "Starting block processing time measurement for head updates"
         );
         
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
-            
-            loop {
-                interval.tick().await;
-                
-                if let Ok(head) = hotblocks.server.get_head(dataset_id) {
-                    if let Some(head) = head {
-                        let block_number = head.number;
-                        let block_hash = head.hash.clone();
-                        
-                        tracing::debug!(
-                            dataset = %dataset_str,
-                            source = %url,
-                            block = %block_number,
-                            "Measuring block processing time"
-                        );
-                        
-                        crate::metrics::report_block_available(
-                            &client,
-                            &dataset_str,
-                            &network, 
-                            block_number,
-                            &block_hash,
-                        ).await;
+        match hotblocks.server.subscribe_head_updates(dataset_id) {
+            Ok(mut head_receiver) => {
+                tokio::spawn(async move {
+                    {
+                        let current_head = head_receiver.borrow().clone();
+                        if let Some(head) = current_head {
+                            let block_number = head.number;
+                            let block_hash = head.hash;
+                            
+                            tracing::debug!(
+                                dataset = %dataset_str,
+                                source = %url,
+                                block = %block_number,
+                                "Measuring block processing time for initial head"
+                            );
+                            
+                            crate::metrics::report_block_available(
+                                &client,
+                                &dataset_str,
+                                &network, 
+                                block_number,
+                                &block_hash,
+                            ).await;
+                        }
                     }
-                }
+                    
+                    while head_receiver.changed().await.is_ok() {
+                        let current_head = head_receiver.borrow().clone();
+                        if let Some(head) = current_head {
+                            let block_number = head.number;
+                            let block_hash = head.hash;
+                            
+                            tracing::debug!(
+                                dataset = %dataset_str,
+                                source = %url,
+                                block = %block_number,
+                                "Measuring block processing time for new head"
+                            );
+                            
+                            crate::metrics::report_block_available(
+                                &client,
+                                &dataset_str,
+                                &network, 
+                                block_number,
+                                &block_hash,
+                            ).await;
+                        }
+                    }
+                    
+                    tracing::warn!(
+                        dataset = %dataset_str,
+                        source = %url,
+                        "Head update subscription ended"
+                    );
+                });
+            },
+            Err(err) => {
+                tracing::error!(
+                    dataset = %dataset_str,
+                    source = %url,
+                    error = ?err,
+                    "Failed to subscribe to head updates, falling back to periodic polling"
+                );
+                
+                // Fallback to periodic polling if subscription fails
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+                    
+                    loop {
+                        interval.tick().await;
+                        
+                        if let Ok(head) = hotblocks.server.get_head(dataset_id) {
+                            if let Some(head) = head {
+                                let block_number = head.number;
+                                let block_hash = head.hash.clone();
+                                
+                                tracing::debug!(
+                                    dataset = %dataset_str,
+                                    source = %url,
+                                    block = %block_number,
+                                    "Measuring block processing time (fallback polling)"
+                                );
+                                
+                                crate::metrics::report_block_available(
+                                    &client,
+                                    &dataset_str,
+                                    &network, 
+                                    block_number,
+                                    &block_hash,
+                                ).await;
+                            }
+                        }
+                    }
+                });
             }
-        });
+        }
     }
     
     let collector = Box::new(MetricsCollector { 
