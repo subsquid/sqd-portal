@@ -241,13 +241,13 @@ pub async fn report_block_available(
         "Querying ingestion timestamp for block"
     );
 
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
     match timestamp_client.fetch_ingestion_timestamp(block_height).await {
         Ok(Some(ingestion_timestamp)) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            
             let processing_time_ms = now - ingestion_timestamp;
             
             let labels = vec![
