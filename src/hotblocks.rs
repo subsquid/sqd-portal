@@ -139,9 +139,6 @@ pub fn register_metrics(registry: &mut Registry, hotblocks: Arc<HotblocksHandle>
                         block = %block_number,
                         "Measuring block processing time for new head"
                     );
-                    
-                    //tmp
-                    tokio::time::sleep(Duration::from_millis(100)).await;
 
                     crate::metrics::report_block_available(
                         &client,
