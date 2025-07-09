@@ -11,6 +11,7 @@ use sqd_hotblocks::{DBRef, Node as HotblocksServer, NodeBuilder as HotblocksServ
 use sqd_storage::db::DatabaseSettings;
 
 use crate::config::Config;
+use crate::metrics::IngestionTimestampClient;
 
 pub struct HotblocksHandle {
     pub server: HotblocksServer,
@@ -86,8 +87,81 @@ async fn run_db_cleanup(db: sqd_hotblocks::DBRef) {
     }
 }
 
-pub fn register_metrics(registry: &mut Registry, hotblocks: Arc<HotblocksHandle>) {
-    let collector = Box::new(MetricsCollector { hotblocks });
+pub fn register_metrics(registry: &mut Registry, hotblocks: Arc<HotblocksHandle>, config: Arc<Config>) {
+    let mut timestamp_clients = Vec::new();
+    
+    for dataset_id in &hotblocks.datasets {
+        let dataset_name = dataset_id.as_str();
+
+        if let Some(dataset_config) = config.datasets.get(dataset_name) {
+            if let Some(real_time) = &dataset_config.real_time {
+                for url in &real_time.data_sources {
+                    tracing::info!(
+                        dataset = %dataset_name,
+                        url = %url,
+                        "Using data source for metrics collection"
+                    );
+                    
+                    let timestamp_client = Arc::new(IngestionTimestampClient::new(url.to_string()));
+                    timestamp_clients.push((*dataset_id, url.to_string(), timestamp_client));
+                }
+            }
+        }
+    }
+    
+    for (dataset, url, client) in &timestamp_clients {
+        let dataset_str = dataset.as_str().to_string();
+        let network = "mainnet".to_string();
+        let client = client.clone();
+        let url = url.clone();
+        let hotblocks = Arc::clone(&hotblocks);
+        let dataset_id = *dataset;
+        
+        tracing::info!(
+            dataset = %dataset_str,
+            source = %url,
+            "Starting block processing time measurement for head updates"
+        );
+        
+        let mut head_receiver = hotblocks.server.subscribe_head_updates(dataset_id)
+            .expect("Dataset should exist since it is from the same list used to build the server");
+        
+        tokio::spawn(async move {
+            while head_receiver.changed().await.is_ok() {
+                let current_head = head_receiver.borrow().clone();
+                if let Some(head) = current_head {
+                    let block_number = head.number;
+                    let block_hash = head.hash;
+                    
+                    tracing::debug!(
+                        dataset = %dataset_str,
+                        source = %url,
+                        block = %block_number,
+                        "Measuring block processing time for new head"
+                    );
+
+                    crate::metrics::report_block_available(
+                        &client,
+                        &dataset_str,
+                        &network, 
+                        block_number,
+                        &block_hash,
+                    ).await;
+                }
+            }
+            
+            tracing::warn!(
+                dataset = %dataset_str,
+                source = %url,
+                "Head update subscription ended"
+            );
+        });
+    }
+    
+    let collector = Box::new(MetricsCollector { 
+        hotblocks,
+    });
+    
     registry.register_collector(collector);
 }
 
@@ -104,6 +178,17 @@ impl MetricsCollector {
 
             let head = self.hotblocks.server.get_head(*dataset).unwrap();
             let finalized_head = self.hotblocks.server.get_finalized_head(*dataset).unwrap();
+            
+            if let Some(head) = head {
+                metrics.head.get_or_create(&labels).set(head.number as i64);
+            }
+            
+            if let Some(finalized_head) = finalized_head {
+                metrics
+                    .finalized_head
+                    .get_or_create(&labels)
+                    .set(finalized_head.number as i64);
+            }
 
             let snapshot = self.hotblocks.db.snapshot();
             let first_chunk = snapshot
@@ -124,16 +209,7 @@ impl MetricsCollector {
                 .ok()
                 .flatten();
             let last_block_timestamp = last_chunk.and_then(|chunk| chunk.last_block_time());
-
-            if let Some(head) = head {
-                metrics.head.get_or_create(&labels).set(head.number as i64);
-            }
-            if let Some(finalized_head) = finalized_head {
-                metrics
-                    .finalized_head
-                    .get_or_create(&labels)
-                    .set(finalized_head.number as i64);
-            }
+            
             if let Some(first_block) = first_block {
                 metrics
                     .first_block

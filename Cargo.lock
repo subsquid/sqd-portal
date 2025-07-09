@@ -2285,6 +2285,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95765f67b4b18863968b4a1bd5bb576f732b29a4a28c7cd84c09fa3e2875f33c"
 
 [[package]]
+name = "faster-hex"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7223ae2d2f179b803433d9c830478527e92b8117eab39460edae7f1614d9fb73"
+dependencies = [
+ "heapless",
+ "serde",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2731,6 +2741,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash32"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2775,6 +2794,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
  "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "heapless"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
+dependencies = [
+ "hash32",
+ "stable_deref_trait",
 ]
 
 [[package]]
@@ -7089,7 +7118,7 @@ dependencies = [
 [[package]]
 name = "sqd-array"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7101,7 +7130,7 @@ dependencies = [
 [[package]]
 name = "sqd-bloom-filter"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 dependencies = [
  "xxhash-rust",
 ]
@@ -7128,7 +7157,7 @@ dependencies = [
 [[package]]
 name = "sqd-data"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7145,7 +7174,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-client"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7159,7 +7188,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-core"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7173,7 +7202,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-source"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 dependencies = [
  "anyhow",
  "futures 0.3.31",
@@ -7186,7 +7215,7 @@ dependencies = [
 [[package]]
 name = "sqd-dataset"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 
 [[package]]
 name = "sqd-messages"
@@ -7249,7 +7278,7 @@ dependencies = [
 [[package]]
 name = "sqd-node"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7278,7 +7307,7 @@ dependencies = [
 [[package]]
 name = "sqd-polars"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7289,7 +7318,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -7339,7 +7368,7 @@ dependencies = [
 [[package]]
 name = "sqd-primitives"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 dependencies = [
  "borsh",
  "serde",
@@ -7349,13 +7378,14 @@ dependencies = [
 [[package]]
 name = "sqd-query"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 dependencies = [
  "anyhow",
  "arrow",
  "bytes 1.9.0",
  "convert_case",
  "dashmap",
+ "faster-hex",
  "identconv",
  "lexical-core",
  "parking_lot 0.12.3",
@@ -7371,7 +7401,7 @@ dependencies = [
 [[package]]
 name = "sqd-storage"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=0837fea#0837fea0a9b74a0bfe2b7170fa55dbe9896317b8"
+source = "git+https://github.com/subsquid/data.git?rev=aa03cf7#aa03cf7dd39e3040b28cf4bc694bbecc316a4b78"
 dependencies = [
  "anyhow",
  "arrow",
