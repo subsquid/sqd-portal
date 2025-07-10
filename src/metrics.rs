@@ -256,7 +256,20 @@ pub async fn report_block_available(
 
     match timestamp_client.fetch_ingestion_timestamp(block_height).await {
         Ok(Some(ingestion_timestamp)) => {
-            let processing_time_ms = now - ingestion_timestamp;
+            let processing_time_ms = if now >= ingestion_timestamp {
+                now - ingestion_timestamp
+            } else {
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    block_height = %block_height,
+                    block_hash = %block_hash,
+                    ingestion_timestamp = %ingestion_timestamp,
+                    current_time = %now,
+                    time_diff_ms = %(ingestion_timestamp - now),
+                    "Ingestion timestamp is slightly ahead of local time - treating as immediate processing"
+                );
+                0
+            };
             
             let labels = vec![
                 ("dataset_name".to_owned(), dataset_name.to_owned()),
