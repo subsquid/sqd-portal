@@ -203,6 +203,14 @@ impl IngestionTimestampClient {
             .send()
             .await?;
         
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            tracing::debug!(
+                url = %url,
+                "Block not found in this ingestion service yet"
+            );
+            return Ok(None);
+        }
+        
         if response.status().is_success() {
             let timestamp_str = response.text().await?;
             
@@ -275,11 +283,11 @@ pub async fn report_block_available(
             );
         },
         Ok(None) => {
-            tracing::warn!(
+            tracing::debug!(
                 dataset = %dataset_name, 
                 block_height = %block_height,
                 block_hash = %block_hash,
-                "Could not find ingestion timestamp for block - verify the ingester's /block-time/height endpoint is working"
+                "Could not find ingestion timestamp for block - it may not be available in this provider yet"
             );
         },
         Err(err) => {
@@ -289,7 +297,7 @@ pub async fn report_block_available(
                 block_hash = %block_hash,
                 error = %err,
                 client_url = %timestamp_client.base_url,
-                "Failed to query ingestion timestamp - check INGESTION_SERVICE_URL environment variable"
+                "Failed to query ingestion timestamp. Check INGESTION_SERVICE_URL config value."
             );
         }
     }
