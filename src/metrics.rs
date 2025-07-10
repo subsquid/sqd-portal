@@ -257,7 +257,7 @@ pub async fn report_block_available(
     match timestamp_client.fetch_ingestion_timestamp(block_height).await {
         Ok(Some(ingestion_timestamp)) => {
             let processing_time_ms = now - ingestion_timestamp;
-             
+            
             let labels = vec![
                 ("dataset_name".to_owned(), dataset_name.to_owned()),
                 ("network".to_owned(), network.to_owned()),
