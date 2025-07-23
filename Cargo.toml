@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 
 [dependencies]
@@ -47,7 +47,7 @@ sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "e4723af", version = "2.0.1", features = ["semver", "bitstring", "assignment_reader"] }
 sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "e4723af", version = "3.0.0", features = ["gateway", "metrics"] }
 
-sqd-data-client = { git = "https://github.com/subsquid/data.git", rev = "aa03cf7" }
-sqd-hotblocks = { git = "https://github.com/subsquid/data.git", package = "sqd-node", rev = "aa03cf7" }
-sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "aa03cf7" }
-sqd-storage = { git = "https://github.com/subsquid/data.git", rev = "aa03cf7" }
+sqd-data-client = { git = "https://github.com/subsquid/data.git", rev = "68f01ce" }
+sqd-hotblocks = { git = "https://github.com/subsquid/data.git", package = "sqd-node", rev = "68f01ce" }
+sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "68f01ce" }
+sqd-storage = { git = "https://github.com/subsquid/data.git", rev = "68f01ce" }
