@@ -84,6 +84,9 @@ pub struct HotblocksConfig {
 
     #[serde(default)]
     pub direct_io: bool,
+
+    #[serde(default)]
+    pub cache_index_and_filter_blocks: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
