@@ -12,6 +12,12 @@ impl<T> UseOnce<T> {
         }
     }
 
+    pub fn empty() -> Self {
+        UseOnce {
+            inner: Mutex::new(None),
+        }
+    }
+
     pub fn take(&self) -> Result<T> {
         self.inner
             .try_lock()

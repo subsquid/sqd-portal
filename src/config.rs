@@ -69,6 +69,9 @@ pub struct Config {
 
     #[serde(default)]
     pub datasets: DatasetsConfig,
+
+    #[serde(default = "default_true")]
+    pub send_logs: bool,
 }
 
 #[serde_as]
@@ -132,6 +135,10 @@ impl Config {
             deser,
         )?)
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_max_parallel_streams() -> usize {

@@ -14,9 +14,9 @@ use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
 
 use sqd_contract_client::{Client as ContractClient, ClientError, PeerId, Worker};
-use sqd_messages::{query_error, query_result, Query, QueryOk};
+use sqd_messages::{query_error, query_result, Query, QueryFinished, QueryOk};
 use sqd_network_transport::{
-    get_agent_info, AgentInfo, GatewayConfig, GatewayTransport, Keypair, P2PTransportBuilder,
+    get_agent_info, AgentInfo, GatewayConfig, GatewayTransportHandle, Keypair, P2PTransportBuilder,
     QueryFailure, TransportArgs,
 };
 
@@ -26,7 +26,7 @@ use super::{ChunkNotFound, NetworkState};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
 use crate::types::{BlockNumber, BlockRange, ChunkId, DataChunk};
-use crate::utils::RwLock;
+use crate::utils::{RwLock, UseOnce};
 use crate::{
     config::Config,
     metrics,
@@ -34,6 +34,10 @@ use crate::{
 };
 
 pub type QueryResult = Result<QueryOk, QueryError>;
+
+const LOGS_QUEUE_SIZE: usize = 10000;
+const CONCURRENT_LOGS: usize = 100;
+const LOGS_SENDING_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CurrentEpoch {
@@ -62,7 +66,7 @@ pub struct NetworkClientStatus {
 
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
-    transport_handle: GatewayTransport,
+    transport_handle: GatewayTransportHandle,
     network_state: NetworkState,
     datasets: Arc<RwLock<Datasets>>,
     contract_client: Box<dyn ContractClient>,
@@ -71,6 +75,8 @@ pub struct NetworkClient {
     local_peer_id: PeerId,
     keypair: Keypair,
     contracts_state: RwLock<ContractsState>,
+    logs_tx: Option<sqd_network_transport::util::Sender<QueryFinished>>,
+    logs_rx: UseOnce<sqd_network_transport::util::Receiver<QueryFinished>>,
 }
 
 impl NetworkClient {
@@ -91,7 +97,15 @@ impl NetworkClient {
         gateway_config.query_config.max_concurrent_streams = None;
         gateway_config.worker_status_via_gossipsub = false;
         gateway_config.worker_status_via_polling = false;
+        gateway_config.log_sending_timeout = LOGS_SENDING_TIMEOUT;
         let (_events, transport_handle) = transport_builder.build_gateway(gateway_config)?;
+
+        let (logs_tx, logs_rx) = if config.send_logs {
+            let (tx, rx) = sqd_network_transport::util::new_queue(LOGS_QUEUE_SIZE, "query_logs");
+            (Some(tx), UseOnce::new(rx))
+        } else {
+            (None, UseOnce::empty())
+        };
 
         let datasets_copy = datasets.clone();
 
@@ -107,6 +121,8 @@ impl NetworkClient {
             local_peer_id,
             keypair,
             contracts_state: RwLock::new(Default::default(), "NetworkClient::contracts_state"),
+            logs_tx,
+            logs_rx,
         });
 
         tokio::spawn(async move {
@@ -128,12 +144,17 @@ impl NetworkClient {
         let this = Arc::clone(&self);
         let token = cancellation_token.child_token();
         let chain_updates_fut = tokio::spawn(async move { this.run_chain_updates(token).await });
+
         let this = Arc::clone(&self);
         let token = cancellation_token.child_token();
         let assignments_loop_fut =
             tokio::spawn(async move { this.run_assignments_loop(token).await });
 
-        tokio::try_join!(chain_updates_fut, assignments_loop_fut)?;
+        let this = Arc::clone(&self);
+        let token = cancellation_token.child_token();
+        let logs_loop_fut = tokio::spawn(async move { this.run_logs_loop(token).await });
+
+        tokio::try_join!(chain_updates_fut, assignments_loop_fut, logs_loop_fut)?;
         Ok(())
     }
 
@@ -244,6 +265,18 @@ impl NetworkClient {
         tracing::info!("Assignment processing task finished");
     }
 
+    async fn run_logs_loop(&self, cancellation_token: CancellationToken) {
+        let Ok(logs_rx) = self.logs_rx.take() else {
+            return;
+        };
+        logs_rx
+            .take_until(cancellation_token.cancelled_owned())
+            .for_each_concurrent(CONCURRENT_LOGS, |msg| async move {
+                self.transport_handle.send_log(&msg).await;
+            })
+            .await;
+    }
+
     pub fn dataset(&self, alias: &str) -> Option<DatasetConfig> {
         self.datasets.read().get(alias).cloned()
     }
@@ -341,9 +374,18 @@ impl NetworkClient {
             metrics::QUERIES_RUNNING.dec();
         });
 
+        let query_start_time = Instant::now();
         let result = self.transport_handle.send_query(worker, query).await;
         scopeguard::ScopeGuard::into_inner(guard);
         metrics::QUERIES_RUNNING.dec();
+        let query_time_micros = query_start_time.elapsed().as_micros();
+
+        if let Some(logs_tx) = &self.logs_tx {
+            if let Ok(result) = result.as_ref() {
+                let log = QueryFinished::new(result, worker.to_string(), query_time_micros as u32);
+                logs_tx.send_lossy(log);
+            }
+        }
 
         self.parse_query_result(worker, result)
     }
@@ -407,10 +449,8 @@ impl NetworkClient {
                                 metrics::report_query_result(peer_id, "too_many_requests");
                                 self.network_state.report_query_success(peer_id);
                                 if retry_after_ms.is_none() {
-                                    self.network_state.hint_backoff(
-                                        peer_id,
-                                        Duration::from_millis(100),
-                                    );
+                                    self.network_state
+                                        .hint_backoff(peer_id, Duration::from_millis(100));
                                 }
                                 Err(QueryError::Retriable("rate limit exceeded".to_owned()))
                             }
