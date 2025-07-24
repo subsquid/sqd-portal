@@ -7118,7 +7118,7 @@ dependencies = [
 [[package]]
 name = "sqd-array"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7130,7 +7130,7 @@ dependencies = [
 [[package]]
 name = "sqd-bloom-filter"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 dependencies = [
  "xxhash-rust",
 ]
@@ -7157,7 +7157,7 @@ dependencies = [
 [[package]]
 name = "sqd-data"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7174,7 +7174,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-client"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7188,7 +7188,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-core"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7202,7 +7202,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-source"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 dependencies = [
  "anyhow",
  "futures 0.3.31",
@@ -7215,7 +7215,7 @@ dependencies = [
 [[package]]
 name = "sqd-dataset"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 
 [[package]]
 name = "sqd-messages"
@@ -7278,7 +7278,7 @@ dependencies = [
 [[package]]
 name = "sqd-node"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7307,7 +7307,7 @@ dependencies = [
 [[package]]
 name = "sqd-polars"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7368,7 +7368,7 @@ dependencies = [
 [[package]]
 name = "sqd-primitives"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 dependencies = [
  "borsh",
  "serde",
@@ -7378,7 +7378,7 @@ dependencies = [
 [[package]]
 name = "sqd-query"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7401,7 +7401,7 @@ dependencies = [
 [[package]]
 name = "sqd-storage"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=a0a5e6d#a0a5e6d508d6004b6dd80dc8dea84beb9583a21c"
+source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
 dependencies = [
  "anyhow",
  "arrow",
