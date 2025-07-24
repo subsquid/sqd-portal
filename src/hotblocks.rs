@@ -33,6 +33,7 @@ pub async fn build_server(config: &Config) -> anyhow::Result<Option<HotblocksHan
     let mut settings = DatabaseSettings::default()
         .with_data_cache_size(hotblocks_config.data_cache_mb)
         .with_direct_io(hotblocks_config.direct_io)
+        .with_cache_index_and_filter_blocks(hotblocks_config.cache_index_and_filter_blocks)
         .with_rocksdb_stats(true);
     if let Some(size) = hotblocks_config.chunk_cache_mb {
         settings = settings.with_chunk_cache_size(size);
