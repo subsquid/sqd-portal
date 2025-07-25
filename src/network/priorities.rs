@@ -6,7 +6,7 @@ use sqd_contract_client::PeerId;
 
 pub type Priority = (PriorityGroup, u8, i64);
 
-const MAX_QUERIES_PER_WORKER: u8 = 3;
+const MAX_QUERIES_PER_WORKER: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum PriorityGroup {
