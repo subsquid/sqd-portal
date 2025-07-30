@@ -452,7 +452,7 @@ impl NetworkClient {
                                     self.network_state
                                         .hint_backoff(peer_id, Duration::from_millis(100));
                                 }
-                                Err(QueryError::Retriable("rate limit exceeded".to_owned()))
+                                Err(QueryError::RateLimitExceeded)
                             }
                         }
                     }
