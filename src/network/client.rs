@@ -293,7 +293,6 @@ impl NetworkClient {
         self.network_state
             .dataset_storage
             .find_chunk(dataset, block)
-            .map(|c| c.chunk)
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {

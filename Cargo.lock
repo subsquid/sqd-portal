@@ -298,7 +298,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-data",
  "arrow-schema",
- "flatbuffers",
+ "flatbuffers 24.12.23",
 ]
 
 [[package]]
@@ -742,7 +742,7 @@ dependencies = [
  "bitflags 2.8.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "regex",
@@ -2345,6 +2345,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flatbuffers"
+version = "25.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1045398c1bfd89168b5fd3f1fc11f6e70b34f6f66300c87d44d3de849463abf1"
+dependencies = [
+ "bitflags 2.8.0",
+ "rustc_version 0.4.1",
+]
+
+[[package]]
 name = "flate2"
 version = "1.0.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3472,15 +3482,6 @@ name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]
@@ -5891,7 +5892,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes 1.9.0",
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.12.1",
  "log",
  "multimap",
@@ -5925,7 +5926,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "157c5a9d7ea5c2ed2d9fb8f495b64759f7816c7eaea54ba3978f0d63000162e3"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.96",
@@ -7128,6 +7129,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqd-assignments"
+version = "0.0.1"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=b02472d#b02472db578906928cabb702eceeb53b4f41d9ef"
+dependencies = [
+ "anyhow",
+ "crypto_box",
+ "flatbuffers 25.2.10",
+ "libp2p-identity",
+ "ouroboros",
+ "serde_json",
+ "sha2",
+ "tracing",
+]
+
+[[package]]
 name = "sqd-bloom-filter"
 version = "0.1.0"
 source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
@@ -7138,7 +7154,7 @@ dependencies = [
 [[package]]
 name = "sqd-contract-client"
 version = "1.2.1"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=5e5ce31#5e5ce313a1d92fe60a41e322451a91c7ad868694"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=b02472d#b02472db578906928cabb702eceeb53b4f41d9ef"
 dependencies = [
  "async-trait",
  "clap",
@@ -7220,7 +7236,7 @@ source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700
 [[package]]
 name = "sqd-messages"
 version = "2.0.2"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=5e5ce31#5e5ce313a1d92fe60a41e322451a91c7ad868694"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=b02472d#b02472db578906928cabb702eceeb53b4f41d9ef"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -7244,7 +7260,7 @@ dependencies = [
 [[package]]
 name = "sqd-network-transport"
 version = "3.0.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=5e5ce31#5e5ce313a1d92fe60a41e322451a91c7ad868694"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=b02472d#b02472db578906928cabb702eceeb53b4f41d9ef"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7344,6 +7360,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "serde_yaml",
+ "sqd-assignments",
  "sqd-contract-client",
  "sqd-data-client",
  "sqd-messages",

@@ -36,9 +36,9 @@ impl NetworkState {
         start_block: u64,
         lease: bool,
     ) -> Result<PeerId, NoWorker> {
-        let dataset_state = self
+        let workers = self
             .dataset_storage
-            .find_chunk(dataset_id, start_block)
+            .find_workers(dataset_id, start_block)
             .map_err(|e| {
                 tracing::warn!(
                     %dataset_id,
@@ -50,17 +50,17 @@ impl NetworkState {
             })?;
 
         // Choose a worker having the requested start_block with the top priority
-        self.pool.write().pick(dataset_state.workers.iter().copied(), lease)
+        self.pool.write().pick(workers.iter().copied(), lease)
     }
 
     pub fn get_workers(&self, dataset_id: &DatasetId, start_block: u64) -> Vec<WorkerDebugInfo> {
-        let Ok(chunk) = self.dataset_storage.find_chunk(dataset_id, start_block) else {
+        let Ok(workers) = self.dataset_storage.find_workers(dataset_id, start_block) else {
             return vec![];
         };
 
         self.pool
             .read()
-            .get_priorities(chunk.workers.iter().copied())
+            .get_priorities(workers.iter().copied())
             .into_iter()
             .map(|(peer_id, priority)| WorkerDebugInfo { peer_id, priority })
             .collect()

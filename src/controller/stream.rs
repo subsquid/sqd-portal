@@ -88,10 +88,10 @@ impl StreamController {
             Err(ChunkNotFound::AfterLast) => {
                 return Err(RequestError::NoData);
             }
-            Err(ChunkNotFound::Gap) | Err(ChunkNotFound::UnknownDataset) => {
+            Err(e) => {
                 // Should not be the case under normal operation
                 return Err(RequestError::InternalError(format!(
-                    "block {} could not be found in dataset {}, please report this to the developers",
+                    "block {} could not be found in dataset {} ({e}), please report this to the developers",
                     first_block, request.dataset_id
                 )));
             }
