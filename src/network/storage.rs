@@ -1,8 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, io::ErrorKind, sync::Arc, time::Duration};
 
-use itertools::Itertools;
+use anyhow::anyhow;
+use sqd_assignments::Assignment;
 use sqd_contract_client::{Network, PeerId};
-use sqd_messages::assignments::{self, Assignment, ChunkSummary};
 use sqd_primitives::BlockRef;
 use tracing::instrument;
 
@@ -13,23 +13,12 @@ use crate::{
     utils::RwLock,
 };
 
-#[derive(Debug, Clone)]
-pub struct AssignedChunk {
-    pub chunk: DataChunk,
-    pub workers: Arc<Vec<PeerId>>,
-}
-
-pub struct DatasetIndex {
-    pub chunks: Vec<AssignedChunk>,
-    pub summary: Option<assignments::ChunkSummary>,
-}
-
 pub struct StorageClient {
-    datasets: RwLock<HashMap<DatasetId, DatasetIndex>>,
+    assignment: RwLock<Option<Assignment>>,
     datasets_config: Arc<RwLock<Datasets>>,
-    workers: RwLock<Vec<PeerId>>,
-    latest_assignment: RwLock<Option<String>>,
+    latest_assignment_id: RwLock<Option<String>>,
     network_state_url: String,
+    reqwest_client: reqwest::Client,
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -38,10 +27,10 @@ pub enum ChunkNotFound {
     UnknownDataset,
     #[error("Block is before the first block which is {first_block}")]
     BeforeFirst { first_block: BlockNumber },
-    #[error("Block falls in a gap between chunks")]
-    Gap,
     #[error("Block is after the last block")]
     AfterLast,
+    #[error("Invalid chunk ID: {0}")]
+    InvalidID(String),
 }
 
 impl StorageClient {
@@ -53,158 +42,207 @@ impl StorageClient {
         let network_state_url =
             format!("https://metadata.sqd-datasets.io/{network_state_filename}");
         Self {
-            datasets: RwLock::new(Default::default(), "StorageClient::datasets"),
+            assignment: RwLock::new(None, "StorageClient::assignment"),
             datasets_config,
-            workers: RwLock::new(Vec::new(), "StorageClient::workers"),
-            latest_assignment: RwLock::new(None, "StorageClient::latest_assignment"),
+            latest_assignment_id: RwLock::new(None, "StorageClient::latest_assignment"),
             network_state_url,
+            reqwest_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .unwrap(),
         }
     }
 
     pub fn has_assignment(&self) -> bool {
-        self.latest_assignment.read().is_some()
+        self.assignment.read().is_some()
     }
 
     pub async fn try_update_assignment(&self) {
+        match self.update_assignment().await {
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!(error = ?err, "Failed to update assignment, waiting for the next one");
+            }
+        }
+    }
+
+    async fn update_assignment(&self) -> anyhow::Result<()> {
         tracing::debug!("Checking for new assignment");
-        let latest_assignment = self.latest_assignment.read().clone();
-        let assignment = match Assignment::try_download(
-            self.network_state_url.clone(),
-            latest_assignment,
-            Duration::from_secs(60),
-        )
-        .await
-        {
-            Ok(Some(assignment)) => assignment,
-            Ok(None) => {
-                tracing::debug!("Assignment has not been changed");
-                return;
-            }
-            Err(err) => {
-                tracing::error!(error = ?err, "Unable to get assignment");
-                return;
-            }
-        };
+        let network_state = self.fetch_network_state().await?;
+        let assignment_id = network_state.assignment.id;
+        if self.latest_assignment_id.read().as_ref() == Some(&assignment_id) {
+            tracing::debug!("Assignment has not been changed");
+            return Ok(());
+        }
 
-        // TODO: use assignment.effective_from
+        let assignment = self
+            .fetch_assignment(
+                &network_state
+                    .assignment
+                    .fb_url
+                    .ok_or(anyhow!("Missing fb_url"))?,
+            )
+            .await?;
 
-        let assignment_id = assignment.id.clone();
+        // TODO: use network_state.assignment.effective_from
+
         tracing::debug!("Got assignment {:?}", assignment_id);
-        *self.latest_assignment.write() = Some(assignment_id.clone());
+        *self.latest_assignment_id.write() = Some(assignment_id.clone());
+        self.set_assignment(assignment);
 
-        let workers = assignment.get_all_peer_ids();
-        let datasets = match parse_assignment(assignment) {
-            Ok(datasets) => datasets,
-            Err(err) => {
-                tracing::error!(error = ?err, "Failed to parse assignment, waiting for the next one");
-                return;
-            }
-        };
-        tracing::debug!("Assignment parsed");
-
-        self.update_datasets(datasets);
-        crate::metrics::KNOWN_WORKERS.set(workers.len() as i64);
-        *self.workers.write() = workers;
         tracing::info!("New assignment saved");
+        Ok(())
+    }
+
+    async fn fetch_network_state(&self) -> anyhow::Result<sqd_messages::assignments::NetworkState> {
+        let response = self
+            .reqwest_client
+            .get(&self.network_state_url)
+            .send()
+            .await?;
+        let network_state = response.json().await?;
+        Ok(network_state)
+    }
+
+    async fn fetch_assignment(&self, url: &str) -> anyhow::Result<Assignment> {
+        use async_compression::tokio::bufread::GzipDecoder;
+        use futures::TryStreamExt;
+        use tokio::io::AsyncReadExt;
+        use tokio_util::io::StreamReader;
+
+        let response = self.reqwest_client.get(url).send().await?;
+        let stream = response.bytes_stream();
+        let reader = StreamReader::new(
+            stream.map_err(|e| std::io::Error::new(ErrorKind::Other, e)),
+        );
+        let mut buf = Vec::new();
+        let mut decoder = GzipDecoder::new(reader);
+        decoder
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to decompress assignment: {}", e))?;
+        Ok(Assignment::from_owned(buf)?)
     }
 
     #[instrument(skip_all)]
-    fn update_datasets(&self, new_datasets: HashMap<DatasetId, DatasetIndex>) {
-        tracing::info!("Saving known chunks");
-
-        debug_assert!(
-            new_datasets
-                .values()
-                .all(|index| index.chunks.is_sorted_by_key(|c| c.chunk.first_block)),
-            "Chunks in the assignment must be sorted"
-        );
-
-        let datasets = self.datasets.read();
-        for (dataset, index) in &new_datasets {
-            let new_len = index.chunks.len();
-            let last_block = index.chunks.last().map_or(0, |r| r.chunk.last_block);
-            let prev = datasets.get(dataset);
-            let old_len = prev.map_or(0, |i| i.chunks.len());
+    fn set_assignment(&self, assignment: Assignment) {
+        let prev = self.assignment.read();
+        for dataset in assignment.datasets().iter() {
+            let dataset_id = DatasetId::from_url(dataset.id());
+            let new_len = dataset.chunks().len();
+            let last_block = dataset.last_block();
+            let prev_ds = prev.as_ref().and_then(|p| p.get_dataset(dataset.id()));
+            let old_len = prev_ds.map_or(0, |p| p.chunks().len());
             if old_len < new_len {
                 tracing::info!(
                     "Got {} new chunk(s) for dataset {}",
                     new_len - old_len,
-                    dataset
+                    dataset_id,
                 );
             }
             let dataset_name = self
                 .datasets_config
                 .read()
-                .default_name(dataset)
+                .default_name(&dataset_id)
                 .map(ToOwned::to_owned);
-            metrics::report_chunk_list_updated(dataset, dataset_name, new_len, last_block);
+            metrics::report_chunk_list_updated(&dataset_id, dataset_name, new_len, last_block);
         }
-        drop(datasets);
+        drop(prev);
 
-        *self.datasets.write() = new_datasets;
+        crate::metrics::KNOWN_WORKERS.set(assignment.workers().len() as i64);
+
+        *self.assignment.write() = Some(assignment);
     }
 
-    pub fn find_chunk(
+    pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound> {
+        let dataset = dataset.to_url();
+        let guard = self.assignment.read();
+        let assignment = guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)?;
+        let chunk = assignment
+            .find_chunk(dataset, block)
+            .map_err(|e| convert_chunk_not_found(e, assignment, dataset))?;
+        Ok(chunk.id().parse().map_err(|e| {
+            tracing::warn!(error = %e, "Failed to parse chunk ID");
+            ChunkNotFound::InvalidID(chunk.id().to_string())
+        })?)
+    }
+
+    pub fn find_workers(
         &self,
         dataset: &DatasetId,
         block: u64,
-    ) -> Result<AssignedChunk, ChunkNotFound> {
-        let datasets = self.datasets.read();
-        let chunks = &datasets
-            .get(dataset)
-            .ok_or(ChunkNotFound::UnknownDataset)?
-            .chunks;
-        let first_block = chunks.first().ok_or(ChunkNotFound::Gap)?.chunk.first_block;
-        if block < first_block {
-            return Err(ChunkNotFound::BeforeFirst { first_block });
-        }
-        let first_suspect =
-            chunks.partition_point(|chunk: &AssignedChunk| (chunk.chunk.last_block) < block);
-        if first_suspect >= chunks.len() {
-            return Err(ChunkNotFound::AfterLast);
-        }
-        if chunks[first_suspect].chunk.first_block <= block {
-            Ok(chunks[first_suspect].clone())
-        } else {
-            Err(ChunkNotFound::Gap)
-        }
+    ) -> Result<Vec<PeerId>, ChunkNotFound> {
+        let dataset = dataset.to_url();
+        let guard = self.assignment.read();
+        let assignment = guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)?;
+        let chunk = assignment
+            .find_chunk(dataset, block)
+            .map_err(|e| convert_chunk_not_found(e, assignment, dataset))?;
+        Ok(chunk
+            .worker_indexes()
+            .iter()
+            .filter_map(|idx| match assignment.get_worker_id(idx) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to parse worker ID #{}", idx);
+                    None
+                }
+            })
+            .collect())
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
-        self.find_chunk(dataset, chunk.last_block + 1)
-            .ok()
-            .map(|c| c.chunk)
+        self.find_chunk(dataset, chunk.last_block + 1).ok()
     }
 
     pub fn first_block(&self, dataset: &DatasetId) -> Option<BlockNumber> {
-        self.datasets
-            .read()
-            .get(dataset)
-            .and_then(|index| index.chunks.first().map(|c| c.chunk.first_block))
+        Some(
+            self.assignment
+                .read()
+                .as_ref()?
+                .get_dataset(dataset.to_url())?
+                .first_block(),
+        )
     }
 
     pub fn head(&self, dataset: &DatasetId) -> Option<BlockRef> {
-        self.datasets.read().get(dataset).and_then(|index| {
-            let number = index.chunks.last().map(|c| c.chunk.last_block);
-            match (number, index.summary.as_ref()) {
-                (Some(number), Some(summary)) => Some(BlockRef {
-                    number: number,
-                    hash: summary.last_block_hash.clone(),
-                }),
-                _ => None,
-            }
+        let guard = self.assignment.read();
+        let dataset = guard.as_ref()?.get_dataset(dataset.to_url())?;
+        dataset.last_block_hash().map(|hash| BlockRef {
+            hash: hash.to_owned(),
+            number: dataset.last_block(),
         })
     }
 
     pub fn get_all_workers(&self) -> Vec<PeerId> {
-        self.workers.read().clone()
+        let guard = self.assignment.read();
+        guard
+            .as_ref()
+            .map(|a| {
+                a.workers()
+                    .iter()
+                    .filter_map(|w| (*w.worker_id()).try_into().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
+    #[instrument(skip(self))]
     pub fn get_dataset_state(&self, dataset: &DatasetId) -> Option<DatasetState> {
         let mut ranges: HashMap<_, Vec<_>> = HashMap::new();
-        for c in &self.datasets.read().get(dataset)?.chunks {
-            for &worker in c.workers.iter() {
-                ranges.entry(worker).or_default().push(c.chunk.range_msg())
+        let guard = self.assignment.read();
+        let assignment = guard.as_ref()?;
+        for c in assignment.get_dataset(dataset.to_url())?.chunks().iter() {
+            let range = c.id().parse::<DataChunk>().unwrap().range_msg();
+            for idx in c.worker_indexes() {
+                let peer_id = match assignment.get_worker_id(idx) {
+                    Ok(peer_id) => peer_id,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to parse worker ID #{}", idx);
+                        continue;
+                    }
+                };
+                ranges.entry(peer_id).or_default().push(range)
             }
         }
         Some(DatasetState {
@@ -216,44 +254,16 @@ impl StorageClient {
     }
 }
 
-#[tracing::instrument(skip_all)]
-fn parse_assignment(assignment: Assignment) -> anyhow::Result<HashMap<DatasetId, DatasetIndex>> {
-    let mut chunks: Vec<(DatasetId, DataChunk, Vec<PeerId>, Option<ChunkSummary>)> = assignment
-        .datasets
-        .into_iter()
-        .flat_map(|dataset| {
-            let dataset_id = DatasetId::from_url(&dataset.id);
-            dataset.chunks.into_iter().flat_map(move |chunk| {
-                chunk
-                    .id
-                    .parse::<DataChunk>()
-                    .map_err(|e| {
-                        tracing::warn!(error=%e, "Couldn't parse chunk id '{}'", chunk.id);
-                    })
-                    .map(|id| (dataset_id.clone(), id, vec![], chunk.summary))
-            })
-        })
-        .collect_vec();
-    for (peer_id, worker) in assignment.worker_assignments {
-        let mut index = 0;
-        for delta in worker.chunks_deltas {
-            index += delta;
-            chunks[index as usize].2.push(peer_id);
-        }
+fn convert_chunk_not_found(
+    e: sqd_assignments::ChunkNotFound,
+    assignment: &Assignment,
+    dataset: &str,
+) -> ChunkNotFound {
+    match e {
+        sqd_assignments::ChunkNotFound::AfterLast => ChunkNotFound::AfterLast,
+        sqd_assignments::ChunkNotFound::BeforeFirst => ChunkNotFound::BeforeFirst {
+            first_block: assignment.get_dataset(dataset).unwrap().first_block(),
+        },
+        sqd_assignments::ChunkNotFound::UnknownDataset => ChunkNotFound::UnknownDataset,
     }
-    chunks.sort_unstable_by_key(|(dataset, chunk, _, _)| (dataset.clone(), chunk.first_block));
-    let mut datasets = HashMap::new();
-    for (dataset_id, chunk, workers, summary) in chunks {
-        let dataset_index = datasets.entry(dataset_id).or_insert_with(|| DatasetIndex {
-            chunks: Vec::new(),
-            summary: None,
-        });
-        dataset_index.chunks.push(AssignedChunk {
-            chunk,
-            workers: Arc::new(workers),
-        });
-        dataset_index.summary = summary; // taken from the last chunk
-    }
-
-    Ok(datasets)
 }
