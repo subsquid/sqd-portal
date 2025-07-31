@@ -585,7 +585,12 @@ fn better_result(prev: Option<&QueryResult>, new: &QueryResult) -> bool {
 }
 
 fn retriable(result: &QueryResult) -> bool {
-    matches!(result, Err(QueryError::Retriable(_)))
+    match result {
+        Ok(_) => false,
+        Err(QueryError::BadRequest(_)) => false,
+        Err(QueryError::Retriable(_)) => true,
+        Err(QueryError::RateLimitExceeded) => true,
+    }
 }
 
 fn short_code(result: &RequestState) -> &'static str {
