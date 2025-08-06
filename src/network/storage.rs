@@ -84,13 +84,13 @@ impl StorageClient {
             )
             .await?;
 
-        // TODO: use network_state.assignment.effective_from
+        tracing::debug!("Downloaded assignment \"{}\"", assignment_id);
 
-        tracing::debug!("Got assignment {:?}", assignment_id);
-        *self.latest_assignment_id.write() = Some(assignment_id.clone());
-        self.set_assignment(assignment);
+        sleep_until(network_state.assignment.effective_from).await;
 
-        tracing::info!("New assignment saved");
+        self.set_assignment(assignment, &assignment_id);
+
+        tracing::info!("Applied assignment \"{}\"", assignment_id);
         Ok(())
     }
 
@@ -112,9 +112,8 @@ impl StorageClient {
 
         let response = self.reqwest_client.get(url).send().await?;
         let stream = response.bytes_stream();
-        let reader = StreamReader::new(
-            stream.map_err(|e| std::io::Error::new(ErrorKind::Other, e)),
-        );
+        let reader =
+            StreamReader::new(stream.map_err(|e| std::io::Error::new(ErrorKind::Other, e)));
         let mut buf = Vec::new();
         let mut decoder = GzipDecoder::new(reader);
         decoder
@@ -125,7 +124,9 @@ impl StorageClient {
     }
 
     #[instrument(skip_all)]
-    fn set_assignment(&self, assignment: Assignment) {
+    fn set_assignment(&self, assignment: Assignment, id: &str) {
+        *self.latest_assignment_id.write() = Some(id.to_owned());
+
         let prev = self.assignment.read();
         for dataset in assignment.datasets().iter() {
             let dataset_id = DatasetId::from_url(dataset.id());
@@ -265,5 +266,15 @@ fn convert_chunk_not_found(
             first_block: assignment.get_dataset(dataset).unwrap().first_block(),
         },
         sqd_assignments::ChunkNotFound::UnknownDataset => ChunkNotFound::UnknownDataset,
+    }
+}
+
+async fn sleep_until(timestamp: u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("time should be after 1970");
+    let until = Duration::from_secs(timestamp);
+    if let Some(delta) = until.checked_sub(now) {
+        tokio::time::sleep(delta).await;
     }
 }
