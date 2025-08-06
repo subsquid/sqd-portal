@@ -71,13 +71,13 @@ impl axum::response::IntoResponse for RequestError {
                 .unwrap(),
 
             s @ Self::RateLimitExceeded => axum::http::Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
+                .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header(header::RETRY_AFTER, 1)
                 .body(axum::body::Body::from(s.to_string()))
                 .unwrap(),
 
             Self::InternalError(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 format!("All query attempts failed, last error: {e}"),
             )
                 .into_response(),
