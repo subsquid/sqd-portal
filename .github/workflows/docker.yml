@@ -8,7 +8,7 @@ on:
 jobs:
   docker:
     name: Build and publish docker image
-    uses: ./.github/workflows/docker-reusable.yml
+    uses: subsquid/github-workflows/.github/workflows/docker-on-tag.yml@main
     with:
       image_name: subsquid/sqd-portal
       push_latest: true
