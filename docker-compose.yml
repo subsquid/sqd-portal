@@ -1,5 +1,5 @@
 services:
-  query_gateway:
+  portal:
     image: subsquid/sqd-portal:0.6.0-rc10
     environment:
       KEY_PATH: /run/secrets/network_key

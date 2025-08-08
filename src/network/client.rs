@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use sqd_contract_client::{Client as ContractClient, ClientError, PeerId, Worker};
 use sqd_messages::{query_error, query_result, Query, QueryFinished, QueryOk};
 use sqd_network_transport::{
-    get_agent_info, AgentInfo, GatewayConfig, GatewayTransportHandle, Keypair, P2PTransportBuilder,
+    get_agent_info, AgentInfo, Keypair, P2PTransportBuilder, PortalConfig, PortalTransportHandle,
     QueryFailure, TransportArgs,
 };
 
@@ -66,7 +66,7 @@ pub struct NetworkClientStatus {
 
 /// Tracks the network state and handles p2p communication
 pub struct NetworkClient {
-    transport_handle: GatewayTransportHandle,
+    transport_handle: PortalTransportHandle,
     network_state: NetworkState,
     datasets: Arc<RwLock<Datasets>>,
     contract_client: Box<dyn ContractClient>,
@@ -92,13 +92,16 @@ impl NetworkClient {
         let local_peer_id = transport_builder.local_peer_id();
         let keypair = transport_builder.keypair();
 
-        let mut gateway_config = GatewayConfig::default();
-        gateway_config.query_config.request_timeout = config.transport_timeout;
-        gateway_config.query_config.max_concurrent_streams = None;
-        gateway_config.worker_status_via_gossipsub = false;
-        gateway_config.worker_status_via_polling = false;
-        gateway_config.log_sending_timeout = LOGS_SENDING_TIMEOUT;
-        let (_events, transport_handle) = transport_builder.build_gateway(gateway_config)?;
+        let portal_config = PortalConfig {
+            query_config: sqd_network_transport::ClientConfig {
+                max_concurrent_streams: None,
+                request_timeout: config.transport_timeout,
+                ..Default::default()
+            },
+            log_sending_timeout: LOGS_SENDING_TIMEOUT,
+            ..Default::default()
+        };
+        let transport_handle = transport_builder.build_portal(portal_config)?;
 
         let (logs_tx, logs_rx) = if config.send_logs {
             let (tx, rx) = sqd_network_transport::util::new_queue(LOGS_QUEUE_SIZE, "query_logs");

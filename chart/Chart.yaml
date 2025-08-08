@@ -1,5 +1,0 @@
-apiVersion: v2
-appVersion: 0.0.1
-name: subsquid-gateway
-type: application
-version: 0.0.1
