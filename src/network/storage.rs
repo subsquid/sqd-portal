@@ -84,8 +84,6 @@ impl StorageClient {
             )
             .await?;
 
-        tracing::debug!("Downloaded assignment \"{}\"", assignment_id);
-
         sleep_until(network_state.assignment.effective_from).await;
 
         self.set_assignment(assignment, &assignment_id);
@@ -120,7 +118,10 @@ impl StorageClient {
             .read_to_end(&mut buf)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to decompress assignment: {}", e))?;
-        Ok(Assignment::from_owned(buf)?)
+
+        tracing::debug!("Downloaded assignment from {}", url);
+
+        Ok(Assignment::from_owned_unchecked(buf))
     }
 
     #[instrument(skip_all)]
