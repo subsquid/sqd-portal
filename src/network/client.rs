@@ -24,6 +24,7 @@ use super::contracts_state::{self, ContractsState};
 use super::priorities::NoWorker;
 use super::{ChunkNotFound, NetworkState};
 use crate::datasets::{DatasetConfig, Datasets};
+use crate::hotblocks::HotblocksHandle;
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
 use crate::types::{BlockNumber, BlockRange, ChunkId, DataChunk};
 use crate::utils::{RwLock, UseOnce};
@@ -84,6 +85,7 @@ impl NetworkClient {
         args: TransportArgs,
         config: Arc<Config>,
         datasets: Arc<RwLock<Datasets>>,
+        hotblocks: Option<Arc<HotblocksHandle>>,
     ) -> anyhow::Result<Arc<NetworkClient>> {
         let network = args.rpc.network;
         let agent_into = get_agent_info!();
@@ -128,11 +130,17 @@ impl NetworkClient {
             logs_rx,
         });
 
+        this.reset_height_updates(hotblocks.clone());
+
+        let client_handle = this.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(config.datasets_update_interval).await;
-                if let Err(e) = Datasets::update(&datasets_copy, &config).await {
-                    tracing::warn!("Failed to update datasets mapping: {e:?}");
+                match Datasets::update(&datasets_copy, &config).await {
+                    Ok(()) => {
+                        client_handle.reset_height_updates(hotblocks.clone());
+                    }
+                    Err(e) => tracing::warn!("Failed to update datasets mapping: {e:?}"),
                 }
             }
         });
@@ -565,6 +573,41 @@ impl NetworkClient {
 
     pub fn is_ready(&self) -> bool {
         self.network_state.dataset_storage.has_assignment()
+    }
+
+    pub fn reset_height_updates(&self, hotblocks: Option<Arc<HotblocksHandle>>) {
+        let Some(hotblocks) = hotblocks.as_ref() else {
+            return;
+        };
+        let datasets = self.datasets.read();
+        self.network_state
+            .dataset_storage
+            .unsubscribe_head_updates();
+        for dataset in datasets.iter() {
+            if let (Some(dataset_id), Some(_)) = (&dataset.network_id, &dataset.hotblocks) {
+                let hotblocks = hotblocks.clone();
+                let name = dataset.default_name.parse().expect("Invalid dataset name");
+                tracing::info!(
+                    "Hotblocks storage for '{name}' set to track dataset height of '{dataset_id}'"
+                );
+                self.network_state.dataset_storage.subscribe_head_updates(
+                    dataset_id,
+                    Box::new(move |block| {
+                        tracing::info!(
+                            "Cleaning hotblocks storage for '{name}' up to block {}",
+                            block.number
+                        );
+                        hotblocks.server.retain(
+                            name,
+                            sqd_hotblocks::RetentionStrategy::FromBlock {
+                                number: block.number + 1,
+                                parent_hash: Some(block.hash),
+                            },
+                        );
+                    }),
+                );
+            }
+        }
     }
 }
 
