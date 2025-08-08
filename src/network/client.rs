@@ -94,15 +94,12 @@ impl NetworkClient {
         let local_peer_id = transport_builder.local_peer_id();
         let keypair = transport_builder.keypair();
 
-        let portal_config = PortalConfig {
-            query_config: sqd_network_transport::ClientConfig {
-                max_concurrent_streams: None,
-                request_timeout: config.transport_timeout,
-                ..Default::default()
-            },
+        let mut portal_config = PortalConfig {
             log_sending_timeout: LOGS_SENDING_TIMEOUT,
             ..Default::default()
         };
+        portal_config.query_config.max_concurrent_streams = None;
+        portal_config.query_config.request_timeout = config.transport_timeout;
         let transport_handle = transport_builder.build_portal(portal_config)?;
 
         let (logs_tx, logs_rx) = if config.send_logs {
