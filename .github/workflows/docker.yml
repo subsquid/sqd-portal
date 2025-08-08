@@ -1,42 +1,17 @@
 name: docker
-on:
-  workflow_dispatch: # manually run
 
-env:
-  CI: true
+on:
+  push:
+    tags:
+      - v**
 
 jobs:
-  publish:
-    name: Build & publish docker images
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - uses: SebRollen/toml-action@v1.2.0
-        id: read_toml
-        with:
-          file: 'Cargo.toml'
-          field: 'package.version'
-
-      - name: Docker login
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_LOGIN }}
-          password: ${{ secrets.DOCKER_TOKEN }}
-
-      - name: Build & publish portal
-        uses: docker/build-push-action@v5
-        env:
-          VERSION: ${{ steps.read_toml.outputs.value }}
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm/v7,linux/arm64/v8,linux/386
-          push: true
-          tags: |
-            subsquid/sqd-portal:${{ env.VERSION }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+  docker:
+    name: Build and publish docker image
+    uses: ./.github/workflows/docker-reusable.yml
+    with:
+      image_name: subsquid/sqd-portal
+      push_latest: true
+    secrets:
+      DOCKER_LOGIN: ${{ secrets.DOCKER_LOGIN }}
+      DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}

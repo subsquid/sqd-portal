@@ -1,0 +1,90 @@
+# This workflow should be triggered on tag pushes for tags starting with "v".
+# I.e. the workflow trigger rule should look like this:
+#
+# on:
+#   push:
+#     tags:
+#       - v**
+
+name: Docker build and push
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Docker image name"
+        required: true
+        type: string
+      platforms:
+        description: "Target platforms for the build"
+        required: false
+        type: string
+        default: "linux/amd64,linux/arm/v7,linux/arm64/v8,linux/386"
+      dockerfile_path:
+        description: "Path to the Dockerfile"
+        required: false
+        type: string
+        default: "Dockerfile"
+      context:
+        description: "Build context path"
+        required: false
+        type: string
+        default: "."
+      push_latest:
+        description: "Whether to also push latest tag"
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      DOCKER_LOGIN:
+        description: "Docker Hub username"
+        required: true
+      DOCKER_TOKEN:
+        description: "Docker Hub access token"
+        required: true
+
+env:
+  CI: true
+
+jobs:
+  publish:
+    name: Build and publish docker image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version
+        run: |
+          VERSION="${GITHUB_REF_NAME:1}"
+          echo "Version: $VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_LOGIN }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Generate tags
+        id: tags
+        run: |
+          TAGS="${{ inputs.image_name }}:${VERSION}"
+          if [ "${{ inputs.push_latest }}" = "true" ]; then
+            TAGS="${TAGS},${{ inputs.image_name }}:latest"
+          fi
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+
+      - name: Docker build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile_path }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
