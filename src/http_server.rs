@@ -21,6 +21,9 @@ use sqd_hotblocks::error::UnknownDataset;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
+use tower_http::request_id::{
+    MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
+};
 
 use crate::datasets::DatasetConfig;
 use crate::types::api_types::AvailableDatasetApiResponse;
@@ -30,7 +33,7 @@ use crate::{
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
     network::{NetworkClient, NoWorker},
-    types::{ChunkId, ClientRequest, DatasetId, ParsedQuery, RequestError, RequestId},
+    types::{ChunkId, ClientRequest, DatasetId, ParsedQuery, RequestError},
     utils::logging,
 };
 
@@ -49,6 +52,10 @@ pub async fn run_server(
 
     tracing::info!("Starting HTTP server listening on {addr}");
     let app = Router::new()
+        .layer(
+            // This layer should be called before the response reaches trace layers
+            PropagateRequestIdLayer::x_request_id(),
+        )
         .route("/datasets", get(get_datasets))
         .route(
             "/datasets/:dataset/finalized-stream",
@@ -85,6 +92,10 @@ pub async fn run_server(
         .route("/ready", get(get_readiness))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
+        .layer(
+            // This layer is added here to be applied before the request reaches trace layers
+            SetRequestIdLayer::x_request_id(MakeRequestUuid::default()),
+        )
         .layer(Extension(task_manager))
         .layer(Extension(network_client))
         .layer(Extension(config))
@@ -574,10 +585,14 @@ where
             .await
             .map_err(IntoResponse::into_response)?;
 
-        let Extension(RequestId(req_id)) = req
+        let req_id = req
             .extract_parts::<Extension<RequestId>>()
             .await
-            .unwrap_or(Extension(RequestId(uuid::Uuid::nil().to_string())));
+            .expect("RequestId should be set by the SetRequestIdLayer")
+            .header_value()
+            .to_str()
+            .expect("RequestId should be a valid string")
+            .to_owned();
 
         let Query(params) = req
             .extract_parts::<Query<HashMap<String, String>>>()

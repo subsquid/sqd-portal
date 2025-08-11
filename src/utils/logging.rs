@@ -1,11 +1,9 @@
 use axum::{extract::Request, response::IntoResponse};
 use tokio::time::{Duration, Instant};
+use tower_http::request_id::RequestId;
 use tracing::Instrument;
 
-use crate::{
-    metrics,
-    types::{ClientRequest, RequestId},
-};
+use crate::{metrics, types::ClientRequest};
 
 const LOG_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -83,20 +81,20 @@ impl StreamStats {
     }
 }
 
-pub async fn middleware(mut req: Request, next: axum::middleware::Next) -> impl IntoResponse {
+pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl IntoResponse {
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let version = req.version();
     let start = Instant::now();
     let request_id = req
-        .headers()
-        .get("x-request-id")
-        .map(|v| v.to_str().unwrap_or_default().to_owned())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .extensions()
+        .get::<RequestId>()
+        .unwrap()
+        .header_value()
+        .to_str()
+        .expect("Request ID should be a valid string");
 
     let span = tracing::span!(tracing::Level::INFO, "http_request", request_id);
-
-    req.extensions_mut().insert(RequestId(request_id));
 
     let response = next.run(req).instrument(span.clone()).await;
 
