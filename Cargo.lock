@@ -6936,7 +6936,7 @@ dependencies = [
 [[package]]
 name = "sqd-array"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6963,7 +6963,7 @@ dependencies = [
 [[package]]
 name = "sqd-bloom-filter"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 dependencies = [
  "xxhash-rust",
 ]
@@ -6990,7 +6990,7 @@ dependencies = [
 [[package]]
 name = "sqd-data"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7007,7 +7007,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-client"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7021,7 +7021,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-core"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7035,7 +7035,7 @@ dependencies = [
 [[package]]
 name = "sqd-data-source"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 dependencies = [
  "anyhow",
  "futures 0.3.31",
@@ -7048,7 +7048,7 @@ dependencies = [
 [[package]]
 name = "sqd-dataset"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 
 [[package]]
 name = "sqd-messages"
@@ -7109,7 +7109,7 @@ dependencies = [
 [[package]]
 name = "sqd-node"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 dependencies = [
  "anyhow",
  "bytes 1.9.0",
@@ -7138,7 +7138,7 @@ dependencies = [
 [[package]]
 name = "sqd-polars"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7149,7 +7149,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.7.12"
+version = "0.7.13"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -7200,7 +7200,7 @@ dependencies = [
 [[package]]
 name = "sqd-primitives"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 dependencies = [
  "borsh",
  "serde",
@@ -7210,7 +7210,7 @@ dependencies = [
 [[package]]
 name = "sqd-query"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7233,7 +7233,7 @@ dependencies = [
 [[package]]
 name = "sqd-storage"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=f68d7d4#f68d7d4fe34d70700fe469987cdce74289d3b6e8"
+source = "git+https://github.com/subsquid/data.git?rev=0e4522f3#0e4522f361aacc127f377226c91e5763b6c312c3"
 dependencies = [
  "anyhow",
  "arrow",
