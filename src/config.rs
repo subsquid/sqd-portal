@@ -197,7 +197,8 @@ where
     #[serde(rename_all = "snake_case")]
     enum Model {
         FromBlock(BlockNumber),
-        Head(BlockNumber),
+        Head(u64),
+        None,
     }
 
     let model = Model::deserialize(de)?;
@@ -207,5 +208,6 @@ where
             parent_hash: None,
         }),
         Model::Head(blocks) => Ok(RetentionStrategy::Head(blocks)),
+        Model::None => Ok(RetentionStrategy::None),
     }
 }
