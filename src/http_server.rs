@@ -221,6 +221,11 @@ async fn run_finalized_stream(
     request.query.prepare_for_network();
     let stream = match task_manager.spawn_stream(request).await {
         Ok(stream) => stream,
+        Err(e @ RequestError::NoData) => {
+            // Delay request from this client for 5 seconds to avoid unnecessary retries
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            return e.into_response();
+        }
         Err(e) => return e.into_response(),
     };
 
