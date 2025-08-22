@@ -107,7 +107,8 @@ impl StorageClient {
             .reqwest_client
             .get(&self.network_state_url)
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
         let network_state = response.json().await?;
         Ok(network_state)
     }
@@ -118,7 +119,12 @@ impl StorageClient {
         use tokio::io::AsyncReadExt;
         use tokio_util::io::StreamReader;
 
-        let response = self.reqwest_client.get(url).send().await?;
+        let response = self
+            .reqwest_client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?;
         let stream = response.bytes_stream();
         let reader =
             StreamReader::new(stream.map_err(|e| std::io::Error::new(ErrorKind::Other, e)));
