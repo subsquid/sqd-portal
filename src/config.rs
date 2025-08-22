@@ -49,6 +49,9 @@ pub struct Config {
     )]
     pub chain_update_interval: Duration,
 
+    #[serde(default = "default_assignments_url")]
+    pub assignments_url: String,
+
     #[serde_as(as = "DurationSeconds")]
     #[serde(
         rename = "assignments_update_interval_sec",
@@ -167,6 +170,10 @@ fn default_default_timeout_quantile() -> f32 {
 
 fn default_chain_update_interval() -> Duration {
     Duration::from_secs(60)
+}
+
+fn default_assignments_url() -> String {
+    String::from("https://metadata.sqd-datasets.io")
 }
 
 fn default_assignments_update_interval() -> Duration {

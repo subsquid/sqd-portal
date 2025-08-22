@@ -18,10 +18,10 @@ pub struct NetworkState {
 }
 
 impl NetworkState {
-    pub fn new(datasets: Arc<RwLock<Datasets>>, network: Network) -> Self {
+    pub fn new(datasets: Arc<RwLock<Datasets>>, network: Network, network_state_url: &str) -> Self {
         Self {
             pool: RwLock::new(WorkersPool::default(), "NetworkState::pool"),
-            dataset_storage: StorageClient::new(datasets, network),
+            dataset_storage: StorageClient::new(datasets, network, network_state_url),
         }
     }
 

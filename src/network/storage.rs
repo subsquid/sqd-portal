@@ -37,13 +37,16 @@ pub enum ChunkNotFound {
 }
 
 impl StorageClient {
-    pub fn new(datasets_config: Arc<RwLock<Datasets>>, network: Network) -> Self {
+    pub fn new(
+        datasets_config: Arc<RwLock<Datasets>>,
+        network: Network,
+        assignments_url: &str,
+    ) -> Self {
         let network_state_filename = match network {
             Network::Tethys => "network-state-tethys.json",
             Network::Mainnet => "network-state-mainnet.json",
         };
-        let network_state_url =
-            format!("https://metadata.sqd-datasets.io/{network_state_filename}");
+        let network_state_url = format!("{assignments_url}/{network_state_filename}");
         Self {
             assignment: RwLock::new(None, "StorageClient::assignment"),
             datasets_config,
