@@ -53,7 +53,8 @@ impl StorageClient {
             latest_assignment_id: RwLock::new(None, "StorageClient::latest_assignment"),
             network_state_url,
             reqwest_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
+                .read_timeout(Duration::from_secs(5))
+                .user_agent(format!("SQD Portal {}", env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap(),
             head_update_subscribers: Mutex::new(
@@ -89,7 +90,7 @@ impl StorageClient {
             .fetch_assignment(
                 &network_state
                     .assignment
-                    .fb_url
+                    .fb_url_v1
                     .ok_or(anyhow!("Missing fb_url"))?,
             )
             .await?;
