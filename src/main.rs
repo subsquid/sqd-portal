@@ -12,6 +12,8 @@ use prometheus_client::registry::Registry;
 use sqd_network_transport::TransportArgs;
 use tokio_util::sync::CancellationToken;
 
+use crate::utils::RwLock;
+
 mod config;
 mod controller;
 mod datasets;
@@ -43,8 +45,6 @@ pub struct Cli {
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
-
-use crate::utils::RwLock;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
