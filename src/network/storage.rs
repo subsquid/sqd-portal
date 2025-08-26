@@ -54,7 +54,7 @@ impl StorageClient {
             network_state_url,
             reqwest_client: reqwest::Client::builder()
                 .read_timeout(Duration::from_secs(5))
-                .user_agent(format!("SQD Portal {}", env!("CARGO_PKG_VERSION")))
+                .user_agent(format!("SQD Portal/{}", env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap(),
             head_update_subscribers: Mutex::new(
