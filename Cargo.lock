@@ -7094,7 +7094,6 @@ dependencies = [
  "lru",
  "parking_lot 0.12.3",
  "pin-project",
- "prometheus-client",
  "prost 0.13.4",
  "serde",
  "sqd-contract-client",
@@ -7148,7 +7147,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.7.17"
+version = "0.7.18"
 dependencies = [
  "anyhow",
  "async-compression",
