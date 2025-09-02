@@ -12,6 +12,7 @@ use tokio::time::Instant;
 use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
+use tracing::error;
 
 use sqd_contract_client::{Client as ContractClient, ClientError, PeerId, Worker};
 use sqd_messages::{query_error, query_result, Query, QueryFinished, QueryOk};
@@ -37,7 +38,8 @@ use crate::{
 pub type QueryResult = Result<QueryOk, QueryError>;
 
 const LOGS_QUEUE_SIZE: usize = 10000;
-const CONCURRENT_LOGS: usize = 100;
+const CONCURRENT_LOGS: usize = 10;
+const MAX_LOGS_CHUNK_SIZE: usize = 100;
 const LOGS_SENDING_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize)]
@@ -279,8 +281,10 @@ impl NetworkClient {
         };
         logs_rx
             .take_until(cancellation_token.cancelled_owned())
+            .ready_chunks(MAX_LOGS_CHUNK_SIZE)
             .for_each_concurrent(CONCURRENT_LOGS, |msg| async move {
-                self.transport_handle.send_log(&msg).await;
+                error!("Sending {} logs", msg.len());
+                self.transport_handle.send_logs(&msg).await;
             })
             .await;
     }
