@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(args.config);
     let hotblocks = hotblocks::build_server(&config).await?.map(Arc::new);
-    let network_client = NetworkClient::new(
+    let network_client_builder = NetworkClient::builder(
         args.transport,
         config.clone(),
         datasets.clone(),
@@ -94,14 +94,14 @@ async fn main() -> anyhow::Result<()> {
     let mut metrics_registry = Registry::with_labels(
         vec![(
             Cow::Borrowed("portal_id"),
-            Cow::Owned(network_client.get_peer_id().to_string()),
+            Cow::Owned(network_client_builder.peer_id().to_string()),
         )]
         .into_iter(),
     );
     metrics::register_metrics(metrics_registry.sub_registry_with_prefix("portal"));
-    // sqd_network_transport::metrics::register_metrics(
-    //     metrics_registry.sub_registry_with_prefix("transport"),
-    // );
+    sqd_network_transport::metrics::register_metrics(
+        metrics_registry.sub_registry_with_prefix("transport"),
+    );
     if let Some(hotblocks) = &hotblocks {
         hotblocks::register_metrics(
             metrics_registry.sub_registry_with_prefix("portal_hotblocks"),
@@ -110,7 +110,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // This should be done only when metrics are registered
+    let network_client = network_client_builder.build()?;
     tracing::info!("Network client initialized");
+
     let task_manager = Arc::new(TaskManager::new(
         network_client.clone(),
         config.max_parallel_streams,

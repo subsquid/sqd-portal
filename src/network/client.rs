@@ -13,7 +13,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
 
-use sqd_contract_client::{Client as ContractClient, ClientError, PeerId, Worker};
+use sqd_contract_client::{Client as ContractClient, ClientError, Network, PeerId, Worker};
 use sqd_messages::{query_error, query_result, Query, QueryFinished, QueryOk};
 use sqd_network_transport::{
     get_agent_info, AgentInfo, Keypair, P2PTransportBuilder, PortalConfig, PortalTransportHandle,
@@ -80,16 +80,29 @@ pub struct NetworkClient {
     logs_rx: UseOnce<sqd_network_transport::util::Receiver<QueryFinished>>,
 }
 
-impl NetworkClient {
-    pub async fn new(
-        args: TransportArgs,
-        config: Arc<Config>,
-        datasets: Arc<RwLock<Datasets>>,
-        hotblocks: Option<Arc<HotblocksHandle>>,
-    ) -> anyhow::Result<Arc<NetworkClient>> {
-        let network = args.rpc.network;
-        let agent_into = get_agent_info!();
-        let transport_builder = P2PTransportBuilder::from_cli(args, agent_into).await?;
+pub struct NetworkClientBuilder {
+    transport_builder: P2PTransportBuilder,
+    network: Network,
+    config: Arc<Config>,
+    datasets: Arc<RwLock<Datasets>>,
+    hotblocks: Option<Arc<HotblocksHandle>>,
+}
+
+impl NetworkClientBuilder {
+    pub fn peer_id(&self) -> PeerId {
+        self.transport_builder.local_peer_id()
+    }
+
+    /// Builds the NetworkClient and starts network communication
+    pub fn build(self) -> anyhow::Result<Arc<NetworkClient>> {
+        let Self {
+            network,
+            config,
+            datasets,
+            hotblocks,
+            transport_builder,
+        } = self;
+
         let contract_client = transport_builder.contract_client();
         let local_peer_id = transport_builder.local_peer_id();
         let keypair = transport_builder.keypair();
@@ -143,6 +156,26 @@ impl NetworkClient {
         });
 
         Ok(this)
+    }
+}
+
+impl NetworkClient {
+    pub async fn builder(
+        args: TransportArgs,
+        config: Arc<Config>,
+        datasets: Arc<RwLock<Datasets>>,
+        hotblocks: Option<Arc<HotblocksHandle>>,
+    ) -> anyhow::Result<NetworkClientBuilder> {
+        let agent_into = get_agent_info!();
+        let network = args.rpc.network;
+        let transport_builder = P2PTransportBuilder::from_cli(args, agent_into).await?;
+        Ok(NetworkClientBuilder {
+            network,
+            config,
+            datasets,
+            hotblocks,
+            transport_builder,
+        })
     }
 
     pub async fn run(
@@ -511,10 +544,6 @@ impl NetworkClient {
 
     pub fn dataset_state(&self, dataset_id: &DatasetId) -> Option<DatasetState> {
         self.network_state.dataset_state(dataset_id)
-    }
-
-    pub fn get_peer_id(&self) -> PeerId {
-        self.local_peer_id
     }
 
     pub fn get_status(&self) -> NetworkClientStatus {
