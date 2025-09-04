@@ -37,7 +37,8 @@ use crate::{
 pub type QueryResult = Result<QueryOk, QueryError>;
 
 const LOGS_QUEUE_SIZE: usize = 10000;
-const CONCURRENT_LOGS: usize = 100;
+const MAX_LOGS_CHUNK_SIZE: usize = 100;
+const CONCURRENT_LOGS: usize = 5;
 const LOGS_SENDING_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize)]
@@ -278,9 +279,10 @@ impl NetworkClient {
             return;
         };
         logs_rx
+            .ready_chunks(MAX_LOGS_CHUNK_SIZE)
             .take_until(cancellation_token.cancelled_owned())
             .for_each_concurrent(CONCURRENT_LOGS, |msg| async move {
-                self.transport_handle.send_log(&msg).await;
+                self.transport_handle.send_logs(msg).await;
             })
             .await;
     }
