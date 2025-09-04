@@ -81,7 +81,8 @@ impl StorageClient {
         tracing::debug!("Checking for new assignment");
         let network_state = self.fetch_network_state().await?;
         let assignment_id = network_state.assignment.id;
-        if self.latest_assignment_id.read().as_ref() == Some(&assignment_id) {
+        let latest_id = self.latest_assignment_id.read().clone();
+        if latest_id == Some(assignment_id) {
             tracing::debug!("Assignment has not been changed");
             return Ok(());
         }
@@ -95,7 +96,9 @@ impl StorageClient {
             )
             .await?;
 
-        sleep_until(network_state.assignment.effective_from).await;
+        if latest_id.is_some() {
+            sleep_until(network_state.assignment.effective_from).await;
+        }
 
         self.set_assignment(assignment, &assignment_id);
 
