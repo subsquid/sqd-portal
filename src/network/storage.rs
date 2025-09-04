@@ -82,7 +82,7 @@ impl StorageClient {
         let network_state = self.fetch_network_state().await?;
         let assignment_id = network_state.assignment.id;
         let latest_id = self.latest_assignment_id.read().clone();
-        if latest_id == Some(assignment_id) {
+        if latest_id.as_ref() == Some(&assignment_id) {
             tracing::debug!("Assignment has not been changed");
             return Ok(());
         }
