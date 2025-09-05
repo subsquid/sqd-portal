@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.7.22-rc1"
+version = "0.7.22-rc2"
 edition = "2021"
 
 [dependencies]
