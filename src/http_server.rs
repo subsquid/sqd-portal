@@ -235,6 +235,7 @@ async fn run_finalized_stream(
     if let Some(head) = head {
         res = res.header(FINALIZED_NUMBER_HEADER, head.number);
         res = res.header(FINALIZED_HASH_HEADER, head.hash);
+        res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
     }
     res.body(Body::from_stream(recompress_gzip(stream)))
         .unwrap()
@@ -250,7 +251,7 @@ async fn run_stream(
 ) -> Response {
     let mut request = restrict_request(&config, request);
 
-    let (head, body) = match (dataset.network_id, hotblocks) {
+    let (head, body, source) = match (dataset.network_id, hotblocks) {
         // TODO: prefer hotblocks storage
         // Prefer data from the network
         (Some(dataset_id), _)
@@ -267,7 +268,11 @@ async fn run_stream(
                 Err(e) => return e.into_response(),
             };
 
-            (head, Body::from_stream(recompress_gzip(stream)))
+            (
+                head,
+                Body::from_stream(recompress_gzip(stream)),
+                DATA_SOURCE_NETWORK,
+            )
         }
         // Then try hotblocks storage
         (_, Some(hotblocks)) if dataset.hotblocks.is_some() => {
@@ -282,6 +287,7 @@ async fn run_stream(
                 Ok(resp) => (
                     resp.finalized_head().cloned(),
                     Body::from_stream(into_stream(resp)),
+                    DATA_SOURCE_REALTIME,
                 ),
                 Err(err) => return hotblocks_error_to_response(err),
             }
@@ -302,7 +308,8 @@ async fn run_stream(
 
     let mut res = Response::builder()
         .header(header::CONTENT_TYPE, "application/jsonl")
-        .header(header::CONTENT_ENCODING, "gzip");
+        .header(header::CONTENT_ENCODING, "gzip")
+        .header(DATA_SOURCE_HEADER, source);
 
     if let Some(head) = head {
         res = res.header(FINALIZED_NUMBER_HEADER, head.number);
@@ -771,3 +778,6 @@ fn hotblocks_error_to_response(err: anyhow::Error) -> Response {
 
 const FINALIZED_NUMBER_HEADER: &str = "X-Sqd-Finalized-Head-Number";
 const FINALIZED_HASH_HEADER: &str = "X-Sqd-Finalized-Head-Hash";
+const DATA_SOURCE_HEADER: &str = "X-Sqd-Data-Source";
+const DATA_SOURCE_NETWORK: &str = "network";
+const DATA_SOURCE_REALTIME: &str = "real_time";
