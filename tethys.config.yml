@@ -2,15 +2,9 @@ hostname: http://0.0.0.0:8000
 sqd_network:
   datasets: https://cdn.subsquid.io/sqd-network/datasets-testnet.yml
   serve: "all"
-hotblocks:
-  db: ./db
 datasets:
-  "solana-beta":
-    sqd_network:
-      dataset_id: "s3://solana-mainnet-1"
+  solana-mainnet:
+    aliases: ["solana-beta"]
+  base-mainnet:
     real_time:
-      kind: solana
-      data_sources:
-        - http://localhost:3000
-      retention:
-        from_block: 0
+      url: http://localhost:9090

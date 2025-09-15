@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.7.22"
+version = "0.8.0"
 edition = "2021"
 
 [dependencies]
@@ -11,6 +11,7 @@ atomic_enum = { version = "0.3.0", features = ["cas"] }
 axum = { version = "0.7", features = ["http2"] }
 base64 = "0.22"
 bimap = "0.6.3"
+bytes = "1.9"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 dotenv = "0.15"
@@ -48,7 +49,5 @@ sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "c795860", version = "2.0.1", features = ["semver", "bitstring", "assignment_reader"] }
 sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "c795860", version = "3.0.0", features = ["portal", "metrics"] }
 
-sqd-data-client = { git = "https://github.com/subsquid/data.git", rev = "0e4522f3" }
-sqd-hotblocks = { git = "https://github.com/subsquid/data.git", package = "sqd-node", rev = "0e4522f3" }
-sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "0e4522f3" }
-sqd-storage = { git = "https://github.com/subsquid/data.git", rev = "0e4522f3" }
+sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "0e4522f3", features = ["serde"] }
+sqd-query = { git = "https://github.com/subsquid/data.git", rev = "0e4522f3" }

@@ -69,13 +69,6 @@ lazy_static::lazy_static! {
     // TODO: add metrics for procedure durations
     static ref MUTEX_HELD_NANOS: Family<Labels, Counter> = Default::default();
     static ref MUTEXES_EXISTING: Family<Labels, Gauge> = Default::default();
-
-    // Use histogram for block processing time (in milliseconds)
-    pub static ref BLOCK_PROCESSING_TIME: Family<Labels, Histogram> = 
-        Family::new_with_constructor(|| Histogram::new(exponential_buckets(1.0, 2.0, 20)));
-        
-    // Add a gauge for the latest block processing time
-    pub static ref LATEST_BLOCK_PROCESSING_TIME: Family<Labels, Gauge> = Default::default();
 }
 
 pub fn report_query_result(worker: PeerId, status: &str) {
@@ -169,151 +162,6 @@ pub fn report_mutex_held_duration(
             ("mode".to_owned(), mode.to_string()),
         ])
         .inc_by(duration.as_nanos() as u64);
-}
-
-pub struct IngestionTimestampClient {
-    client: reqwest::Client,
-    base_url: String,
-}
-
-impl IngestionTimestampClient {
-    pub fn new(base_url: String) -> Self {
-        let base_url = base_url.trim_end_matches('/').to_string();
-        tracing::info!(url = %base_url, "Creating timestamp client for ingestion service");
-        IngestionTimestampClient {
-            client: reqwest::Client::new(),
-            base_url,
-        }
-    }
-
-    pub async fn fetch_ingestion_timestamp(
-        &self,
-        block_height: u64,
-    ) -> Result<Option<u64>, reqwest::Error> {
-        let base_url = self.base_url.trim_end_matches('/');
-        let url = format!(
-            "{}/block-time/{}",
-            base_url, block_height
-        );
-
-        tracing::debug!(url = %url, "Requesting ingestion timestamp");
-        
-        let response = self.client.get(&url)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await?;
-        
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            tracing::debug!(
-                url = %url,
-                "Block not found in this ingestion service yet"
-            );
-            return Ok(None);
-        }
-        
-        if response.status().is_success() {
-            let timestamp_str = response.text().await?;
-            
-            match timestamp_str.parse::<u64>() {
-                Ok(timestamp) => {
-                    tracing::debug!(url = %url, timestamp = %timestamp, "Successfully received timestamp");
-                    return Ok(Some(timestamp));
-                }
-                Err(e) => {
-                    tracing::warn!(url = %url, error = %e, response = %timestamp_str, "Failed to parse timestamp response");
-                    return Ok(None);
-                }
-            }
-        } else {
-            tracing::warn!(
-                url = %url, 
-                status = %response.status(), 
-                "Non-success status code from ingestion service"
-            );
-            return Err(response.error_for_status().unwrap_err());
-        }
-    }
-}
-
-pub async fn report_block_available(
-    timestamp_client: &IngestionTimestampClient,
-    dataset_name: &str,
-    network: &str,
-    block_height: u64,
-    block_hash: &str,
-) {
-    tracing::debug!(
-        dataset = %dataset_name,
-        block_height = %block_height,
-        block_hash = %block_hash,
-        "Querying ingestion timestamp for block"
-    );
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    match timestamp_client.fetch_ingestion_timestamp(block_height).await {
-        Ok(Some(ingestion_timestamp)) => {
-            let processing_time_ms = if now >= ingestion_timestamp {
-                now - ingestion_timestamp
-            } else {
-                tracing::warn!(
-                    dataset = %dataset_name,
-                    block_height = %block_height,
-                    block_hash = %block_hash,
-                    ingestion_timestamp = %ingestion_timestamp,
-                    current_time = %now,
-                    time_diff_ms = %(ingestion_timestamp - now),
-                    "Ingestion timestamp is slightly ahead of local time - treating as immediate processing"
-                );
-                0
-            };
-            
-            let labels = vec![
-                ("dataset_name".to_owned(), dataset_name.to_owned()),
-                ("network".to_owned(), network.to_owned()),
-                ("source".to_owned(), timestamp_client.base_url.clone()),
-            ];
-            
-            BLOCK_PROCESSING_TIME
-                .get_or_create(&labels)
-                .observe(processing_time_ms as f64);
-                
-            LATEST_BLOCK_PROCESSING_TIME
-                .get_or_create(&labels)
-                .set(processing_time_ms as i64);
-            
-            tracing::debug!(
-                dataset = %dataset_name,
-                block_height = %block_height,
-                block_hash = %block_hash,
-                processing_time_ms = %processing_time_ms,
-                ingestion_timestamp = %ingestion_timestamp,
-                current_time = %now,
-                "Successfully measured block processing time"
-            );
-        },
-        Ok(None) => {
-            tracing::debug!(
-                dataset = %dataset_name, 
-                block_height = %block_height,
-                block_hash = %block_hash,
-                "Could not find ingestion timestamp for block - it may not be available in this provider yet"
-            );
-        },
-        Err(err) => {
-            tracing::warn!(
-                dataset = %dataset_name,
-                block_height = %block_height,
-                block_hash = %block_hash,
-                error = %err,
-                client_url = %timestamp_client.base_url,
-                "Failed to query ingestion timestamp. Check INGESTION_SERVICE_URL config value."
-            );
-        }
-    }
 }
 
 pub fn register_metrics(registry: &mut Registry) {
@@ -417,17 +265,5 @@ pub fn register_metrics(registry: &mut Registry) {
         "mutexes_existing",
         "Number of existing mutexes",
         MUTEXES_EXISTING.clone(),
-    );
-
-    registry.register(
-        "block_processing_time_ms",
-        "Time taken to process a block from ingestion to availability in the portal (milliseconds)",
-        BLOCK_PROCESSING_TIME.clone(),
-    );
-    
-    registry.register(
-        "latest_block_processing_time_ms", 
-        "Latest block processing time in milliseconds",
-        LATEST_BLOCK_PROCESSING_TIME.clone(),
     );
 }
