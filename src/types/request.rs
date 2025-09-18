@@ -1,4 +1,4 @@
-use sqd_hotblocks::Query;
+use sqd_query::Query;
 
 use super::{BlockRange, DatasetId};
 
@@ -80,7 +80,7 @@ impl ParsedQuery {
         self.raw
     }
 
-    pub fn into_parsed(self) -> Query {
+    pub fn _into_parsed(self) -> Query {
         self.parsed
     }
 }

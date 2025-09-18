@@ -82,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
 
     let config = Arc::new(args.config);
-    let hotblocks = hotblocks::build_server(&config).await?.map(Arc::new);
+    let hotblocks = Arc::new(hotblocks::build_server(&config).await?);
     let network_client_builder = NetworkClient::builder(
         args.transport,
         config.clone(),
@@ -102,13 +102,6 @@ async fn main() -> anyhow::Result<()> {
     sqd_network_transport::metrics::register_metrics(
         metrics_registry.sub_registry_with_prefix("transport"),
     );
-    if let Some(hotblocks) = &hotblocks {
-        hotblocks::register_metrics(
-            metrics_registry.sub_registry_with_prefix("portal_hotblocks"),
-            hotblocks.clone(),
-            config.clone(),
-        );
-    }
 
     // This should be done only when metrics are registered
     let network_client = network_client_builder.build()?;

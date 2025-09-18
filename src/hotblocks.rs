@@ -1,296 +1,136 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
-use anyhow::Context;
-use prometheus_client::{
-    encoding::{DescriptorEncoder, EncodeMetric},
-    metrics::{family::Family, gauge::Gauge},
-    registry::Registry,
-};
-use sqd_data_client::reqwest::ReqwestDataClient;
-use sqd_hotblocks::{DBRef, Node as HotblocksServer, NodeBuilder as HotblocksServerBuilder};
-use sqd_storage::db::DatabaseSettings;
+use sqd_primitives::BlockNumber;
 
 use crate::config::Config;
-use crate::metrics::IngestionTimestampClient;
 
 pub struct HotblocksHandle {
-    pub server: HotblocksServer,
-    pub db: DBRef,
-    pub datasets: Vec<sqd_storage::db::DatasetId>,
+    pub client: reqwest::Client,
+    // Datasets are referenced by their default name in the config
+    pub urls: BTreeMap<String, String>,
 }
 
-pub async fn build_server(config: &Config) -> anyhow::Result<Option<HotblocksHandle>> {
-    let has_sources = config.datasets.iter().any(|(_, d)| d.real_time.is_some());
-    if !has_sources {
-        return Ok(None);
-    }
+#[derive(thiserror::Error, Debug)]
+pub enum HotblocksErr {
+    #[error("Dataset not configured")]
+    UnknownDataset,
+    #[error("Request to hotblocks database failed: {0}")]
+    Request(#[from] reqwest::Error),
+}
 
+pub async fn build_server(config: &Config) -> anyhow::Result<HotblocksHandle> {
     tracing::info!("Initializing hotblocks storage");
-    let hotblocks_config = config
-        .hotblocks
-        .as_ref()
-        .expect("Hotblocks database path not specified");
-    let mut settings = DatabaseSettings::default()
-        .with_data_cache_size(hotblocks_config.data_cache_mb)
-        .with_direct_io(hotblocks_config.direct_io)
-        .with_cache_index_and_filter_blocks(hotblocks_config.cache_index_and_filter_blocks)
-        .with_rocksdb_stats(true);
-    if let Some(size) = hotblocks_config.chunk_cache_mb {
-        settings = settings.with_chunk_cache_size(size);
-    }
-    let db = Arc::new(
-        settings
-            .open(&hotblocks_config.db)
-            .context("failed to open hotblocks database")?,
-    );
 
-    tokio::spawn(run_db_cleanup(db.clone()));
-
-    let mut builder = HotblocksServerBuilder::new(db.clone());
-
-    let http_client = sqd_data_client::reqwest::default_http_client();
-    let mut datasets = Vec::new();
+    let mut urls = BTreeMap::new();
     for (default_name, dataset) in config.datasets.iter() {
         if let Some(hotblocks) = &dataset.real_time {
-            let data_sources = hotblocks
-                .data_sources
-                .iter()
-                .map(|url| ReqwestDataClient::new(http_client.clone(), url.clone()))
-                .collect();
-            let dataset_id = default_name.parse().map_err(|s| anyhow::anyhow!("{}", s))?;
-            builder.add_dataset(
-                dataset_id,
-                hotblocks.kind,
-                data_sources,
-                hotblocks.retention.clone(),
-            );
-            datasets.push(dataset_id);
+            let remote_name = hotblocks.dataset.as_ref().unwrap_or(default_name);
+            let url = hotblocks
+                .url
+                .join("datasets/")
+                .unwrap()
+                .join(remote_name)
+                .unwrap();
+            urls.insert(default_name.clone(), url.into());
         }
     }
 
-    Ok(Some(HotblocksHandle {
-        server: builder.build().await?,
-        db,
-        datasets,
-    }))
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_gzip()
+        .no_deflate()
+        .no_brotli()
+        .no_zstd()
+        .read_timeout(Duration::from_secs(1))
+        .build()?;
+
+    Ok(HotblocksHandle { client, urls })
 }
 
-async fn run_db_cleanup(db: sqd_hotblocks::DBRef) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        let db = db.clone();
-        let result = tokio::task::spawn_blocking(move || db.cleanup()).await;
-        match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(err)) => tracing::error!(error =? err, "database cleanup task failed"),
-            Err(_) => tracing::error!("database cleanup task panicked"),
-        }
+impl HotblocksHandle {
+    pub async fn request_head(&self, dataset: &str) -> Result<reqwest::Response, HotblocksErr> {
+        let Some(url) = self.urls.get(dataset) else {
+            return Err(HotblocksErr::UnknownDataset);
+        };
+
+        let response = self.client.get(format!("{url}/head")).send().await?;
+
+        Ok(response)
     }
-}
 
-pub fn register_metrics(registry: &mut Registry, hotblocks: Arc<HotblocksHandle>, config: Arc<Config>) {
-    let mut timestamp_clients = Vec::new();
-    
-    for dataset_id in &hotblocks.datasets {
-        let dataset_name = dataset_id.as_str();
+    pub async fn _get_head(&self, dataset: &str) -> Result<sqd_primitives::BlockRef, HotblocksErr> {
+        let result = self
+            .request_head(dataset)
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
 
-        if let Some(dataset_config) = config.datasets.get(dataset_name) {
-            if let Some(real_time) = &dataset_config.real_time {
-                for url in &real_time.data_sources {
-                    tracing::info!(
-                        dataset = %dataset_name,
-                        url = %url,
-                        "Using data source for metrics collection"
-                    );
-                    
-                    let timestamp_client = Arc::new(IngestionTimestampClient::new(url.to_string()));
-                    timestamp_clients.push((*dataset_id, url.to_string(), timestamp_client));
-                }
-            }
-        }
+        Ok(result)
     }
-    
-    for (dataset, url, client) in &timestamp_clients {
-        let dataset_str = dataset.as_str().to_string();
-        let network = "mainnet".to_string();
-        let client = client.clone();
-        let url = url.clone();
-        let hotblocks = Arc::clone(&hotblocks);
-        let dataset_id = *dataset;
-        
-        tracing::info!(
-            dataset = %dataset_str,
-            source = %url,
-            "Starting block processing time measurement for head updates"
-        );
-        
-        let mut head_receiver = hotblocks.server.subscribe_head_updates(dataset_id)
-            .expect("Dataset should exist since it is from the same list used to build the server");
-        
-        tokio::spawn(async move {
-            while head_receiver.changed().await.is_ok() {
-                let current_head = head_receiver.borrow().clone();
-                if let Some(head) = current_head {
-                    let block_number = head.number;
-                    let block_hash = head.hash;
-                    
-                    tracing::debug!(
-                        dataset = %dataset_str,
-                        source = %url,
-                        block = %block_number,
-                        "Measuring block processing time for new head"
-                    );
 
-                    crate::metrics::report_block_available(
-                        &client,
-                        &dataset_str,
-                        &network, 
-                        block_number,
-                        &block_hash,
-                    ).await;
-                }
-            }
-            
-            tracing::warn!(
-                dataset = %dataset_str,
-                source = %url,
-                "Head update subscription ended"
-            );
-        });
+    pub async fn request_finalized_head(
+        &self,
+        dataset: &str,
+    ) -> Result<reqwest::Response, HotblocksErr> {
+        let Some(url) = self.urls.get(dataset) else {
+            return Err(HotblocksErr::UnknownDataset);
+        };
+
+        let response = self
+            .client
+            .get(format!("{url}/finalized-head"))
+            .send()
+            .await?;
+
+        Ok(response)
     }
-    
-    let collector = Box::new(MetricsCollector { 
-        hotblocks,
-    });
-    
-    registry.register_collector(collector);
-}
 
-struct MetricsCollector {
-    hotblocks: Arc<HotblocksHandle>,
-}
+    pub async fn _get_finalized_head(
+        &self,
+        dataset: &str,
+    ) -> Result<sqd_primitives::BlockRef, HotblocksErr> {
+        let result = self
+            .request_finalized_head(dataset)
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
 
-impl MetricsCollector {
-    fn collect(&self) -> Metrics {
-        let metrics = Metrics::default();
-
-        for dataset in &self.hotblocks.datasets {
-            let labels = [("dataset_name", dataset.as_str().to_owned())];
-
-            let head = self.hotblocks.server.get_head(*dataset).unwrap();
-            let finalized_head = self.hotblocks.server.get_finalized_head(*dataset).unwrap();
-            
-            if let Some(head) = head {
-                metrics.head.get_or_create(&labels).set(head.number as i64);
-            }
-            
-            if let Some(finalized_head) = finalized_head {
-                metrics
-                    .finalized_head
-                    .get_or_create(&labels)
-                    .set(finalized_head.number as i64);
-            }
-
-            let snapshot = self.hotblocks.db.snapshot();
-            let first_chunk = snapshot
-                .get_first_chunk(*dataset)
-                .inspect_err(|e| {
-                    tracing::warn!(error = ?e, dataset = %dataset, "failed to get first chunk from hotblocks DB")
-                })
-                .ok()
-                .flatten();
-            let first_block = first_chunk.as_ref().map(|chunk| chunk.first_block());
-            let first_block_timestamp = first_chunk.and_then(|chunk| chunk.first_block_time());
-
-            let last_chunk = snapshot
-                .get_last_chunk(*dataset)
-                .inspect_err(|e| {
-                    tracing::warn!(error = ?e, dataset = %dataset, "failed to get last chunk from hotblocks DB")
-                })
-                .ok()
-                .flatten();
-            let last_block_timestamp = last_chunk.and_then(|chunk| chunk.last_block_time());
-            
-            if let Some(first_block) = first_block {
-                metrics
-                    .first_block
-                    .get_or_create(&labels)
-                    .set(first_block as i64);
-            }
-            if let Some(timestamp) = first_block_timestamp {
-                metrics
-                    .first_block_timestamp
-                    .get_or_create(&labels)
-                    .set(timestamp as i64);
-            }
-            if let Some(timestamp) = last_block_timestamp {
-                metrics
-                    .last_block_timestamp
-                    .get_or_create(&labels)
-                    .set(timestamp as i64);
-            }
-        }
-
-        metrics
+        Ok(result)
     }
-}
 
-impl prometheus_client::collector::Collector for MetricsCollector {
-    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
-        let metrics = self.collect();
+    pub async fn stream(
+        &self,
+        dataset: &str,
+        query: &str,
+    ) -> Result<reqwest::Response, HotblocksErr> {
+        let Some(url) = self.urls.get(dataset) else {
+            return Err(HotblocksErr::UnknownDataset);
+        };
 
-        metrics.head.encode(encoder.encode_descriptor(
-            "head",
-            "The last block number in the hotblocks storage",
-            None,
-            metrics.head.metric_type(),
-        )?)?;
-        metrics.finalized_head.encode(encoder.encode_descriptor(
-            "finalized_head",
-            "The last finalized block number in the hotblocks storage",
-            None,
-            metrics.finalized_head.metric_type(),
-        )?)?;
-        metrics.first_block.encode(encoder.encode_descriptor(
-            "first_block",
-            "The first block existing in the hotblocks storage",
-            None,
-            metrics.first_block.metric_type(),
-        )?)?;
-        metrics
-            .first_block_timestamp
-            .encode(encoder.encode_descriptor(
-                "first_block_timestamp",
-                "The timestamp of the first block in the hotblocks storage",
-                None,
-                metrics.first_block_timestamp.metric_type(),
-            )?)?;
-        metrics
-            .last_block_timestamp
-            .encode(encoder.encode_descriptor(
-                "last_block_timestamp",
-                "The timestamp of the last block in the hotblocks storage",
-                None,
-                metrics.last_block_timestamp.metric_type(),
-            )?)?;
+        let response = self
+            .client
+            .post(format!("{url}/stream"))
+            .body(query.to_string())
+            .send()
+            .await?;
+
+        Ok(response)
+    }
+
+    pub async fn retain(&self, dataset: &str, from_block: BlockNumber) -> Result<(), HotblocksErr> {
+        let Some(url) = self.urls.get(dataset) else {
+            return Err(HotblocksErr::UnknownDataset);
+        };
+
+        self.client
+            .post(format!("{url}/retention"))
+            .json(&serde_json::json!({"FromBlock": {"number": from_block}}))
+            .send()
+            .await?
+            .error_for_status()?;
 
         Ok(())
-    }
-}
-
-type Labels = [(&'static str, String); 1];
-
-#[derive(Default)]
-struct Metrics {
-    head: Family<Labels, Gauge>,
-    finalized_head: Family<Labels, Gauge>,
-    first_block: Family<Labels, Gauge>,
-    first_block_timestamp: Family<Labels, Gauge>,
-    last_block_timestamp: Family<Labels, Gauge>,
-}
-
-impl std::fmt::Debug for MetricsCollector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MetricsCollector").finish()
     }
 }
