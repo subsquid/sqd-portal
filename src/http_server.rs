@@ -510,6 +510,7 @@ async fn get_worker(
 async fn execute_query(
     Path((dataset_id_encoded, worker_id)): Path<(String, PeerId)>,
     Extension(client): Extension<Arc<NetworkClient>>,
+    Extension(req): Extension<RequestId>,
     query: ParsedQuery, // request body
 ) -> Response {
     let dataset_id = match DatasetId::from_base64(&dataset_id_encoded) {
@@ -523,6 +524,8 @@ async fn execute_query(
         }
     };
 
+    let request_id = req.header_value().to_str().unwrap_or("").to_string(); 
+
     let Ok(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
         return RequestError::NoData.into_response();
     };
@@ -531,7 +534,7 @@ async fn execute_query(
         .expect("Found chunk should intersect with query");
     let fut = client.query_worker(
         worker_id,
-        "".to_string(), // assuming this function is deprecated
+        request_id,
         ChunkId::new(dataset_id, chunk),
         range,
         query.into_string(),
