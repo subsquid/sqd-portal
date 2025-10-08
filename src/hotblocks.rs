@@ -41,7 +41,7 @@ pub async fn build_server(config: &Config) -> anyhow::Result<HotblocksHandle> {
         .no_deflate()
         .no_brotli()
         .no_zstd()
-        .read_timeout(Duration::from_secs(1))
+        .connect_timeout(Duration::from_secs(1))
         .build()?;
 
     Ok(HotblocksHandle { client, urls })
