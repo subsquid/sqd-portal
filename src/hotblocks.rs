@@ -112,6 +112,7 @@ impl HotblocksHandle {
         let response = self
             .client
             .post(format!("{url}/stream"))
+            .header("Content-Type", "application/json")
             .body(query.to_string())
             .send()
             .await?;
