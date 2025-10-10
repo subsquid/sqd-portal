@@ -1,9 +1,7 @@
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use axum::body::Bytes;
-use axum::http::Method;
-use axum::BoxError;
+use axum::http::{HeaderValue, Method};
 use axum::{
     async_trait,
     body::Body,
@@ -13,11 +11,9 @@ use axum::{
     routing::{get, post},
     Extension, RequestExt, Router,
 };
-use futures::TryStream;
 use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
-use sqd_hotblocks::error::UnknownDataset;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
@@ -26,6 +22,7 @@ use tower_http::request_id::{
 };
 
 use crate::datasets::DatasetConfig;
+use crate::hotblocks::HotblocksErr;
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::utils::conversion::{json_lines_to_json, recompress_gzip};
 use crate::{
@@ -43,7 +40,7 @@ pub async fn run_server(
     metrics_registry: Registry,
     addr: SocketAddr,
     config: Arc<Config>,
-    hotblocks: Option<Arc<HotblocksHandle>>,
+    hotblocks: Arc<HotblocksHandle>,
 ) -> anyhow::Result<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
@@ -83,8 +80,6 @@ pub async fn run_server(
         .route("/datasets/:dataset/:start_block/worker", get(get_worker))
         // end backward compatibility routes
         .route("/status", get(get_status))
-        .route("/debug/db_stats", get(get_db_stats))
-        .route("/debug/db_property/:cf/:name", get(get_db_property))
         .route("/debug/workers", get(get_all_workers))
         .route("/datasets/:dataset/:block/debug", get(get_debug_block))
         .layer(axum::middleware::from_fn(logging::middleware))
@@ -109,94 +104,72 @@ pub async fn run_server(
     Ok(())
 }
 
+/// Gets the finalized head corresponding to the /finalized-stream behaviour.
+/// If the dataset has an archival data source, the archival head is returned.
+/// Otherwise, the finalized head from the real-time source is returned.
+///
+/// The successful response is either "null" or a JSON object with "number" and "hash" fields.
 async fn get_finalized_head(
-    Extension(hotblocks): Extension<Option<Arc<HotblocksHandle>>>,
+    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     dataset: DatasetConfig,
 ) -> Response {
-    match (hotblocks, dataset) {
-        (
-            _,
-            DatasetConfig {
-                network_id: Some(dataset_id),
-                ..
-            },
-        ) => {
-            // Prefer network data source to correspond to the /finalized-stream behaviour
-            let head = network.head(&dataset_id).map(|head| {
-                json!({
-                    "number": head.number,
-                    "hash": head.hash,
-                })
-            });
-            axum::Json(head).into_response()
-        }
-
-        (Some(hotblocks), dataset) if dataset.hotblocks.is_some() => {
-            match hotblocks
-                .server
-                .get_finalized_head(dataset.default_name.parse().unwrap())
-            {
-                Ok(head) => axum::Json(head).into_response(),
-                Err(UnknownDataset { .. }) => {
-                    unreachable!("dataset should be known by the hotblocks service")
-                }
-            }
-        }
-
-        (_, dataset) => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("Dataset {} has no data sources", dataset.default_name),
-            )
-                .into_response()
-        }
+    // Prefer network data source to correspond to the /finalized-stream behaviour
+    if let Some(dataset_id) = dataset.network_id {
+        let head = network.head(&dataset_id).map(|head| {
+            json!({
+                "number": head.number,
+                "hash": head.hash,
+            })
+        });
+        return axum::Json(head).into_response();
     }
+
+    if dataset.hotblocks.is_some() {
+        return forward_hotblocks_response(
+            hotblocks
+                .request_finalized_head(&dataset.default_name)
+                .await,
+        );
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        format!("Dataset {} has no data sources", dataset.default_name),
+    )
+        .into_response()
 }
 
+/// Gets the head corresponding to the /stream behaviour.
+/// If the dataset has a real-time data source, its head is returned.
+/// Otherwise, archival head is returned.
+///
+/// The successful response is either "null" or a JSON object with "number" and "hash" fields.
 async fn get_head(
-    Extension(hotblocks): Extension<Option<Arc<HotblocksHandle>>>,
+    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     dataset: DatasetConfig,
 ) -> Response {
-    match (hotblocks, dataset) {
-        (Some(hotblocks), dataset) if dataset.hotblocks.is_some() => {
-            match hotblocks
-                .server
-                .get_head(dataset.default_name.parse().unwrap())
-            {
-                Ok(head) => axum::Json(head).into_response(),
-                Err(UnknownDataset { .. }) => {
-                    unreachable!("dataset should be known by the hotblocks service")
-                }
-            }
-        }
-
-        (
-            _,
-            DatasetConfig {
-                network_id: Some(dataset_id),
-                ..
-            },
-        ) => {
-            // Fall back to network data source
-            let head = network.head(&dataset_id).map(|head| {
-                json!({
-                    "number": head.number,
-                    "hash": head.hash,
-                })
-            });
-            axum::Json(head).into_response()
-        }
-
-        (_, dataset) => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("Dataset {} has no data sources", dataset.default_name),
-            )
-                .into_response()
-        }
+    if dataset.hotblocks.is_some() {
+        return forward_hotblocks_response(hotblocks.request_head(&dataset.default_name).await);
     }
+
+    // Fall back to network data source
+    if let Some(dataset_id) = dataset.network_id {
+        let head = network.head(&dataset_id).map(|head| {
+            json!({
+                "number": head.number,
+                "hash": head.hash,
+            })
+        });
+        return axum::Json(head).into_response();
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        format!("Dataset {} has no data sources", dataset.default_name),
+    )
+        .into_response()
 }
 
 async fn run_finalized_stream_restricted(
@@ -245,16 +218,15 @@ async fn run_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
     Extension(network): Extension<Arc<NetworkClient>>,
-    Extension(hotblocks): Extension<Option<Arc<HotblocksHandle>>>,
+    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
     dataset: DatasetConfig,
     request: ClientRequest,
 ) -> Response {
     let mut request = restrict_request(&config, request);
 
-    let (head, body, source) = match (dataset.network_id, hotblocks) {
-        // TODO: prefer hotblocks storage
+    match dataset.network_id {
         // Prefer data from the network
-        (Some(dataset_id), _)
+        Some(dataset_id)
             if network
                 .get_height(&dataset_id)
                 .is_some_and(|height| request.query.first_block() <= height) =>
@@ -267,55 +239,47 @@ async fn run_stream(
                 Ok(stream) => stream,
                 Err(e) => return e.into_response(),
             };
+            let body = Body::from_stream(recompress_gzip(stream));
 
-            (
-                head,
-                Body::from_stream(recompress_gzip(stream)),
-                DATA_SOURCE_NETWORK,
-            )
+            let mut res = Response::builder()
+                .header(header::CONTENT_TYPE, "application/jsonl")
+                .header(header::CONTENT_ENCODING, "gzip")
+                .header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
+            if let Some(head) = head {
+                res = res.header(FINALIZED_NUMBER_HEADER, head.number);
+                res = res.header(FINALIZED_HASH_HEADER, head.hash);
+            }
+            res.body(body).unwrap()
         }
         // Then try hotblocks storage
-        (_, Some(hotblocks)) if dataset.hotblocks.is_some() => {
-            let result = hotblocks
-                .server
-                .query(
-                    (*dataset.default_name).try_into().unwrap(),
-                    request.query.into_parsed(),
-                )
-                .await;
-            match result {
-                Ok(resp) => (
-                    resp.finalized_head().cloned(),
-                    Body::from_stream(into_stream(resp)),
-                    DATA_SOURCE_REALTIME,
-                ),
-                Err(err) => return hotblocks_error_to_response(err),
+        // TODO: if the query is below the first hotblock, return 500 instead of 400
+        _ if dataset.hotblocks.is_some() => {
+            let mut res = forward_hotblocks_response(
+                hotblocks
+                    .stream(&dataset.default_name, &request.query.into_string())
+                    .await,
+            );
+
+            if res.status().is_success() {
+                res.headers_mut().append(
+                    DATA_SOURCE_HEADER,
+                    HeaderValue::from_static(DATA_SOURCE_REALTIME),
+                );
             }
+            res
         }
         // If requested block is above the network height and there is no hotblocks storage, return 204
-        (Some(_dataset_id), _) => {
+        Some(_dataset_id) => {
             // Delay request from this client for 5 seconds to avoid unnecessary retries
-            // TODO: actually wait for data arrival
             tokio::time::sleep(Duration::from_secs(5)).await;
-            return RequestError::NoData.into_response();
+            RequestError::NoData.into_response()
         }
-        (None, _) => {
+        None => {
             unreachable!(
                 "invalid dataset name should have been handled in the ClientRequest parser"
             )
         }
-    };
-
-    let mut res = Response::builder()
-        .header(header::CONTENT_TYPE, "application/jsonl")
-        .header(header::CONTENT_ENCODING, "gzip")
-        .header(DATA_SOURCE_HEADER, source);
-
-    if let Some(head) = head {
-        res = res.header(FINALIZED_NUMBER_HEADER, head.number);
-        res = res.header(FINALIZED_HASH_HEADER, head.hash);
     }
-    res.body(body).unwrap()
 }
 
 async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
@@ -362,50 +326,8 @@ async fn get_dataset_metadata(
         .network_id
         .as_ref()
         .and_then(|dataset| network.first_existing_block(dataset));
+    // TODO: get first real-time block if there is no archival data
     axum::Json(AvailableDatasetApiResponse::new(metadata, first_block))
-}
-
-async fn get_db_stats(
-    Extension(hotblocks): Extension<Option<Arc<HotblocksHandle>>>,
-) -> impl IntoResponse {
-    let Some(hotblocks) = hotblocks else {
-        return (
-            StatusCode::NOT_FOUND,
-            "Hotblocks storage is not enabled".to_string(),
-        )
-            .into_response();
-    };
-
-    match hotblocks.db.get_statistics() {
-        Some(stats) => stats.into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            "Failed to get hotblocks database statistics".to_string(),
-        )
-            .into_response(),
-    }
-}
-
-async fn get_db_property(
-    Path((cf, property)): Path<(String, String)>,
-    Extension(hotblocks): Extension<Option<Arc<HotblocksHandle>>>,
-) -> Response {
-    let Some(hotblocks) = hotblocks else {
-        return (
-            StatusCode::NOT_FOUND,
-            "Hotblocks storage is not enabled".to_string(),
-        )
-            .into_response();
-    };
-
-    match hotblocks.db.get_property(&cf, &property) {
-        Ok(Some(stats)) => stats.into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "Not found".to_string()).into_response(),
-        Err(e) => {
-            tracing::error!("Failed to get hotblocks database property: {e:?}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
-    }
 }
 
 async fn get_debug_block(
@@ -733,50 +655,27 @@ fn restrict_request(config: &Config, request: ClientRequest) -> ClientRequest {
     }
 }
 
-fn into_stream(resp: sqd_hotblocks::QueryResponse) -> impl TryStream<Ok = Bytes, Error = BoxError> {
-    futures::stream::try_unfold(resp, |mut resp| async {
-        if let Some(bytes) = resp.next_bytes().await? {
-            Ok(Some((bytes, resp)))
-        } else {
-            Ok(None)
+fn forward_hotblocks_response(response: Result<reqwest::Response, HotblocksErr>) -> Response {
+    match response {
+        Ok(response) => forward_response(response),
+        Err(HotblocksErr::UnknownDataset) => {
+            unreachable!("dataset should be known by the hotblocks service")
         }
-    })
+        Err(HotblocksErr::Request(e)) => (
+            StatusCode::BAD_GATEWAY,
+            format!("Hotblocks request error: {e}"),
+        )
+            .into_response(),
+    }
 }
 
-#[allow(clippy::if_same_then_else)]
-fn hotblocks_error_to_response(err: anyhow::Error) -> Response {
-    if let Some(above_the_head) = err.downcast_ref::<sqd_hotblocks::error::QueryIsAboveTheHead>() {
-        let mut res = Response::builder().status(204);
-        if let Some(head) = above_the_head.finalized_head.as_ref() {
-            res = res.header(FINALIZED_NUMBER_HEADER, head.number);
-            res = res.header(FINALIZED_HASH_HEADER, head.hash.as_str());
-        }
-        return res.body(Body::empty()).unwrap();
+fn forward_response(response: reqwest::Response) -> axum::response::Response {
+    let mut builder = Response::builder().status(response.status());
+    for (key, value) in response.headers() {
+        builder = builder.header(key, value);
     }
-
-    if let Some(fork) = err.downcast_ref::<sqd_hotblocks::error::UnexpectedBaseBlock>() {
-        return (
-            StatusCode::CONFLICT,
-            axum::Json(serde_json::json!({
-                "previousBlocks": &fork.prev_blocks
-            })),
-        )
-            .into_response();
-    }
-
-    let status_code = if err.is::<sqd_hotblocks::error::UnknownDataset>() {
-        StatusCode::NOT_FOUND
-    } else if err.is::<sqd_hotblocks::error::QueryKindMismatch>() {
-        StatusCode::BAD_REQUEST
-    } else if err.is::<sqd_hotblocks::error::BlockRangeMissing>() {
-        StatusCode::BAD_REQUEST
-    } else if err.is::<sqd_hotblocks::error::Busy>() {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
-
-    (status_code, format!("{:#}", err)).into_response()
+    let body = Body::from_stream(response.bytes_stream());
+    builder.body(body).unwrap()
 }
 
 const FINALIZED_NUMBER_HEADER: &str = "X-Sqd-Finalized-Head-Number";

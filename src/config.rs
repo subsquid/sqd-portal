@@ -2,12 +2,8 @@ use serde::Deserialize;
 use serde_with::serde_derive::Serialize;
 use serde_with::{serde_as, DurationSeconds};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
-
-use sqd_hotblocks::{self, RetentionStrategy};
-use sqd_primitives::BlockNumber;
 
 use crate::types::DatasetRef;
 
@@ -68,31 +64,11 @@ pub struct Config {
 
     pub sqd_network: SqdNetworkConfig,
 
-    pub hotblocks: Option<HotblocksConfig>,
-
     #[serde(default)]
     pub datasets: DatasetsConfig,
 
     #[serde(default = "default_true")]
     pub send_logs: bool,
-}
-
-#[serde_as]
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HotblocksConfig {
-    pub db: PathBuf,
-
-    #[serde(default = "default_hotblocks_data_cache_mb")]
-    pub data_cache_mb: usize,
-
-    pub chunk_cache_mb: Option<usize>,
-
-    #[serde(default)]
-    pub direct_io: bool,
-
-    #[serde(default)]
-    pub cache_index_and_filter_blocks: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,10 +99,9 @@ pub struct DatasetConfigModel {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RealTimeConfig {
-    pub kind: sqd_hotblocks::DatasetKind,
-    pub data_sources: Vec<Url>,
-    #[serde(deserialize_with = "parse_retention")]
-    pub retention: RetentionStrategy,
+    pub url: Url,
+    // By default use the dataset name as in the config key
+    pub dataset: Option<String>,
 }
 
 impl Config {
@@ -184,37 +159,10 @@ fn default_datasets_update_interval() -> Duration {
     Duration::from_secs(10 * 60)
 }
 
-fn default_hotblocks_data_cache_mb() -> usize {
-    4096
-}
-
 fn parse_hostname<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
     Ok(s.trim_end_matches('/').to_owned())
-}
-
-fn parse_retention<'de, D>(de: D) -> Result<RetentionStrategy, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    enum Model {
-        FromBlock(BlockNumber),
-        Head(u64),
-        None,
-    }
-
-    let model = Model::deserialize(de)?;
-    match model {
-        Model::FromBlock(block) => Ok(RetentionStrategy::FromBlock {
-            number: block,
-            parent_hash: None,
-        }),
-        Model::Head(blocks) => Ok(RetentionStrategy::Head(blocks)),
-        Model::None => Ok(RetentionStrategy::None),
-    }
 }

@@ -86,7 +86,7 @@ pub struct NetworkClientBuilder {
     network: Network,
     config: Arc<Config>,
     datasets: Arc<RwLock<Datasets>>,
-    hotblocks: Option<Arc<HotblocksHandle>>,
+    hotblocks: Arc<HotblocksHandle>,
 }
 
 impl NetworkClientBuilder {
@@ -165,7 +165,7 @@ impl NetworkClient {
         args: TransportArgs,
         config: Arc<Config>,
         datasets: Arc<RwLock<Datasets>>,
-        hotblocks: Option<Arc<HotblocksHandle>>,
+        hotblocks: Arc<HotblocksHandle>,
     ) -> anyhow::Result<NetworkClientBuilder> {
         let agent_into = get_agent_info!();
         let network = args.rpc.network;
@@ -603,10 +603,7 @@ impl NetworkClient {
         self.network_state.dataset_storage.has_assignment()
     }
 
-    pub fn reset_height_updates(&self, hotblocks: Option<Arc<HotblocksHandle>>) {
-        let Some(hotblocks) = hotblocks.as_ref() else {
-            return;
-        };
+    pub fn reset_height_updates(&self, hotblocks: Arc<HotblocksHandle>) {
         let datasets = self.datasets.read();
         self.network_state
             .dataset_storage
@@ -614,24 +611,27 @@ impl NetworkClient {
         for dataset in datasets.iter() {
             if let (Some(dataset_id), Some(_)) = (&dataset.network_id, &dataset.hotblocks) {
                 let hotblocks = hotblocks.clone();
-                let name = dataset.default_name.parse().expect("Invalid dataset name");
+                let name = dataset.default_name.clone();
                 tracing::info!(
                     "Hotblocks storage for '{name}' set to track dataset height of '{dataset_id}'"
                 );
                 self.network_state.dataset_storage.subscribe_head_updates(
                     dataset_id,
                     Box::new(move |block| {
-                        tracing::info!(
-                            "Cleaning hotblocks storage for '{name}' up to block {}",
-                            block.number
-                        );
-                        hotblocks.server.retain(
-                            name,
-                            sqd_hotblocks::RetentionStrategy::FromBlock {
-                                number: block.number + 1,
-                                parent_hash: Some(block.hash),
-                            },
-                        );
+                        let hotblocks = hotblocks.clone();
+                        let name = name.clone();
+                        tokio::spawn(async move {
+                            tracing::info!(
+                                "Cleaning hotblocks storage for '{name}' up to block {}",
+                                block.number
+                            );
+                            let res = hotblocks.retain_with_retries(&name, block.number + 1).await;
+                            if let Err(e) = res {
+                                tracing::warn!(
+                                    "Failed to clean hotblocks storage for '{name}': {e:?}"
+                                );
+                            }
+                        });
                     }),
                 );
             }
