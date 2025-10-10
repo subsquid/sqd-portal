@@ -34,6 +34,7 @@ thiserror = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = "0.1"
 tokio-util = "0.7.11"
+tower = "0.5"
 tower-http = { version = "0.6.1", features = ["cors", "decompression-gzip", "request-id", "trace"] }
 tracing = { version = "0.1", features = ["async-await"] }
 tracing-futures = { version = "0.2.5", features = ["tokio", "futures-03"] }

@@ -1,5 +1,11 @@
-use axum::{extract::Request, response::IntoResponse};
+use axum::{
+    extract::Request,
+    response::{IntoResponse, Response},
+    routing::MethodRouter,
+};
+use std::task::{Context, Poll};
 use tokio::time::{Duration, Instant};
+use tower::{Layer, Service};
 use tower_http::request_id::RequestId;
 use tracing::Instrument;
 
@@ -89,7 +95,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
     let request_id = req
         .extensions()
         .get::<RequestId>()
-        .unwrap()
+        .expect("RequestId should be set by SetRequestIdLayer")
         .header_value()
         .to_str()
         .expect("Request ID should be a valid string");
@@ -99,6 +105,13 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
     let response = next.run(req).instrument(span.clone()).await;
 
     let latency = start.elapsed();
+
+    let endpoint = response
+        .extensions()
+        .get::<EndpointName>()
+        .map(|e| e.0.clone())
+        .unwrap_or_else(|| path.clone());
+
     span.in_scope(|| {
         tracing::info!(
             target: "http_request",
@@ -111,15 +124,81 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         );
     });
 
-    let endpoint = {
-        if path.contains("/query") {
-            "/query".to_string()
-        } else {
-            let path = path.split('/').last().expect("HTTP Path can't be empty");
-            format!("/{path}")
-        }
-    };
     metrics::report_http_response(endpoint, response.status(), latency.as_secs_f64());
 
     response
+}
+
+pub trait MethodRouterExt {
+    fn endpoint(self, endpoint: impl Into<String>) -> Self;
+}
+
+impl<S> MethodRouterExt for MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    fn endpoint(self, endpoint: impl Into<String>) -> Self {
+        self.layer(EndpointAnnotationLayer::new(endpoint))
+    }
+}
+
+#[derive(Clone)]
+pub struct EndpointName(pub String);
+
+#[derive(Clone)]
+pub struct EndpointAnnotationLayer {
+    endpoint: String,
+}
+
+impl EndpointAnnotationLayer {
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+        }
+    }
+}
+
+impl<S> Layer<S> for EndpointAnnotationLayer {
+    type Service = EndpointAnnotationService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        EndpointAnnotationService {
+            inner,
+            endpoint: self.endpoint.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct EndpointAnnotationService<S> {
+    inner: S,
+    endpoint: String,
+}
+
+impl<S> Service<Request> for EndpointAnnotationService<S>
+where
+    S: Service<Request, Response = Response> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request) -> Self::Future {
+        let endpoint = self.endpoint.clone();
+        let fut = self.inner.call(req);
+
+        Box::pin(async move {
+            let mut response = fut.await?;
+            // Store the endpoint name in the response extensions for the middleware to use
+            response.extensions_mut().insert(EndpointName(endpoint));
+            Ok(response)
+        })
+    }
 }

@@ -25,6 +25,7 @@ use crate::datasets::DatasetConfig;
 use crate::hotblocks::HotblocksErr;
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::utils::conversion::{json_lines_to_json, recompress_gzip};
+use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
     controller::task_manager::TaskManager,
@@ -53,38 +54,62 @@ pub async fn run_server(
             // This layer should be called before the response reaches trace layers
             PropagateRequestIdLayer::x_request_id(),
         )
-        .route("/datasets", get(get_datasets))
+        .route("/datasets", get(get_datasets).endpoint("/datasets"))
         .route(
             "/datasets/:dataset/finalized-stream",
-            post(run_finalized_stream_restricted),
+            post(run_finalized_stream_restricted).endpoint("/finalized-stream"),
         )
         .route(
             "/datasets/:dataset/finalized-stream/debug",
-            post(run_finalized_stream),
+            post(run_finalized_stream).endpoint("/finalized-stream/debug"),
         )
-        .route("/datasets/:dataset/stream", post(run_stream))
-        .route("/datasets/:dataset/finalized-head", get(get_finalized_head))
-        .route("/datasets/:dataset/head", get(get_head))
-        .route("/datasets/:dataset/state", get(get_dataset_state))
-        .route("/datasets/:dataset/metadata", get(get_dataset_metadata))
+        .route(
+            "/datasets/:dataset/stream",
+            post(run_stream).endpoint("/stream"),
+        )
+        .route(
+            "/datasets/:dataset/finalized-head",
+            get(get_finalized_head).endpoint("/finalized-head"),
+        )
+        .route("/datasets/:dataset/head", get(get_head).endpoint("/head"))
+        .route(
+            "/datasets/:dataset/state",
+            get(get_dataset_state).endpoint("/state"),
+        )
+        .route(
+            "/datasets/:dataset/metadata",
+            get(get_dataset_metadata).endpoint("/metadata"),
+        )
         // backward compatibility routes
         .route(
             "/datasets/:dataset/finalized-stream/height",
-            get(get_height),
+            get(get_height).endpoint("/height"),
         )
         .route(
             "/datasets/:dataset_id/query/:worker_id",
-            post(execute_query),
+            post(execute_query).endpoint("/query"),
         )
-        .route("/datasets/:dataset/height", get(get_height))
-        .route("/datasets/:dataset/:start_block/worker", get(get_worker))
+        .route(
+            "/datasets/:dataset/height",
+            get(get_height).endpoint("/height"),
+        )
+        .route(
+            "/datasets/:dataset/:start_block/worker",
+            get(get_worker).endpoint("/worker"),
+        )
         // end backward compatibility routes
-        .route("/status", get(get_status))
-        .route("/debug/workers", get(get_all_workers))
-        .route("/datasets/:dataset/:block/debug", get(get_debug_block))
-        .layer(axum::middleware::from_fn(logging::middleware))
+        .route("/status", get(get_status).endpoint("/status"))
+        .route(
+            "/debug/workers",
+            get(get_all_workers).endpoint("/debug/workers"),
+        )
+        .route(
+            "/datasets/:dataset/:block/debug",
+            get(get_debug_block).endpoint("/block/debug"),
+        )
         .route("/metrics", get(get_metrics))
         .route("/ready", get(get_readiness))
+        .route_layer(axum::middleware::from_fn(logging::middleware))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
         .layer(
