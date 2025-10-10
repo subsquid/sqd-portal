@@ -134,4 +134,35 @@ impl HotblocksHandle {
 
         Ok(())
     }
+
+    pub async fn retain_with_retries(
+        &self,
+        dataset: &str,
+        from_block: BlockNumber,
+    ) -> Result<(), HotblocksErr> {
+        if self.urls.get(dataset).is_none() {
+            return Err(HotblocksErr::UnknownDataset);
+        };
+
+        const MAX_RETRIES: u32 = 5;
+        const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+        for attempt in 1..=MAX_RETRIES {
+            match self.retain(dataset, from_block).await {
+                Ok(_) => return Ok(()),
+                Err(e) if attempt < MAX_RETRIES => {
+                    tracing::debug!(
+                        "Retain request failed for {}: {}. Retrying in {:?}...",
+                        dataset,
+                        e,
+                        RETRY_DELAY
+                    );
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        unreachable!()
+    }
 }

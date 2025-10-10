@@ -625,7 +625,7 @@ impl NetworkClient {
                                 "Cleaning hotblocks storage for '{name}' up to block {}",
                                 block.number
                             );
-                            let res = hotblocks.retain(&name, block.number + 1).await;
+                            let res = hotblocks.retain_with_retries(&name, block.number + 1).await;
                             if let Err(e) = res {
                                 tracing::warn!(
                                     "Failed to clean hotblocks storage for '{name}': {e:?}"
