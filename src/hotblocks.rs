@@ -10,6 +10,12 @@ pub struct HotblocksHandle {
     pub urls: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamMode {
+    Finalized,
+    RealTime,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum HotblocksErr {
     #[error("Dataset not configured")]
@@ -104,14 +110,20 @@ impl HotblocksHandle {
         &self,
         dataset: &str,
         query: &str,
+        mode: StreamMode,
     ) -> Result<reqwest::Response, HotblocksErr> {
         let Some(url) = self.urls.get(dataset) else {
             return Err(HotblocksErr::UnknownDataset);
         };
 
+        let endpoint = match mode {
+            StreamMode::Finalized => "finalized-stream",
+            StreamMode::RealTime => "stream",
+        };
+
         let response = self
             .client
-            .post(format!("{url}/stream"))
+            .post(format!("{url}/{endpoint}"))
             .header("Content-Type", "application/json")
             .body(query.to_string())
             .send()

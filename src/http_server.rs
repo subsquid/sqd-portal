@@ -22,7 +22,7 @@ use tower_http::request_id::{
 };
 
 use crate::datasets::DatasetConfig;
-use crate::hotblocks::HotblocksErr;
+use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::utils::conversion::{json_lines_to_json, recompress_gzip};
 use crate::utils::logging::MethodRouterExt;
@@ -54,24 +54,37 @@ pub async fn run_server(
             // This layer should be called before the response reaches trace layers
             PropagateRequestIdLayer::x_request_id(),
         )
+        // Portal status
+        .route("/status", get(get_status).endpoint("/status"))
         .route("/datasets", get(get_datasets).endpoint("/datasets"))
+        // Streaming data
         .route(
-            "/datasets/:dataset/finalized-stream",
-            post(run_finalized_stream_restricted).endpoint("/finalized-stream"),
+            "/datasets/:dataset/archival-stream",
+            post(run_archival_stream_restricted).endpoint("/archival-stream"),
         )
         .route(
-            "/datasets/:dataset/finalized-stream/debug",
-            post(run_finalized_stream).endpoint("/finalized-stream/debug"),
+            "/datasets/:dataset/archival-stream/debug",
+            post(run_archival_stream).endpoint("/archival-stream/debug"),
+        )
+        .route(
+            "/datasets/:dataset/finalized-stream",
+            post(run_finalized_stream).endpoint("/finalized-stream"),
         )
         .route(
             "/datasets/:dataset/stream",
             post(run_stream).endpoint("/stream"),
+        )
+        // Getting head
+        .route(
+            "/datasets/:dataset/archival-head",
+            get(get_archival_head).endpoint("/archival-head"),
         )
         .route(
             "/datasets/:dataset/finalized-head",
             get(get_finalized_head).endpoint("/finalized-head"),
         )
         .route("/datasets/:dataset/head", get(get_head).endpoint("/head"))
+        // Dataset info
         .route(
             "/datasets/:dataset/state",
             get(get_dataset_state).endpoint("/state"),
@@ -80,9 +93,9 @@ pub async fn run_server(
             "/datasets/:dataset/metadata",
             get(get_dataset_metadata).endpoint("/metadata"),
         )
-        // backward compatibility routes
+        // Backward compatibility routes
         .route(
-            "/datasets/:dataset/finalized-stream/height",
+            "/datasets/:dataset/archival-stream/height",
             get(get_height).endpoint("/height"),
         )
         .route(
@@ -97,8 +110,7 @@ pub async fn run_server(
             "/datasets/:dataset/:start_block/worker",
             get(get_worker).endpoint("/worker"),
         )
-        // end backward compatibility routes
-        .route("/status", get(get_status).endpoint("/status"))
+        // Internal routes
         .route(
             "/debug/workers",
             get(get_all_workers).endpoint("/debug/workers"),
@@ -129,17 +141,14 @@ pub async fn run_server(
     Ok(())
 }
 
-/// Gets the finalized head corresponding to the /finalized-stream behaviour.
-/// If the dataset has an archival data source, the archival head is returned.
-/// Otherwise, the finalized head from the real-time source is returned.
+/// Gets the archival head corresponding to the /archival-stream behaviour.
 ///
 /// The successful response is either "null" or a JSON object with "number" and "hash" fields.
-async fn get_finalized_head(
-    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+async fn get_archival_head(
     Extension(network): Extension<Arc<NetworkClient>>,
     dataset: DatasetConfig,
 ) -> Response {
-    // Prefer network data source to correspond to the /finalized-stream behaviour
+    // Prefer network data source to correspond to the /archival-stream behaviour
     if let Some(dataset_id) = dataset.network_id {
         let head = network.head(&dataset_id).map(|head| {
             json!({
@@ -150,12 +159,41 @@ async fn get_finalized_head(
         return axum::Json(head).into_response();
     }
 
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "Dataset {} has no archival data source",
+            dataset.default_name
+        ),
+    )
+        .into_response()
+}
+
+/// Gets the finalized head corresponding to the /finalized-stream behaviour.
+///
+/// The successful response is either "null" or a JSON object with "number" and "hash" fields.
+async fn get_finalized_head(
+    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    dataset: DatasetConfig,
+) -> Response {
     if dataset.hotblocks.is_some() {
         return forward_hotblocks_response(
             hotblocks
                 .request_finalized_head(&dataset.default_name)
                 .await,
         );
+    }
+
+    // Fall back to network data source
+    if let Some(dataset_id) = dataset.network_id {
+        let head = network.head(&dataset_id).map(|head| {
+            json!({
+                "number": head.number,
+                "hash": head.hash,
+            })
+        });
+        return axum::Json(head).into_response();
     }
 
     (
@@ -197,7 +235,7 @@ async fn get_head(
         .into_response()
 }
 
-async fn run_finalized_stream_restricted(
+async fn run_archival_stream_restricted(
     task_manager: Extension<Arc<TaskManager>>,
     network: Extension<Arc<NetworkClient>>,
     Extension(config): Extension<Arc<Config>>,
@@ -205,10 +243,10 @@ async fn run_finalized_stream_restricted(
     raw_request: ClientRequest,
 ) -> Response {
     let request = restrict_request(&config, raw_request);
-    run_finalized_stream(task_manager, network, dataset_id, request).await
+    run_archival_stream(task_manager, network, dataset_id, request).await
 }
 
-async fn run_finalized_stream(
+async fn run_archival_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     dataset_id: DatasetId,
@@ -247,6 +285,47 @@ async fn run_stream(
     dataset: DatasetConfig,
     request: ClientRequest,
 ) -> Response {
+    run_stream_internal(
+        task_manager,
+        config,
+        network,
+        hotblocks,
+        dataset,
+        request,
+        StreamMode::RealTime,
+    )
+    .await
+}
+
+async fn run_finalized_stream(
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(config): Extension<Arc<Config>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    dataset: DatasetConfig,
+    request: ClientRequest,
+) -> Response {
+    run_stream_internal(
+        task_manager,
+        config,
+        network,
+        hotblocks,
+        dataset,
+        request,
+        StreamMode::Finalized,
+    )
+    .await
+}
+
+async fn run_stream_internal(
+    task_manager: Arc<TaskManager>,
+    config: Arc<Config>,
+    network: Arc<NetworkClient>,
+    hotblocks: Arc<HotblocksHandle>,
+    dataset: DatasetConfig,
+    request: ClientRequest,
+    mode: StreamMode,
+) -> Response {
     let mut request = restrict_request(&config, request);
 
     match dataset.network_id {
@@ -281,7 +360,7 @@ async fn run_stream(
         _ if dataset.hotblocks.is_some() => {
             let mut res = forward_hotblocks_response(
                 hotblocks
-                    .stream(&dataset.default_name, &request.query.into_string())
+                    .stream(&dataset.default_name, &request.query.into_string(), mode)
                     .await,
             );
 
@@ -471,7 +550,7 @@ async fn execute_query(
         }
     };
 
-    let request_id = req.header_value().to_str().unwrap_or("").to_string(); 
+    let request_id = req.header_value().to_str().unwrap_or("").to_string();
 
     let Ok(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
         return RequestError::NoData.into_response();
