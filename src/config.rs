@@ -85,6 +85,7 @@ pub struct SqdNetworkConfig {
 pub enum ServeMode {
     #[default]
     All,
+    Manual,
 }
 
 pub type DatasetsConfig = BTreeMap<String, DatasetConfigModel>;

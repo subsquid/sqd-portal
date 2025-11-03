@@ -78,18 +78,20 @@ impl Datasets {
             });
         }
 
-        let ServeMode::All = config.sqd_network.serve;
-        for (name, id) in mapping {
-            if let Entry::Vacant(entry) = alias_to_index.entry(name.clone()) {
-                entry.insert(datasets.len());
-                datasets.push(DatasetConfig {
-                    default_name: name.clone(),
-                    aliases: Vec::new(),
-                    network_id: Some(id.clone()),
-                    hotblocks: None,
-                });
-                if let Entry::Vacant(entry) = id_to_default_name.entry(id) {
-                    entry.insert(name);
+        if let ServeMode::All = config.sqd_network.serve {
+            // Add all datasets from the mapping that are not already present
+            for (name, id) in mapping {
+                if let Entry::Vacant(entry) = alias_to_index.entry(name.clone()) {
+                    entry.insert(datasets.len());
+                    datasets.push(DatasetConfig {
+                        default_name: name.clone(),
+                        aliases: Vec::new(),
+                        network_id: Some(id.clone()),
+                        hotblocks: None,
+                    });
+                    if let Entry::Vacant(entry) = id_to_default_name.entry(id) {
+                        entry.insert(name);
+                    }
                 }
             }
         }
@@ -219,20 +221,12 @@ mod tests {
                         "dataset_name": "solana-mainnet"
                     },
                     "real_time": {
-                        "kind": "solana",
-                        "data_sources": ["http://localhost:8080"],
-                        "retention": {
-                            "from_block": 300000000
-                        }
+                        "url": "http://localhost:8080"
                     }
                 },
                 "local": {
                     "real_time": {
-                        "kind": "evm",
-                        "data_sources": ["http://localhost:8081"],
-                        "retention": {
-                            "from_block": 0
-                        }
+                        "url": "http://localhost:8081"
                     }
                 },
                 "custom": {
@@ -373,6 +367,58 @@ mod tests {
                 (&DatasetId::from_url("s3://solana-mainnet-2"), "beta"),
                 // ethereum-mainnet-2 has been overwritten by eth-main alias
             ]
+        );
+    }
+
+    #[test]
+    fn test_datasets_config_manual_mode() {
+        let json = serde_json::json!({
+            "hostname": "http://localhost:8000",
+            "sqd_network": {
+                "datasets": "file://datasets.yaml",
+                "serve": "manual"
+            },
+            "datasets": {
+                "ethereum-mainnet": {
+                    "aliases": ["eth-main"],
+                },
+                "custom": {
+                    "sqd_network": {
+                        "dataset_id": "s3://solana-mainnet"
+                    }
+                }
+            }
+        });
+        let config = serde_json::from_value::<Config>(json).unwrap();
+        let mapping = [
+            (
+                "ethereum-mainnet".to_owned(),
+                DatasetId::from_url("s3://ethereum-mainnet-1"),
+            ),
+            (
+                "arbitrum-one".to_owned(),
+                DatasetId::from_url("s3://arbitrum-one"),
+            ),
+        ]
+        .into_iter()
+        .collect::<BiBTreeMap<_, _>>();
+        let datasets = Datasets::parse(&config, mapping).unwrap();
+
+        // In manual mode, only explicitly configured datasets should be available
+        assert!(datasets.get("ethereum-mainnet").is_some());
+        assert!(datasets.get("eth-main").is_some());
+        assert!(datasets.get("custom").is_some());
+
+        // arbitrum-one should NOT be available since it's not in the config
+        assert!(datasets.get("arbitrum-one").is_none());
+
+        // Verify the dataset list only contains configured datasets
+        assert_eq!(
+            datasets
+                .iter()
+                .map(|d| d.default_name.clone())
+                .collect::<Vec<_>>(),
+            vec!["custom", "ethereum-mainnet"]
         );
     }
 }
