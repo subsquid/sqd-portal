@@ -1,0 +1,40 @@
+services:
+  # Loads data from RPC and serves full blocks
+  hotblocks-service:
+    image: subsquid/evm-hotblocks-service:4229b9b2
+    environment:
+      SQD_INFO: "*"
+    command: >
+      --http-rpc ${RPC_URL}
+      --receipts
+      --traces
+      --diffs
+      --use-debug-api-for-statediffs
+      --verify-tx-sender
+      --verify-tx-root
+      --verify-logs-bloom
+      --block-cache-size 10
+    # --verify-receipts-root
+    # --verify-block-hash
+
+  # Loads full blocks from hotblocks-service and provides query API over it
+  hotblocks-db:
+    image: subsquid/data-hotblocks:a8e7c369
+    environment:
+      RUST_LOG: "info"
+    command: >
+      --datasets /app/config.yaml
+      --db /run/db
+      --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - db-data:/run/db
+    depends_on:
+      - hotblocks-service
+
+# Warning: stores entire blockchain data!
+# Make sure you have enough disk space
+volumes:
+  db-data:
