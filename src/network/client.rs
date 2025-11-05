@@ -77,8 +77,9 @@ pub struct NetworkClient {
     local_peer_id: PeerId,
     keypair: Keypair,
     contracts_state: RwLock<ContractsState>,
-    logs_tx: Option<sqd_network_transport::util::Sender<QueryFinished>>,
-    logs_rx: UseOnce<sqd_network_transport::util::Receiver<QueryFinished>>,
+    logs_tx: Option<sqd_network_transport::util::Sender<Box<dyn FnOnce() -> QueryFinished + Send>>>,
+    logs_rx:
+        UseOnce<sqd_network_transport::util::Receiver<Box<dyn FnOnce() -> QueryFinished + Send>>>,
 }
 
 pub struct NetworkClientBuilder {
@@ -314,7 +315,11 @@ impl NetworkClient {
         logs_rx
             .ready_chunks(MAX_LOGS_CHUNK_SIZE)
             .take_until(cancellation_token.cancelled_owned())
-            .for_each_concurrent(CONCURRENT_LOGS, |msg| async move {
+            .for_each_concurrent(CONCURRENT_LOGS, |log_fns| async move {
+                let msg =
+                    tokio::task::spawn_blocking(|| log_fns.into_iter().map(|f| f()).collect())
+                        .await
+                        .unwrap();
                 self.transport_handle.send_logs(msg).await;
             })
             .await;
@@ -399,9 +404,17 @@ impl NetworkClient {
             timestamp_ms: timestamp_now_ms(),
             signature: Default::default(),
         };
-        query
-            .sign(&self.keypair, worker)
-            .expect("Query should be valid to sign");
+        let query = tokio::task::spawn_blocking({
+            let keypair = self.keypair.clone();
+            move || {
+                query
+                    .sign(&keypair, worker)
+                    .expect("Query should be valid to sign");
+                query
+            }
+        })
+        .await
+        .unwrap();
 
         metrics::QUERIES_RUNNING.inc();
         metrics::QUERIES_SENT
@@ -424,15 +437,18 @@ impl NetworkClient {
 
         if let Some(logs_tx) = &self.logs_tx {
             if let Ok(result) = result.as_ref() {
-                let log = QueryFinished::new(result, worker.to_string(), query_time_micros as u32);
-                logs_tx.send_lossy(log);
+                let result = result.clone();
+                let f = move || {
+                    QueryFinished::new(&result, worker.to_string(), query_time_micros as u32)
+                };
+                logs_tx.send_lossy(Box::new(f));
             }
         }
 
-        self.parse_query_result(worker, result)
+        self.parse_query_result(worker, result).await
     }
 
-    fn parse_query_result(
+    async fn parse_query_result(
         &self,
         peer_id: PeerId,
         result: Result<sqd_messages::QueryResult, QueryFailure>,
@@ -440,7 +456,7 @@ impl NetworkClient {
         use query_error::Err;
 
         match result {
-            Ok(q) if !q.verify_signature(peer_id) => {
+            Ok(q) if !verify_signature(&q, peer_id).await => {
                 metrics::report_query_result(peer_id, "validation_error");
                 self.network_state.report_query_failure(peer_id);
                 Err(QueryError::Retriable(format!(
@@ -637,6 +653,13 @@ impl NetworkClient {
             }
         }
     }
+}
+
+async fn verify_signature(query: &sqd_messages::QueryResult, peer_id: PeerId) -> bool {
+    let query = query.clone();
+    tokio::task::spawn_blocking(move || query.verify_signature(peer_id))
+        .await
+        .unwrap()
 }
 
 #[inline(always)]
