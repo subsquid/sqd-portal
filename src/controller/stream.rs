@@ -11,7 +11,7 @@ use std::{
 use futures::FutureExt;
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 use crate::{
     controller::timeouts::TimeoutManager,
@@ -150,7 +150,7 @@ impl StreamController {
         result
     }
 
-    #[instrument(skip_all, fields(chunk_index = slot.data_range.chunk_index))]
+    #[instrument(skip_all, level="trace", fields(chunk_index = slot.data_range.chunk_index))]
     fn poll_slot(&mut self, slot: &mut Slot, ctx: &mut Context<'_>) -> bool {
         let RequestState::Pending(pending) = &mut slot.state else {
             return false;
@@ -217,9 +217,10 @@ impl StreamController {
         }
 
         if retry {
+            tracing::debug!("Handling retry, {} tries left", pending.tries_left);
             assert!(pending.tries_left > 0);
             pending.tries_left -= 1;
-            match self.send_query(&slot.data_range, ctx) {
+            match self.send_query(&slot.data_range) {
                 Ok(worker_request) => {
                     pending.set_timeout(self.timeouts.current_timeout());
                     pending.requests.push(worker_request);
@@ -305,6 +306,7 @@ impl StreamController {
         result
     }
 
+    #[instrument(skip_all, level = "trace")]
     fn try_fill_slots(&mut self, ctx: &mut Context<'_>) {
         if self.buffer.back().is_some_and(Slot::is_paused) {
             // Either the amount of compute units is low or the network is overloaded.
@@ -382,7 +384,7 @@ impl StreamController {
             .intersect_with(&range.range)
             .expect("Chunk doesn't contain requested data");
         let range = range.with_range(block_range);
-        let mut pending = match self.send_query(&range, ctx) {
+        let mut pending = match self.send_query(&range) {
             Ok(request) => PendingRequests::new(
                 request,
                 self.timeouts.current_timeout(),
@@ -416,7 +418,6 @@ impl StreamController {
     fn send_query(
         &mut self,
         range: &DataRange,
-        ctx: &mut Context<'_>,
     ) -> Result<WorkerRequest, SendQueryError> {
         let worker =
             match self
@@ -435,7 +436,7 @@ impl StreamController {
             worker,
         );
         let start_time = tokio::time::Instant::now();
-        let mut fut = self
+        let fut = self
             .network
             .clone()
             .query_worker(
@@ -446,11 +447,10 @@ impl StreamController {
                 self.request.query.to_string(),
                 false,
             )
-            .boxed();
-        assert!(fut.poll_unpin(ctx).is_pending());
+            .in_current_span();
         self.stats.query_sent();
         Ok(WorkerRequest {
-            resp: fut,
+            resp: tokio::spawn(fut).map(|r| r.unwrap()).boxed(),
             start_time,
             worker,
         })

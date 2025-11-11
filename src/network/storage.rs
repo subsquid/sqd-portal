@@ -106,7 +106,7 @@ impl StorageClient {
         Ok(())
     }
 
-    async fn fetch_network_state(&self) -> anyhow::Result<sqd_messages::assignments::NetworkState> {
+    async fn fetch_network_state(&self) -> anyhow::Result<sqd_assignments::NetworkState> {
         let response = self
             .reqwest_client
             .get(&self.network_state_url)
