@@ -220,7 +220,7 @@ impl StreamController {
             tracing::debug!("Handling retry, {} tries left", pending.tries_left);
             assert!(pending.tries_left > 0);
             pending.tries_left -= 1;
-            match self.send_query(&slot.data_range, ctx) {
+            match self.send_query(&slot.data_range) {
                 Ok(worker_request) => {
                     pending.set_timeout(self.timeouts.current_timeout());
                     pending.requests.push(worker_request);
@@ -384,7 +384,7 @@ impl StreamController {
             .intersect_with(&range.range)
             .expect("Chunk doesn't contain requested data");
         let range = range.with_range(block_range);
-        let mut pending = match self.send_query(&range, ctx) {
+        let mut pending = match self.send_query(&range) {
             Ok(request) => PendingRequests::new(
                 request,
                 self.timeouts.current_timeout(),
@@ -418,7 +418,6 @@ impl StreamController {
     fn send_query(
         &mut self,
         range: &DataRange,
-        ctx: &mut Context<'_>,
     ) -> Result<WorkerRequest, SendQueryError> {
         let worker =
             match self
@@ -437,7 +436,7 @@ impl StreamController {
             worker,
         );
         let start_time = tokio::time::Instant::now();
-        let mut fut = self
+        let fut = self
             .network
             .clone()
             .query_worker(
@@ -448,12 +447,10 @@ impl StreamController {
                 self.request.query.to_string(),
                 false,
             )
-            .in_current_span()
-            .boxed();
-        assert!(fut.poll_unpin(ctx).is_pending());
+            .in_current_span();
         self.stats.query_sent();
         Ok(WorkerRequest {
-            resp: fut,
+            resp: tokio::spawn(fut).map(|r| r.unwrap()).boxed(),
             start_time,
             worker,
         })
