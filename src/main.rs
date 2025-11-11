@@ -41,6 +41,9 @@ pub struct Cli {
     /// Whether the logs should be structured in JSON format
     #[arg(long, env)]
     pub json_log: bool,
+
+    #[arg(long, env, hide(true))]
+    pub log_span_durations: bool,
 }
 
 #[cfg(not(target_env = "msvc"))]
@@ -50,7 +53,9 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-fn setup_tracing(json: bool) {
+fn setup_tracing(json: bool, log_span_durations: bool) {
+    use tracing_subscriber::fmt::format::FmtSpan;
+
     let env_filter = tracing_subscriber::EnvFilter::builder().parse_lossy(
         std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV)
             .unwrap_or(format!("info,{}=debug", std::env!("CARGO_CRATE_NAME"))),
@@ -68,6 +73,11 @@ fn setup_tracing(json: bool) {
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_target(false)
+            .with_span_events(if log_span_durations {
+                FmtSpan::CLOSE
+            } else {
+                FmtSpan::NONE
+            })
             .compact()
             .init();
     };
@@ -77,7 +87,7 @@ fn setup_tracing(json: bool) {
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let args = Cli::parse();
-    setup_tracing(args.json_log);
+    setup_tracing(args.json_log, args.log_span_durations);
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
 

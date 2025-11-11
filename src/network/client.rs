@@ -19,6 +19,7 @@ use sqd_network_transport::{
     get_agent_info, AgentInfo, Keypair, P2PTransportBuilder, PortalConfig, PortalTransportHandle,
     QueryFailure, TransportArgs,
 };
+use tracing::{debug_span, instrument, Instrument};
 
 use super::contracts_state::{self, ContractsState};
 use super::priorities::NoWorker;
@@ -318,10 +319,17 @@ impl NetworkClient {
             .ready_chunks(MAX_LOGS_CHUNK_SIZE)
             .take_until(cancellation_token.cancelled_owned())
             .for_each_concurrent(CONCURRENT_LOGS, |log_fns| async move {
-                let msg =
-                    tokio::task::spawn_blocking(|| log_fns.into_iter().map(|f| f()).collect())
-                        .await
-                        .unwrap();
+                let msg = tokio::task::spawn_blocking(|| {
+                    log_fns
+                        .into_iter()
+                        .map(|f| {
+                            let _span = debug_span!("generate_log");
+                            f()
+                        })
+                        .collect()
+                })
+                .await
+                .unwrap();
                 self.transport_handle.send_logs(msg).await;
             })
             .await;
@@ -377,6 +385,7 @@ impl NetworkClient {
         self.network_state.get_height(dataset)
     }
 
+    #[instrument(skip_all, level = "debug", fields(query_id))]
     pub async fn query_worker(
         self: Arc<Self>,
         worker: PeerId,
@@ -387,6 +396,7 @@ impl NetworkClient {
         lease: bool,
     ) -> QueryResult {
         let query_id = generate_query_id();
+        tracing::Span::current().record("query_id", &query_id);
         tracing::trace!("Sending query {query_id} to {worker}");
 
         if lease {
@@ -415,6 +425,7 @@ impl NetworkClient {
                 query
             }
         })
+        .instrument(tracing::debug_span!("sign_query"))
         .await
         .unwrap();
 
@@ -432,7 +443,11 @@ impl NetworkClient {
         });
 
         let query_start_time = Instant::now();
-        let result = self.transport_handle.send_query(worker, query).await;
+        let result = self
+            .transport_handle
+            .send_query(worker, query)
+            .instrument(tracing::debug_span!("running_query"))
+            .await;
         scopeguard::ScopeGuard::into_inner(guard);
         metrics::QUERIES_RUNNING.dec();
         let query_time_micros = query_start_time.elapsed().as_micros();
@@ -450,6 +465,7 @@ impl NetworkClient {
         self.parse_query_result(worker, result).await
     }
 
+    #[instrument(skip_all, level = "debug")]
     async fn parse_query_result(
         &self,
         peer_id: PeerId,
@@ -657,6 +673,7 @@ impl NetworkClient {
     }
 }
 
+#[instrument(skip_all, level = "debug")]
 async fn verify_signature(query: &sqd_messages::QueryResult, peer_id: PeerId) -> bool {
     let query = query.clone();
     tokio::task::spawn_blocking(move || query.verify_signature(peer_id))

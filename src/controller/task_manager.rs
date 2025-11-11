@@ -52,7 +52,7 @@ impl TaskManager {
         let mut streamer = StreamController::new(request, self.network_client.clone())?;
         let first_chunk = streamer
             .next()
-            .in_current_span()
+            .instrument(tracing::debug_span!("stream_next"))
             .await
             .expect("First chunk missing from the stream")?;
         Ok(stream! {
