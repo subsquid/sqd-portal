@@ -69,6 +69,9 @@ pub struct Config {
 
     #[serde(default = "default_true")]
     pub send_logs: bool,
+
+    #[serde(default = "default_true")]
+    pub verify_worker_responses: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -80,6 +80,7 @@ pub struct NetworkClient {
     logs_tx: Option<sqd_network_transport::util::Sender<Box<dyn FnOnce() -> QueryFinished + Send>>>,
     logs_rx:
         UseOnce<sqd_network_transport::util::Receiver<Box<dyn FnOnce() -> QueryFinished + Send>>>,
+    verify_responses: bool,
 }
 
 pub struct NetworkClientBuilder {
@@ -140,6 +141,7 @@ impl NetworkClientBuilder {
             contracts_state: RwLock::new(Default::default(), "NetworkClient::contracts_state"),
             logs_tx,
             logs_rx,
+            verify_responses: config.verify_worker_responses,
         });
 
         this.reset_height_updates(hotblocks.clone());
@@ -456,7 +458,7 @@ impl NetworkClient {
         use query_error::Err;
 
         match result {
-            Ok(q) if !verify_signature(&q, peer_id).await => {
+            Ok(q) if self.verify_responses && !verify_signature(&q, peer_id).await => {
                 metrics::report_query_result(peer_id, "validation_error");
                 self.network_state.report_query_failure(peer_id);
                 Err(QueryError::Retriable(format!(
