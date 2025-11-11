@@ -22,6 +22,7 @@ pub fn json_lines_to_json(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(writer.finish()?)
 }
 
+// TODO: implement fast concatenation algorithm because this is currently the bottleneck in streaming
 pub fn recompress_gzip<S>(stream: S) -> impl futures::Stream<Item = std::io::Result<Bytes>>
 where
     S: futures::Stream<Item = Vec<u8>>,
@@ -33,7 +34,7 @@ where
     decoder.multiple_members(true);
 
     let encoder =
-        GzipEncoder::with_quality(BufReader::new(decoder), async_compression::Level::Default);
+        GzipEncoder::with_quality(BufReader::new(decoder), async_compression::Level::Fastest);
 
     ReaderStream::new(encoder)
 }
