@@ -677,6 +677,18 @@ where
             },
             None => config.default_retries,
         };
+        let max_chunks = match params.get("max_chunks") {
+            Some(value) => match value.parse() {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    return Err(
+                        RequestError::BadRequest(format!("Couldn't parse max_chunks: {e}"))
+                            .into_response(),
+                    )
+                }
+            },
+            None => None,
+        };
 
         Ok(ClientRequest {
             dataset_id: DatasetId::from_url("-"), // will be filled later, if the request goes to the network
@@ -684,7 +696,7 @@ where
             query,
             request_id: req_id,
             buffer_size,
-            max_chunks: config.max_chunks_per_stream,
+            max_chunks,
             timeout_quantile,
             retries,
         })
@@ -745,13 +757,19 @@ where
 }
 
 fn restrict_request(config: &Config, request: ClientRequest) -> ClientRequest {
+    let max_chunks = match (request.max_chunks, config.max_chunks_per_stream) {
+        (Some(requested), Some(limit)) => Some(requested.min(limit)),
+        (Some(requested), None) => Some(requested),
+        (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    };
     ClientRequest {
         query: request.query,
         dataset_id: request.dataset_id,
         dataset_name: request.dataset_name,
         request_id: request.request_id,
         buffer_size: request.buffer_size.min(config.max_buffer_size),
-        max_chunks: request.max_chunks.min(config.max_chunks_per_stream),
+        max_chunks,
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
     }
