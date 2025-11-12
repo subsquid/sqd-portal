@@ -507,6 +507,7 @@ impl NetworkClient {
                                 )))
                             }
                             Err::NotFound(s) => {
+                                // Chunk was not found on the worker. It's probably still downloading it
                                 metrics::report_query_result(peer_id, "not_found");
                                 self.network_state.report_query_error(peer_id);
                                 Err(QueryError::Retriable(s))
@@ -514,11 +515,15 @@ impl NetworkClient {
                             Err::ServerError(s) => {
                                 metrics::report_query_result(peer_id, "server_error");
                                 self.network_state.report_query_error(peer_id);
-                                Err(QueryError::Retriable(format!("internal error: {s}")))
+                                Err(QueryError::Failure(s))
                             }
                             Err::ServerOverloaded(()) => {
                                 metrics::report_query_result(peer_id, "server_overloaded");
                                 self.network_state.report_query_error(peer_id);
+                                if retry_after_ms.is_none() {
+                                    self.network_state
+                                        .hint_backoff(peer_id, Duration::from_millis(1000));
+                                }
                                 Err(QueryError::Retriable("worker overloaded".to_owned()))
                             }
                             Err::TooManyRequests(()) => {
@@ -545,9 +550,9 @@ impl NetworkClient {
                 Err(QueryError::Retriable("unknown error message".to_string()))
             }
             Err(QueryFailure::InvalidRequest(e)) => {
-                metrics::report_query_result(peer_id, "bad_request");
-                Err(QueryError::BadRequest(format!(
-                    "couldn't send request: {e}"
+                metrics::report_query_result(peer_id, "invalid");
+                Err(QueryError::Failure(format!(
+                    "portal tried to send invalid request: {e}"
                 )))
             }
             Err(QueryFailure::InvalidResponse(e)) => {

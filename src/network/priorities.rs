@@ -171,7 +171,7 @@ impl WorkersPool {
 
     pub fn hint_backoff(&mut self, worker: PeerId, backoff: Duration) {
         self.modify(worker, |stats| {
-            stats.paused_until = Some(Instant::now() + backoff);
+            stats.paused_until = stats.paused_until.max(Some(Instant::now() + backoff));
         });
     }
 

@@ -12,6 +12,8 @@ pub enum RequestError {
     NoData,
     #[error("{0}")]
     InternalError(String),
+    #[error("{0}")]
+    Failure(String),
     #[error("No available workers to serve the request")]
     Unavailable,
     #[error("Rate limit exceeded")]
@@ -26,6 +28,8 @@ pub enum QueryError {
     BadRequest(String),
     #[error("{0}")]
     Retriable(String),
+    #[error("{0}")]
+    Failure(String),
     #[error("rate limit exceeded")]
     RateLimitExceeded,
 }
@@ -43,7 +47,10 @@ impl RequestError {
         match value {
             QueryError::BadRequest(s) => RequestError::BadRequest(s),
             QueryError::Retriable(s) => {
-                RequestError::InternalError(format!("failed query to worker {worker}: {s}"))
+                RequestError::InternalError(format!("received error from worker {worker}: {s}"))
+            }
+            QueryError::Failure(s) => {
+                RequestError::Failure(format!("worker {worker} failed: {s}"))
             }
             QueryError::RateLimitExceeded => RequestError::RateLimitExceeded,
         }
@@ -62,6 +69,10 @@ impl axum::response::IntoResponse for RequestError {
 
             s @ Self::Unavailable => {
                 (StatusCode::SERVICE_UNAVAILABLE, s.to_string()).into_response()
+            }
+
+            s @ Self::Failure(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, s.to_string()).into_response()
             }
 
             s @ Self::BusyFor(duration) => axum::http::Response::builder()
@@ -96,6 +107,7 @@ impl RequestError {
             Self::BadRequest(_) => "bad_request",
             Self::NoData => "no_data",
             Self::InternalError(_) => "internal_error",
+            Self::Failure(_) => "failure",
             Self::Unavailable | Self::BusyFor(_) | Self::RateLimitExceeded => "overloaded",
         }
     }
