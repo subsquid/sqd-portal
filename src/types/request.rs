@@ -48,29 +48,6 @@ impl ParsedQuery {
         (begin <= end).then_some(begin..=end)
     }
 
-    // Network query format is incompatible with hotblock queries
-    // This should be removed once the network query format is updated
-    pub fn prepare_for_network(&mut self) {
-        match self.parsed {
-            Query::Eth(ref mut q) => {
-                q.parent_block_hash = None;
-            }
-            Query::Solana(ref mut q) => {
-                q.parent_block_hash = None;
-            }
-            Query::Substrate(ref mut q) => {
-                q.parent_block_hash = None;
-            }
-            Query::Fuel(ref mut q) => {
-                q.parent_block_hash = None;
-            }
-            Query::Hyperliquid(ref mut q) => {
-                q.parent_block_hash = None;
-            }
-        }
-        self.raw = self.parsed.to_json_string()
-    }
-
     #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
         self.raw.clone()

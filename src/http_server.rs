@@ -254,7 +254,6 @@ async fn run_archival_stream(
 ) -> Response {
     let head = network.head(&dataset_id);
     request.dataset_id = dataset_id;
-    request.query.prepare_for_network();
     let stream = match task_manager.spawn_stream(request).await {
         Ok(stream) => stream,
         Err(e @ RequestError::NoData) => {
@@ -337,7 +336,6 @@ async fn run_stream_internal(
         {
             let head = network.head(&dataset_id);
             request.dataset_id = dataset_id;
-            request.query.prepare_for_network();
 
             let stream = match task_manager.spawn_stream(request).await {
                 Ok(stream) => stream,
