@@ -132,7 +132,7 @@ fn default_transport_timeout() -> Duration {
 }
 
 fn default_default_buffer_size() -> usize {
-    50
+    10
 }
 
 fn default_max_buffer_size() -> usize {
