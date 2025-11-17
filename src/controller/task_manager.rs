@@ -59,11 +59,11 @@ impl TaskManager {
             let _ = guard;
             yield first_chunk;
             loop {
-                match streamer.next().await {
+                match streamer.next().instrument(tracing::debug_span!("stream_next")).await {
                     None => break,
                     Some(Ok(chunk)) => yield chunk,
                     Some(Err(e)) => {
-                        tracing::warn!("Stream got interrupted: {:?}", e);
+                        tracing::warn!("Stream got interrupted: {}", e);
                         // There is no way to pass the error to the client
                         break;
                     }
