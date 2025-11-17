@@ -87,14 +87,13 @@ pub fn report_backoff(worker: PeerId) {
 }
 
 pub fn report_http_response(endpoint: String, status: StatusCode, seconds_to_first_byte: f64) {
-    HTTP_STATUS
-        .get_or_create(&vec![
-            ("endpoint".to_owned(), endpoint.clone()),
-            ("status".to_owned(), status.as_str().to_owned()),
-        ])
-        .inc();
+    let labels = vec![
+        ("endpoint".to_owned(), endpoint.clone()),
+        ("status".to_owned(), status.as_str().to_owned()),
+    ];
+    HTTP_STATUS.get_or_create(&labels).inc();
     HTTP_TTFB
-        .get_or_create(&vec![("endpoint".to_owned(), endpoint)])
+        .get_or_create(&labels)
         .observe(seconds_to_first_byte);
 }
 
