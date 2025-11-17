@@ -47,6 +47,7 @@ lazy_static::lazy_static! {
     pub static ref QUERIES_RUNNING: Gauge = Default::default();
     static ref QUERY_RESULTS: Family<Labels, Counter> = Default::default();
     static ref QUERY_BACKOFF: Family<Labels, Counter> = Default::default();
+    static ref QUERY_DURATIONS: Histogram = Histogram::new(exponential_buckets(0.001, 2.0, 20));
 
     pub static ref ACTIVE_STREAMS: Gauge = Default::default();
     pub static ref COMPLETED_STREAMS: Counter = Default::default();
@@ -78,6 +79,10 @@ pub fn report_query_result(worker: PeerId, status: &str) {
             ("status".to_owned(), status.to_owned()),
         ])
         .inc();
+}
+
+pub fn report_query_ok(duration: std::time::Duration) {
+    QUERY_DURATIONS.observe(duration.as_secs_f64());
 }
 
 pub fn report_backoff(worker: PeerId) {
@@ -193,6 +198,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "queries_backoff_hints",
         "Number of times the RPS limit has been hit",
         QUERY_BACKOFF.clone(),
+    );
+    registry.register(
+        "query_durations_seconds",
+        "Durations of successful queries",
+        QUERY_DURATIONS.clone(),
     );
     registry.register(
         "known_workers",

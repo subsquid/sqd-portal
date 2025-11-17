@@ -450,19 +450,21 @@ impl NetworkClient {
             .await;
         scopeguard::ScopeGuard::into_inner(guard);
         metrics::QUERIES_RUNNING.dec();
-        let query_time_micros = query_start_time.elapsed().as_micros();
+        let query_time = query_start_time.elapsed();
 
         if let Some(logs_tx) = &self.logs_tx {
             if let Ok(result) = result.as_ref() {
                 let result = result.clone();
                 let f = move || {
-                    QueryFinished::new(&result, worker.to_string(), query_time_micros as u32)
+                    QueryFinished::new(&result, worker.to_string(), query_time.as_micros() as u32)
                 };
                 logs_tx.send_lossy(Box::new(f));
             }
         }
 
-        self.parse_query_result(worker, result).await
+        self.parse_query_result(worker, result)
+            .await
+            .inspect(|_| metrics::report_query_ok(query_time))
     }
 
     #[instrument(skip_all, level = "debug")]
