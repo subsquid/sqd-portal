@@ -16,6 +16,24 @@ pub enum StreamMode {
     RealTime,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Status {
+    pub kind: String,
+    pub retention_strategy: serde_json::Value,
+    pub data: Option<StatusData>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusData {
+    pub first_block: BlockNumber,
+    pub last_block: BlockNumber,
+    pub last_block_hash: String,
+    pub last_block_timestamp: Option<u64>,
+    pub finalized_head: Option<sqd_primitives::BlockRef>,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum HotblocksErr {
     #[error("Dataset not configured")]
@@ -98,6 +116,38 @@ impl HotblocksHandle {
     ) -> Result<sqd_primitives::BlockRef, HotblocksErr> {
         let result = self
             .request_finalized_head(dataset)
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(result)
+    }
+
+    pub async fn request_status(
+        &self,
+        dataset: &str,
+    ) -> Result<reqwest::Response, HotblocksErr> {
+        let Some(url) = self.urls.get(dataset) else {
+            return Err(HotblocksErr::UnknownDataset);
+        };
+
+        let response = self
+            .client
+            .get(format!("{url}/status"))
+            .send()
+            .await?;
+
+        Ok(response)
+    }
+
+    #[tracing::instrument(skip_all, ret, err)]
+    pub async fn get_status(
+        &self,
+        dataset: &str,
+    ) -> Result<Status, HotblocksErr> {
+        let result = self
+            .request_status(dataset)
             .await?
             .error_for_status()?
             .json()

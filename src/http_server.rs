@@ -446,13 +446,20 @@ async fn get_dataset_state(
 
 async fn get_dataset_metadata(
     Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
     metadata: DatasetConfig,
 ) -> impl IntoResponse {
-    let first_block = metadata
+    let first_block = if let Some(first_block) = metadata
         .network_id
         .as_ref()
-        .and_then(|dataset| network.first_existing_block(dataset));
-    // TODO: get first real-time block if there is no archival data
+        .and_then(|dataset| network.first_existing_block(dataset))
+    {
+        Some(first_block)
+    } else if let Ok(status) = hotblocks.get_status(&metadata.default_name).await {
+        status.data.map(|d| d.first_block)
+    } else {
+        None
+    };
     axum::Json(AvailableDatasetApiResponse::new(metadata, first_block))
 }
 
