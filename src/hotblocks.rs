@@ -64,7 +64,7 @@ impl HotblocksHandle {
         Ok(response)
     }
 
-    pub async fn _get_head(&self, dataset: &str) -> Result<sqd_primitives::BlockRef, HotblocksErr> {
+    pub async fn get_head(&self, dataset: &str) -> Result<sqd_primitives::BlockRef, HotblocksErr> {
         let result = self
             .request_head(dataset)
             .await?
@@ -92,7 +92,7 @@ impl HotblocksHandle {
         Ok(response)
     }
 
-    pub async fn _get_finalized_head(
+    pub async fn get_finalized_head(
         &self,
         dataset: &str,
     ) -> Result<sqd_primitives::BlockRef, HotblocksErr> {

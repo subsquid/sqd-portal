@@ -252,28 +252,31 @@ async fn run_archival_stream(
     dataset_id: DatasetId,
     mut request: ClientRequest,
 ) -> Response {
-    let head = network.head(&dataset_id);
+    let mut res = Response::builder();
+    res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
+    if let Some(head) = network.head(&dataset_id) {
+        // Don't use hotblocks data source at all for this endpoint
+        res = res
+            .header(FINALIZED_NUMBER_HEADER, head.number)
+            .header(FINALIZED_HASH_HEADER, head.hash)
+            .header(HEAD_NUMBER_HEADER, head.number);
+    }
+
     request.dataset_id = dataset_id;
-    let stream = match task_manager.spawn_stream(request).await {
-        Ok(stream) => stream,
-        Err(e @ RequestError::NoData) => {
+
+    match task_manager.spawn_stream(request).await {
+        Ok(stream) => res
+            .header(header::CONTENT_TYPE, "application/jsonl")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(Body::from_stream(recompress_gzip(stream)))
+            .unwrap(),
+        Err(RequestError::NoData) => {
             // Delay request from this client for 5 seconds to avoid unnecessary retries
             tokio::time::sleep(Duration::from_secs(5)).await;
-            return e.into_response();
+            res.status(StatusCode::NO_CONTENT).body(().into()).unwrap()
         }
-        Err(e) => return e.into_response(),
-    };
-
-    let mut res = Response::builder()
-        .header(header::CONTENT_TYPE, "application/jsonl")
-        .header(header::CONTENT_ENCODING, "gzip");
-    if let Some(head) = head {
-        res = res.header(FINALIZED_NUMBER_HEADER, head.number);
-        res = res.header(FINALIZED_HASH_HEADER, head.hash);
-        res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
+        Err(e) => e.into_response(),
     }
-    res.body(Body::from_stream(recompress_gzip(stream)))
-        .unwrap()
 }
 
 async fn run_stream(
@@ -334,25 +337,40 @@ async fn run_stream_internal(
                 .get_height(&dataset_id)
                 .is_some_and(|height| request.query.first_block() <= height) =>
         {
-            let head = network.head(&dataset_id);
+            let archival_head = network.head(&dataset_id);
+            let head_task = tokio::spawn({
+                let archival_head = archival_head.clone();
+                async move {
+                    let ds = &dataset.default_name;
+                    let head = match mode {
+                        StreamMode::RealTime => hotblocks.get_head(ds).await,
+                        StreamMode::Finalized => hotblocks.get_finalized_head(ds).await,
+                    };
+                    head.ok().or(archival_head.clone()).map(|b| b.number)
+                }
+            });
+
             request.dataset_id = dataset_id;
 
             let stream = match task_manager.spawn_stream(request).await {
                 Ok(stream) => stream,
                 Err(e) => return e.into_response(),
             };
-            let body = Body::from_stream(recompress_gzip(stream));
 
-            let mut res = Response::builder()
-                .header(header::CONTENT_TYPE, "application/jsonl")
-                .header(header::CONTENT_ENCODING, "gzip")
-                .header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
-            if let Some(head) = head {
+            let mut res = Response::builder().header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
+            if let Some(head) = archival_head {
                 res = res.header(FINALIZED_NUMBER_HEADER, head.number);
                 res = res.header(FINALIZED_HASH_HEADER, head.hash);
             }
-            res.body(body).unwrap()
+            if let Some(head) = head_task.await.unwrap() {
+                res = res.header(HEAD_NUMBER_HEADER, head);
+            }
+            res.header(header::CONTENT_TYPE, "application/jsonl")
+                .header(header::CONTENT_ENCODING, "gzip")
+                .body(Body::from_stream(recompress_gzip(stream)))
+                .unwrap()
         }
+
         // Then try hotblocks storage
         // TODO: if the query is below the first hotblock, return 500 instead of 400
         _ if dataset.hotblocks.is_some() => {
@@ -363,18 +381,24 @@ async fn run_stream_internal(
             );
 
             if res.status().is_success() {
-                res.headers_mut().append(
-                    DATA_SOURCE_HEADER,
-                    HeaderValue::from_static(DATA_SOURCE_REALTIME),
-                );
+                res.headers_mut()
+                    .append(DATA_SOURCE_HEADER, DATA_SOURCE_REALTIME);
             }
             res
         }
         // If requested block is above the network height and there is no hotblocks storage, return 204
-        Some(_dataset_id) => {
+        Some(dataset_id) => {
             // Delay request from this client for 5 seconds to avoid unnecessary retries
             tokio::time::sleep(Duration::from_secs(5)).await;
-            RequestError::NoData.into_response()
+
+            let mut res = Response::builder();
+            res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
+            if let Some(head) = network.head(&dataset_id) {
+                res = res.header(FINALIZED_NUMBER_HEADER, head.number);
+                res = res.header(FINALIZED_HASH_HEADER, head.hash);
+                res = res.header(HEAD_NUMBER_HEADER, head.number);
+            }
+            res.status(StatusCode::NO_CONTENT).body(().into()).unwrap()
         }
         None => {
             unreachable!(
@@ -798,8 +822,9 @@ fn forward_response(response: reqwest::Response) -> axum::response::Response {
     builder.body(body).unwrap()
 }
 
-const FINALIZED_NUMBER_HEADER: &str = "X-Sqd-Finalized-Head-Number";
-const FINALIZED_HASH_HEADER: &str = "X-Sqd-Finalized-Head-Hash";
-const DATA_SOURCE_HEADER: &str = "X-Sqd-Data-Source";
-const DATA_SOURCE_NETWORK: &str = "network";
-const DATA_SOURCE_REALTIME: &str = "real_time";
+const FINALIZED_NUMBER_HEADER: &str = "x-sqd-finalized-head-number";
+const FINALIZED_HASH_HEADER: &str = "x-sqd-finalized-head-hash";
+const HEAD_NUMBER_HEADER: &str = "x-sqd-head-number";
+const DATA_SOURCE_HEADER: &str = "x-sqd-data-source";
+const DATA_SOURCE_NETWORK: HeaderValue = HeaderValue::from_static("network");
+const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static("real_time");
