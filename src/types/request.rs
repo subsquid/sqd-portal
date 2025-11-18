@@ -3,7 +3,7 @@ use sqd_query::Query;
 use super::{BlockRange, DatasetId};
 
 #[derive(Debug, Clone)]
-pub struct ClientRequest {
+pub struct StreamRequest {
     pub dataset_id: DatasetId,
     pub dataset_name: String,
     pub query: ParsedQuery,
@@ -12,6 +12,7 @@ pub struct ClientRequest {
     pub max_chunks: Option<usize>,
     pub timeout_quantile: f32,
     pub retries: u8,
+    pub compression: Compression,
 }
 
 #[derive(Debug, Clone)]
@@ -19,6 +20,12 @@ pub struct ParsedQuery {
     raw: String,
     without_parent_hash: Option<String>,
     parsed: Query,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    Gzip,
+    Zstd,
 }
 
 impl ParsedQuery {
@@ -93,5 +100,14 @@ impl ParsedQuery {
 
     pub fn _into_parsed(self) -> Query {
         self.parsed
+    }
+}
+
+impl Compression {
+    pub fn content_encoding(&self) -> &'static str {
+        match self {
+            Compression::Gzip => "gzip",
+            Compression::Zstd => "zstd",
+        }
     }
 }

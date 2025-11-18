@@ -17,7 +17,7 @@ use crate::{
     controller::timeouts::TimeoutManager,
     network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult},
     types::{
-        BlockRange, ChunkId, ClientRequest, DataChunk, QueryError, RequestError, ResponseChunk,
+        BlockRange, ChunkId, StreamRequest, DataChunk, QueryError, RequestError, ResponseChunk,
         SendQueryError,
     },
     utils::{logging::StreamStats, SlidingArray},
@@ -26,7 +26,7 @@ use crate::{
 const MAX_IDLE_TIME: Duration = Duration::from_millis(1000);
 
 pub struct StreamController {
-    request: ClientRequest,
+    request: StreamRequest,
     network: Arc<NetworkClient>,
     buffer: SlidingArray<Slot>,
     next_chunk: Option<DataChunk>,
@@ -74,7 +74,7 @@ struct WorkerRequest {
 }
 
 impl StreamController {
-    pub fn new(request: ClientRequest, network: Arc<NetworkClient>) -> Result<Self, RequestError> {
+    pub fn new(request: StreamRequest, network: Arc<NetworkClient>) -> Result<Self, RequestError> {
         let first_block = request.query.first_block();
 
         let first_chunk = match network.find_chunk(&request.dataset_id, first_block) {
@@ -447,6 +447,7 @@ impl StreamController {
                 ChunkId::new(self.request.dataset_id.clone(), range.chunk),
                 range.range.clone(),
                 query,
+                self.request.compression,
                 false,
             )
             .in_current_span();

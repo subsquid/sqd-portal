@@ -27,7 +27,7 @@ use super::{ChunkNotFound, NetworkState};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::hotblocks::HotblocksHandle;
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
-use crate::types::{BlockNumber, BlockRange, ChunkId, DataChunk};
+use crate::types::{BlockNumber, BlockRange, ChunkId, Compression, DataChunk};
 use crate::utils::{RwLock, UseOnce};
 use crate::{
     config::Config,
@@ -398,6 +398,7 @@ impl NetworkClient {
         chunk_id: ChunkId,
         block_range: BlockRange,
         query: String,
+        compression: Compression,
         lease: bool,
     ) -> QueryResult {
         let query_id = generate_query_id();
@@ -408,6 +409,10 @@ impl NetworkClient {
             self.network_state.lease_worker(worker);
         }
 
+        let compression = match compression {
+            Compression::Gzip => sqd_messages::Compression::Gzip,
+            Compression::Zstd => sqd_messages::Compression::Zstd,
+        } as i32;
         let mut query = Query {
             dataset: chunk_id.dataset.to_url().to_owned(),
             query_id: query_id.clone(),
@@ -420,7 +425,7 @@ impl NetworkClient {
             chunk_id: chunk_id.chunk.to_string(),
             timestamp_ms: timestamp_now_ms(),
             signature: Default::default(),
-            compression: sqd_messages::Compression::Gzip as i32,
+            compression,
         };
         let query = tokio::task::spawn_blocking({
             let keypair = self.keypair.clone();

@@ -9,7 +9,7 @@ use tower::{Layer, Service};
 use tower_http::request_id::RequestId;
 use tracing::Instrument;
 
-use crate::{metrics, types::ClientRequest};
+use crate::{metrics, types::StreamRequest};
 
 const LOG_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -64,7 +64,7 @@ impl StreamStats {
         }
     }
 
-    pub fn write_summary(&self, request: &ClientRequest, error: Option<String>) {
+    pub fn write_summary(&self, request: &StreamRequest, error: Option<String>) {
         // tracing::debug!(
         //     dataset = %request.dataset_id,
         //     query = request.query.to_string(),
