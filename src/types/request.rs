@@ -17,6 +17,7 @@ pub struct ClientRequest {
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
     raw: String,
+    without_parent_hash: Option<String>,
     parsed: Query,
 }
 
@@ -26,6 +27,7 @@ impl ParsedQuery {
         query.validate()?;
         Ok(Self {
             raw: str,
+            without_parent_hash: None,
             parsed: query,
         })
     }
@@ -46,6 +48,31 @@ impl ParsedQuery {
             *range.end()
         };
         (begin <= end).then_some(begin..=end)
+    }
+
+    // TODO: consider optimizing by passing a flag to workers
+    pub fn without_parent_hash(&mut self) -> String {
+        if self.without_parent_hash.is_none() {
+            match self.parsed {
+                Query::Eth(ref mut q) => {
+                    q.parent_block_hash = None;
+                }
+                Query::Solana(ref mut q) => {
+                    q.parent_block_hash = None;
+                }
+                Query::Substrate(ref mut q) => {
+                    q.parent_block_hash = None;
+                }
+                Query::Fuel(ref mut q) => {
+                    q.parent_block_hash = None;
+                }
+                Query::Hyperliquid(ref mut q) => {
+                    q.parent_block_hash = None;
+                }
+            }
+            self.without_parent_hash = Some(self.parsed.to_json_string());
+        }
+        self.without_parent_hash.clone().unwrap()
     }
 
     #[allow(clippy::inherent_to_string)]

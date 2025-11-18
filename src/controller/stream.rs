@@ -415,10 +415,7 @@ impl StreamController {
         })
     }
 
-    fn send_query(
-        &mut self,
-        range: &DataRange,
-    ) -> Result<WorkerRequest, SendQueryError> {
+    fn send_query(&mut self, range: &DataRange) -> Result<WorkerRequest, SendQueryError> {
         let worker =
             match self
                 .network
@@ -435,6 +432,11 @@ impl StreamController {
             range.range.end(),
             worker,
         );
+        let query = if range.chunk_index == 0 {
+            self.request.query.to_string()
+        } else {
+            self.request.query.without_parent_hash()
+        };
         let start_time = tokio::time::Instant::now();
         let fut = self
             .network
@@ -444,7 +446,7 @@ impl StreamController {
                 self.request.request_id.to_string(),
                 ChunkId::new(self.request.dataset_id.clone(), range.chunk),
                 range.range.clone(),
-                self.request.query.to_string(),
+                query,
                 false,
             )
             .in_current_span();
