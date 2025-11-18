@@ -4,6 +4,8 @@ use tokio::time::Instant;
 
 use sqd_contract_client::PeerId;
 
+use crate::metrics;
+
 pub type Priority = (PriorityGroup, u8, i64);
 
 const MAX_QUERIES_PER_WORKER: u8 = 1;
@@ -97,7 +99,10 @@ impl WorkersPool {
             })
             .min_by_key(|&(_, priority)| priority)
             .ok_or(NoWorker::AllUnavailable)?;
+
         tracing::trace!("Picked worker {:?} with priority {:?}", best, best_priority);
+        metrics::report_worker_picked(&best, &format!("{:?}", best_priority.0));
+
         let worker = match best_priority.0 {
             PriorityGroup::Unavailable => return Err(NoWorker::AllUnavailable),
             PriorityGroup::Backoff => return Err(NoWorker::Backoff(best_priority.2)),

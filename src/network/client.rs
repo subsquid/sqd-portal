@@ -477,7 +477,7 @@ impl NetworkClient {
 
         match result {
             Ok(q) if self.verify_responses && !verify_signature(&q, peer_id).await => {
-                metrics::report_query_result(peer_id, "validation_error");
+                metrics::report_query_result(&peer_id, "validation_error");
                 self.network_state.report_query_failure(peer_id);
                 Err(QueryError::Retriable(format!(
                     "invalid worker signature from {peer_id}, result: {q:?}"
@@ -491,18 +491,18 @@ impl NetworkClient {
                 if let Some(backoff) = retry_after_ms {
                     self.network_state
                         .hint_backoff(peer_id, Duration::from_millis(backoff.into()));
-                    metrics::report_backoff(peer_id);
+                    metrics::report_backoff(&peer_id);
                 };
                 match result {
                     query_result::Result::Ok(ok) => {
-                        metrics::report_query_result(peer_id, "ok");
+                        metrics::report_query_result(&peer_id, "ok");
                         self.network_state.report_query_success(peer_id);
                         Ok(ok)
                     }
                     query_result::Result::Err(sqd_messages::QueryError { err: Some(err) }) => {
                         match err {
                             Err::BadRequest(s) => {
-                                metrics::report_query_result(peer_id, "bad_request");
+                                metrics::report_query_result(&peer_id, "bad_request");
                                 self.network_state.report_query_success(peer_id);
                                 Err(QueryError::BadRequest(format!(
                                     "couldn't parse request: {s}"
@@ -510,17 +510,17 @@ impl NetworkClient {
                             }
                             Err::NotFound(s) => {
                                 // Chunk was not found on the worker. It's probably still downloading it
-                                metrics::report_query_result(peer_id, "not_found");
+                                metrics::report_query_result(&peer_id, "not_found");
                                 self.network_state.report_query_error(peer_id);
                                 Err(QueryError::Retriable(s))
                             }
                             Err::ServerError(s) => {
-                                metrics::report_query_result(peer_id, "server_error");
+                                metrics::report_query_result(&peer_id, "server_error");
                                 self.network_state.report_query_error(peer_id);
                                 Err(QueryError::Failure(s))
                             }
                             Err::ServerOverloaded(()) => {
-                                metrics::report_query_result(peer_id, "server_overloaded");
+                                metrics::report_query_result(&peer_id, "server_overloaded");
                                 self.network_state.report_query_error(peer_id);
                                 if retry_after_ms.is_none() {
                                     self.network_state
@@ -529,7 +529,7 @@ impl NetworkClient {
                                 Err(QueryError::Retriable("worker overloaded".to_owned()))
                             }
                             Err::TooManyRequests(()) => {
-                                metrics::report_query_result(peer_id, "too_many_requests");
+                                metrics::report_query_result(&peer_id, "too_many_requests");
                                 self.network_state.report_query_success(peer_id);
                                 if retry_after_ms.is_none() {
                                     self.network_state
@@ -540,32 +540,32 @@ impl NetworkClient {
                         }
                     }
                     query_result::Result::Err(sqd_messages::QueryError { err: None }) => {
-                        metrics::report_query_result(peer_id, "invalid");
+                        metrics::report_query_result(&peer_id, "invalid");
                         self.network_state.report_query_error(peer_id);
                         Err(QueryError::Retriable("unknown error message".to_string()))
                     }
                 }
             }
             Ok(sqd_messages::QueryResult { result: None, .. }) => {
-                metrics::report_query_result(peer_id, "invalid");
+                metrics::report_query_result(&peer_id, "invalid");
                 self.network_state.report_query_error(peer_id);
                 Err(QueryError::Retriable("unknown error message".to_string()))
             }
             Err(QueryFailure::InvalidRequest(e)) => {
-                metrics::report_query_result(peer_id, "invalid");
+                metrics::report_query_result(&peer_id, "invalid");
                 Err(QueryError::Failure(format!(
                     "portal tried to send invalid request: {e}"
                 )))
             }
             Err(QueryFailure::InvalidResponse(e)) => {
-                metrics::report_query_result(peer_id, "invalid");
+                metrics::report_query_result(&peer_id, "invalid");
                 self.network_state.report_query_error(peer_id);
                 Err(QueryError::Retriable(format!(
                     "couldn't decode response: {e}"
                 )))
             }
             Err(QueryFailure::Timeout(t)) => {
-                metrics::report_query_result(peer_id, "timeout");
+                metrics::report_query_result(&peer_id, "timeout");
                 self.network_state.report_query_failure(peer_id);
                 let msg = match t {
                     sqd_network_transport::StreamClientTimeout::Connect => {
@@ -578,7 +578,7 @@ impl NetworkClient {
                 Err(QueryError::Retriable(msg.to_owned()))
             }
             Err(QueryFailure::TransportError(e)) => {
-                metrics::report_query_result(peer_id, "transport_error");
+                metrics::report_query_result(&peer_id, "transport_error");
                 self.network_state.report_query_failure(peer_id);
                 Err(QueryError::Retriable(format!("transport error: {e}")))
             }

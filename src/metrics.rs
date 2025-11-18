@@ -48,6 +48,7 @@ lazy_static::lazy_static! {
     static ref QUERY_RESULTS: Family<Labels, Counter> = Default::default();
     static ref QUERY_BACKOFF: Family<Labels, Counter> = Default::default();
     static ref QUERY_DURATIONS: Histogram = Histogram::new(exponential_buckets(0.001, 2.0, 20));
+    static ref WORKER_PICKED: Family<Labels, Counter> = Default::default();
 
     pub static ref ACTIVE_STREAMS: Gauge = Default::default();
     pub static ref COMPLETED_STREAMS: Counter = Default::default();
@@ -72,7 +73,7 @@ lazy_static::lazy_static! {
     static ref MUTEXES_EXISTING: Family<Labels, Gauge> = Default::default();
 }
 
-pub fn report_query_result(worker: PeerId, status: &str) {
+pub fn report_query_result(worker: &PeerId, status: &str) {
     QUERY_RESULTS
         .get_or_create(&vec![
             ("worker".to_owned(), worker.to_string()),
@@ -85,7 +86,16 @@ pub fn report_query_ok(duration: std::time::Duration) {
     QUERY_DURATIONS.observe(duration.as_secs_f64());
 }
 
-pub fn report_backoff(worker: PeerId) {
+pub fn report_worker_picked(worker: &PeerId, priority: &str) {
+    WORKER_PICKED
+        .get_or_create(&vec![
+            ("worker".to_owned(), worker.to_string()),
+            ("priority".to_owned(), priority.to_owned()),
+        ])
+        .inc();
+}
+
+pub fn report_backoff(worker: &PeerId) {
     QUERY_BACKOFF
         .get_or_create(&vec![("worker".to_owned(), worker.to_string())])
         .inc();
@@ -203,6 +213,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "query_durations_seconds",
         "Durations of successful queries",
         QUERY_DURATIONS.clone(),
+    );
+    registry.register(
+        "worker_picked",
+        "Number of times a worker was picked with a given priority",
+        WORKER_PICKED.clone(),
     );
     registry.register(
         "known_workers",
