@@ -218,12 +218,16 @@ impl StorageClient {
         Ok(chunk
             .worker_indexes()
             .iter()
-            .filter_map(|idx| match assignment.get_worker_id(idx) {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to parse worker ID #{}", idx);
-                    None
+            .filter_map(|idx| {
+                let w = assignment.get_worker_by_index(idx);
+                if w.status() == sqd_assignments::WorkerStatus::UnsupportedVersion {
+                    return None;
                 }
+                w.peer_id()
+                    .inspect_err(
+                        |e| tracing::warn!(error = %e, "Failed to parse worker ID #{}", idx),
+                    )
+                    .ok()
             })
             .collect())
     }

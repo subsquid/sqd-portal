@@ -415,6 +415,7 @@ impl NetworkClient {
             chunk_id: chunk_id.chunk.to_string(),
             timestamp_ms: timestamp_now_ms(),
             signature: Default::default(),
+            compression: sqd_messages::Compression::Gzip as i32,
         };
         let query = tokio::task::spawn_blocking({
             let keypair = self.keypair.clone();
