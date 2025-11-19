@@ -3,8 +3,7 @@ sqd_network:
   datasets: https://cdn.subsquid.io/sqd-network/datasets-testnet.yml
   serve: "all"
 datasets:
-  solana-mainnet:
-    aliases: ["solana-beta"]
+  # An example of a dataset configured to use real-time data
   base-mainnet:
     real_time:
       url: http://localhost:9090

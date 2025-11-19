@@ -3,19 +3,19 @@ services:
     image: subsquid/sqd-portal:0.8.1
     environment:
       KEY_PATH: /run/secrets/network_key
-      CONFIG: /app/data/${NETWORK}.config.yml
+      CONFIG: /app/data/${NETWORK:?}.config.yml
       HTTP_LISTEN_ADDR: 0.0.0.0:8000
-      NETWORK: "${NETWORK}"
-      BOOT_NODES: "${BOOT_NODES}"
-      RPC_URL: "${RPC_URL}"
-      L1_RPC_URL: "${L1_RPC_URL}"
+      NETWORK: "${NETWORK:?}"
+      BOOT_NODES: "${BOOT_NODES:?}"
+      RPC_URL: "${RPC_URL:?}"
+      L1_RPC_URL: "${L1_RPC_URL:?}"
     volumes:
       - ./:/app/data
     secrets:
       - network_key
     ports:
-      - "${HTTP_LISTEN_ADDR}:8000"
+      - "${HTTP_LISTEN_ADDR:?}:8000"
 
 secrets:
   network_key:
-    file: "${KEY_PATH}"
+    file: "${KEY_PATH:?}"
