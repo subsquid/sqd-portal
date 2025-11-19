@@ -47,7 +47,7 @@ impl RequestError {
         match value {
             QueryError::BadRequest(s) => RequestError::BadRequest(s),
             QueryError::Retriable(s) => {
-                RequestError::InternalError(format!("received error from worker {worker}: {s}"))
+                RequestError::InternalError(format!("received an error from worker {worker}: {s}"))
             }
             QueryError::Failure(s) => {
                 RequestError::Failure(format!("worker {worker} failed: {s}"))
