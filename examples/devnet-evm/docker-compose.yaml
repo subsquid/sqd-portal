@@ -1,11 +1,11 @@
 services:
   # Loads data from RPC and serves full blocks
   hotblocks-service:
-    image: subsquid/evm-hotblocks-service:4229b9b2
+    image: subsquid/evm-hotblocks-service:latest
     environment:
       SQD_INFO: "*"
     command: >
-      --http-rpc ${RPC_URL}
+      --http-rpc ${RPC_URL:?}
       --receipts
       --traces
       --diffs
@@ -19,7 +19,7 @@ services:
 
   # Loads full blocks from hotblocks-service and provides query API over it
   hotblocks-db:
-    image: subsquid/data-hotblocks:a8e7c369
+    image: subsquid/data-hotblocks:latest
     environment:
       RUST_LOG: "info"
     command: >
