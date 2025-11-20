@@ -75,6 +75,10 @@ impl ParsedQuery {
         self.without_parent_hash.clone().unwrap()
     }
 
+    pub fn remove_parent_hash(&mut self) {
+        self.raw = self.without_parent_hash();
+    }
+
     #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
         self.raw.clone()

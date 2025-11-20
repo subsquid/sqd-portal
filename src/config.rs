@@ -72,6 +72,9 @@ pub struct Config {
 
     #[serde(default = "default_true")]
     pub verify_worker_responses: bool,
+
+    #[serde(default)]
+    pub skip_parent_hash_validation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

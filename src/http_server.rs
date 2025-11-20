@@ -672,7 +672,11 @@ where
             .extract_parts::<Extension<Arc<Config>>>()
             .await
             .map_err(IntoResponse::into_response)?;
-        let query: ParsedQuery = req.extract().await.map_err(IntoResponse::into_response)?;
+        let mut query: ParsedQuery = req.extract().await.map_err(IntoResponse::into_response)?;
+
+        if config.skip_parent_hash_validation {
+            query.remove_parent_hash();
+        }
 
         let buffer_size = match params.get("buffer_size").map(|v| v.parse()) {
             Some(Ok(value)) => value,
