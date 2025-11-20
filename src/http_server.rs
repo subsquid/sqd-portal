@@ -11,6 +11,8 @@ use axum::{
     routing::{get, post},
     Extension, RequestExt, Router,
 };
+use bytes::Bytes;
+use futures::StreamExt;
 use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
@@ -24,6 +26,7 @@ use tower_http::request_id::{
 use crate::datasets::DatasetConfig;
 use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
+use crate::types::Compression;
 use crate::utils::conversion::{json_lines_to_json, recompress_gzip};
 use crate::utils::logging::MethodRouterExt;
 use crate::{
@@ -31,7 +34,7 @@ use crate::{
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
     network::{NetworkClient, NoWorker},
-    types::{ChunkId, ClientRequest, DatasetId, ParsedQuery, RequestError},
+    types::{ChunkId, DatasetId, ParsedQuery, RequestError, StreamRequest},
     utils::logging,
 };
 
@@ -240,7 +243,7 @@ async fn run_archival_stream_restricted(
     network: Extension<Arc<NetworkClient>>,
     Extension(config): Extension<Arc<Config>>,
     dataset_id: DatasetId,
-    raw_request: ClientRequest,
+    raw_request: StreamRequest,
 ) -> Response {
     let request = restrict_request(&config, raw_request);
     run_archival_stream(task_manager, network, dataset_id, request).await
@@ -250,7 +253,7 @@ async fn run_archival_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     dataset_id: DatasetId,
-    mut request: ClientRequest,
+    mut request: StreamRequest,
 ) -> Response {
     let mut res = Response::builder();
     res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
@@ -263,13 +266,21 @@ async fn run_archival_stream(
     }
 
     request.dataset_id = dataset_id;
+    let compression = request.compression;
 
     match task_manager.spawn_stream(request).await {
-        Ok(stream) => res
-            .header(header::CONTENT_TYPE, "application/jsonl")
-            .header(header::CONTENT_ENCODING, "gzip")
-            .body(Body::from_stream(recompress_gzip(stream)))
-            .unwrap(),
+        Ok(stream) => {
+            let body = match compression {
+                Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
+                Compression::Zstd => Body::from_stream(
+                    stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))),
+                ),
+            };
+            res.header(header::CONTENT_TYPE, "application/jsonl")
+                .header(header::CONTENT_ENCODING, compression.content_encoding())
+                .body(body)
+                .unwrap()
+        }
         Err(RequestError::NoData) => {
             // Delay request from this client for 5 seconds to avoid unnecessary retries
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -285,7 +296,7 @@ async fn run_stream(
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
     dataset: DatasetConfig,
-    request: ClientRequest,
+    request: StreamRequest,
 ) -> Response {
     run_stream_internal(
         task_manager,
@@ -305,7 +316,7 @@ async fn run_finalized_stream(
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
     dataset: DatasetConfig,
-    request: ClientRequest,
+    request: StreamRequest,
 ) -> Response {
     run_stream_internal(
         task_manager,
@@ -325,7 +336,7 @@ async fn run_stream_internal(
     network: Arc<NetworkClient>,
     hotblocks: Arc<HotblocksHandle>,
     dataset: DatasetConfig,
-    request: ClientRequest,
+    request: StreamRequest,
     mode: StreamMode,
 ) -> Response {
     let mut request = restrict_request(&config, request);
@@ -351,6 +362,7 @@ async fn run_stream_internal(
             });
 
             request.dataset_id = dataset_id;
+            let compression = request.compression;
 
             let stream = match task_manager.spawn_stream(request).await {
                 Ok(stream) => stream,
@@ -365,9 +377,15 @@ async fn run_stream_internal(
             if let Some(head) = head_task.await.unwrap() {
                 res = res.header(HEAD_NUMBER_HEADER, head);
             }
+            let body = match compression {
+                Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
+                Compression::Zstd => Body::from_stream(
+                    stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))),
+                ),
+            };
             res.header(header::CONTENT_TYPE, "application/jsonl")
-                .header(header::CONTENT_ENCODING, "gzip")
-                .body(Body::from_stream(recompress_gzip(stream)))
+                .header(header::CONTENT_ENCODING, compression.content_encoding())
+                .body(body)
                 .unwrap()
         }
 
@@ -593,6 +611,7 @@ async fn execute_query(
         ChunkId::new(dataset_id, chunk),
         range,
         query.into_string(),
+        Compression::Gzip,
         true,
     );
     let result = match fut.await {
@@ -643,7 +662,7 @@ where
 }
 
 #[async_trait]
-impl<S> FromRequest<S> for ClientRequest
+impl<S> FromRequest<S> for StreamRequest
 where
     S: Send + Sync,
 {
@@ -672,11 +691,6 @@ where
             .extract_parts::<Extension<Arc<Config>>>()
             .await
             .map_err(IntoResponse::into_response)?;
-        let mut query: ParsedQuery = req.extract().await.map_err(IntoResponse::into_response)?;
-
-        if config.skip_parent_hash_validation {
-            query.remove_parent_hash();
-        }
 
         let buffer_size = match params.get("buffer_size").map(|v| v.parse()) {
             Some(Ok(value)) => value,
@@ -725,7 +739,14 @@ where
             None => None,
         };
 
-        Ok(ClientRequest {
+        let compression = determine_compression_format(req.headers());
+
+        let mut query: ParsedQuery = req.extract().await.map_err(IntoResponse::into_response)?;
+        if config.skip_parent_hash_validation {
+            query.remove_parent_hash();
+        }
+
+        Ok(StreamRequest {
             dataset_id: DatasetId::from_url("-"), // will be filled later, if the request goes to the network
             dataset_name: dataset.default_name,
             query,
@@ -734,8 +755,22 @@ where
             max_chunks,
             timeout_quantile,
             retries,
+            compression,
         })
     }
+}
+
+fn determine_compression_format(headers: &HeaderMap) -> Compression {
+    // Prefer zstd if the client supports it
+    if let Some(encodings) = headers.get(header::ACCEPT_ENCODING) {
+        if let Ok(encodings_str) = encodings.to_str() {
+            if encodings_str.contains("zstd") {
+                return Compression::Zstd;
+            }
+        }
+    }
+    // Default to gzip
+    Compression::Gzip
 }
 
 #[async_trait]
@@ -791,22 +826,19 @@ where
     }
 }
 
-fn restrict_request(config: &Config, request: ClientRequest) -> ClientRequest {
+fn restrict_request(config: &Config, request: StreamRequest) -> StreamRequest {
     let max_chunks = match (request.max_chunks, config.max_chunks_per_stream) {
         (Some(requested), Some(limit)) => Some(requested.min(limit)),
         (Some(requested), None) => Some(requested),
         (None, Some(limit)) => Some(limit),
         (None, None) => None,
     };
-    ClientRequest {
-        query: request.query,
-        dataset_id: request.dataset_id,
-        dataset_name: request.dataset_name,
-        request_id: request.request_id,
+    StreamRequest {
         buffer_size: request.buffer_size.min(config.max_buffer_size),
         max_chunks,
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
+        ..request
     }
 }
 

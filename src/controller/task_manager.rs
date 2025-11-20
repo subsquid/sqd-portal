@@ -10,7 +10,7 @@ use tracing_futures::Instrument;
 use crate::{
     metrics,
     network::NetworkClient,
-    types::{ClientRequest, RequestError, ResponseChunk},
+    types::{StreamRequest, RequestError, ResponseChunk},
 };
 
 use super::stream::StreamController;
@@ -33,7 +33,7 @@ impl TaskManager {
 
     pub async fn spawn_stream(
         self: Arc<Self>,
-        request: ClientRequest,
+        request: StreamRequest,
     ) -> Result<impl Stream<Item = ResponseChunk>, RequestError> {
         let running_tasks = self.running_tasks.fetch_add(1, Ordering::Relaxed);
         if running_tasks >= self.max_tasks {
