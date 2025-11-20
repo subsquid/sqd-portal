@@ -47,7 +47,7 @@ This peer id is what you need to register on chain.
 
 Start the portal with
 ```bash
-KEY_PATH=portal.key docker-compose up
+KEY_PATH=portal.key docker compose up
 ```
 It will use `.env` and `mainnet.config.yml`/`tethys.config.yml` files for configuration.
 
