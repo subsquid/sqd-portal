@@ -11,6 +11,7 @@ use axum::{
     routing::{get, post},
     Extension, RequestExt, Router,
 };
+use futures::StreamExt;
 use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
@@ -92,6 +93,10 @@ pub async fn run_server(
         .route(
             "/datasets/:dataset/metadata",
             get(get_dataset_metadata).endpoint("/metadata"),
+        )
+        .route(
+            "/datasets/:dataset/resolve-timestamp/:timestamp",
+            get(get_blocknumber_by_timestamp).endpoint("/resolve-timestamp"),
         )
         // Backward compatibility routes
         .route(
@@ -432,6 +437,148 @@ async fn get_dataset_metadata(
         .and_then(|dataset| network.first_existing_block(dataset));
     // TODO: get first real-time block if there is no archival data
     axum::Json(AvailableDatasetApiResponse::new(metadata, first_block))
+}
+
+async fn get_blocknumber_by_timestamp(
+    Path((dataset_id, timestamp)): Path<(DatasetId, u64)>,
+    Extension(req): Extension<RequestId>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(config): Extension<Arc<Config>>,
+    // Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+) -> impl IntoResponse {
+    let ts = timestamp * 1000; // milliseconds
+    tracing::info!("GET BLOCKNUMBER BY TIMESTAMP with {dataset_id} and {ts}");
+    let Ok(chunk) = network.find_chunk_by_timestamp(&dataset_id, ts) else {
+        return RequestError::NoData.into_response();
+    };
+    tracing::info!("CHUNK: {:?}", chunk);
+    let Some(dataset) = network.dataset("base-mainnet") else {
+        tracing::warn!("dataset not found for {}", dataset_id);
+        return (
+            StatusCode::NOT_FOUND, 
+            format!("Unknown dataset: {dataset_id}")
+        ).into_response()
+    };
+
+    let Ok(pquery) = build_blocknumber_query(
+        &dataset_id, 
+        chunk.first_block, 
+        chunk.last_block
+    ) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("No data for dataset {dataset_id}"),
+        ).into_response()
+    };
+
+    let mut request = build_request(
+        &config,
+        req.header_value().to_str().unwrap_or(""),
+        pquery, 
+        &dataset_id, 
+        &dataset.default_name, 
+        1
+    );
+
+    request.query.prepare_for_network();
+
+    let stream = match task_manager.spawn_stream(request).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::warn!("spawn stream: {:?}", e);
+                return e.into_response()
+            }
+    };
+
+    tracing::info!("have stream!");
+    let bytes: Vec<u8> = stream
+        .collect::<Vec<Vec<u8>>>()
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+
+    tracing::info!("Stream length: {}", bytes.len());
+
+    let Ok(js) = String::from_utf8(bytes) else {
+        tracing::info!("response stream from worker is not UTF-8");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("response stream from worker is not UTF-8"),
+        ).into_response()
+    };
+
+    let Ok(chunks) = serde_json::from_str::<serde_json::Value>(&js) else {
+        tracing::info!("cannot compile response stream");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("response stream is not proper JSON"),
+        ).into_response()
+    };
+    
+    let n = find_blocknumber(ts, &chunks);
+
+    axum::Json(json!(n)).into_response()
+}
+
+fn find_blocknumber(ts: u64, jarray: &serde_json::Value) -> Result<u64, &'static str> {
+    let Ok(chunks) = (match jarray {
+        serde_json::Value::Array(chunks) => Ok(chunks),
+        _ => Err("not an array"),
+    }) else {
+        return Err("response is not an array");  
+    };
+    for chunk in chunks {
+        match chunk {
+            serde_json::Value::Object(chunk) => {
+                let bts = match &chunk["timestamp"] {
+                    serde_json::Value::Number(n) => n.clone().as_u64().unwrap_or(0),
+                    _ => 0,
+                };
+                if bts >= ts {
+                    match &chunk["number"] {
+                        serde_json::Value::Number(n) => return Ok(n.clone().as_u64().unwrap_or(0)),
+                        _ => break,
+                    };
+                }
+            }
+            _ => break, 
+        } 
+    }
+    Ok(0) // return error
+}
+
+fn build_blocknumber_query(ds: &DatasetId, first_block: u64, last_block: u64) -> anyhow::Result<ParsedQuery> {
+    let query = json!({
+        "type": "solana", // depends on dataset
+        "fromBlock": first_block,
+        "toBlock": last_block,
+        "fields": {
+            "block": {
+                "number": true,
+                "timestamp": true
+            }
+        },
+    });
+
+    ParsedQuery::try_from(query.to_string()).map_err(|e| {
+        tracing::warn!("cannot parse my own query: {:?}", e);
+        e
+    })
+}
+
+fn build_request(config: &Config, req_id: &str, pq: ParsedQuery, did: &DatasetId, dname: &str, max_chunks: usize) -> ClientRequest {
+    ClientRequest {
+        query: pq,
+        dataset_id: did.clone(),
+        dataset_name: dname.to_string(),
+        request_id: req_id.to_string(),
+        buffer_size: config.max_buffer_size,
+        max_chunks: Some(max_chunks),
+        timeout_quantile: config.default_timeout_quantile,
+        retries: config.default_retries,
+    }
 }
 
 async fn get_debug_block(
