@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 
 [dependencies]
@@ -50,5 +50,5 @@ sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "2c360df", version = "2.0.1", features = ["semver", "bitstring"] }
 sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "2c360df", version = "3.0.0", features = ["portal", "metrics"] }
 
-sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "0e4522f3", features = ["serde"] }
-sqd-query = { git = "https://github.com/subsquid/data.git", rev = "0e4522f3" }
+sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "90a91d94", features = ["serde"] }
+sqd-query = { git = "https://github.com/subsquid/data.git", rev = "90a91d94" }
