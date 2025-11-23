@@ -24,7 +24,7 @@ use tower_http::request_id::{
 use crate::datasets::DatasetConfig;
 use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
-use crate::utils::conversion::{json_lines_to_json, recompress_gzip};
+use crate::utils::conversion::{join_gzip, json_lines_to_json, recompress_gzip};
 use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
@@ -268,7 +268,7 @@ async fn run_archival_stream(
         Ok(stream) => res
             .header(header::CONTENT_TYPE, "application/jsonl")
             .header(header::CONTENT_ENCODING, "gzip")
-            .body(Body::from_stream(recompress_gzip(stream)))
+            .body(Body::from_stream(join_gzip(stream)))
             .unwrap(),
         Err(RequestError::NoData) => {
             // Delay request from this client for 5 seconds to avoid unnecessary retries
@@ -367,7 +367,7 @@ async fn run_stream_internal(
             }
             res.header(header::CONTENT_TYPE, "application/jsonl")
                 .header(header::CONTENT_ENCODING, "gzip")
-                .body(Body::from_stream(recompress_gzip(stream)))
+                .body(Body::from_stream(join_gzip(stream)))
                 .unwrap()
         }
 
