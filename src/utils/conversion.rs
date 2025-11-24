@@ -1,12 +1,15 @@
 use std::slice;
 
 use anyhow::anyhow;
-use hex_literal::hex;
 use async_compression::tokio::bufread::{GzipDecoder, GzipEncoder};
 use async_stream::stream;
-use futures::{Stream, StreamExt, pin_mut};
+use futures::{pin_mut, Stream, StreamExt};
+use hex_literal::hex;
 use itertools::Itertools;
-use libz_ng_sys::{Z_BLOCK, Z_DATA_ERROR, Z_MEM_ERROR, Z_OK, crc32_combine, inflate, inflateEnd, inflateInit2_, z_stream};
+use libz_ng_sys::{
+    crc32_combine, inflate, inflateEnd, inflateInit2_, z_stream, Z_BLOCK, Z_DATA_ERROR,
+    Z_MEM_ERROR, Z_OK,
+};
 use tokio::io::BufReader;
 use tokio_util::{
     bytes::Bytes,
@@ -114,7 +117,7 @@ pub struct StreamIn<S: Stream<Item = Vec<u8>> + Unpin> {
     buf: Vec<u8>,
 }
 
-impl <S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
+impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
     fn new(stream: S) -> Self {
         Self {
             stream,
@@ -125,7 +128,11 @@ impl <S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
     }
 
     async fn load(&mut self) -> Result<(), anyhow::Error> {
-        self.buf = self.stream.next().await.ok_or(anyhow!("faild to load data from incoming stream"))?;
+        self.buf = self
+            .stream
+            .next()
+            .await
+            .ok_or(anyhow!("faild to load data from incoming stream"))?;
         self.left = self.buf.len();
         self.next = self.buf.as_mut_ptr();
         Ok(())
@@ -221,7 +228,7 @@ impl <S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
         Ok(left_before_header - self.left)
     }
 
-    async fn reset_and_pull(&mut self,  strm: &mut ZStreamWrap) -> Result<(), anyhow::Error> {
+    async fn reset_and_pull(&mut self, strm: &mut ZStreamWrap) -> Result<(), anyhow::Error> {
         self.left = 0;
         self.zpull(strm).await?;
         //Ok(self.buf.as_mut_ptr())
@@ -238,23 +245,17 @@ impl <S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
     }
 }
 
-
-unsafe impl <S: Stream<Item = Vec<u8>> + Unpin> Send for StreamIn<S> {
-    
-}
+unsafe impl<S: Stream<Item = Vec<u8>> + Unpin> Send for StreamIn<S> {}
 
 struct ZStreamWrap(z_stream);
 
-unsafe impl Send for ZStreamWrap {
-    
-}
+unsafe impl Send for ZStreamWrap {}
 
-pub fn join_gzip<S: Stream<Item = Vec<u8>>>(data: S)
-    -> impl Stream<Item = Result<Bytes, anyhow::Error>>
-{
-    
+pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
+    data: S,
+) -> impl Stream<Item = Result<Bytes, anyhow::Error>> {
     stream! {
-        
+
         let mut crc = unsafe { libz_ng_sys::crc32(0, std::ptr::null(), 0) };
         let mut tot = 0u32;
         let buf = hex!("1f8b08000000000000ff");
