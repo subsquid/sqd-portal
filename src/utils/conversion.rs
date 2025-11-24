@@ -177,10 +177,12 @@ impl <S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
         Ok(res)
     }
 
-    async fn gzhead(&mut self) -> Result<(), anyhow::Error> {
+    async fn gzhead(&mut self) -> Result<usize, anyhow::Error> {
         if self.left == 0 {
             self.load().await?;
         }
+        let left_before_header = self.left;
+
         /* verify gzip magic header and compression method */
         if self.get().await? != 0x1f || self.get().await? != 0x8b || self.get().await? != 8 {
             return Err(anyhow!("File is not a valid gzip archive"));
@@ -216,7 +218,7 @@ impl <S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
             self.skip(2).await?;
         }
 
-        Ok(())
+        Ok(left_before_header - self.left)
     }
 
     async fn reset_and_pull(&mut self,  strm: &mut zstream_wrap) -> Result<(), anyhow::Error> {
@@ -280,8 +282,8 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(data: S)
         loop {
             // let mut strm = strm_mutex.lock().unwrap();
 
-            match input.gzhead().await {
-                Ok(_) => {},
+            let mut skip = match input.gzhead().await {
+                Ok(res) => { res },
                 Err(_) => {
                     yield Ok([&[3u8, 0u8], &crc.to_le_bytes()[..], &tot.to_le_bytes()[..]].concat().into());
                     break;
@@ -308,7 +310,8 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(data: S)
                 /* if input used and output done, write used input and get more */
                 if strm_wrap.0.avail_in == 0 && strm_wrap.0.avail_out != 0 {
                     let buffer: &[u8] = unsafe {
-                        let start = input.buf.as_mut_ptr();
+                        let start = input.buf.as_mut_ptr().wrapping_add(skip);
+                        skip = 0;
                         slice::from_raw_parts(start, strm_wrap.0.next_in.offset_from(start).try_into()?)
                     };
                     yield Ok(buffer.to_vec().into());
@@ -354,7 +357,8 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(data: S)
                         if strm_wrap.0.avail_in == 0 {
                             /* don't have that byte yet -- get it */
                             let buffer: &[u8] = unsafe {
-                                let start = input.buf.as_mut_ptr();
+                                let start = input.buf.as_mut_ptr().wrapping_add(skip);
+                                skip = 0;
                                 slice::from_raw_parts(start, strm_wrap.0.next_in.offset_from(start).try_into()?)
                             };
                             yield Ok(buffer.to_vec().into());
@@ -373,7 +377,8 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(data: S)
             /* copy used input, write empty blocks to get to byte boundary */
             let pos = strm_wrap.0.data_type & 7;
             let buffer: &[u8] = unsafe {
-                let start = input.buf.as_mut_ptr();
+                let start = input.buf.as_mut_ptr().wrapping_add(skip);
+                skip = 0;
                 slice::from_raw_parts(start, (input.next().offset_from(start) - 1).try_into()?)
             };
             yield Ok(buffer.to_vec().into());
