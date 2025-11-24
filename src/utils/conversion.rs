@@ -1,4 +1,4 @@
-use std::{slice, sync::{Arc, Mutex}};
+use std::slice;
 
 use anyhow::anyhow;
 use hex_literal::hex;
@@ -30,7 +30,7 @@ pub fn json_lines_to_json(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(writer.finish()?)
 }
 
-// TODO: implement fast concatenation algorithm because this is currently the bottleneck in streaming
+#[allow(dead_code)]
 pub fn recompress_gzip<S>(stream: S) -> impl futures::Stream<Item = std::io::Result<Bytes>>
 where
     S: futures::Stream<Item = Vec<u8>>,
@@ -157,7 +157,7 @@ impl <S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
         Ok(())
     }
 
-    async fn zpull(&mut self, strm: &mut zstream_wrap) -> Result<(), anyhow::Error> {
+    async fn zpull(&mut self, strm: &mut ZStreamWrap) -> Result<(), anyhow::Error> {
         if self.left == 0 {
             self.load().await?;
         }
@@ -221,7 +221,7 @@ impl <S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
         Ok(left_before_header - self.left)
     }
 
-    async fn reset_and_pull(&mut self,  strm: &mut zstream_wrap) -> Result<(), anyhow::Error> {
+    async fn reset_and_pull(&mut self,  strm: &mut ZStreamWrap) -> Result<(), anyhow::Error> {
         self.left = 0;
         self.zpull(strm).await?;
         //Ok(self.buf.as_mut_ptr())
@@ -243,9 +243,9 @@ unsafe impl <S: Stream<Item = Vec<u8>> + Unpin> Send for StreamIn<S> {
     
 }
 
-struct zstream_wrap(z_stream);
+struct ZStreamWrap(z_stream);
 
-unsafe impl Send for zstream_wrap {
+unsafe impl Send for ZStreamWrap {
     
 }
 
@@ -263,7 +263,7 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(data: S)
         let mut input = StreamIn::new(data);
         let mut junk: Box<[u8; CHUNK]> = vec![0u8; CHUNK].try_into().unwrap();
 
-        let mut strm_wrap = zstream_wrap(z_stream {
+        let mut strm_wrap = ZStreamWrap(z_stream {
             next_in: std::ptr::null_mut(),
             avail_in: 0,
             total_in: 0,
@@ -378,7 +378,6 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(data: S)
             let pos = strm_wrap.0.data_type & 7;
             let buffer: &[u8] = unsafe {
                 let start = input.buf.as_mut_ptr().wrapping_add(skip);
-                skip = 0;
                 slice::from_raw_parts(start, (input.next().offset_from(start) - 1).try_into()?)
             };
             yield Ok(buffer.to_vec().into());
