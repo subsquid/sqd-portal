@@ -69,6 +69,9 @@ impl ParsedQuery {
                 Query::Hyperliquid(ref mut q) => {
                     q.parent_block_hash = None;
                 }
+                Query::HyperliquidFills(ref mut q) => {
+                    q.parent_block_hash = None;
+                }
             }
             self.without_parent_hash = Some(self.parsed.to_json_string());
         }
