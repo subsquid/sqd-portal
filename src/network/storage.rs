@@ -206,11 +206,17 @@ impl StorageClient {
         })?)
     }
 
-    pub fn find_chunk_by_timestamp(&self, dataset: &DatasetId, ts: u64) -> Result<DataChunk, ChunkNotFound> {
+    pub fn find_chunk_by_timestamp(
+        &self,
+        dataset: &DatasetId,
+        ts: u64,
+    ) -> Result<DataChunk, ChunkNotFound> {
         let dataset = dataset.to_url();
         let guard = self.assignment.read();
         let assignment = guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)?;
-        let dataset = assignment.get_dataset(dataset).ok_or(ChunkNotFound::UnknownDataset)?;
+        let dataset = assignment
+            .get_dataset(dataset)
+            .ok_or(ChunkNotFound::UnknownDataset)?;
 
         let chunks = dataset.chunks();
 
@@ -236,7 +242,7 @@ impl StorageClient {
         }
         let chunk = chunks.get(right as usize);
         if chunk.last_block_timestamp().unwrap_or(0) < ts {
-            return Err(ChunkNotFound::BeforeFirst{
+            return Err(ChunkNotFound::BeforeFirst {
                 first_block: dataset.first_block(),
             });
         }

@@ -5,7 +5,7 @@ use futures::{pin_mut, Stream, StreamExt};
 use hex_literal::hex;
 use itertools::Itertools;
 use libz_ng_sys::crc32_combine;
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio_util::{
     bytes::Bytes,
     io::{ReaderStream, StreamReader},
@@ -167,6 +167,26 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
         }
     }
 }
+
+pub fn get_gzip_decoder<S>(
+    stream: S,
+) -> GzipDecoder<BufReader<tokio_util::io::StreamReader<S, bytes::Bytes>>>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
+{
+    let mut decoder = GzipDecoder::new(BufReader::new(StreamReader::new(stream)));
+    decoder.multiple_members(true);
+    decoder
+}
+
+pub async fn stream_to_string<S>(stream: S) -> anyhow::Result<String>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
+{
+    let mut decoder = get_gzip_decoder(stream);
+    let mut bytes: Vec<u8> = Vec::new();
+    decoder.read_to_end(&mut bytes).await?;
+    Ok(String::from_utf8(bytes)?)
 
 #[cfg(test)]
 mod tests {
