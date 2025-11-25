@@ -11,8 +11,9 @@ use axum::{
     routing::{get, post},
     Extension, RequestExt, Router,
 };
-use futures::StreamExt;
+use futures::{pin_mut, StreamExt};
 use prometheus_client::registry::Registry;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
@@ -25,7 +26,7 @@ use tower_http::request_id::{
 use crate::datasets::DatasetConfig;
 use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
-use crate::utils::conversion::{json_lines_to_json, recompress_gzip};
+use crate::utils::conversion::{json_lines_to_json, recompress_gzip, stream_to_string};
 use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
@@ -469,118 +470,111 @@ async fn get_dataset_metadata(
 }
 
 async fn get_blocknumber_by_timestamp(
-    Path((dataset_id, timestamp)): Path<(DatasetId, u64)>,
+    Path((_, timestamp)): Path<(DatasetId, u64)>,
     Extension(req): Extension<RequestId>,
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
-    // Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    dataset: DatasetConfig,
 ) -> impl IntoResponse {
     let ts = timestamp * 1000; // milliseconds
-    tracing::info!("GET BLOCKNUMBER BY TIMESTAMP with {dataset_id} and {ts}");
+    let dataset_id = dataset
+        .network_id
+        .expect("invalid dataset name should have been handled in request parser");
+
     let Ok(chunk) = network.find_chunk_by_timestamp(&dataset_id, ts) else {
         return RequestError::NoData.into_response();
     };
-    tracing::info!("CHUNK: {:?}", chunk);
-    let Some(dataset) = network.dataset("base-mainnet") else {
-        tracing::warn!("dataset not found for {}", dataset_id);
-        return (
-            StatusCode::NOT_FOUND, 
-            format!("Unknown dataset: {dataset_id}")
-        ).into_response()
-    };
 
-    let Ok(pquery) = build_blocknumber_query(
-        &dataset_id, 
-        chunk.first_block, 
-        chunk.last_block
-    ) else {
+    let Ok(pquery) = build_blocknumber_query(&dataset_id, chunk.first_block, chunk.last_block)
+    else {
+        tracing::warn!("cannot build blocknumber query for {}", dataset_id);
         return (
             StatusCode::NOT_FOUND,
             format!("No data for dataset {dataset_id}"),
-        ).into_response()
+        )
+            .into_response();
     };
 
     let mut request = build_request(
         &config,
         req.header_value().to_str().unwrap_or(""),
-        pquery, 
-        &dataset_id, 
-        &dataset.default_name, 
-        1
+        pquery,
+        &dataset_id,
+        &dataset.default_name,
+        1,
     );
 
     request.query.prepare_for_network();
 
     let stream = match task_manager.spawn_stream(request).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::warn!("spawn stream: {:?}", e);
-                return e.into_response()
-            }
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::warn!("spawn stream error: {:?}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("spawn stream error: {:?}", e),
+            )
+                .into_response();
+        }
     };
 
-    tracing::info!("have stream!");
-    let bytes: Vec<u8> = stream
-        .collect::<Vec<Vec<u8>>>()
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
+    pin_mut!(stream);
 
-    tracing::info!("Stream length: {}", bytes.len());
-
-    let Ok(js) = String::from_utf8(bytes) else {
-        tracing::info!("response stream from worker is not UTF-8");
+    let js = stream_to_string(
+        stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result))),
+    )
+    .await;
+    if let Err(e) = js {
+        tracing::warn!("stream processing error: {:?}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("response stream from worker is not UTF-8"),
-        ).into_response()
+            format!("stream processing error: {:?}", e),
+        )
+            .into_response();
     };
+    let js = js.unwrap();
 
-    let Ok(chunks) = serde_json::from_str::<serde_json::Value>(&js) else {
-        tracing::info!("cannot compile response stream");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("response stream is not proper JSON"),
-        ).into_response()
+    let n = match find_block_in_chunk(timestamp, &js) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("cannot find blocknumber in chunk: {:?}", e);
+            return (StatusCode::NOT_FOUND, format!("{:?}", e)).into_response();
+        }
     };
-    
-    let n = find_blocknumber(ts, &chunks);
 
     axum::Json(json!(n)).into_response()
 }
 
-fn find_blocknumber(ts: u64, jarray: &serde_json::Value) -> Result<u64, &'static str> {
-    let Ok(chunks) = (match jarray {
-        serde_json::Value::Array(chunks) => Ok(chunks),
-        _ => Err("not an array"),
-    }) else {
-        return Err("response is not an array");  
-    };
-    for chunk in chunks {
-        match chunk {
-            serde_json::Value::Object(chunk) => {
-                let bts = match &chunk["timestamp"] {
-                    serde_json::Value::Number(n) => n.clone().as_u64().unwrap_or(0),
-                    _ => 0,
-                };
-                if bts >= ts {
-                    match &chunk["number"] {
-                        serde_json::Value::Number(n) => return Ok(n.clone().as_u64().unwrap_or(0)),
-                        _ => break,
-                    };
-                }
-            }
-            _ => break, 
-        } 
-    }
-    Ok(0) // return error
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BlockSummary {
+    header: SummaryHeader,
 }
 
-fn build_blocknumber_query(ds: &DatasetId, first_block: u64, last_block: u64) -> anyhow::Result<ParsedQuery> {
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SummaryHeader {
+    number: u64,
+    timestamp: u64,
+}
+
+fn find_block_in_chunk(ts: u64, js: &str) -> Result<u64, anyhow::Error> {
+    for line in js.lines() {
+        let summary = serde_json::from_str::<BlockSummary>(line)?;
+        if summary.header.timestamp >= ts {
+            return Ok(summary.header.number);
+        }
+    }
+    Err(anyhow::anyhow!("cannot find block in chunk"))
+}
+
+fn build_blocknumber_query(
+    ds: &DatasetId,
+    first_block: u64,
+    last_block: u64,
+) -> anyhow::Result<ParsedQuery> {
     let query = json!({
         "type": "solana", // depends on dataset
+        "includeAllBlocks": true,
         "fromBlock": first_block,
         "toBlock": last_block,
         "fields": {
@@ -595,19 +589,6 @@ fn build_blocknumber_query(ds: &DatasetId, first_block: u64, last_block: u64) ->
         tracing::warn!("cannot parse my own query: {:?}", e);
         e
     })
-}
-
-fn build_request(config: &Config, req_id: &str, pq: ParsedQuery, did: &DatasetId, dname: &str, max_chunks: usize) -> ClientRequest {
-    ClientRequest {
-        query: pq,
-        dataset_id: did.clone(),
-        dataset_name: dname.to_string(),
-        request_id: req_id.to_string(),
-        buffer_size: config.max_buffer_size,
-        max_chunks: Some(max_chunks),
-        timeout_quantile: config.default_timeout_quantile,
-        retries: config.default_retries,
-    }
 }
 
 async fn get_debug_block(
@@ -952,6 +933,26 @@ fn restrict_request(config: &Config, request: ClientRequest) -> ClientRequest {
         request_id: request.request_id,
         buffer_size: request.buffer_size.min(config.max_buffer_size),
         max_chunks,
+        timeout_quantile: config.default_timeout_quantile,
+        retries: config.default_retries,
+    }
+}
+
+fn build_request(
+    config: &Config,
+    req_id: &str,
+    pq: ParsedQuery,
+    did: &DatasetId,
+    dname: &str,
+    max_chunks: usize,
+) -> ClientRequest {
+    ClientRequest {
+        query: pq,
+        dataset_id: did.clone(),
+        dataset_name: dname.to_string(),
+        request_id: req_id.to_string(),
+        buffer_size: config.max_buffer_size,
+        max_chunks: Some(max_chunks),
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
     }
