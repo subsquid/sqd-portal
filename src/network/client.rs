@@ -338,7 +338,11 @@ impl NetworkClient {
             .find_chunk(dataset, block)
     }
 
-    pub fn find_chunk_by_timestamp(&self, dataset: &DatasetId, timestamp: u64) -> Result<DataChunk, ChunkNotFound> {
+    pub fn find_chunk_by_timestamp(
+        &self,
+        dataset: &DatasetId,
+        timestamp: u64,
+    ) -> Result<DataChunk, ChunkNotFound> {
         self.network_state
             .dataset_storage
             .find_chunk_by_timestamp(dataset, timestamp)
