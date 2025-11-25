@@ -370,6 +370,15 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
                             unsafe { *strm_wrap.0.next_in.wrapping_add(0) &= !1 };
                         }
                     }
+                } else {
+                    if strm_wrap.0.avail_in > 0 {
+                            let buffer: &[u8] = unsafe {
+                                let start = input.buf.as_mut_ptr().wrapping_add(skip);
+                                slice::from_raw_parts(start, strm_wrap.0.next_in.offset_from(start).try_into()?)
+                            };
+                            skip += buffer.len();
+                            yield Ok(buffer.to_vec().into());
+                    }
                 }
             }
 
