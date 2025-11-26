@@ -486,7 +486,7 @@ async fn get_blocknumber_by_timestamp(
         return RequestError::NoData.into_response();
     };
 
-    let Ok(pquery) = build_blocknumber_query(&dataset_id, chunk.first_block, chunk.last_block)
+    let Ok(pquery) = build_blocknumber_query(&dataset.kind, chunk.first_block, chunk.last_block)
     else {
         tracing::warn!("cannot build blocknumber query for {}", dataset_id);
         return (
@@ -511,11 +511,7 @@ async fn get_blocknumber_by_timestamp(
         Ok(stream) => stream,
         Err(e) => {
             tracing::warn!("spawn stream error: {:?}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("spawn stream error: {:?}", e),
-            )
-                .into_response();
+            return e.into_response();
         }
     };
 
@@ -528,7 +524,7 @@ async fn get_blocknumber_by_timestamp(
     if let Err(e) = js {
         tracing::warn!("stream processing error: {:?}", e);
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::NOT_FOUND,
             format!("stream processing error: {:?}", e),
         )
             .into_response();
@@ -568,12 +564,12 @@ fn find_block_in_chunk(ts: u64, js: &str) -> Result<u64, anyhow::Error> {
 }
 
 fn build_blocknumber_query(
-    ds: &DatasetId,
+    kind: &str,
     first_block: u64,
     last_block: u64,
 ) -> anyhow::Result<ParsedQuery> {
     let query = json!({
-        "type": "solana", // depends on dataset
+        "type": kind.to_string(),
         "includeAllBlocks": true,
         "fromBlock": first_block,
         "toBlock": last_block,
