@@ -5,6 +5,9 @@ sqd_network:
 datasets:
   solana-mainnet:
     aliases: ["solana-beta"]
+    kind: "solana"
   base-mainnet:
+    kind: "evm"
+    aliases: ["base"]
     real_time:
       url: http://localhost:9090

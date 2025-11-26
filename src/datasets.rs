@@ -7,7 +7,7 @@ use anyhow::Context;
 use bimap::BiBTreeMap;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{btree_map::Entry, BTreeMap},
+    collections::{btree_map::Entry, BTreeMap, HashMap},
     fs::File,
     io::BufReader,
 };
@@ -24,24 +24,30 @@ pub struct DatasetConfig {
     pub aliases: Vec<String>,
     pub network_id: Option<DatasetId>,
     pub hotblocks: Option<RealTimeConfig>,
+    pub kind: String,
 }
 
 type DatasetsMapping = BiBTreeMap<String, DatasetId>;
+type DatasetKinds = HashMap<String, String>;
 
 impl Datasets {
     pub async fn load(config: &Config) -> anyhow::Result<Self> {
-        let mapping = load_mapping(&config.sqd_network.datasets_url).await?;
-        Self::parse(config, mapping)
+        let (mapping, kinds) = load_mapping_and_kinds(&config.sqd_network.datasets_url).await?;
+        Self::parse(config, mapping, kinds)
     }
 
-    fn parse(config: &Config, mapping: BiBTreeMap<String, DatasetId>) -> anyhow::Result<Self> {
+    fn parse(
+        config: &Config,
+        mapping: DatasetsMapping,
+        kinds: DatasetKinds,
+    ) -> anyhow::Result<Self> {
         let mut datasets: Vec<DatasetConfig> = Vec::new();
         let mut alias_to_index = BTreeMap::new();
         let mut id_to_default_name = BTreeMap::new();
         for (default_name, ds) in config.datasets.clone() {
             let network_id = match ds.sqd_network {
-                Some(DatasetRef::Name(name)) => mapping.get_by_left(&name).cloned(),
-                Some(DatasetRef::Id(id)) => Some(id),
+                Some(DatasetRef::Name(ref name)) => mapping.get_by_left(name).cloned(),
+                Some(DatasetRef::Id(ref id)) => Some(id).cloned(),
                 None => mapping.get_by_left(&default_name).cloned(),
             };
 
@@ -70,11 +76,21 @@ impl Datasets {
                     });
             }
 
+            let kind = if ds.kind.is_empty() {
+                kinds.get(&default_name).map_or("", |v| v).to_string()
+            } else {
+                ds.kind.to_string()
+            };
+            if kind.is_empty() {
+                anyhow::bail!("Unknown kind for dataset {default_name}");
+            };
+
             datasets.push(DatasetConfig {
                 default_name,
                 aliases: ds.aliases,
                 network_id,
                 hotblocks: ds.real_time,
+                kind: kind,
             });
         }
 
@@ -83,12 +99,19 @@ impl Datasets {
             for (name, id) in mapping {
                 if let Entry::Vacant(entry) = alias_to_index.entry(name.clone()) {
                     entry.insert(datasets.len());
+                    let kind = kinds.get(&name).map_or("", |v| v).to_string();
+                    if kind.is_empty() {
+                        anyhow::bail!("Unknown kind for dataset {name}");
+                    };
+
                     datasets.push(DatasetConfig {
                         default_name: name.clone(),
                         aliases: Vec::new(),
                         network_id: Some(id.clone()),
                         hotblocks: None,
+                        kind: kind,
                     });
+
                     if let Entry::Vacant(entry) = id_to_default_name.entry(id) {
                         entry.insert(name);
                     }
@@ -133,32 +156,37 @@ impl Datasets {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "kebab-case")]
 struct NetworkDatasets {
     sqd_network_datasets: Vec<NetworkDataset>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct NetworkDataset {
     id: String,
     name: String,
+    kind: String,
 }
 
-async fn load_mapping(url: &str) -> anyhow::Result<DatasetsMapping> {
+async fn load_mapping_and_kinds(url: &str) -> anyhow::Result<(DatasetsMapping, DatasetKinds)> {
     let file = load_networks(url).await?;
-    let result = parse_mapping(file)?;
-    tracing::debug!("Datasets file loaded, {} datasets found", result.len());
-    Ok(result)
+    let (mapping, kinds) = parse_network_datasets(file.clone())?;
+    tracing::debug!("Datasets file loaded, {} datasets found", mapping.len());
+    Ok((mapping, kinds))
 }
 
-fn parse_mapping(file: NetworkDatasets) -> anyhow::Result<DatasetsMapping> {
+fn parse_network_datasets(
+    file: NetworkDatasets,
+) -> anyhow::Result<(DatasetsMapping, DatasetKinds)> {
     let mut datasets = BiBTreeMap::new();
+    let mut kinds = HashMap::new();
     for dataset in file.sqd_network_datasets {
         let dataset_id = DatasetId::from_url(&dataset.id);
-        datasets.insert(dataset.name, dataset_id);
+        datasets.insert(dataset.name.clone(), dataset_id);
+        kinds.insert(dataset.name, dataset.kind);
     }
-    Ok(datasets)
+    Ok((datasets, kinds))
 }
 
 async fn load_networks(url: &str) -> anyhow::Result<NetworkDatasets> {
@@ -214,9 +242,11 @@ mod tests {
             "datasets": {
                 "ethereum-mainnet": {
                     "aliases": ["eth-main"],
+                    "kind": "evm"
                 },
                 "solana-mainnet": {
                     "aliases": ["solana"],
+                    "kind": "solana",
                     "sqd_network": {
                         "dataset_name": "solana-mainnet"
                     },
@@ -225,21 +255,26 @@ mod tests {
                     }
                 },
                 "local": {
+                    "kind": "solana",
                     "real_time": {
                         "url": "http://localhost:8081"
                     }
                 },
                 "custom": {
+                    "kind": "solana",
                     "sqd_network": {
                         "dataset_id": "s3://solana-mainnet"
                     }
                 },
                 "beta": {
+                    "kind": "solana",
                     "sqd_network": {
                         "dataset_id": "s3://solana-mainnet-2" // not in mapping
                     }
                 },
-                "empty": {}
+                "empty": {
+                    "kind": "empty",
+                },
             }
         });
         let config = serde_json::from_value::<Config>(json).unwrap();
@@ -263,7 +298,20 @@ mod tests {
         ]
         .into_iter()
         .collect::<BiBTreeMap<_, _>>();
-        let datasets = Datasets::parse(&config, mapping).unwrap();
+
+        let kinds = [
+            (
+                "ethereum-mainnet".to_owned(),
+                "shall_be_overwritten_by_config".to_string(),
+            ),
+            ("eth-main".to_owned(), "evm".to_string()),
+            ("solana-mainnet".to_owned(), "solana".to_string()),
+            ("arbitrum-one".to_owned(), "evm".to_string()),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let datasets = Datasets::parse(&config, mapping, kinds).unwrap();
 
         let beta_meta = datasets.get("beta").unwrap();
         let sol_meta = datasets.get("solana").unwrap();
@@ -283,6 +331,7 @@ mod tests {
                 aliases: vec![],
                 hotblocks: None,
                 network_id: Some(DatasetId::from_url("s3://solana-mainnet-2")),
+                kind: "solana".to_string(),
             }
         );
 
@@ -293,6 +342,7 @@ mod tests {
                 aliases: vec!["solana".to_owned()],
                 hotblocks: Some(hotblocks_config.clone()),
                 network_id: Some(DatasetId::from_url("s3://solana-mainnet")),
+                kind: "solana".to_string(),
             }
         );
 
@@ -303,6 +353,7 @@ mod tests {
                 aliases: vec!["eth-main".to_owned()],
                 hotblocks: None,
                 network_id: Some(DatasetId::from_url("s3://ethereum-mainnet-1")),
+                kind: "evm".to_string(),
             }
         );
 
@@ -313,6 +364,7 @@ mod tests {
                 aliases: vec![],
                 hotblocks: Some(hotblocks_config),
                 network_id: None,
+                kind: "solana".to_string(),
             }
         );
 
@@ -323,6 +375,7 @@ mod tests {
                 aliases: vec![],
                 hotblocks: None,
                 network_id: Some(DatasetId::from_url("s3://solana-mainnet")),
+                kind: "solana".to_string(),
             }
         );
 
@@ -333,6 +386,7 @@ mod tests {
                 aliases: vec![],
                 hotblocks: None,
                 network_id: None,
+                kind: "empty".to_string(),
             }
         );
 
@@ -381,8 +435,10 @@ mod tests {
             "datasets": {
                 "ethereum-mainnet": {
                     "aliases": ["eth-main"],
+                    "kind": "evm",
                 },
                 "custom": {
+                    "kind": "solana",
                     "sqd_network": {
                         "dataset_id": "s3://solana-mainnet"
                     }
@@ -402,7 +458,15 @@ mod tests {
         ]
         .into_iter()
         .collect::<BiBTreeMap<_, _>>();
-        let datasets = Datasets::parse(&config, mapping).unwrap();
+
+        let kinds = [
+            ("ethereum-mainnet".to_owned(), "evm".to_string()),
+            ("arbitrum-one".to_owned(), "evm".to_string()),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let datasets = Datasets::parse(&config, mapping, kinds).unwrap();
 
         // In manual mode, only explicitly configured datasets should be available
         assert!(datasets.get("ethereum-mainnet").is_some());

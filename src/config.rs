@@ -96,6 +96,7 @@ pub struct DatasetConfigModel {
     pub aliases: Vec<String>,
     pub sqd_network: Option<DatasetRef>,
     pub real_time: Option<RealTimeConfig>,
+    pub kind: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
