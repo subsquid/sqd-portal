@@ -30,8 +30,7 @@ use crate::datasets::DatasetConfig;
 use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::types::Compression;
-use crate::utils::conversion::{join_gzip_default, json_lines_to_json, recompress_gzip, stream_to_string};
-use crate::utils::conversion::{json_lines_to_json, recompress_gzip, stream_to_string};
+use crate::utils::conversion::{collect_to_string, join_gzip_default, json_lines_to_json, recompress_gzip};
 use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
@@ -511,7 +510,11 @@ async fn get_blocknumber_by_timestamp(
         .expect("invalid dataset name should have been handled in request parser");
 
     let Ok(chunk) = network.find_chunk_by_timestamp(&dataset_id, ts) else {
-        return RequestError::NoData.into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            format!("No chunk found for timestamp"),
+        )
+            .into_response();
     };
 
     let Ok(pquery) = build_blocknumber_query(&dataset.kind, chunk.first_block, chunk.last_block)
@@ -528,9 +531,9 @@ async fn get_blocknumber_by_timestamp(
         &config,
         req.header_value().to_str().unwrap_or(""),
         pquery,
-        &dataset_id,
-        &dataset.default_name,
-        1,
+        dataset_id.clone(),
+        dataset.default_name.clone(),
+        Some(1),
     );
 
     request.query.prepare_for_network();
@@ -545,10 +548,11 @@ async fn get_blocknumber_by_timestamp(
 
     pin_mut!(stream);
 
-    let js = stream_to_string(
+    let js = collect_to_string(
         stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result))),
     )
     .await;
+
     if let Err(e) = js {
         tracing::warn!("stream processing error: {:?}", e);
         return (
@@ -567,7 +571,7 @@ async fn get_blocknumber_by_timestamp(
         }
     };
 
-    axum::Json(json!(n)).into_response()
+    format!("{n}").into_response()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -581,6 +585,7 @@ struct SummaryHeader {
     timestamp: u64,
 }
 
+#[tracing::instrument]
 fn find_block_in_chunk(ts: u64, js: &str) -> Result<u64, anyhow::Error> {
     for line in js.lines() {
         let summary = serde_json::from_str::<BlockSummary>(line)?;
@@ -984,17 +989,17 @@ fn build_request(
     config: &Config,
     req_id: &str,
     pq: ParsedQuery,
-    did: &DatasetId,
-    dname: &str,
-    max_chunks: usize,
+    did: DatasetId,
+    dname: String,
+    max_chunks: Option<usize>,
 ) -> ClientRequest {
     ClientRequest {
         query: pq,
-        dataset_id: did.clone(),
-        dataset_name: dname.to_string(),
+        dataset_id: did,
+        dataset_name: dname,
         request_id: req_id.to_string(),
         buffer_size: config.max_buffer_size,
-        max_chunks: Some(max_chunks),
+        max_chunks: max_chunks,
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
     }

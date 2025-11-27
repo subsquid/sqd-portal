@@ -179,7 +179,7 @@ where
     decoder
 }
 
-pub async fn stream_to_string<S>(stream: S) -> anyhow::Result<String>
+pub async fn collect_to_string<S>(stream: S) -> anyhow::Result<String>
 where
     S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
 {
