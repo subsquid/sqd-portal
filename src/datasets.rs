@@ -76,10 +76,10 @@ impl Datasets {
                     });
             }
 
-            let kind = if ds.kind.is_empty() {
+            let kind = if ds.kind.as_ref().map_or("", |v| v).is_empty() {
                 kinds.get(&default_name).map_or("", |v| v).to_string()
             } else {
-                ds.kind.to_string()
+                ds.kind.as_ref().unwrap().to_string()
             };
             if kind.is_empty() {
                 anyhow::bail!("Unknown kind for dataset {default_name}");
@@ -99,8 +99,8 @@ impl Datasets {
             for (name, id) in mapping {
                 if let Entry::Vacant(entry) = alias_to_index.entry(name.clone()) {
                     entry.insert(datasets.len());
-                    let kind = kinds.get(&name).map_or("", |v| v).to_string();
-                    if kind.is_empty() {
+
+                    let Some(kind) = kinds.get(&name) else {
                         anyhow::bail!("Unknown kind for dataset {name}");
                     };
 
@@ -109,7 +109,7 @@ impl Datasets {
                         aliases: Vec::new(),
                         network_id: Some(id.clone()),
                         hotblocks: None,
-                        kind: kind,
+                        kind: kind.clone(),
                     });
 
                     if let Entry::Vacant(entry) = id_to_default_name.entry(id) {
