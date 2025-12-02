@@ -231,7 +231,6 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
     async fn reset_and_pull(&mut self, strm: &mut ZStreamWrap) -> Result<(), anyhow::Error> {
         self.left = 0;
         self.zpull(strm).await?;
-        //Ok(self.buf.as_mut_ptr())
         Ok(())
     }
 
@@ -298,7 +297,6 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
             /* inflate and copy compressed data, clear last-block bit if requested */
             let mut len = 0;
             input.zpull(&mut strm_wrap).await?;
-            //let mut start = strm_wrap.0.next_in;
             let mut last = unsafe { *strm_wrap.0.next_in.wrapping_add(0) } & 1 > 0;
             if last {
                 unsafe { *strm_wrap.0.next_in.wrapping_add(0) &= !1 };
@@ -313,7 +311,6 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
                         slice::from_raw_parts(start, strm_wrap.0.next_in.offset_from(start).try_into()?)
                     };
                     yield Ok(buffer.to_vec().into());
-                    //start = input.reset_and_pull(&mut strm_wrap).await?;
                     input.reset_and_pull(&mut strm_wrap).await?;
                 }
                 /* decompress -- return early when end-of-block reached */
