@@ -268,19 +268,17 @@ async fn run_archival_stream(
     match task_manager.spawn_stream(request).await {
         Ok(stream) => {
             if config.use_gzjoin {
-                res
-                    .header(header::CONTENT_TYPE, "application/jsonl")
+                res.header(header::CONTENT_TYPE, "application/jsonl")
                     .header(header::CONTENT_ENCODING, "gzip")
                     .body(Body::from_stream(join_gzip(stream)))
                     .unwrap()
             } else {
-                res
-                    .header(header::CONTENT_TYPE, "application/jsonl")
+                res.header(header::CONTENT_TYPE, "application/jsonl")
                     .header(header::CONTENT_ENCODING, "gzip")
                     .body(Body::from_stream(recompress_gzip(stream)))
                     .unwrap()
             }
-        },
+        }
         Err(RequestError::NoData) => {
             // Delay request from this client for 5 seconds to avoid unnecessary retries
             tokio::time::sleep(Duration::from_secs(5)).await;

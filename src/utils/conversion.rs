@@ -453,8 +453,9 @@ mod tests {
         let gt = testcase.concat();
         let stream = join_gzip(generate_data(testcase));
         pin_mut!(stream);
-        let reader =
-        StreamReader::new(stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result.unwrap()))));
+        let reader = StreamReader::new(
+            stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result.unwrap()))),
+        );
         let decoder = GzipDecoder::new(reader);
         let mut buf_reader = BufReader::with_capacity(100_000_000, decoder);
         let result = buf_reader.fill_buf().await.unwrap();
@@ -463,35 +464,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_smoke() {
-        let input = vec![vec![1u8,2],vec![3,4]];
+        let input = vec![vec![1u8, 2], vec![3, 4]];
         pack_join_unpack(input).await;
     }
 
     #[tokio::test]
     async fn test_const() {
-        let input = vec![vec![1u8; 100_000],vec![3; 100_000]];
+        let input = vec![vec![1u8; 100_000], vec![3; 100_000]];
         pack_join_unpack(input).await;
     }
 
     #[tokio::test]
     async fn test_rand() {
         let mut rng = rand::rng();
-        let input = (0..99).map(|_| {
-            let mut data = [0u8; 100_000];
-            rng.fill_bytes(&mut data);
-            data.to_vec()
-        }).collect();
+        let input = (0..99)
+            .map(|_| {
+                let mut data = [0u8; 100_000];
+                rng.fill_bytes(&mut data);
+                data.to_vec()
+            })
+            .collect();
         pack_join_unpack(input).await;
     }
 
     #[tokio::test]
     async fn test_rand_long() {
         let mut rng = rand::rng();
-        let input = (0..9).map(|_| {
-            let mut data = [0u8; 1_000_000];
-            rng.fill_bytes(&mut data);
-            data.to_vec()
-        }).collect();
+        let input = (0..9)
+            .map(|_| {
+                let mut data = [0u8; 1_000_000];
+                rng.fill_bytes(&mut data);
+                data.to_vec()
+            })
+            .collect();
         pack_join_unpack(input).await;
     }
 }
