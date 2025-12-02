@@ -7,3 +7,7 @@ datasets:
   base-mainnet:
     real_time:
       url: http://localhost:9090
+priorities:
+  window_ok_secs: 60
+  window_slow_secs: 60
+  window_errors_secs: 120

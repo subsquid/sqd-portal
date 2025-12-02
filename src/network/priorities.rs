@@ -1,4 +1,5 @@
-use serde::Serialize;
+use rand::seq::IndexedRandom;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 use tokio::time::Instant;
 
@@ -7,8 +8,6 @@ use sqd_contract_client::PeerId;
 use crate::metrics;
 
 pub type Priority = (PriorityGroup, u8, i64);
-
-const MAX_QUERIES_PER_WORKER: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum PriorityGroup {
@@ -24,9 +23,33 @@ pub enum NoWorker {
     Backoff(Instant),
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct WorkersPool {
+    config: PrioritiesConfig,
     workers: HashMap<PeerId, WorkerStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrioritiesConfig {
+    pub max_queries_per_worker: u8,
+    pub window_ok_secs: u32,
+    pub window_slow_secs: u32,
+    pub window_errors_secs: u32,
+    pub window_timeouts_secs: u32,
+}
+
+impl Default for PrioritiesConfig {
+    fn default() -> Self {
+        Self {
+            max_queries_per_worker: 1,
+            window_ok_secs: 3,
+            window_slow_secs: 3,
+            window_errors_secs: 30,
+            // Timeouts are especially painful because they cause a 60s delay.
+            window_timeouts_secs: 300,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -34,85 +57,77 @@ struct WorkerStats {
     last_query: Instant,
     running_queries: u8,
     paused_until: Option<Instant>,
-    ok: EventCounter<3>,
-    slow: EventCounter<3>,
-    server_errors: Cooldown<30>,
-    // Timeouts are especially painful because they cause a 60s delay.
-    timeouts: Cooldown<300>,
+    ok: EventCounter,
+    slow: EventCounter,
+    server_errors: Cooldown,
+    timeouts: Cooldown,
 }
 
-impl Default for WorkerStats {
-    fn default() -> Self {
+impl WorkerStats {
+    fn new(config: &PrioritiesConfig) -> Self {
         let now = Instant::now();
         Self {
             last_query: now,
             running_queries: 0,
             paused_until: None,
-            ok: EventCounter::new(now),
-            slow: EventCounter::new(now),
-            server_errors: Cooldown::default(),
-            timeouts: Cooldown::default(),
+            ok: EventCounter::new(config.window_ok_secs, now),
+            slow: EventCounter::new(config.window_slow_secs, now),
+            server_errors: Cooldown::new(config.window_errors_secs),
+            timeouts: Cooldown::new(config.window_timeouts_secs),
         }
     }
-}
-
-// Less is better
-fn priority(worker: &WorkerStats, now: Instant) -> (PriorityGroup, u8, Instant) {
-    if let Some(paused_until) = worker.paused_until {
-        if now < paused_until {
-            return (PriorityGroup::Backoff, worker.running_queries, paused_until);
-        }
-    }
-    let penalty = if worker.server_errors.observed(now)
-        || worker.timeouts.observed(now)
-        || worker.running_queries >= MAX_QUERIES_PER_WORKER
-    {
-        PriorityGroup::Unavailable
-    } else if worker.slow.estimate(now) > worker.ok.estimate(now) {
-        PriorityGroup::Slow
-    } else {
-        PriorityGroup::Best
-    };
-    (penalty, worker.running_queries, worker.last_query)
-}
-
-fn serializable_priority(worker: &WorkerStats, now: Instant) -> Priority {
-    let (group, queries, time) = priority(worker, now);
-    (group, queries, -((now - time).as_secs() as i64))
 }
 
 impl WorkersPool {
+    pub fn new(config: PrioritiesConfig) -> Self {
+        Self {
+            config,
+            workers: HashMap::new(),
+        }
+    }
+
     pub fn pick(
         &mut self,
         workers: impl IntoIterator<Item = PeerId>,
         lease: bool,
     ) -> Result<PeerId, NoWorker> {
         let now = Instant::now();
-        let default_priority = WorkerStats::default();
-        let (best, best_priority) = workers
+        let mut unknown_workers = Vec::new();
+        let best_known = workers
             .into_iter()
-            .map(|peer_id| {
-                (
-                    peer_id,
-                    priority(self.workers.get(&peer_id).unwrap_or(&default_priority), now),
-                )
+            .filter_map(|peer_id| match self.workers.get(&peer_id) {
+                None => {
+                    unknown_workers.push(peer_id);
+                    None
+                }
+                Some(stats) => Some((peer_id, self.priority(stats, now))),
             })
-            .min_by_key(|&(_, priority)| priority)
+            .min_by_key(|&(_, priority)| priority);
+
+        let (worker, best_priority) = unknown_workers
+            // prefer new workers, randomly choosing one
+            .choose(&mut rand::rng())
+            .map(|peer_id| (*peer_id, (PriorityGroup::Best, 0, Instant::now())))
+            .or(best_known)
             .ok_or(NoWorker::AllUnavailable)?;
 
-        tracing::trace!("Picked worker {:?} with priority {:?}", best, best_priority);
-        metrics::report_worker_picked(&best, &format!("{:?}", best_priority.0));
+        tracing::trace!(
+            "Picked worker {:?} with priority {:?}",
+            worker,
+            best_priority
+        );
+        metrics::report_worker_picked(&worker, &format!("{:?}", best_priority.0));
 
-        let worker = match best_priority.0 {
-            PriorityGroup::Unavailable => return Err(NoWorker::AllUnavailable),
-            PriorityGroup::Backoff => return Err(NoWorker::Backoff(best_priority.2)),
-            _ => best,
-        };
-
-        if lease {
-            self.lease(worker);
+        match best_priority.0 {
+            PriorityGroup::Unavailable => Err(NoWorker::AllUnavailable),
+            PriorityGroup::Backoff => Err(NoWorker::Backoff(best_priority.2)),
+            _ => {
+                if lease {
+                    self.lease(worker);
+                }
+                Ok(worker)
+            }
         }
-        Ok(worker)
     }
 
     pub fn get_priorities(
@@ -120,16 +135,17 @@ impl WorkersPool {
         workers: impl IntoIterator<Item = PeerId>,
     ) -> Vec<(PeerId, Priority)> {
         let now = Instant::now();
-        let default_priority = WorkerStats::default();
+        let default_priority = Self::default_serializable_priority();
         let mut v: Vec<_> = workers
             .into_iter()
             .map(|peer_id| {
                 (
                     peer_id,
-                    serializable_priority(
-                        self.workers.get(&peer_id).unwrap_or(&default_priority),
-                        now,
-                    ),
+                    self.workers
+                        .get(&peer_id)
+                        .map_or(default_priority, |stats| {
+                            self.serializable_priority(stats, now)
+                        }),
                 )
             })
             .collect();
@@ -183,39 +199,81 @@ impl WorkersPool {
     pub fn reset_allocations(&mut self) {}
 
     fn modify(&mut self, worker: PeerId, f: impl FnOnce(&mut WorkerStats)) {
-        f(self.workers.entry(worker).or_default());
+        f(self
+            .workers
+            .entry(worker)
+            .or_insert_with(|| WorkerStats::new(&self.config)));
+    }
+
+    // Less is better
+    fn priority(&self, worker: &WorkerStats, now: Instant) -> (PriorityGroup, u8, Instant) {
+        if let Some(paused_until) = worker.paused_until {
+            if now < paused_until {
+                return (PriorityGroup::Backoff, worker.running_queries, paused_until);
+            }
+        }
+        let penalty = if worker.server_errors.observed(now)
+            || worker.timeouts.observed(now)
+            || worker.running_queries >= self.config.max_queries_per_worker
+        {
+            PriorityGroup::Unavailable
+        } else if worker.slow.estimate(now) > worker.ok.estimate(now) {
+            PriorityGroup::Slow
+        } else {
+            PriorityGroup::Best
+        };
+        (penalty, worker.running_queries, worker.last_query)
+    }
+
+    fn serializable_priority(&self, worker: &WorkerStats, now: Instant) -> Priority {
+        let (group, queries, time) = self.priority(worker, now);
+        (group, queries, -((now - time).as_secs() as i64))
+    }
+
+    fn default_serializable_priority() -> Priority {
+        (PriorityGroup::Best, 0, 0)
     }
 }
 
-#[derive(Default, Debug, Clone)]
-struct Cooldown<const S: u64> {
+#[derive(Debug, Clone)]
+struct Cooldown {
+    seconds: u32,
     last_observed: Option<Instant>,
 }
 
-impl<const S: u64> Cooldown<S> {
+impl Cooldown {
+    fn new(seconds: u32) -> Self {
+        Self {
+            seconds,
+            last_observed: None,
+        }
+    }
+
     fn observe(&mut self, now: Instant) {
         self.last_observed = Some(now);
     }
 
     fn observed(&self, now: Instant) -> bool {
         self.last_observed
-            .map_or(false, |last| (now - last).as_secs() < S)
+            .map_or(false, |last| (now - last).as_secs() < self.seconds as u64)
     }
 }
 
 /// A counter for the approximate number of events in the last `window` with constant memory usage.
 /// If `estimate` returned `n`, then the number of events observed in
-/// the last `2 * S` seconds is not more than `2 * n`.
+/// the last `2 * window` seconds is not more than `2 * n`.
 #[derive(Debug, Clone)]
-struct EventCounter<const S: u64> {
+struct EventCounter {
+    window: u32,
     last_time: Instant,
     count: u32,
     prev_count: u32,
 }
 
-impl<const S: u64> EventCounter<S> {
-    fn new(now: Instant) -> Self {
+impl EventCounter {
+    fn new(window: u32, now: Instant) -> Self {
         Self {
+            window,
             last_time: now,
             count: 0,
             prev_count: 0,
@@ -223,11 +281,11 @@ impl<const S: u64> EventCounter<S> {
     }
 
     fn observe(&mut self, now: Instant) {
-        if (now - self.last_time).as_secs() > 2 * S {
+        if (now - self.last_time).as_secs() > 2 * self.window as u64 {
             self.prev_count = 0;
             self.count = 0;
             self.last_time = now;
-        } else if (now - self.last_time).as_secs() > S {
+        } else if (now - self.last_time).as_secs() > self.window as u64 {
             self.prev_count = self.count;
             self.count = 0;
             self.last_time = now;
@@ -236,9 +294,9 @@ impl<const S: u64> EventCounter<S> {
     }
 
     fn estimate(&self, now: Instant) -> u32 {
-        if (now - self.last_time).as_secs() > 2 * S {
+        if (now - self.last_time).as_secs() > 2 * self.window as u64 {
             0
-        } else if (now - self.last_time).as_secs() > S {
+        } else if (now - self.last_time).as_secs() > self.window as u64 {
             self.count
         } else {
             std::cmp::max(self.prev_count, self.count)

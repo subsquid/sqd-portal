@@ -128,7 +128,12 @@ impl NetworkClientBuilder {
 
         let datasets_copy = datasets.clone();
 
-        let network_state = NetworkState::new(datasets.clone(), network, &config.assignments_url);
+        let network_state = NetworkState::new(
+            datasets.clone(),
+            network,
+            &config.assignments_url,
+            config.priorities.clone(),
+        );
 
         let this = Arc::new(NetworkClient {
             chain_update_interval: config.chain_update_interval,

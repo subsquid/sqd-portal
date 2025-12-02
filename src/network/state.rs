@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use sqd_network_transport::PeerId;
 
+use crate::network::priorities::PrioritiesConfig;
 use crate::network::StorageClient;
 use crate::types::api_types::WorkerDebugInfo;
 use crate::types::DatasetId;
@@ -18,9 +19,14 @@ pub struct NetworkState {
 }
 
 impl NetworkState {
-    pub fn new(datasets: Arc<RwLock<Datasets>>, network: Network, network_state_url: &str) -> Self {
+    pub fn new(
+        datasets: Arc<RwLock<Datasets>>,
+        network: Network,
+        network_state_url: &str,
+        priorities_config: PrioritiesConfig,
+    ) -> Self {
         Self {
-            pool: RwLock::new(WorkersPool::default(), "NetworkState::pool"),
+            pool: RwLock::new(WorkersPool::new(priorities_config), "NetworkState::pool"),
             dataset_storage: StorageClient::new(datasets, network, network_state_url),
         }
     }

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use url::Url;
 
+use crate::network::PrioritiesConfig;
 use crate::types::DatasetRef;
 
 #[serde_as]
@@ -66,6 +67,9 @@ pub struct Config {
 
     #[serde(default)]
     pub datasets: DatasetsConfig,
+
+    #[serde(default)]
+    pub priorities: PrioritiesConfig,
 
     #[serde(default = "default_true")]
     pub send_logs: bool,
