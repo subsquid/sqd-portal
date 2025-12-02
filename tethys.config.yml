@@ -1,4 +1,5 @@
 hostname: http://0.0.0.0:8000
+use_gzjoin: true
 sqd_network:
   datasets: https://cdn.subsquid.io/sqd-network/datasets-testnet.yml
   serve: "all"

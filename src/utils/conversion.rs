@@ -255,7 +255,6 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
     data: S,
 ) -> impl Stream<Item = Result<Bytes, anyhow::Error>> {
     stream! {
-
         let mut crc = unsafe { libz_ng_sys::crc32(0, std::ptr::null(), 0) };
         let mut tot = 0u32;
         let buf = hex!("1f8b08000000000000ff");
@@ -281,8 +280,6 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
             zfree: allocator::zfree,
         });
         loop {
-            // let mut strm = strm_mutex.lock().unwrap();
-
             let mut skip = match input.gzhead().await {
                 Ok(res) => { res },
                 Err(_) => {
@@ -374,7 +371,7 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
                     if strm_wrap.0.avail_in > 0 {
                             let buffer: &[u8] = unsafe {
                                 let start = input.buf.as_mut_ptr().wrapping_add(skip);
-                                slice::from_raw_parts(start, strm_wrap.0.next_in.offset_from(start).try_into()?)
+                                slice::from_raw_parts(start, (strm_wrap.0.next_in.offset_from(start) - 1).try_into()?)
                             };
                             skip += buffer.len();
                             yield Ok(buffer.to_vec().into());
@@ -388,7 +385,7 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
             let pos = strm_wrap.0.data_type & 7;
             let buffer: &[u8] = unsafe {
                 let start = input.buf.as_mut_ptr().wrapping_add(skip);
-                slice::from_raw_parts(start, (input.next().offset_from(start) - 1).try_into()?)
+                slice::from_raw_parts(start, (input.next().offset_from(start) - 1).try_into().unwrap_or(0))
             };
             yield Ok(buffer.to_vec().into());
 
@@ -432,5 +429,69 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
             /* clean up */
             unsafe { inflateEnd(&mut strm_wrap.0) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::RngCore;
+    use tokio::io::AsyncBufReadExt;
+
+    use super::*;
+
+    fn generate_data(data: Vec<Vec<u8>>) -> impl Stream<Item = Vec<u8>> {
+        stream! {
+            for datum in data {
+                let encoder = GzipEncoder::with_quality(&datum[..], async_compression::Level::Fastest);
+                let buf = BufReader::with_capacity(100_000_000, encoder).fill_buf().await.unwrap().to_vec();
+                yield buf;
+            }
+        }
+    }
+
+    async fn pack_join_unpack(testcase: Vec<Vec<u8>>) {
+        let gt = testcase.concat();
+        let stream = join_gzip(generate_data(testcase));
+        pin_mut!(stream);
+        let reader =
+        StreamReader::new(stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result.unwrap()))));
+        let decoder = GzipDecoder::new(reader);
+        let mut buf_reader = BufReader::with_capacity(100_000_000, decoder);
+        let result = buf_reader.fill_buf().await.unwrap();
+        assert_eq!(result.to_vec(), gt);
+    }
+
+    #[tokio::test]
+    async fn test_smoke() {
+        let input = vec![vec![1u8,2],vec![3,4]];
+        pack_join_unpack(input).await;
+    }
+
+    #[tokio::test]
+    async fn test_const() {
+        let input = vec![vec![1u8; 100_000],vec![3; 100_000]];
+        pack_join_unpack(input).await;
+    }
+
+    #[tokio::test]
+    async fn test_rand() {
+        let mut rng = rand::rng();
+        let input = (0..99).map(|_| {
+            let mut data = [0u8; 100_000];
+            rng.fill_bytes(&mut data);
+            data.to_vec()
+        }).collect();
+        pack_join_unpack(input).await;
+    }
+
+    #[tokio::test]
+    async fn test_rand_long() {
+        let mut rng = rand::rng();
+        let input = (0..9).map(|_| {
+            let mut data = [0u8; 1_000_000];
+            rng.fill_bytes(&mut data);
+            data.to_vec()
+        }).collect();
+        pack_join_unpack(input).await;
     }
 }

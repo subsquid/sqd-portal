@@ -238,17 +238,18 @@ async fn get_head(
 async fn run_archival_stream_restricted(
     task_manager: Extension<Arc<TaskManager>>,
     network: Extension<Arc<NetworkClient>>,
-    Extension(config): Extension<Arc<Config>>,
+    config: Extension<Arc<Config>>,
     dataset_id: DatasetId,
     raw_request: ClientRequest,
 ) -> Response {
     let request = restrict_request(&config, raw_request);
-    run_archival_stream(task_manager, network, dataset_id, request).await
+    run_archival_stream(task_manager, network, config, dataset_id, request).await
 }
 
 async fn run_archival_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(config): Extension<Arc<Config>>,
     dataset_id: DatasetId,
     mut request: ClientRequest,
 ) -> Response {
@@ -265,11 +266,21 @@ async fn run_archival_stream(
     request.dataset_id = dataset_id;
 
     match task_manager.spawn_stream(request).await {
-        Ok(stream) => res
-            .header(header::CONTENT_TYPE, "application/jsonl")
-            .header(header::CONTENT_ENCODING, "gzip")
-            .body(Body::from_stream(join_gzip(stream)))
-            .unwrap(),
+        Ok(stream) => {
+            if config.use_gzjoin {
+                res
+                    .header(header::CONTENT_TYPE, "application/jsonl")
+                    .header(header::CONTENT_ENCODING, "gzip")
+                    .body(Body::from_stream(join_gzip(stream)))
+                    .unwrap()
+            } else {
+                res
+                    .header(header::CONTENT_TYPE, "application/jsonl")
+                    .header(header::CONTENT_ENCODING, "gzip")
+                    .body(Body::from_stream(recompress_gzip(stream)))
+                    .unwrap()
+            }
+        },
         Err(RequestError::NoData) => {
             // Delay request from this client for 5 seconds to avoid unnecessary retries
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -365,10 +376,17 @@ async fn run_stream_internal(
             if let Some(head) = head_task.await.unwrap() {
                 res = res.header(HEAD_NUMBER_HEADER, head);
             }
-            res.header(header::CONTENT_TYPE, "application/jsonl")
-                .header(header::CONTENT_ENCODING, "gzip")
-                .body(Body::from_stream(join_gzip(stream)))
-                .unwrap()
+            if config.use_gzjoin {
+                res.header(header::CONTENT_TYPE, "application/jsonl")
+                    .header(header::CONTENT_ENCODING, "gzip")
+                    .body(Body::from_stream(join_gzip(stream)))
+                    .unwrap()
+            } else {
+                res.header(header::CONTENT_TYPE, "application/jsonl")
+                    .header(header::CONTENT_ENCODING, "gzip")
+                    .body(Body::from_stream(recompress_gzip(stream)))
+                    .unwrap()
+            }
         }
 
         // Then try hotblocks storage
