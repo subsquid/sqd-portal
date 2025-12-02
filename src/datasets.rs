@@ -4,10 +4,9 @@ use crate::{
     utils::RwLock,
 };
 use anyhow::Context;
-use bimap::BiBTreeMap;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{btree_map::Entry, BTreeMap, HashMap},
+    collections::{btree_map::Entry, BTreeMap},
     fs::File,
     io::BufReader,
 };
@@ -27,30 +26,27 @@ pub struct DatasetConfig {
     pub kind: String,
 }
 
-type DatasetsMapping = BiBTreeMap<String, DatasetId>;
-type DatasetKinds = HashMap<String, String>;
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
+struct NetDataset {
+    dataset_id: DatasetId,
+    kind: String,
+}
+
+type DatasetsMapping = BTreeMap<String, NetDataset>;
 
 impl Datasets {
     pub async fn load(config: &Config) -> anyhow::Result<Self> {
-        let (mapping, kinds) = load_mapping_and_kinds(&config.sqd_network.datasets_url).await?;
-        Self::parse(config, mapping, kinds)
+        let mapping = load_mapping(&config.sqd_network.datasets_url).await?;
+        Self::parse(config, mapping)
     }
 
-    fn parse(
-        config: &Config,
-        mapping: DatasetsMapping,
-        kinds: DatasetKinds,
-    ) -> anyhow::Result<Self> {
+    fn parse(config: &Config, mapping: DatasetsMapping) -> anyhow::Result<Self> {
         let mut datasets: Vec<DatasetConfig> = Vec::new();
         let mut alias_to_index = BTreeMap::new();
         let mut id_to_default_name = BTreeMap::new();
         for (default_name, ds) in config.datasets.clone() {
-            let network_id = match ds.sqd_network {
-                Some(DatasetRef::Name(ref name)) => mapping.get_by_left(name).cloned(),
-                Some(DatasetRef::Id(ref id)) => Some(id).cloned(),
-                None => mapping.get_by_left(&default_name).cloned(),
-            };
-
+            let (network_id, ds_summary) =
+                netdata_from_mapping(ds.sqd_network, &default_name, &mapping);
             let index = datasets.len();
             for alias in ds.aliases.iter().chain(Some(&default_name)) {
                 let prev = alias_to_index.insert(alias.clone(), index);
@@ -76,14 +72,10 @@ impl Datasets {
                     });
             }
 
-            let kind = if ds.kind.as_ref().map_or("", |v| v).is_empty() {
-                kinds.get(&default_name).map_or("", |v| v).to_string()
-            } else {
-                ds.kind.as_ref().unwrap().to_string()
-            };
-            if kind.is_empty() {
-                anyhow::bail!("Unknown kind for dataset {default_name}");
-            };
+            let kind = ds
+                .kind
+                .or_else(|| ds_summary.as_ref().map(|s| s.kind.clone()))
+                .ok_or_else(|| anyhow::anyhow!("Unknown kind for dataset {default_name}"))?;
 
             datasets.push(DatasetConfig {
                 default_name,
@@ -96,23 +88,19 @@ impl Datasets {
 
         if let ServeMode::All = config.sqd_network.serve {
             // Add all datasets from the mapping that are not already present
-            for (name, id) in mapping {
+            for (name, ds) in mapping {
                 if let Entry::Vacant(entry) = alias_to_index.entry(name.clone()) {
                     entry.insert(datasets.len());
-
-                    let Some(kind) = kinds.get(&name) else {
-                        anyhow::bail!("Unknown kind for dataset {name}");
-                    };
 
                     datasets.push(DatasetConfig {
                         default_name: name.clone(),
                         aliases: Vec::new(),
-                        network_id: Some(id.clone()),
+                        network_id: Some(ds.dataset_id.clone()),
                         hotblocks: None,
-                        kind: kind.clone(),
+                        kind: ds.kind.clone(),
                     });
 
-                    if let Entry::Vacant(entry) = id_to_default_name.entry(id) {
+                    if let Entry::Vacant(entry) = id_to_default_name.entry(ds.dataset_id) {
                         entry.insert(name);
                     }
                 }
@@ -156,6 +144,23 @@ impl Datasets {
     }
 }
 
+fn netdata_from_mapping<'a>(
+    dref: Option<DatasetRef>,
+    default_name: &'a str,
+    mapping: &'a DatasetsMapping,
+) -> (Option<DatasetId>, Option<&'a NetDataset>) {
+    let (tmp, key) = match &dref {
+        Some(DatasetRef::Id(id)) => (Some(id.clone()), default_name),
+        Some(DatasetRef::Name(name)) => (None, name.as_str()),
+        None => (None, default_name),
+    };
+
+    let entry = mapping.get(key);
+    let id = tmp.or_else(|| entry.map(|m| m.dataset_id.clone()));
+
+    (id, entry)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "kebab-case")]
 struct NetworkDatasets {
@@ -169,24 +174,23 @@ struct NetworkDataset {
     kind: String,
 }
 
-async fn load_mapping_and_kinds(url: &str) -> anyhow::Result<(DatasetsMapping, DatasetKinds)> {
+async fn load_mapping(url: &str) -> anyhow::Result<DatasetsMapping> {
     let file = load_networks(url).await?;
-    let (mapping, kinds) = parse_network_datasets(file.clone())?;
+    let mapping = parse_network_datasets(file.clone())?;
     tracing::debug!("Datasets file loaded, {} datasets found", mapping.len());
-    Ok((mapping, kinds))
+    Ok(mapping)
 }
 
-fn parse_network_datasets(
-    file: NetworkDatasets,
-) -> anyhow::Result<(DatasetsMapping, DatasetKinds)> {
-    let mut datasets = BiBTreeMap::new();
-    let mut kinds = HashMap::new();
+fn parse_network_datasets(file: NetworkDatasets) -> anyhow::Result<DatasetsMapping> {
+    let mut datasets = BTreeMap::new();
     for dataset in file.sqd_network_datasets {
-        let dataset_id = DatasetId::from_url(&dataset.id);
-        datasets.insert(dataset.name.clone(), dataset_id);
-        kinds.insert(dataset.name, dataset.kind);
+        let summary = NetDataset {
+            dataset_id: DatasetId::from_url(&dataset.id),
+            kind: dataset.kind.to_string(),
+        };
+        datasets.insert(dataset.name.clone(), summary);
     }
-    Ok((datasets, kinds))
+    Ok(datasets)
 }
 
 async fn load_networks(url: &str) -> anyhow::Result<NetworkDatasets> {
@@ -217,8 +221,6 @@ fn load_local_file(full_path: &str) -> anyhow::Result<NetworkDatasets> {
 
 #[cfg(test)]
 mod tests {
-    use bimap::BiBTreeMap;
-
     use super::*;
 
     impl PartialEq for DatasetConfig {
@@ -281,37 +283,37 @@ mod tests {
         let mapping = [
             (
                 "ethereum-mainnet".to_owned(),
-                DatasetId::from_url("s3://ethereum-mainnet-1"),
+                NetDataset {
+                    dataset_id: DatasetId::from_url("s3://ethereum-mainnet-1"),
+                    kind: "shall_be_overwritten_by_config".to_string(),
+                },
             ),
             (
                 "eth-main".to_owned(),
-                DatasetId::from_url("s3://ethereum-mainnet-2"),
+                NetDataset {
+                    dataset_id: DatasetId::from_url("s3://ethereum-mainnet-2"),
+                    kind: "evm".to_string(),
+                },
             ),
             (
                 "solana-mainnet".to_owned(),
-                DatasetId::from_url("s3://solana-mainnet"),
+                NetDataset {
+                    dataset_id: DatasetId::from_url("s3://solana-mainnet"),
+                    kind: "solana".to_string(),
+                },
             ),
             (
                 "arbitrum-one".to_owned(),
-                DatasetId::from_url("s3://arbitrum-one"),
+                NetDataset {
+                    dataset_id: DatasetId::from_url("s3://arbitrum-one"),
+                    kind: "evm".to_string(),
+                },
             ),
         ]
         .into_iter()
-        .collect::<BiBTreeMap<_, _>>();
+        .collect::<BTreeMap<_, _>>();
 
-        let kinds = [
-            (
-                "ethereum-mainnet".to_owned(),
-                "shall_be_overwritten_by_config".to_string(),
-            ),
-            ("eth-main".to_owned(), "evm".to_string()),
-            ("solana-mainnet".to_owned(), "solana".to_string()),
-            ("arbitrum-one".to_owned(), "evm".to_string()),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
-
-        let datasets = Datasets::parse(&config, mapping, kinds).unwrap();
+        let datasets = Datasets::parse(&config, mapping).unwrap();
 
         let beta_meta = datasets.get("beta").unwrap();
         let sol_meta = datasets.get("solana").unwrap();
@@ -449,24 +451,23 @@ mod tests {
         let mapping = [
             (
                 "ethereum-mainnet".to_owned(),
-                DatasetId::from_url("s3://ethereum-mainnet-1"),
+                NetDataset {
+                    dataset_id: DatasetId::from_url("s3://ethereum-mainnet-1"),
+                    kind: "evm".to_string(),
+                },
             ),
             (
                 "arbitrum-one".to_owned(),
-                DatasetId::from_url("s3://arbitrum-one"),
+                NetDataset {
+                    dataset_id: DatasetId::from_url("s3://arbitrum-one"),
+                    kind: "evm".to_string(),
+                },
             ),
         ]
         .into_iter()
-        .collect::<BiBTreeMap<_, _>>();
+        .collect::<BTreeMap<_, _>>();
 
-        let kinds = [
-            ("ethereum-mainnet".to_owned(), "evm".to_string()),
-            ("arbitrum-one".to_owned(), "evm".to_string()),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>();
-
-        let datasets = Datasets::parse(&config, mapping, kinds).unwrap();
+        let datasets = Datasets::parse(&config, mapping).unwrap();
 
         // In manual mode, only explicitly configured datasets should be available
         assert!(datasets.get("ethereum-mainnet").is_some());
