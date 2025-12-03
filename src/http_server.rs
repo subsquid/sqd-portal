@@ -16,7 +16,6 @@ use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
 use futures::{pin_mut, StreamExt};
 use prometheus_client::registry::Registry;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
@@ -31,6 +30,7 @@ use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::types::Compression;
 use crate::utils::conversion::{collect_to_string, join_gzip_default, json_lines_to_json, recompress_gzip};
+use crate::utils::internal_query::{build_blocknumber_query, find_block_in_chunk};
 use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
@@ -572,52 +572,6 @@ async fn get_blocknumber_by_timestamp(
     };
 
     format!("{n}").into_response()
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct BlockSummary {
-    header: SummaryHeader,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct SummaryHeader {
-    number: u64,
-    timestamp: u64,
-}
-
-#[tracing::instrument]
-fn find_block_in_chunk(ts: u64, js: &str) -> Result<u64, anyhow::Error> {
-    for line in js.lines() {
-        let summary = serde_json::from_str::<BlockSummary>(line)?;
-        if summary.header.timestamp >= ts {
-            return Ok(summary.header.number);
-        }
-    }
-    Err(anyhow::anyhow!("cannot find block in chunk"))
-}
-
-fn build_blocknumber_query(
-    kind: &str,
-    first_block: u64,
-    last_block: u64,
-) -> anyhow::Result<ParsedQuery> {
-    let query = json!({
-        "type": kind.to_string(),
-        "includeAllBlocks": true,
-        "fromBlock": first_block,
-        "toBlock": last_block,
-        "fields": {
-            "block": {
-                "number": true,
-                "timestamp": true
-            }
-        },
-    });
-
-    ParsedQuery::try_from(query.to_string()).map_err(|e| {
-        tracing::warn!("cannot parse my own query: {:?}", e);
-        e
-    })
 }
 
 async fn get_debug_block(
