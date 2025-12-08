@@ -96,8 +96,8 @@ pub async fn run_server(
             get(get_dataset_metadata).endpoint("/metadata"),
         )
         .route(
-            "/datasets/:dataset/resolve-timestamp/:timestamp",
-            get(get_blocknumber_by_timestamp).endpoint("/resolve-timestamp"),
+            "/datasets/:dataset/timestamps/:timestamp/block",
+            get(get_blocknumber_by_timestamp).endpoint("/timestamps/block"),
         )
         // Backward compatibility routes
         .route(
@@ -465,8 +465,8 @@ async fn get_blocknumber_by_timestamp(
     else {
         tracing::warn!("cannot build blocknumber query for {}", dataset_id);
         return (
-            StatusCode::NOT_FOUND,
-            format!("No data for dataset {dataset_id}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Cannot build timestamp query for {dataset_id}"),
         )
             .into_response();
     };
@@ -486,7 +486,7 @@ async fn get_blocknumber_by_timestamp(
         Ok(stream) => stream,
         Err(e) => {
             tracing::warn!("spawn stream error: {:?}", e);
-            return e.into_response();
+            return (StatusCode::BAD_GATEWAY, "SQD Network error").into_response();
         }
     };
 
@@ -500,18 +500,19 @@ async fn get_blocknumber_by_timestamp(
     if let Err(e) = js {
         tracing::warn!("stream processing error: {:?}", e);
         return (
-            StatusCode::NOT_FOUND,
-            format!("stream processing error: {:?}", e),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("stream processing error"),
         )
             .into_response();
     };
+
     let js = js.unwrap();
 
     let n = match find_block_in_chunk(timestamp, &js) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("cannot find blocknumber in chunk: {:?}", e);
-            return (StatusCode::NOT_FOUND, format!("{:?}", e)).into_response();
+            return (StatusCode::NOT_FOUND, "block not in chunk").into_response();
         }
     };
 
