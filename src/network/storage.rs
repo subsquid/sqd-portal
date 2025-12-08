@@ -212,39 +212,9 @@ impl StorageClient {
         let dataset = dataset.to_url();
         let guard = self.assignment.read();
         let assignment = guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)?;
-        let dataset = assignment
-            .get_dataset(dataset)
-            .ok_or(ChunkNotFound::UnknownDataset)?;
-
-        let chunks = dataset.chunks();
-
-        // find first chunk such that chunk.last_block_timestamp >= ts
-        let mut left = -1;
-        let mut right = chunks.len() as isize;
-        while left + 1 < right {
-            let mid = (left + right) / 2;
-            let chunk = chunks.get(mid as usize);
-            let this_ts = chunk.last_block_timestamp().unwrap_or(0);
-            if this_ts == ts {
-                right = mid;
-                break;
-            }
-            if this_ts < ts {
-                left = mid;
-            } else {
-                right = mid;
-            }
-        }
-        if right == chunks.len() as isize {
-            return Err(ChunkNotFound::AfterLast);
-        }
-        let chunk = chunks.get(right as usize);
-        if chunk.last_block_timestamp().unwrap_or(0) < ts {
-            return Err(ChunkNotFound::BeforeFirst {
-                first_block: dataset.first_block(),
-            });
-        }
-
+        let chunk = assignment
+            .find_chunk_by_timestamp(dataset, ts)
+            .map_err(|e| convert_chunk_not_found(e, assignment, dataset))?;
         Ok(chunk.id().parse().map_err(|e| {
             tracing::warn!(error = %e, "Failed to parse chunk ID");
             ChunkNotFound::InvalidID(chunk.id().to_string())
