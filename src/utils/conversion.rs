@@ -1,5 +1,3 @@
-use std::slice;
-
 use anyhow::anyhow;
 use async_compression::tokio::bufread::{GzipDecoder, GzipEncoder};
 use async_stream::stream;
@@ -249,13 +247,9 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
         Ok(self.buf[start..offset.try_into()?].to_vec())
     }
 
-    fn next(&self) -> *mut u8 {
-        self.next
-    }
-
-    fn set_read_ptr(&mut self, next: *mut u8, left: usize) {
-        self.left = left;
-        self.next = next;
+    fn set_read_ptr(&mut self, strm: &ZStreamWrap) {
+        self.left = strm.stream.avail_in as usize;
+        self.next = strm.stream.next_in;
     }
 }
 
@@ -430,13 +424,13 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
             }
 
             /* update buffer with unused input */
-            input.set_read_ptr(strm_wrap.stream.next_in, strm_wrap.stream.avail_in as usize);
+            input.set_read_ptr(&strm_wrap);
             /* copy used input, write empty blocks to get to byte boundary */
             let pos = strm_wrap.get_unused_bits();
             let buffer = input.copy_processed_buffer(&mut strm_wrap, false)?;
             yield Ok(buffer.into());
 
-            let mut last_byte = strm_wrap.get_last_byte(); //unsafe { *input.next().wrapping_sub(1) };
+            let mut last_byte = strm_wrap.get_last_byte();
             if pos == 0 {
                 /* already at byte boundary, or last file: write last byte */
                 yield Ok(vec![last_byte].into());
