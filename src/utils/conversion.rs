@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use anyhow::anyhow;
 use async_compression::tokio::bufread::{GzipDecoder, GzipEncoder};
 use async_stream::stream;
@@ -14,8 +16,8 @@ use tokio_util::{
     io::{ReaderStream, StreamReader},
 };
 
-const CHUNK: usize = 32768;
-// const CHUNK: usize = 128;
+// const CHUNK: usize = 32768;
+const CHUNK: usize = 128;
 
 #[allow(unstable_name_collisions)]
 pub fn json_lines_to_json(data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -112,7 +114,7 @@ mod allocator {
 pub struct StreamIn<S: Stream<Item = Vec<u8>> + Unpin> {
     stream: S,
     left: usize,
-    next: *mut u8,
+    next: usize,
     buf: Vec<u8>,
     skip: usize,
 }
@@ -122,7 +124,7 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
         Self {
             stream,
             left: 0,
-            next: std::ptr::null_mut(),
+            next: 0,
             buf: Default::default(),
             skip: 0,
         }
@@ -135,7 +137,7 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
             .await
             .ok_or(anyhow!("faild to load data from incoming stream"))?;
         self.left = self.buf.len();
-        self.next = self.buf.as_mut_ptr();
+        self.next = 0;
         Ok(())
     }
 
@@ -147,8 +149,8 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
             return Err(anyhow!("Unexpected EoF"));
         }
         self.left -= 1;
-        let res = unsafe { *self.next };
-        self.next = self.next.wrapping_add(1);
+        let res = self.buf[self.next];
+        self.next += 1;
         Ok(res)
     }
 
@@ -161,7 +163,7 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
         }
 
         self.left -= skip;
-        self.next = self.next.wrapping_add(skip);
+        self.next += skip;
         Ok(())
     }
 
@@ -173,7 +175,7 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
             return Err(anyhow!("Unexpected EoF"));
         }
         strm.stream.avail_in = self.left as u32;
-        strm.stream.next_in = self.next;
+        strm.stream.next_in = self.buf.as_mut_ptr().wrapping_add(self.next); //self.next;
         Ok(())
     }
 
@@ -249,20 +251,19 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
 
     fn set_read_ptr(&mut self, strm: &ZStreamWrap) {
         self.left = strm.stream.avail_in as usize;
-        self.next = strm.stream.next_in;
+        self.next = self.buf.len() - self.left; //strm.stream.next_in;
     }
 }
 
-unsafe impl<S: Stream<Item = Vec<u8>> + Unpin> Send for StreamIn<S> {}
 
 struct ZStreamWrap {
-    pub stream: z_stream,
-    pub junk: Box<[u8; CHUNK]>,
+    stream: Box::<z_stream>,
+    junk: Box<[u8; CHUNK]>,
 }
 
 impl ZStreamWrap {
     pub fn new() -> Self{
-        let stream = z_stream {
+        let stream = Box::new(z_stream {
             next_in: std::ptr::null_mut(),
             avail_in: 0,
             total_in: 0,
@@ -277,7 +278,8 @@ impl ZStreamWrap {
             state: std::ptr::null_mut(),
             zalloc: allocator::zalloc,
             zfree: allocator::zfree,
-        };
+        });
+
         ZStreamWrap {
             stream,
             junk: vec![0u8; CHUNK].try_into().unwrap(),
@@ -285,7 +287,7 @@ impl ZStreamWrap {
     }
 
     pub fn init(&mut self) -> Result<(), anyhow::Error> {
-        let ret = unsafe { inflateInit2_(&mut self.stream, -15, std::ptr::null(), 0) };
+        let ret = unsafe { inflateInit2_(&mut *self.stream, -15, std::ptr::null(), 0) };
         if ret != Z_OK {
             return Err(anyhow!("Failed to init inflate machinery"));
         }
@@ -296,7 +298,7 @@ impl ZStreamWrap {
     pub fn decompress_availble_data(&mut self) -> Result<usize, anyhow::Error> {
         self.stream.avail_out = CHUNK as u32;
         self.stream.next_out = self.junk.as_mut_ptr();
-        let ret = unsafe { inflate(&mut self.stream, Z_BLOCK) };
+        let ret = unsafe { inflate(&mut *self.stream, Z_BLOCK) };
 
         if ret == Z_MEM_ERROR {
             return Err(anyhow!("Out of memory"));
@@ -323,18 +325,16 @@ impl ZStreamWrap {
     pub fn clear_last_flag(&self) -> bool {
         let last = unsafe { *self.stream.next_in.wrapping_add(0) } & 1 > 0;
         if last {
-            unsafe { *self.stream.next_in.wrapping_add(0) &= !1 };
+            unsafe { *self.stream.next_in.wrapping_add(0) &= !1; };
         }
         last
     }
 
     pub fn clear_last_flag_with_unused_bits(&self, pos: u8) -> bool {
         let pos = (0x100u16 >> pos) as u8;
-        let last = unsafe { *self.stream.next_in.wrapping_sub(1) } & pos > 0; //???????
+        let last = unsafe { *self.stream.next_in.wrapping_sub(1) } & pos > 0;
         if last {
-            unsafe {
-                *self.stream.next_in.wrapping_sub(1) &= !pos;
-            }
+            unsafe { *self.stream.next_in.wrapping_sub(1) &= !pos; };
         };
         last
     }
@@ -348,7 +348,7 @@ impl ZStreamWrap {
     }
 
     pub fn cleanup(&mut self) {
-        unsafe { inflateEnd(&mut self.stream) };
+        unsafe { inflateEnd(&mut *self.stream) };
     }
 }
 
@@ -539,5 +539,12 @@ mod tests {
             })
             .collect();
         pack_join_unpack(input).await;
+    }
+
+    proptest_async::proptest! {
+        #[test]
+        async fn random_join(input in proptest::collection::vec(proptest::collection::vec(0..255u8, 10000..40000), 1..5)) {
+            pack_join_unpack(input).await;
+        }
     }
 }
