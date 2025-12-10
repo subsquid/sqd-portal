@@ -17,6 +17,7 @@ use tokio_util::{
 };
 
 const CHUNK: usize = 32768;
+// const CHUNK: usize = 128;
 
 #[allow(unstable_name_collisions)]
 pub fn json_lines_to_json(data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -115,6 +116,7 @@ pub struct StreamIn<S: Stream<Item = Vec<u8>> + Unpin> {
     left: usize,
     next: *mut u8,
     buf: Vec<u8>,
+    skip: usize,
 }
 
 impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
@@ -124,6 +126,7 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
             left: 0,
             next: std::ptr::null_mut(),
             buf: Default::default(),
+            skip: 0,
         }
     }
 
@@ -171,8 +174,8 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
         if self.left == 0 {
             return Err(anyhow!("Unexpected EoF"));
         }
-        strm.0.avail_in = self.left as u32;
-        strm.0.next_in = self.next;
+        strm.stream.avail_in = self.left as u32;
+        strm.stream.next_in = self.next;
         Ok(())
     }
 
@@ -225,13 +228,25 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
             self.skip(2).await?;
         }
 
+        self.skip = left_before_header - self.left;
         Ok(left_before_header - self.left)
     }
 
     async fn reset_and_pull(&mut self, strm: &mut ZStreamWrap) -> Result<(), anyhow::Error> {
         self.left = 0;
+        self.skip = 0;
         self.zpull(strm).await?;
         Ok(())
+    }
+
+    fn copy_processed_buffer(&mut self, strm: &mut ZStreamWrap, include_next_byte: bool) -> Result<Vec<u8>, anyhow::Error> {
+        let mut offset = unsafe { strm.stream.next_in.offset_from(self.buf.as_ptr()) };
+        if !include_next_byte {
+            offset -= 1;
+        }
+        let start = self.skip;
+        self.skip = offset.try_into()?;
+        Ok(self.buf[start..offset.try_into()?].to_vec())
     }
 
     fn next(&self) -> *mut u8 {
@@ -246,23 +261,14 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> StreamIn<S> {
 
 unsafe impl<S: Stream<Item = Vec<u8>> + Unpin> Send for StreamIn<S> {}
 
-struct ZStreamWrap(z_stream);
+struct ZStreamWrap {
+    pub stream: z_stream,
+    pub junk: Box<[u8; CHUNK]>,
+}
 
-unsafe impl Send for ZStreamWrap {}
-
-pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
-    data: S,
-) -> impl Stream<Item = Result<Bytes, anyhow::Error>> {
-    stream! {
-        let mut crc = unsafe { libz_ng_sys::crc32(0, std::ptr::null(), 0) };
-        let mut tot = 0u32;
-        let buf = hex!("1f8b08000000000000ff");
-        yield Ok(buf.to_vec().into());
-        pin_mut!(data);
-        let mut input = StreamIn::new(data);
-        let mut junk: Box<[u8; CHUNK]> = vec![0u8; CHUNK].try_into().unwrap();
-
-        let mut strm_wrap = ZStreamWrap(z_stream {
+impl ZStreamWrap {
+    pub fn new() -> Self{
+        let stream = z_stream {
             next_in: std::ptr::null_mut(),
             avail_in: 0,
             total_in: 0,
@@ -277,9 +283,98 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
             state: std::ptr::null_mut(),
             zalloc: allocator::zalloc,
             zfree: allocator::zfree,
-        });
+        };
+        ZStreamWrap {
+            stream,
+            junk: vec![0u8; CHUNK].try_into().unwrap(),
+        }
+    }
+
+    pub fn init(&mut self) -> Result<(), anyhow::Error> {
+        let ret = unsafe { inflateInit2_(&mut self.stream, -15, std::ptr::null(), 0) };
+        if ret != Z_OK {
+            return Err(anyhow!("Failed to init inflate machinery"));
+        }
+        self.stream.avail_out = 0;
+        Ok(())
+    }
+
+    pub fn decompress_availble_data(&mut self) -> Result<usize, anyhow::Error> {
+        self.stream.avail_out = CHUNK as u32;
+        self.stream.next_out = self.junk.as_mut_ptr();
+        let ret = unsafe { inflate(&mut self.stream, Z_BLOCK) };
+
+        if ret == Z_MEM_ERROR {
+            return Err(anyhow!("Out of memory"));
+        }
+        if ret == Z_DATA_ERROR {
+            return Err(anyhow!("invalid compressed data"));
+        }
+
+        Ok(CHUNK - self.stream.avail_out as usize)
+    }
+
+    pub fn can_read_more(&self) -> bool {
+        self.stream.avail_in > 0
+    }
+
+    pub fn can_write_more(&self) -> bool {
+        self.stream.avail_out > 0
+    }
+
+    pub fn is_block_boundary(&self) -> bool {
+        self.stream.data_type & 128 > 0
+    }
+
+    pub fn clear_last_flag(&self) -> bool {
+        let last = unsafe { *self.stream.next_in.wrapping_add(0) } & 1 > 0;
+        if last {
+            unsafe { *self.stream.next_in.wrapping_add(0) &= !1 };
+        }
+        last
+    }
+
+    pub fn clear_last_flag_with_unused_bits(&self, pos: u8) -> bool {
+        let pos = (0x100u16 >> pos) as u8;
+        let last = unsafe { *self.stream.next_in.wrapping_sub(1) } & pos > 0; //???????
+        if last {
+            unsafe {
+                *self.stream.next_in.wrapping_sub(1) &= !pos;
+            }
+        };
+        last
+    }
+
+    pub fn get_unused_bits(&self) -> u8 {
+        (self.stream.data_type & 7) as u8
+    }
+
+    pub fn get_last_byte(&self) -> u8 {
+        unsafe { *self.stream.next_in.wrapping_sub(1) }
+    }
+
+    pub fn cleanup(&mut self) {
+        unsafe { inflateEnd(&mut self.stream) };
+    }
+}
+
+unsafe impl Send for ZStreamWrap {}
+
+pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
+    data: S,
+) -> impl Stream<Item = Result<Bytes, anyhow::Error>> {
+    stream! {
+        let mut crc = unsafe { libz_ng_sys::crc32(0, std::ptr::null(), 0) };
+        let mut tot = 0u32;
+        let buf = hex!("1f8b08000000000000ff");
+        yield Ok(buf.to_vec().into());
+        pin_mut!(data);
+        let mut input = StreamIn::new(data);
+        // let mut junk: Box<[u8; CHUNK]> = vec![0u8; CHUNK].try_into().unwrap();
+
+        let mut strm_wrap = ZStreamWrap::new();
         loop {
-            let mut skip = match input.gzhead().await {
+            let _ = match input.gzhead().await {
                 Ok(res) => { res },
                 Err(_) => {
                     yield Ok([&[3u8, 0u8], &crc.to_le_bytes()[..], &tot.to_le_bytes()[..]].concat().into());
@@ -287,106 +382,61 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
                 },
             };
 
-
-            let mut ret = unsafe { inflateInit2_(&mut strm_wrap.0, -15, std::ptr::null(), 0) };
-            if ret != Z_OK {
-                yield Err(anyhow!("Failed to init inflate machinery"));
-                break;
-            }
+            strm_wrap.init()?;
 
             /* inflate and copy compressed data, clear last-block bit if requested */
             let mut len = 0;
             input.zpull(&mut strm_wrap).await?;
-            let mut last = unsafe { *strm_wrap.0.next_in.wrapping_add(0) } & 1 > 0;
-            if last {
-                unsafe { *strm_wrap.0.next_in.wrapping_add(0) &= !1 };
-            }
-            strm_wrap.0.avail_out = 0;
+            let mut last = strm_wrap.clear_last_flag();
             loop {
                 /* if input used and output done, write used input and get more */
-                if strm_wrap.0.avail_in == 0 && strm_wrap.0.avail_out != 0 {
-                    let buffer: &[u8] = unsafe {
-                        let start = input.buf.as_mut_ptr().wrapping_add(skip);
-                        skip = 0;
-                        slice::from_raw_parts(start, strm_wrap.0.next_in.offset_from(start).try_into()?)
-                    };
-                    yield Ok(buffer.to_vec().into());
+                if !strm_wrap.can_read_more() && strm_wrap.can_write_more() {
+                    let buffer = input.copy_processed_buffer(&mut strm_wrap, true)?;
+                    yield Ok(buffer.into());
                     input.reset_and_pull(&mut strm_wrap).await?;
                 }
                 /* decompress -- return early when end-of-block reached */
-                strm_wrap.0.avail_out = CHUNK as u32;
-                strm_wrap.0.next_out = junk.as_mut_ptr();
-                ret = unsafe { inflate(&mut strm_wrap.0, Z_BLOCK) };
-
-                if ret == Z_MEM_ERROR {
-                    yield Err(anyhow!("Out of memory"));
-                    return;
-                }
-                if ret == Z_DATA_ERROR {
-                    yield Err(anyhow!("invalid compressed data"));
-                    return;
-                }
-
                 /* update length of uncompressed data */
-                len += CHUNK - strm_wrap.0.avail_out as usize;
+                len += strm_wrap.decompress_availble_data()?;
+
                 /* check for block boundary (only get this when block copied out) */
-                if strm_wrap.0.data_type & 128 > 0 {
+                if strm_wrap.is_block_boundary() {
                     /* if that was the last block, then done */
                     if last {
                         break;
                     }
                     /* number of unused bits in last byte */
-                    let mut pos = (strm_wrap.0.data_type & 7) as u8;
+                    let pos = strm_wrap.get_unused_bits();
                     /* find the next last-block bit */
                     if pos != 0 {
                         /* next last-block bit is in last used byte */
-                        pos = (0x100u16 >> pos) as u8;
-                        last = unsafe { *strm_wrap.0.next_in.wrapping_sub(1) } & pos > 0; //???????
-                        if last {
-                            unsafe {
-                                *strm_wrap.0.next_in.wrapping_sub(1) &= !pos;
-                            }
-                        }
+                        last = strm_wrap.clear_last_flag_with_unused_bits(pos);
                     } else {
                         /* next last-block bit is in next unused byte */
-                        if strm_wrap.0.avail_in == 0 {
+                        if !strm_wrap.can_read_more() {
                             /* don't have that byte yet -- get it */
-                            let buffer: &[u8] = unsafe {
-                                let start = input.buf.as_mut_ptr().wrapping_add(skip);
-                                skip = 0;
-                                slice::from_raw_parts(start, strm_wrap.0.next_in.offset_from(start).try_into()?)
-                            };
-                            yield Ok(buffer.to_vec().into());
+                            let buffer = input.copy_processed_buffer(&mut strm_wrap, true)?;
+                            yield Ok(buffer.into());
                             input.reset_and_pull(&mut strm_wrap).await?
                         }
-                        last = unsafe { *strm_wrap.0.next_in.wrapping_add(0) } & 1 > 0;
-                        if last {
-                            unsafe { *strm_wrap.0.next_in.wrapping_add(0) &= !1 };
-                        }
+                        last = strm_wrap.clear_last_flag();
                     }
                 } else {
-                    if strm_wrap.0.avail_in > 0 {
-                            let buffer: &[u8] = unsafe {
-                                let start = input.buf.as_mut_ptr().wrapping_add(skip);
-                                slice::from_raw_parts(start, (strm_wrap.0.next_in.offset_from(start) - 1).try_into()?)
-                            };
-                            skip += buffer.len();
-                            yield Ok(buffer.to_vec().into());
+                    if strm_wrap.can_read_more() {
+                        let buffer = input.copy_processed_buffer(&mut strm_wrap, false)?;
+                        yield Ok(buffer.into());
                     }
                 }
             }
 
             /* update buffer with unused input */
-            input.set_read_ptr(strm_wrap.0.next_in, strm_wrap.0.avail_in as usize);
+            input.set_read_ptr(strm_wrap.stream.next_in, strm_wrap.stream.avail_in as usize);
             /* copy used input, write empty blocks to get to byte boundary */
-            let pos = strm_wrap.0.data_type & 7;
-            let buffer: &[u8] = unsafe {
-                let start = input.buf.as_mut_ptr().wrapping_add(skip);
-                slice::from_raw_parts(start, (input.next().offset_from(start) - 1).try_into().unwrap_or(0))
-            };
-            yield Ok(buffer.to_vec().into());
+            let pos = strm_wrap.get_unused_bits();
+            let buffer = input.copy_processed_buffer(&mut strm_wrap, false)?;
+            yield Ok(buffer.into());
 
-            let mut last_byte = unsafe { *input.next().wrapping_sub(1) };
+            let mut last_byte = strm_wrap.get_last_byte(); //unsafe { *input.next().wrapping_sub(1) };
             if pos == 0 {
                 /* already at byte boundary, or last file: write last byte */
                 yield Ok(vec![last_byte].into());
@@ -424,7 +474,7 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
             let _ = input.get4().await?;
             tot += len as u32;
             /* clean up */
-            unsafe { inflateEnd(&mut strm_wrap.0) };
+            strm_wrap.cleanup();
         }
     }
 }
