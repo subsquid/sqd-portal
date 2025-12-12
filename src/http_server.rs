@@ -527,7 +527,7 @@ async fn get_blocknumber_by_timestamp(
             .into_response();
     };
 
-    let mut request = build_request(
+    let request = build_request(
         &config,
         req.header_value().to_str().unwrap_or(""),
         pquery,
@@ -535,8 +535,6 @@ async fn get_blocknumber_by_timestamp(
         dataset.default_name.clone(),
         Some(1),
     );
-
-    request.query.prepare_for_network();
 
     let stream = match task_manager.spawn_stream(request).await {
         Ok(stream) => stream,
