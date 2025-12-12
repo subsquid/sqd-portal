@@ -79,6 +79,9 @@ pub struct Config {
 
     #[serde(default)]
     pub skip_parent_hash_validation: bool,
+
+    #[serde(default)]
+    pub use_gzjoin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
