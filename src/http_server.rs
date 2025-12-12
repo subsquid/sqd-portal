@@ -11,6 +11,7 @@ use axum::{
     routing::{get, post},
     Extension, RequestExt, Router,
 };
+use futures::{pin_mut, StreamExt};
 use prometheus_client::registry::Registry;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
@@ -24,7 +25,8 @@ use tower_http::request_id::{
 use crate::datasets::DatasetConfig;
 use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
-use crate::utils::conversion::{json_lines_to_json, recompress_gzip};
+use crate::utils::conversion::{collect_to_string, json_lines_to_json, recompress_gzip};
+use crate::utils::internal_query::{build_blocknumber_query, find_block_in_chunk};
 use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
@@ -92,6 +94,10 @@ pub async fn run_server(
         .route(
             "/datasets/:dataset/metadata",
             get(get_dataset_metadata).endpoint("/metadata"),
+        )
+        .route(
+            "/datasets/:dataset/timestamps/:timestamp/block",
+            get(get_blocknumber_by_timestamp).endpoint("/timestamps/block"),
         )
         // Backward compatibility routes
         .route(
@@ -463,6 +469,83 @@ async fn get_dataset_metadata(
     axum::Json(AvailableDatasetApiResponse::new(metadata, first_block))
 }
 
+async fn get_blocknumber_by_timestamp(
+    Path((_, timestamp)): Path<(DatasetId, u64)>,
+    Extension(req): Extension<RequestId>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(config): Extension<Arc<Config>>,
+    dataset: DatasetConfig,
+) -> impl IntoResponse {
+    let ts = timestamp * 1000; // milliseconds
+    let dataset_id = dataset
+        .network_id
+        .expect("invalid dataset name should have been handled in request parser");
+
+    let Ok(chunk) = network.find_chunk_by_timestamp(&dataset_id, ts) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("No chunk found for timestamp"),
+        )
+            .into_response();
+    };
+
+    let Ok(pquery) = build_blocknumber_query(&dataset.kind, chunk.first_block, chunk.last_block)
+    else {
+        tracing::warn!("cannot build blocknumber query for {}", dataset_id);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Cannot build timestamp query for {dataset_id}"),
+        )
+            .into_response();
+    };
+
+    let request = build_request(
+        &config,
+        req.header_value().to_str().unwrap_or(""),
+        pquery,
+        dataset_id.clone(),
+        dataset.default_name.clone(),
+        Some(1),
+    );
+
+    let stream = match task_manager.spawn_stream(request).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::warn!("spawn stream error: {:?}", e);
+            return (StatusCode::BAD_GATEWAY, "SQD Network error").into_response();
+        }
+    };
+
+    pin_mut!(stream);
+
+    let js = collect_to_string(
+        stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result))),
+    )
+    .await;
+
+    if let Err(e) = js {
+        tracing::warn!("stream processing error: {:?}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("stream processing error"),
+        )
+            .into_response();
+    };
+
+    let js = js.unwrap();
+
+    let n = match find_block_in_chunk(timestamp, &js) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("cannot find blocknumber in chunk: {:?}", e);
+            return (StatusCode::NOT_FOUND, "block not in chunk").into_response();
+        }
+    };
+
+    format!("{n}").into_response()
+}
+
 async fn get_debug_block(
     Path((_dataset, block)): Path<(String, u64)>,
     dataset_id: DatasetId,
@@ -798,13 +881,31 @@ fn restrict_request(config: &Config, request: ClientRequest) -> ClientRequest {
         (None, Some(limit)) => Some(limit),
         (None, None) => None,
     };
-    ClientRequest {
-        query: request.query,
-        dataset_id: request.dataset_id,
-        dataset_name: request.dataset_name,
-        request_id: request.request_id,
-        buffer_size: request.buffer_size.min(config.max_buffer_size),
+    build_request(
+        &config,
+        &request.request_id,
+        request.query,
+        request.dataset_id,
+        request.dataset_name,
         max_chunks,
+    )
+}
+
+fn build_request(
+    config: &Config,
+    req_id: &str,
+    pq: ParsedQuery,
+    did: DatasetId,
+    dname: String,
+    max_chunks: Option<usize>,
+) -> ClientRequest {
+    ClientRequest {
+        query: pq,
+        dataset_id: did,
+        dataset_name: dname,
+        request_id: req_id.to_string(),
+        buffer_size: config.max_buffer_size,
+        max_chunks: max_chunks,
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
     }
