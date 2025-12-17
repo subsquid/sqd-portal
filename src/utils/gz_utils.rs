@@ -316,6 +316,9 @@ mod tests {
 
     type EmptyStream = stream::Iter<std::vec::IntoIter<Vec<u8>>>;
 
+    const GZIP_HEADER_LEN: usize = 10;
+    const STORED_BLOCK_OVERHEAD: usize = 5; // 1b header + LEN + NLEN
+
     fn holder_with_buffer(buf: Vec<u8>, offset: usize) -> GzStreamHolder<EmptyStream> {
         let stream = stream::iter(Vec::<Vec<u8>>::new());
         let mut holder = GzStreamHolder::new(stream);
@@ -438,5 +441,118 @@ mod tests {
 
         assert_eq!(holder.get_unused_bits(), 0b0000_0101);
         assert_eq!(holder.get_last_byte(), 0xBC);
+    }
+
+    fn stored_block_size(payload_len: usize) -> usize {
+        assert!(payload_len <= u16::MAX as usize);
+        STORED_BLOCK_OVERHEAD + payload_len
+    }
+
+    fn build_stored_block(data: &[u8], is_final: bool) -> Vec<u8> {
+        assert!(data.len() <= u16::MAX as usize);
+        let mut block = Vec::with_capacity(stored_block_size(data.len()));
+        block.push(if is_final { 0x01 } else { 0x00 });
+        let len = data.len() as u16;
+        block.extend_from_slice(&len.to_le_bytes());
+        block.extend_from_slice(&(!len).to_le_bytes());
+        block.extend_from_slice(data);
+        block
+    }
+
+    fn build_member_from_blocks(blocks: &[&[u8]]) -> Vec<u8> {
+        assert!(!blocks.is_empty());
+        let mut member = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
+        let mut crc = unsafe { libz_ng_sys::crc32(0, std::ptr::null(), 0) };
+        let mut total = 0u32;
+
+        for (idx, block) in blocks.iter().enumerate() {
+            let block_bytes = build_stored_block(block, idx == blocks.len() - 1);
+            member.extend_from_slice(&block_bytes);
+            total += block.len() as u32;
+            unsafe {
+                crc = libz_ng_sys::crc32(crc, block.as_ptr(), block.len() as u32);
+            }
+        }
+
+        member.extend_from_slice(&crc.to_le_bytes());
+        member.extend_from_slice(&total.to_le_bytes());
+        member
+    }
+
+    fn crc32_for_blocks(blocks: &[&[u8]]) -> u32 {
+        unsafe {
+            let mut crc = libz_ng_sys::crc32(0, std::ptr::null(), 0);
+            for block in blocks {
+                crc = libz_ng_sys::crc32(crc, block.as_ptr(), block.len() as u32);
+            }
+            crc
+        }
+    }
+
+    #[tokio::test]
+    async fn test_block_state_helpers_on_multi_block_members() {
+        let block_alpha: &[u8] = b"alpha-block-payload";
+        let block_beta: &[u8] = b"beta-block-data-that-continues";
+        let block_gamma: &[u8] = b"gamma-member-ending";
+
+        let first_member_blocks = [block_alpha, block_beta];
+        let second_member_blocks = [block_gamma];
+        let member_one = build_member_from_blocks(&first_member_blocks);
+        let member_two = build_member_from_blocks(&second_member_blocks);
+        let combined: Vec<u8> = member_one
+            .iter()
+            .chain(member_two.iter())
+            .copied()
+            .collect();
+
+        let first_chunk_len = GZIP_HEADER_LEN + stored_block_size(block_alpha.len());
+        let (chunk_a, chunk_b) = combined.split_at(first_chunk_len);
+        let stream = stream::iter(vec![chunk_a.to_vec(), chunk_b.to_vec()]);
+        let mut holder = GzStreamHolder::new(stream);
+
+        holder.gzhead().await.unwrap();
+        holder.init().unwrap();
+        holder.zpull().await.unwrap();
+
+        let produced_alpha = holder.decompress_availble_data().unwrap();
+        assert_eq!(produced_alpha, block_alpha.len());
+        assert!(holder.is_block_boundary());
+        assert_eq!(holder.get_unused_bits(), 0);
+        assert!(holder.can_write_more());
+        assert!(!holder.can_read_more());
+
+        holder.reset_and_pull().await.unwrap();
+
+        let produced_beta = holder.decompress_availble_data().unwrap();
+        assert_eq!(produced_beta, block_beta.len());
+        assert!(holder.is_block_boundary());
+        assert_eq!(holder.get_unused_bits(), 0);
+        assert!(holder.can_write_more());
+        assert!(holder.can_read_more());
+
+        holder.set_read_ptr();
+        let crc_first = holder.get4().await.unwrap();
+        let len_first = holder.get4().await.unwrap();
+        assert_eq!(crc_first, crc32_for_blocks(&first_member_blocks));
+        assert_eq!(len_first as usize, block_alpha.len() + block_beta.len());
+        holder.cleanup();
+
+        holder.gzhead().await.unwrap();
+        holder.init().unwrap();
+        holder.zpull().await.unwrap();
+
+        let produced_gamma = holder.decompress_availble_data().unwrap();
+        assert_eq!(produced_gamma, block_gamma.len());
+        assert!(holder.is_block_boundary());
+        assert_eq!(holder.get_unused_bits(), 0);
+        assert!(holder.can_write_more());
+        assert!(holder.can_read_more());
+
+        holder.set_read_ptr();
+        let crc_second = holder.get4().await.unwrap();
+        let len_second = holder.get4().await.unwrap();
+        assert_eq!(crc_second, crc32_for_blocks(&second_member_blocks));
+        assert_eq!(len_second as usize, block_gamma.len());
+        holder.cleanup();
     }
 }
