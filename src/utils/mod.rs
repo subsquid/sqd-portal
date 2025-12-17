@@ -1,4 +1,5 @@
 pub mod conversion;
+mod gz_utils;
 pub mod logging;
 mod measuring_mutex;
 mod measuring_rwlock;
@@ -6,7 +7,6 @@ mod measuring_rwlock;
 mod once;
 mod sliding_array;
 mod string_pool;
-mod gz_utils;
 
 pub use measuring_mutex::MeasuringMutex as Mutex;
 pub use measuring_rwlock::MeasuringRwLock as RwLock;

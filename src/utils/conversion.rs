@@ -113,11 +113,9 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
                         }
                         last = input.clear_last_flag();
                     }
-                } else {
-                    if input.can_read_more() {
-                        let buffer = input.copy_processed_buffer(false)?;
-                        yield Ok(buffer.into());
-                    }
+                } else if input.can_read_more() {
+                    let buffer = input.copy_processed_buffer(false)?;
+                    yield Ok(buffer.into());
                 }
             }
 
@@ -173,18 +171,17 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
     use futures::{future::join_all, lock::Mutex};
+    use std::{sync::Arc, time::Duration};
 
     use flate2::bufread::GzDecoder;
+    use rand::rngs::StdRng;
     use rand::RngCore;
+    use rand::SeedableRng;
     use std::io::Read;
     use tokio::{io::AsyncBufReadExt, time::sleep};
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
 
     // use core::slice::SlicePattern;
-    
 
     use super::*;
 
@@ -233,19 +230,28 @@ mod tests {
         let gt = testcase.concat();
         let len_test = testcase.len();
         assert!(len_test > 3);
-        let stream = join_gzip_default(Box::pin(generate_data(testcase[..len_test / 2].to_vec(), 100_000)));
+        let stream = join_gzip_default(Box::pin(generate_data(
+            testcase[..len_test / 2].to_vec(),
+            100_000,
+        )));
         pin_mut!(stream);
         let mut part_a = Vec::default();
         while let Some(Ok(data)) = stream.next().await {
             part_a.extend(data);
         }
-        let stream = join_gzip_default(Box::pin(generate_data(testcase[len_test / 2..].to_vec(), 100_000)));
+        let stream = join_gzip_default(Box::pin(generate_data(
+            testcase[len_test / 2..].to_vec(),
+            100_000,
+        )));
         pin_mut!(stream);
         let mut part_b = Vec::default();
         while let Some(Ok(data)) = stream.next().await {
             part_b.extend(data);
         }
-        let stream = join_gzip_default(Box::pin(stream_data([part_a, part_b].to_vec(), final_fragmentation)));
+        let stream = join_gzip_default(Box::pin(stream_data(
+            [part_a, part_b].to_vec(),
+            final_fragmentation,
+        )));
         pin_mut!(stream);
         let reader = StreamReader::new(
             stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result.unwrap()))),
@@ -260,13 +266,15 @@ mod tests {
     async fn test_forced_async() {
         let input = vec![vec![1u8, 2], vec![3, 4]];
         let gt = input.concat();
-        let stream = Arc::new(Mutex::new(Box::pin(join_gzip_default(Box::pin(generate_data(input, 10))))));
+        let stream = Arc::new(Mutex::new(Box::pin(join_gzip_default(Box::pin(
+            generate_data(input, 10),
+        )))));
         let vec = Arc::new(Mutex::new(Vec::<u8>::default()));
-        
+
         let mut futures = Vec::new();
         for _ in 0..10 {
             let local_stream = Arc::clone(&stream);
-            let local_vec =  Arc::clone(&vec);
+            let local_vec = Arc::clone(&vec);
             let future = tokio::spawn(async move {
                 let millis;
                 {
@@ -278,8 +286,8 @@ mod tests {
                 match locked_stream.next().await {
                     Some(Ok(result)) => {
                         local_vec.lock().await.extend(result);
-                    },
-                    _ => {},
+                    }
+                    _ => {}
                 };
             });
             futures.push(future);
@@ -305,13 +313,15 @@ mod tests {
             })
             .collect::<Vec<Vec<u8>>>();
         let gt = input.concat();
-        let stream = Arc::new(Mutex::new(Box::pin(join_gzip_default(Box::pin(generate_data(input, 10))))));
+        let stream = Arc::new(Mutex::new(Box::pin(join_gzip_default(Box::pin(
+            generate_data(input, 10),
+        )))));
         let vec = Arc::new(Mutex::new(Vec::<u8>::default()));
-        
+
         let mut futures = Vec::new();
         for _ in 0..100 {
             let local_stream = Arc::clone(&stream);
-            let local_vec =  Arc::clone(&vec);
+            let local_vec = Arc::clone(&vec);
             let future = tokio::spawn(async move {
                 let millis;
                 {
@@ -323,8 +333,8 @@ mod tests {
                 match locked_stream.next().await {
                     Some(Ok(result)) => {
                         local_vec.lock().await.extend(result);
-                    },
-                    _ => {},
+                    }
+                    _ => {}
                 };
             });
             futures.push(future);
@@ -346,13 +356,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_hierarchical_smoke() {
-        let input = vec![vec![1u8, 2], vec![3, 4], vec![5, 6], vec![7, 8],];
+        let input = vec![vec![1u8, 2], vec![3, 4], vec![5, 6], vec![7, 8]];
         hierarchical_join_unpack(input, 10_000).await;
     }
 
     #[tokio::test]
     async fn test_hierarchical_exact_block_boundary() {
-        let input = vec![vec![1u8, 2, 1, 1, 1, 1, 1, 1, 1, 1], vec![3, 4], vec![5, 6], vec![7, 8],];
+        let input = vec![
+            vec![1u8, 2, 1, 1, 1, 1, 1, 1, 1, 1],
+            vec![3, 4],
+            vec![5, 6],
+            vec![7, 8],
+        ];
         hierarchical_join_unpack(input, 17).await;
     }
 

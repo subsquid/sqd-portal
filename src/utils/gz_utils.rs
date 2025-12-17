@@ -1,9 +1,9 @@
 use anyhow::anyhow;
 use futures::Stream;
-use libz_ng_sys::{Z_BLOCK, Z_DATA_ERROR, Z_MEM_ERROR, Z_OK, inflate, inflateEnd, inflateInit2_, z_stream};
+use libz_ng_sys::{
+    inflate, inflateEnd, inflateInit2_, z_stream, Z_BLOCK, Z_DATA_ERROR, Z_MEM_ERROR, Z_OK,
+};
 use tokio_stream::StreamExt;
-
-
 
 mod allocator {
     use libz_ng_sys::uInt;
@@ -71,7 +71,7 @@ pub struct GzStreamHolder<S: Stream<Item = Vec<u8>> + Unpin> {
     next: usize,
     buf: Vec<u8>,
     skip: usize,
-    zstream: Box::<z_stream>,
+    zstream: Box<z_stream>,
     chunk_size: usize,
     junk: Box<[u8]>,
 }
@@ -79,7 +79,10 @@ pub struct GzStreamHolder<S: Stream<Item = Vec<u8>> + Unpin> {
 impl<S: Stream<Item = Vec<u8>> + Unpin> GzStreamHolder<S> {
     pub fn new(stream: S, chunk_size: usize) -> Self {
         assert!(chunk_size > 0, "chunk size must be positive");
-        assert!(chunk_size <= u32::MAX as usize, "chunk size must fit into u32 for zlib");
+        assert!(
+            chunk_size <= u32::MAX as usize,
+            "chunk size must fit into u32 for zlib"
+        );
         let zstream = Box::new(z_stream {
             next_in: std::ptr::null_mut(),
             avail_in: 0,
@@ -223,7 +226,10 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> GzStreamHolder<S> {
         Ok(())
     }
 
-    pub fn copy_processed_buffer(&mut self, include_next_byte: bool) -> Result<Vec<u8>, anyhow::Error> {
+    pub fn copy_processed_buffer(
+        &mut self,
+        include_next_byte: bool,
+    ) -> Result<Vec<u8>, anyhow::Error> {
         let mut offset = unsafe { self.zstream.next_in.offset_from(self.buf.as_ptr()) };
         if !include_next_byte {
             offset -= 1;
@@ -277,7 +283,9 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> GzStreamHolder<S> {
     pub fn clear_last_flag(&self) -> bool {
         let last = unsafe { *self.zstream.next_in.wrapping_add(0) } & 1 > 0;
         if last {
-            unsafe { *self.zstream.next_in.wrapping_add(0) &= !1; };
+            unsafe {
+                *self.zstream.next_in.wrapping_add(0) &= !1;
+            };
         }
         last
     }
@@ -286,7 +294,9 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> GzStreamHolder<S> {
         let pos = (0x100u16 >> pos) as u8;
         let last = unsafe { *self.zstream.next_in.wrapping_sub(1) } & pos > 0;
         if last {
-            unsafe { *self.zstream.next_in.wrapping_sub(1) &= !pos; };
+            unsafe {
+                *self.zstream.next_in.wrapping_sub(1) &= !pos;
+            };
         };
         last
     }
@@ -309,8 +319,8 @@ unsafe impl<S: Stream<Item = Vec<u8>> + Unpin> Send for GzStreamHolder<S> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::write::GzEncoder;
     use flate2::write::DeflateEncoder;
+    use flate2::write::GzEncoder;
     use flate2::Compression;
     use futures::stream;
     use std::io::Write;
@@ -325,7 +335,10 @@ mod tests {
     fn holder_with_buffer(buf: Vec<u8>, offset: usize) -> GzStreamHolder<EmptyStream> {
         let stream = stream::iter(Vec::<Vec<u8>>::new());
         let mut holder = GzStreamHolder::new(stream, TEST_CHUNK_SIZE);
-        assert!(offset <= buf.len(), "offset must point inside or one past buffer");
+        assert!(
+            offset <= buf.len(),
+            "offset must point inside or one past buffer"
+        );
         holder.buf = buf;
         unsafe {
             holder.zstream.next_in = holder.buf.as_mut_ptr().add(offset);
@@ -590,8 +603,12 @@ mod tests {
         assert!(holder.can_read_more(), "expected more than one gzip block");
 
         let start = holder.skip;
-        let next_in_offset = unsafe { holder.zstream.next_in.offset_from(holder.buf.as_ptr()) } as usize;
-        assert!(next_in_offset > start + 1, "inflate consumed too few bytes for assertion");
+        let next_in_offset =
+            unsafe { holder.zstream.next_in.offset_from(holder.buf.as_ptr()) } as usize;
+        assert!(
+            next_in_offset > start + 1,
+            "inflate consumed too few bytes for assertion"
+        );
 
         let expected = holder.buf[start..next_in_offset - 1].to_vec();
         let extracted = holder.copy_processed_buffer(false).unwrap();
@@ -630,7 +647,8 @@ mod tests {
         }
 
         let start = holder.skip;
-        let next_in_offset = unsafe { holder.zstream.next_in.offset_from(holder.buf.as_ptr()) } as usize;
+        let next_in_offset =
+            unsafe { holder.zstream.next_in.offset_from(holder.buf.as_ptr()) } as usize;
         assert_eq!(next_in_offset, first.len());
         let expected = holder.buf[start..next_in_offset].to_vec();
 
