@@ -304,3 +304,90 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> GzStreamHolder<S> {
 }
 
 unsafe impl<S: Stream<Item = Vec<u8>> + Unpin> Send for GzStreamHolder<S> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use futures::stream;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn test_gzhead_basic() {
+        let data = b"hello world";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let stream = stream::iter(vec![compressed]);
+        let mut holder = GzStreamHolder::new(stream);
+        let skip = holder.gzhead().await.unwrap();
+        assert_eq!(skip, 10);
+    }
+
+    #[tokio::test]
+    async fn test_gzhead_with_filename() {
+        let data = b"hello";
+        let mut deflate_encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        deflate_encoder.write_all(data).unwrap();
+        let deflated = deflate_encoder.finish().unwrap();
+        let mut compressed = vec![0x1f, 0x8b, 0x08, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
+        compressed.extend_from_slice(b"file");
+        compressed.push(0);
+        compressed.extend_from_slice(&deflated);
+        let stream = stream::iter(vec![compressed]);
+        let mut holder = GzStreamHolder::new(stream);
+        let skip = holder.gzhead().await.unwrap();
+        assert_eq!(skip, 15);
+    }
+
+    #[tokio::test]
+    async fn test_gzhead_invalid_magic() {
+        let compressed = vec![0x1f, 0x8c, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
+        let stream = stream::iter(vec![compressed]);
+        let mut holder = GzStreamHolder::new(stream);
+        let res = holder.gzhead().await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_gzhead_reserved_flags() {
+        let compressed = vec![0x1f, 0x8b, 0x08, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
+        let stream = stream::iter(vec![compressed]);
+        let mut holder = GzStreamHolder::new(stream);
+        let res = holder.gzhead().await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_decompress_length() {
+        let data = b"hello world";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let stream = stream::iter(vec![compressed]);
+        let mut holder = GzStreamHolder::new(stream);
+        holder.gzhead().await.unwrap();
+        holder.init().unwrap();
+        holder.zpull().await.unwrap();
+        let len = holder.decompress_availble_data().unwrap();
+        assert_eq!(len, data.len());
+    }
+
+    #[tokio::test]
+    async fn test_decompress_length_large() {
+        let data = vec![b'a'; 200];
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&data).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let stream = stream::iter(vec![compressed]);
+        let mut holder = GzStreamHolder::new(stream);
+        holder.gzhead().await.unwrap();
+        holder.init().unwrap();
+        holder.zpull().await.unwrap();
+        let len = holder.decompress_availble_data().unwrap();
+        // Since data is 200, and CHUNK=128, first decompress gives 128
+        assert_eq!(len, 128);
+    }
+}
