@@ -13,6 +13,8 @@ use tokio_util::{
 
 use crate::utils::gz_utils::GzStreamHolder;
 
+const JOIN_GZIP_CHUNK_SIZE: usize = 32 * 1024;
+
 #[allow(unstable_name_collisions)]
 pub fn json_lines_to_json(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     use std::io::{Read, Write};
@@ -54,7 +56,7 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
         let buf = hex!("1f8b08000000000000ff");
         yield Ok(buf.to_vec().into());
         pin_mut!(data);
-        let mut input = GzStreamHolder::new(data);
+        let mut input = GzStreamHolder::new(data, JOIN_GZIP_CHUNK_SIZE);
 
         loop {
             let _ = match input.gzhead().await {

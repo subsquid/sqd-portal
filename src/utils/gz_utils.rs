@@ -3,9 +3,6 @@ use futures::Stream;
 use libz_ng_sys::{Z_BLOCK, Z_DATA_ERROR, Z_MEM_ERROR, Z_OK, inflate, inflateEnd, inflateInit2_, z_stream};
 use tokio_stream::StreamExt;
 
-// const CHUNK: usize = 32768;
-const CHUNK: usize = 128;
-
 
 
 mod allocator {
@@ -75,11 +72,14 @@ pub struct GzStreamHolder<S: Stream<Item = Vec<u8>> + Unpin> {
     buf: Vec<u8>,
     skip: usize,
     zstream: Box::<z_stream>,
-    junk: Box<[u8; CHUNK]>,
+    chunk_size: usize,
+    junk: Box<[u8]>,
 }
 
 impl<S: Stream<Item = Vec<u8>> + Unpin> GzStreamHolder<S> {
-    pub fn new(stream: S) -> Self {
+    pub fn new(stream: S, chunk_size: usize) -> Self {
+        assert!(chunk_size > 0, "chunk size must be positive");
+        assert!(chunk_size <= u32::MAX as usize, "chunk size must fit into u32 for zlib");
         let zstream = Box::new(z_stream {
             next_in: std::ptr::null_mut(),
             avail_in: 0,
@@ -104,7 +104,8 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> GzStreamHolder<S> {
             buf: Default::default(),
             skip: 0,
             zstream,
-            junk: vec![0u8; CHUNK].try_into().unwrap(),
+            chunk_size,
+            junk: vec![0u8; chunk_size].into_boxed_slice(),
         }
     }
 
@@ -247,7 +248,7 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> GzStreamHolder<S> {
     }
 
     pub fn decompress_availble_data(&mut self) -> Result<usize, anyhow::Error> {
-        self.zstream.avail_out = CHUNK as u32;
+        self.zstream.avail_out = self.chunk_size as u32;
         self.zstream.next_out = self.junk.as_mut_ptr();
         let ret = unsafe { inflate(&mut *self.zstream, Z_BLOCK) };
 
@@ -258,7 +259,7 @@ impl<S: Stream<Item = Vec<u8>> + Unpin> GzStreamHolder<S> {
             return Err(anyhow!("invalid compressed data"));
         }
 
-        Ok(CHUNK - self.zstream.avail_out as usize)
+        Ok(self.chunk_size - self.zstream.avail_out as usize)
     }
 
     pub fn can_read_more(&self) -> bool {
@@ -318,11 +319,12 @@ mod tests {
 
     const GZIP_HEADER_LEN: usize = 10;
     const STORED_BLOCK_OVERHEAD: usize = 5; // 1b header + LEN + NLEN
+    const TEST_CHUNK_SIZE: usize = 128;
     const MULTI_BLOCK_SAMPLE_LEN: usize = 70_000;
 
     fn holder_with_buffer(buf: Vec<u8>, offset: usize) -> GzStreamHolder<EmptyStream> {
         let stream = stream::iter(Vec::<Vec<u8>>::new());
-        let mut holder = GzStreamHolder::new(stream);
+        let mut holder = GzStreamHolder::new(stream, TEST_CHUNK_SIZE);
         assert!(offset <= buf.len(), "offset must point inside or one past buffer");
         holder.buf = buf;
         unsafe {
@@ -338,7 +340,7 @@ mod tests {
         encoder.write_all(data).unwrap();
         let compressed = encoder.finish().unwrap();
         let stream = stream::iter(vec![compressed]);
-        let mut holder = GzStreamHolder::new(stream);
+        let mut holder = GzStreamHolder::new(stream, TEST_CHUNK_SIZE);
         let skip = holder.gzhead().await.unwrap();
         assert_eq!(skip, 10);
     }
@@ -354,7 +356,7 @@ mod tests {
         compressed.push(0);
         compressed.extend_from_slice(&deflated);
         let stream = stream::iter(vec![compressed]);
-        let mut holder = GzStreamHolder::new(stream);
+        let mut holder = GzStreamHolder::new(stream, TEST_CHUNK_SIZE);
         let skip = holder.gzhead().await.unwrap();
         assert_eq!(skip, 15);
     }
@@ -363,7 +365,7 @@ mod tests {
     async fn test_gzhead_invalid_magic() {
         let compressed = vec![0x1f, 0x8c, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
         let stream = stream::iter(vec![compressed]);
-        let mut holder = GzStreamHolder::new(stream);
+        let mut holder = GzStreamHolder::new(stream, TEST_CHUNK_SIZE);
         let res = holder.gzhead().await;
         assert!(res.is_err());
     }
@@ -372,7 +374,7 @@ mod tests {
     async fn test_gzhead_reserved_flags() {
         let compressed = vec![0x1f, 0x8b, 0x08, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
         let stream = stream::iter(vec![compressed]);
-        let mut holder = GzStreamHolder::new(stream);
+        let mut holder = GzStreamHolder::new(stream, TEST_CHUNK_SIZE);
         let res = holder.gzhead().await;
         assert!(res.is_err());
     }
@@ -384,7 +386,7 @@ mod tests {
         encoder.write_all(data).unwrap();
         let compressed = encoder.finish().unwrap();
         let stream = stream::iter(vec![compressed]);
-        let mut holder = GzStreamHolder::new(stream);
+        let mut holder = GzStreamHolder::new(stream, TEST_CHUNK_SIZE);
         holder.gzhead().await.unwrap();
         holder.init().unwrap();
         holder.zpull().await.unwrap();
@@ -399,12 +401,12 @@ mod tests {
         encoder.write_all(&data).unwrap();
         let compressed = encoder.finish().unwrap();
         let stream = stream::iter(vec![compressed]);
-        let mut holder = GzStreamHolder::new(stream);
+        let mut holder = GzStreamHolder::new(stream, TEST_CHUNK_SIZE);
         holder.gzhead().await.unwrap();
         holder.init().unwrap();
         holder.zpull().await.unwrap();
         let len = holder.decompress_availble_data().unwrap();
-        // Since data is 200, and CHUNK=128, first decompress gives 128
+        // Since data is 200, and TEST_CHUNK_SIZE=128, first decompress gives 128
         assert_eq!(len, 128);
     }
 
@@ -516,7 +518,7 @@ mod tests {
         let first_chunk_len = GZIP_HEADER_LEN + stored_block_size(block_alpha.len());
         let (chunk_a, chunk_b) = combined.split_at(first_chunk_len);
         let stream = stream::iter(vec![chunk_a.to_vec(), chunk_b.to_vec()]);
-        let mut holder = GzStreamHolder::new(stream);
+        let mut holder = GzStreamHolder::new(stream, TEST_CHUNK_SIZE);
 
         holder.gzhead().await.unwrap();
         holder.init().unwrap();
@@ -568,7 +570,7 @@ mod tests {
     async fn test_copy_processed_buffer_excludes_next_byte_at_block_boundary() {
         let compressed = gzip_multiblock_member(MULTI_BLOCK_SAMPLE_LEN);
         let stream = stream::iter(vec![compressed.clone()]);
-        let mut holder = GzStreamHolder::new(stream);
+        let mut holder = GzStreamHolder::new(stream, TEST_CHUNK_SIZE);
 
         holder.gzhead().await.unwrap();
         holder.init().unwrap();
@@ -610,7 +612,7 @@ mod tests {
         let first = compressed[..split_at].to_vec();
         let second = compressed[split_at..].to_vec();
         let stream = stream::iter(vec![first.clone(), second]);
-        let mut holder = GzStreamHolder::new(stream);
+        let mut holder = GzStreamHolder::new(stream, TEST_CHUNK_SIZE);
 
         holder.gzhead().await.unwrap();
         holder.init().unwrap();
