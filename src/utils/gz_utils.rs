@@ -314,6 +314,19 @@ mod tests {
     use futures::stream;
     use std::io::Write;
 
+    type EmptyStream = stream::Iter<std::vec::IntoIter<Vec<u8>>>;
+
+    fn holder_with_buffer(buf: Vec<u8>, offset: usize) -> GzStreamHolder<EmptyStream> {
+        let stream = stream::iter(Vec::<Vec<u8>>::new());
+        let mut holder = GzStreamHolder::new(stream);
+        assert!(offset <= buf.len(), "offset must point inside or one past buffer");
+        holder.buf = buf;
+        unsafe {
+            holder.zstream.next_in = holder.buf.as_mut_ptr().add(offset);
+        }
+        holder
+    }
+
     #[tokio::test]
     async fn test_gzhead_basic() {
         let data = b"hello world";
@@ -389,5 +402,41 @@ mod tests {
         let len = holder.decompress_availble_data().unwrap();
         // Since data is 200, and CHUNK=128, first decompress gives 128
         assert_eq!(len, 128);
+    }
+
+    #[test]
+    fn test_clear_last_flag_clears_bfinal_bit() {
+        let holder = holder_with_buffer(vec![0b0000_0001, 0u8], 0);
+        let had_last_flag = holder.clear_last_flag();
+        assert!(had_last_flag);
+        assert_eq!(holder.buf[0] & 1, 0);
+
+        // second call sees the bit already cleared and should report false
+        assert!(!holder.clear_last_flag());
+    }
+
+    #[test]
+    fn test_clear_last_flag_with_unused_bits_masks_previous_byte() {
+        let holder = holder_with_buffer(vec![0b1001_0000, 0b0000_0000], 1);
+
+        // pos=1 -> mask 0b1000_0000, clearing the highest bit in the previous byte
+        assert!(holder.clear_last_flag_with_unused_bits(1));
+        assert_eq!(holder.buf[0], 0b0001_0000);
+
+        // pos=4 -> mask 0b0001_0000, clearing the lower nibble flag
+        assert!(holder.clear_last_flag_with_unused_bits(4));
+        assert_eq!(holder.buf[0], 0);
+
+        // Once both bits are cleared, subsequent calls should return false
+        assert!(!holder.clear_last_flag_with_unused_bits(4));
+    }
+
+    #[test]
+    fn test_bit_introspection_helpers() {
+        let mut holder = holder_with_buffer(vec![0xAA, 0xBC, 0xDE], 2);
+        holder.zstream.data_type = 0b1010_0101;
+
+        assert_eq!(holder.get_unused_bits(), 0b0000_0101);
+        assert_eq!(holder.get_last_byte(), 0xBC);
     }
 }
