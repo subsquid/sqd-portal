@@ -47,8 +47,15 @@ where
     ReaderStream::new(encoder)
 }
 
+pub fn join_gzip_default<S: Stream<Item = Vec<u8>>>(
+    data: S,
+) -> impl Stream<Item = Result<Bytes, anyhow::Error>> {
+    join_gzip(data, JOIN_GZIP_CHUNK_SIZE)
+}
+
 pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
     data: S,
+    gzip_chunk_size: usize,
 ) -> impl Stream<Item = Result<Bytes, anyhow::Error>> {
     stream! {
         let mut crc = unsafe { libz_ng_sys::crc32(0, std::ptr::null(), 0) };
@@ -56,7 +63,7 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
         let buf = hex!("1f8b08000000000000ff");
         yield Ok(buf.to_vec().into());
         pin_mut!(data);
-        let mut input = GzStreamHolder::new(data, JOIN_GZIP_CHUNK_SIZE);
+        let mut input = GzStreamHolder::new(data, gzip_chunk_size);
 
         loop {
             let _ = match input.gzhead().await {
@@ -209,9 +216,9 @@ mod tests {
         }
     }
 
-    async fn pack_join_unpack(testcase: Vec<Vec<u8>>) {
+    async fn pack_join_unpack(testcase: Vec<Vec<u8>>, chunk_size: usize) {
         let gt = testcase.concat();
-        let stream = join_gzip(Box::pin(generate_data(testcase, 100_000)));
+        let stream = join_gzip(Box::pin(generate_data(testcase, 100_000)), chunk_size);
         pin_mut!(stream);
         let reader = StreamReader::new(
             stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result.unwrap()))),
@@ -226,19 +233,19 @@ mod tests {
         let gt = testcase.concat();
         let len_test = testcase.len();
         assert!(len_test > 3);
-        let stream = join_gzip(Box::pin(generate_data(testcase[..len_test / 2].to_vec(), 100_000)));
+        let stream = join_gzip_default(Box::pin(generate_data(testcase[..len_test / 2].to_vec(), 100_000)));
         pin_mut!(stream);
         let mut part_a = Vec::default();
         while let Some(Ok(data)) = stream.next().await {
             part_a.extend(data);
         }
-        let stream = join_gzip(Box::pin(generate_data(testcase[len_test / 2..].to_vec(), 100_000)));
+        let stream = join_gzip_default(Box::pin(generate_data(testcase[len_test / 2..].to_vec(), 100_000)));
         pin_mut!(stream);
         let mut part_b = Vec::default();
         while let Some(Ok(data)) = stream.next().await {
             part_b.extend(data);
         }
-        let stream = join_gzip(Box::pin(stream_data([part_a, part_b].to_vec(), final_fragmentation)));
+        let stream = join_gzip_default(Box::pin(stream_data([part_a, part_b].to_vec(), final_fragmentation)));
         pin_mut!(stream);
         let reader = StreamReader::new(
             stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result.unwrap()))),
@@ -253,7 +260,7 @@ mod tests {
     async fn test_forced_async() {
         let input = vec![vec![1u8, 2], vec![3, 4]];
         let gt = input.concat();
-        let stream = Arc::new(Mutex::new(Box::pin(join_gzip(Box::pin(generate_data(input, 10))))));
+        let stream = Arc::new(Mutex::new(Box::pin(join_gzip_default(Box::pin(generate_data(input, 10))))));
         let vec = Arc::new(Mutex::new(Vec::<u8>::default()));
         
         let mut futures = Vec::new();
@@ -298,7 +305,7 @@ mod tests {
             })
             .collect::<Vec<Vec<u8>>>();
         let gt = input.concat();
-        let stream = Arc::new(Mutex::new(Box::pin(join_gzip(Box::pin(generate_data(input, 10))))));
+        let stream = Arc::new(Mutex::new(Box::pin(join_gzip_default(Box::pin(generate_data(input, 10))))));
         let vec = Arc::new(Mutex::new(Vec::<u8>::default()));
         
         let mut futures = Vec::new();
@@ -334,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn test_smoke() {
         let input = vec![vec![1u8, 2], vec![3, 4]];
-        pack_join_unpack(input).await;
+        pack_join_unpack(input, JOIN_GZIP_CHUNK_SIZE).await;
     }
 
     #[tokio::test]
@@ -352,7 +359,13 @@ mod tests {
     #[tokio::test]
     async fn test_const() {
         let input = vec![vec![1u8; 100_000], vec![3; 100_000]];
-        pack_join_unpack(input).await;
+        pack_join_unpack(input, JOIN_GZIP_CHUNK_SIZE).await;
+    }
+
+    #[tokio::test]
+    async fn test_const_small_chunk() {
+        let input = vec![vec![1u8; 100_000], vec![3; 100_000]];
+        pack_join_unpack(input, 128).await;
     }
 
     #[tokio::test]
@@ -366,7 +379,7 @@ mod tests {
                 data.to_vec()
             })
             .collect();
-        pack_join_unpack(input).await;
+        pack_join_unpack(input, JOIN_GZIP_CHUNK_SIZE).await;
     }
 
     #[tokio::test]
@@ -380,13 +393,13 @@ mod tests {
                 data.to_vec()
             })
             .collect();
-        pack_join_unpack(input).await;
+        pack_join_unpack(input, JOIN_GZIP_CHUNK_SIZE).await;
     }
 
     proptest_async::proptest! {
         #[test]
         async fn random_join(input in proptest::collection::vec(proptest::collection::vec(0..255u8, 10000..40000), 1..5)) {
-            pack_join_unpack(input).await;
+            pack_join_unpack(input, JOIN_GZIP_CHUNK_SIZE).await;
         }
     }
 }

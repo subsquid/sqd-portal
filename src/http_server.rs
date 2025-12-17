@@ -24,7 +24,7 @@ use tower_http::request_id::{
 use crate::datasets::DatasetConfig;
 use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
-use crate::utils::conversion::{join_gzip, json_lines_to_json, recompress_gzip};
+use crate::utils::conversion::{join_gzip_default, json_lines_to_json, recompress_gzip};
 use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
@@ -270,7 +270,7 @@ async fn run_archival_stream(
             if config.use_gzjoin {
                 res.header(header::CONTENT_TYPE, "application/jsonl")
                     .header(header::CONTENT_ENCODING, "gzip")
-                    .body(Body::from_stream(join_gzip(stream)))
+                    .body(Body::from_stream(join_gzip_default(stream)))
                     .unwrap()
             } else {
                 res.header(header::CONTENT_TYPE, "application/jsonl")
@@ -377,7 +377,7 @@ async fn run_stream_internal(
             if config.use_gzjoin {
                 res.header(header::CONTENT_TYPE, "application/jsonl")
                     .header(header::CONTENT_ENCODING, "gzip")
-                    .body(Body::from_stream(join_gzip(stream)))
+                    .body(Body::from_stream(join_gzip_default(stream)))
                     .unwrap()
             } else {
                 res.header(header::CONTENT_TYPE, "application/jsonl")
