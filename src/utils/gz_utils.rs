@@ -318,6 +318,7 @@ mod tests {
 
     const GZIP_HEADER_LEN: usize = 10;
     const STORED_BLOCK_OVERHEAD: usize = 5; // 1b header + LEN + NLEN
+    const MULTI_BLOCK_SAMPLE_LEN: usize = 70_000;
 
     fn holder_with_buffer(buf: Vec<u8>, offset: usize) -> GzStreamHolder<EmptyStream> {
         let stream = stream::iter(Vec::<Vec<u8>>::new());
@@ -489,6 +490,13 @@ mod tests {
         }
     }
 
+    fn gzip_multiblock_member(len: usize) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
+        let payload: Vec<u8> = (0..len).map(|idx| (idx % 251) as u8).collect();
+        encoder.write_all(&payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
     #[tokio::test]
     async fn test_block_state_helpers_on_multi_block_members() {
         let block_alpha: &[u8] = b"alpha-block-payload";
@@ -553,6 +561,86 @@ mod tests {
         let len_second = holder.get4().await.unwrap();
         assert_eq!(crc_second, crc32_for_blocks(&second_member_blocks));
         assert_eq!(len_second as usize, block_gamma.len());
+        holder.cleanup();
+    }
+
+    #[tokio::test]
+    async fn test_copy_processed_buffer_excludes_next_byte_at_block_boundary() {
+        let compressed = gzip_multiblock_member(MULTI_BLOCK_SAMPLE_LEN);
+        let stream = stream::iter(vec![compressed.clone()]);
+        let mut holder = GzStreamHolder::new(stream);
+
+        holder.gzhead().await.unwrap();
+        holder.init().unwrap();
+        holder.zpull().await.unwrap();
+        let _ = holder.clear_last_flag();
+
+        let mut guard = 0usize;
+        loop {
+            holder.decompress_availble_data().unwrap();
+            guard += 1;
+            assert!(guard < 1024, "inflate failed to reach block boundary");
+            if holder.is_block_boundary() {
+                break;
+            }
+        }
+
+        assert!(holder.can_read_more(), "expected more than one gzip block");
+
+        let start = holder.skip;
+        let next_in_offset = unsafe { holder.zstream.next_in.offset_from(holder.buf.as_ptr()) } as usize;
+        assert!(next_in_offset > start + 1, "inflate consumed too few bytes for assertion");
+
+        let expected = holder.buf[start..next_in_offset - 1].to_vec();
+        let extracted = holder.copy_processed_buffer(false).unwrap();
+        assert_eq!(extracted, expected);
+        assert_eq!(holder.skip, next_in_offset - 1);
+
+        // without additional progress nothing new should be returned
+        assert!(holder.copy_processed_buffer(false).unwrap().is_empty());
+
+        holder.cleanup();
+    }
+
+    #[tokio::test]
+    async fn test_copy_processed_buffer_includes_next_byte_when_fragment_is_exhausted() {
+        let compressed = gzip_multiblock_member(MULTI_BLOCK_SAMPLE_LEN);
+        let split_at = GZIP_HEADER_LEN + 256;
+        assert!(split_at < compressed.len() - 8);
+        let first = compressed[..split_at].to_vec();
+        let second = compressed[split_at..].to_vec();
+        let stream = stream::iter(vec![first.clone(), second]);
+        let mut holder = GzStreamHolder::new(stream);
+
+        holder.gzhead().await.unwrap();
+        holder.init().unwrap();
+        holder.zpull().await.unwrap();
+        let _ = holder.clear_last_flag();
+
+        let mut guard = 0usize;
+        loop {
+            holder.decompress_availble_data().unwrap();
+            guard += 1;
+            assert!(guard < 1024, "inflate failed to exhaust first fragment");
+            if !holder.can_read_more() && holder.can_write_more() {
+                break;
+            }
+        }
+
+        let start = holder.skip;
+        let next_in_offset = unsafe { holder.zstream.next_in.offset_from(holder.buf.as_ptr()) } as usize;
+        assert_eq!(next_in_offset, first.len());
+        let expected = holder.buf[start..next_in_offset].to_vec();
+
+        let extracted = holder.copy_processed_buffer(true).unwrap();
+        assert!(!extracted.is_empty());
+        assert_eq!(extracted, expected);
+        assert_eq!(holder.skip, next_in_offset);
+
+        holder.reset_and_pull().await.unwrap();
+        assert!(holder.left > 0);
+        assert_eq!(holder.skip, 0);
+
         holder.cleanup();
     }
 }
