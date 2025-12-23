@@ -30,7 +30,6 @@ pub fn json_lines_to_json(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(writer.finish()?)
 }
 
-#[allow(dead_code)]
 pub fn recompress_gzip<S>(stream: S) -> impl futures::Stream<Item = std::io::Result<Bytes>>
 where
     S: futures::Stream<Item = Vec<u8>>,
@@ -351,6 +350,12 @@ mod tests {
     #[tokio::test]
     async fn test_smoke() {
         let input = vec![vec![1u8, 2], vec![3, 4]];
+        pack_join_unpack(input, JOIN_GZIP_CHUNK_SIZE).await;
+    }
+
+    #[tokio::test]
+    async fn test_empty() {
+        let input = vec![vec![], vec![]];
         pack_join_unpack(input, JOIN_GZIP_CHUNK_SIZE).await;
     }
 
