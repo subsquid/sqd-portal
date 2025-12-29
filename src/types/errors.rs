@@ -49,9 +49,7 @@ impl RequestError {
             QueryError::Retriable(s) => {
                 RequestError::InternalError(format!("received an error from worker {worker}: {s}"))
             }
-            QueryError::Failure(s) => {
-                RequestError::Failure(format!("worker {worker} failed: {s}"))
-            }
+            QueryError::Failure(s) => RequestError::Failure(format!("worker {worker} failed: {s}")),
             QueryError::RateLimitExceeded => RequestError::RateLimitExceeded,
         }
     }

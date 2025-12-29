@@ -82,6 +82,12 @@ pub struct Config {
 
     #[serde(default)]
     pub use_gzjoin: bool,
+
+    #[serde(default = "default_sentry_dsn")]
+    pub sentry_dsn: String,
+
+    #[serde(default = "default_sentry_sampling_rate")]
+    pub sentry_sampling_rate: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +177,14 @@ fn default_assignments_update_interval() -> Duration {
 
 fn default_datasets_update_interval() -> Duration {
     Duration::from_secs(10 * 60)
+}
+
+fn default_sentry_sampling_rate() -> f32 {
+    0.01
+}
+
+fn default_sentry_dsn() -> String {
+    "https://b74e352d92a89dc36c3e6064284669af@o1149243.ingest.us.sentry.io/4510617125191680".into()
 }
 
 fn parse_hostname<'de, D>(deserializer: D) -> Result<String, D::Error>

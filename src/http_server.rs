@@ -12,6 +12,7 @@ use axum::{
     Extension, RequestExt, Router,
 };
 use prometheus_client::registry::Registry;
+use sentry::integrations::tower as sentry_tower;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
@@ -50,6 +51,7 @@ pub async fn run_server(
 
     tracing::info!("Starting HTTP server listening on {addr}");
     let app = Router::new()
+        .layer(sentry_tower::NewSentryLayer::new_from_top())
         .layer(
             // This layer should be called before the response reaches trace layers
             PropagateRequestIdLayer::x_request_id(),

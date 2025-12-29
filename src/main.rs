@@ -53,25 +53,41 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+fn setup_sentry(config: &Config, args: &Cli) -> sentry::ClientInitGuard {
+    let environment = args.transport.rpc.network.to_string();
+    sentry::init((
+        config.sentry_dsn.as_str(),
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            environment: Some(environment.into()),
+            traces_sample_rate: config.sentry_sampling_rate,
+            attach_stacktrace: true,
+            send_default_pii: true,
+            ..Default::default()
+        },
+    ))
+}
+
 fn setup_tracing(json: bool, log_span_durations: bool) {
     use tracing_subscriber::fmt::format::FmtSpan;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
 
     let env_filter = tracing_subscriber::EnvFilter::builder().parse_lossy(
         std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV)
             .unwrap_or(format!("info,{}=debug", std::env!("CARGO_CRATE_NAME"))),
     );
 
-    if json {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
+    let fmt_layer = if json {
+        tracing_subscriber::fmt::layer()
             .with_target(false)
             .json()
             .with_span_list(false)
             .flatten_event(true)
-            .init();
+            .boxed()
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
+        tracing_subscriber::fmt::layer()
             .with_target(false)
             .with_span_events(if log_span_durations {
                 FmtSpan::CLOSE
@@ -79,14 +95,23 @@ fn setup_tracing(json: bool, log_span_durations: bool) {
                 FmtSpan::NONE
             })
             .compact()
-            .init();
+            .boxed()
     };
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .with(sentry::integrations::tracing::layer())
+        .init();
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let args = Cli::parse();
+
+    // Initialize Sentry before tracing to integrate them
+    let _sentry_guard = setup_sentry(&args.config, &args);
     setup_tracing(args.json_log, args.log_span_durations);
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));

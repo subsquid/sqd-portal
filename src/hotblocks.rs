@@ -124,28 +124,18 @@ impl HotblocksHandle {
         Ok(result)
     }
 
-    pub async fn request_status(
-        &self,
-        dataset: &str,
-    ) -> Result<reqwest::Response, HotblocksErr> {
+    pub async fn request_status(&self, dataset: &str) -> Result<reqwest::Response, HotblocksErr> {
         let Some(url) = self.urls.get(dataset) else {
             return Err(HotblocksErr::UnknownDataset);
         };
 
-        let response = self
-            .client
-            .get(format!("{url}/status"))
-            .send()
-            .await?;
+        let response = self.client.get(format!("{url}/status")).send().await?;
 
         Ok(response)
     }
 
     #[tracing::instrument(skip_all, ret, err)]
-    pub async fn get_status(
-        &self,
-        dataset: &str,
-    ) -> Result<Status, HotblocksErr> {
+    pub async fn get_status(&self, dataset: &str) -> Result<Status, HotblocksErr> {
         let result = self
             .request_status(dataset)
             .await?
