@@ -77,6 +77,7 @@ impl StorageClient {
         }
     }
 
+    #[instrument(skip_all)]
     async fn update_assignment(&self) -> anyhow::Result<()> {
         tracing::debug!("Checking for new assignment");
         let network_state = self.fetch_network_state().await?;
@@ -117,6 +118,7 @@ impl StorageClient {
         Ok(network_state)
     }
 
+    #[instrument(skip_all)]
     async fn fetch_assignment(&self, url: &str) -> anyhow::Result<Assignment> {
         use async_compression::tokio::bufread::GzipDecoder;
         use futures::TryStreamExt;
