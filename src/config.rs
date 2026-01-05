@@ -123,6 +123,8 @@ pub struct RealTimeConfig {
     pub url: Url,
     // By default use the dataset name as in the config key
     pub dataset: Option<String>,
+    // By default use the kind in config
+    pub kind: Option<String>,
 }
 
 impl Config {

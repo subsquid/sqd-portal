@@ -89,6 +89,7 @@ impl Datasets {
 
             let kind = ds
                 .kind
+                .or_else(|| ds.real_time.as_ref().and_then(|r| r.kind.clone()))
                 .or_else(|| net_ds.as_ref().and_then(|s| s.kind.clone()))
                 .ok_or_else(|| anyhow::anyhow!("Unknown kind for dataset {default_name}"))?;
 
@@ -256,13 +257,14 @@ mod tests {
                         "dataset_name": "solana-mainnet"
                     },
                     "real_time": {
-                        "url": "http://localhost:8080"
+                        "url": "http://localhost:8080",
+                        "kind": "not_used"
                     }
                 },
                 "local": {
-                    "kind": "solana",
                     "real_time": {
-                        "url": "http://localhost:8081"
+                        "url": "http://localhost:8081",
+                        "kind": "solana",
                     }
                 },
                 "custom": {

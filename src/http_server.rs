@@ -16,6 +16,7 @@ use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
 use futures::{pin_mut, StreamExt};
 use prometheus_client::registry::Registry;
+use serde::Serialize;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
@@ -37,7 +38,7 @@ use crate::{
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
     network::{NetworkClient, NoWorker},
-    types::{ChunkId, DatasetId, ParsedQuery, RequestError, StreamRequest},
+    types::{ChunkId, ClientRequest, DatasetId, GenericError, ParsedQuery, RequestError, StreamRequest},
     utils::logging,
 };
 
@@ -496,6 +497,11 @@ async fn get_dataset_metadata(
     axum::Json(AvailableDatasetApiResponse::new(metadata, first_block))
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct BlockNumberResponse {
+    block_number: u64,
+}
+
 async fn get_blocknumber_by_timestamp(
     Path((_, timestamp)): Path<(DatasetId, u64)>,
     Extension(req): Extension<RequestId>,
@@ -503,28 +509,32 @@ async fn get_blocknumber_by_timestamp(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
     dataset: DatasetConfig,
-) -> impl IntoResponse {
+) -> Result<axum::Json<BlockNumberResponse>, (StatusCode, axum::Json<GenericError>)> {
     let ts = timestamp * 1000; // milliseconds
     let dataset_id = dataset
         .network_id
         .expect("invalid dataset name should have been handled in request parser");
 
     let Ok(chunk) = network.find_chunk_by_timestamp(&dataset_id, ts) else {
-        return (
+        return Err((
             StatusCode::NOT_FOUND,
-            format!("No chunk found for timestamp"),
-        )
-            .into_response();
+            GenericError {
+                message: "No chunk found for timestamp".to_string(),
+            }
+            .into(),
+        ));
     };
 
     let Ok(pquery) = build_blocknumber_query(&dataset.kind, chunk.first_block, chunk.last_block)
     else {
         tracing::warn!("cannot build blocknumber query for {}", dataset_id);
-        return (
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Cannot build timestamp query for {dataset_id}"),
-        )
-            .into_response();
+            GenericError {
+                message: format!("Cannot build timestamp query for {dataset_id}"),
+            }
+            .into(),
+        ));
     };
 
     let request = build_request(
@@ -540,7 +550,13 @@ async fn get_blocknumber_by_timestamp(
         Ok(stream) => stream,
         Err(e) => {
             tracing::warn!("spawn stream error: {:?}", e);
-            return (StatusCode::BAD_GATEWAY, "SQD Network error").into_response();
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                GenericError {
+                    message: "SQD Network error".to_string(),
+                }
+                .into(),
+            ));
         }
     };
 
@@ -553,11 +569,13 @@ async fn get_blocknumber_by_timestamp(
 
     if let Err(e) = js {
         tracing::warn!("stream processing error: {:?}", e);
-        return (
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("stream processing error"),
-        )
-            .into_response();
+            GenericError {
+                message: "stream processing error".to_string(),
+            }
+            .into(),
+        ));
     };
 
     let js = js.unwrap();
@@ -566,11 +584,17 @@ async fn get_blocknumber_by_timestamp(
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("cannot find blocknumber in chunk: {:?}", e);
-            return (StatusCode::NOT_FOUND, "block not in chunk").into_response();
+            return Err((
+                StatusCode::NOT_FOUND,
+                GenericError {
+                    message: "block not in chunk".to_string(),
+                }
+                .into(),
+            ));
         }
     };
 
-    format!("{n}").into_response()
+    Ok(BlockNumberResponse { block_number: n }.into())
 }
 
 async fn get_debug_block(
