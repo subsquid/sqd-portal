@@ -6843,7 +6843,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.9.0-rc2"
+version = "0.9.0-rc3"
 dependencies = [
  "anyhow",
  "async-compression",

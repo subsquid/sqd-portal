@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use axum::http::StatusCode;
+use serde::Serialize;
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
 
@@ -111,4 +112,9 @@ impl RequestError {
             Self::Unavailable | Self::BusyFor(_) | Self::RateLimitExceeded => "overloaded",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GenericError {
+    pub message: String,
 }
