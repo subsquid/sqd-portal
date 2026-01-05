@@ -8,7 +8,7 @@ A high-performance data gateway for the [SQD Network](https://docs.sqd.ai/subsqu
 
 ### SQD Network
 
-The SQD Network is powered by over 2,000 decentralized workers and delivers static blockchain data with a typical delay of up to a few hours from the chain head. Datasets are stored in a highly redundant way, enabling very high streaming speeds.
+The SQD Network is powered by over 2,000 decentralized workers and delivers static blockchain data with a typical delay of up to a few hours from the chain head, enabling very high streaming speeds.
 
 To access SQD Network you'll need to lock SQD tokens to your Portal's peer id in the smart contract (e.g., in the [Network App](https://network.subsquid.io/portal)). The more tokens are locked, the more bandwidth the portal will get.
 
