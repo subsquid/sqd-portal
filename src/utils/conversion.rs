@@ -187,6 +187,7 @@ where
     let mut bytes: Vec<u8> = Vec::new();
     decoder.read_to_end(&mut bytes).await?;
     Ok(String::from_utf8(bytes)?)
+}
 
 #[cfg(test)]
 mod tests {

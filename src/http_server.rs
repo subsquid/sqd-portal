@@ -12,10 +12,9 @@ use axum::{
     Extension, RequestExt, Router,
 };
 use bytes::Bytes;
-use prometheus_client::registry::Registry;
-use sentry::integrations::tower as sentry_tower;
 use futures::{pin_mut, StreamExt};
 use prometheus_client::registry::Registry;
+use sentry::integrations::tower as sentry_tower;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
@@ -38,7 +37,7 @@ use crate::{
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
     network::{NetworkClient, NoWorker},
-    types::{ChunkId, ClientRequest, DatasetId, GenericError, ParsedQuery, RequestError, StreamRequest},
+    types::{ChunkId, DatasetId, GenericError, ParsedQuery, RequestError, StreamRequest},
     utils::logging,
 };
 
@@ -969,8 +968,8 @@ fn build_request(
     did: DatasetId,
     dname: String,
     max_chunks: Option<usize>,
-) -> ClientRequest {
-    ClientRequest {
+) -> StreamRequest {
+    StreamRequest {
         query: pq,
         dataset_id: did,
         dataset_name: dname,
@@ -979,6 +978,7 @@ fn build_request(
         max_chunks: max_chunks,
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
+        compression: Compression::Gzip,
     }
 }
 
