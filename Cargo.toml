@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.8.6"
+version = "0.8.7"
 edition = "2021"
 
 [dependencies]
@@ -53,7 +53,7 @@ proptest_async = { version = "0.2.1", default-features = false, features = ["tok
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
 
-sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "7b112d2", features = ["reader"] }
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "e430030", features = ["reader"] }
 sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "2c360df", version = "1.2.1" }
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "2c360df", version = "2.0.1", features = ["semver", "bitstring"] }
 sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "2c360df", version = "3.0.0", features = ["portal", "metrics"] }
