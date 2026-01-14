@@ -9,5 +9,5 @@ pub use api_types::DatasetRef;
 pub use chunk::*;
 pub use common::*;
 pub use dataset::*;
-pub use errors::{QueryError, RequestError, SendQueryError};
+pub use errors::{GenericError, QueryError, RequestError, SendQueryError};
 pub use request::*;

@@ -115,6 +115,7 @@ pub struct DatasetConfigModel {
     pub aliases: Vec<String>,
     pub sqd_network: Option<DatasetRef>,
     pub real_time: Option<RealTimeConfig>,
+    pub kind: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -122,6 +123,8 @@ pub struct RealTimeConfig {
     pub url: Url,
     // By default use the dataset name as in the config key
     pub dataset: Option<String>,
+    // By default use the kind in config
+    pub kind: Option<String>,
 }
 
 impl Config {

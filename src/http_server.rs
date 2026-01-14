@@ -12,9 +12,10 @@ use axum::{
     Extension, RequestExt, Router,
 };
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{pin_mut, StreamExt};
 use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
+use serde::Serialize;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
@@ -28,14 +29,15 @@ use crate::datasets::DatasetConfig;
 use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::types::Compression;
-use crate::utils::conversion::{join_gzip_default, json_lines_to_json, recompress_gzip};
+use crate::utils::conversion::{collect_to_string, join_gzip_default, json_lines_to_json, recompress_gzip};
+use crate::utils::internal_query::{build_blocknumber_query, find_block_in_chunk};
 use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
     network::{NetworkClient, NoWorker},
-    types::{ChunkId, DatasetId, ParsedQuery, RequestError, StreamRequest},
+    types::{ChunkId, DatasetId, GenericError, ParsedQuery, RequestError, StreamRequest},
     utils::logging,
 };
 
@@ -97,6 +99,10 @@ pub async fn run_server(
         .route(
             "/datasets/:dataset/metadata",
             get(get_dataset_metadata).endpoint("/metadata"),
+        )
+        .route(
+            "/datasets/:dataset/timestamps/:timestamp/block",
+            get(get_blocknumber_by_timestamp).endpoint("/timestamps/block"),
         )
         // Backward compatibility routes
         .route(
@@ -490,6 +496,106 @@ async fn get_dataset_metadata(
     axum::Json(AvailableDatasetApiResponse::new(metadata, first_block))
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct BlockNumberResponse {
+    block_number: u64,
+}
+
+async fn get_blocknumber_by_timestamp(
+    Path((_, timestamp)): Path<(DatasetId, u64)>,
+    Extension(req): Extension<RequestId>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(config): Extension<Arc<Config>>,
+    dataset: DatasetConfig,
+) -> Result<axum::Json<BlockNumberResponse>, (StatusCode, axum::Json<GenericError>)> {
+    let ts = timestamp * 1000; // milliseconds
+    let dataset_id = dataset
+        .network_id
+        .expect("invalid dataset name should have been handled in request parser");
+
+    let Ok(chunk) = network.find_chunk_by_timestamp(&dataset_id, ts) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            GenericError {
+                message: "No chunk found for timestamp".to_string(),
+            }
+            .into(),
+        ));
+    };
+
+    let Ok(pquery) = build_blocknumber_query(&dataset.kind, chunk.first_block, chunk.last_block)
+    else {
+        tracing::warn!("cannot build blocknumber query for {}", dataset_id);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            GenericError {
+                message: format!("Cannot build timestamp query for {dataset_id}"),
+            }
+            .into(),
+        ));
+    };
+
+    let request = build_request(
+        &config,
+        req.header_value().to_str().unwrap_or(""),
+        pquery,
+        dataset_id.clone(),
+        dataset.default_name.clone(),
+        Some(1),
+    );
+
+    let stream = match task_manager.spawn_stream(request).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::warn!("spawn stream error: {:?}", e);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                GenericError {
+                    message: "SQD Network error".to_string(),
+                }
+                .into(),
+            ));
+        }
+    };
+
+    pin_mut!(stream);
+
+    let js = collect_to_string(
+        stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result))),
+    )
+    .await;
+
+    if let Err(e) = js {
+        tracing::warn!("stream processing error: {:?}", e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            GenericError {
+                message: "stream processing error".to_string(),
+            }
+            .into(),
+        ));
+    };
+
+    let js = js.unwrap();
+
+    let n = match find_block_in_chunk(timestamp, &js) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("cannot find blocknumber in chunk: {:?}", e);
+            return Err((
+                StatusCode::NOT_FOUND,
+                GenericError {
+                    message: "block not in chunk".to_string(),
+                }
+                .into(),
+            ));
+        }
+    };
+
+    Ok(BlockNumberResponse { block_number: n }.into())
+}
+
 async fn get_debug_block(
     Path((_dataset, block)): Path<(String, u64)>,
     dataset_id: DatasetId,
@@ -852,6 +958,27 @@ fn restrict_request(config: &Config, request: StreamRequest) -> StreamRequest {
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
         ..request
+    }
+}
+
+fn build_request(
+    config: &Config,
+    req_id: &str,
+    pq: ParsedQuery,
+    did: DatasetId,
+    dname: String,
+    max_chunks: Option<usize>,
+) -> StreamRequest {
+    StreamRequest {
+        query: pq,
+        dataset_id: did,
+        dataset_name: dname,
+        request_id: req_id.to_string(),
+        buffer_size: config.max_buffer_size,
+        max_chunks: max_chunks,
+        timeout_quantile: config.default_timeout_quantile,
+        retries: config.default_retries,
+        compression: Compression::Gzip,
     }
 }
 

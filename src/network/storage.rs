@@ -206,6 +206,23 @@ impl StorageClient {
         })?)
     }
 
+    pub fn find_chunk_by_timestamp(
+        &self,
+        dataset: &DatasetId,
+        ts: u64,
+    ) -> Result<DataChunk, ChunkNotFound> {
+        let dataset = dataset.to_url();
+        let guard = self.assignment.read();
+        let assignment = guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)?;
+        let chunk = assignment
+            .find_chunk_by_timestamp(dataset, ts)
+            .map_err(|e| convert_chunk_not_found(e, assignment, dataset))?;
+        Ok(chunk.id().parse().map_err(|e| {
+            tracing::warn!(error = %e, "Failed to parse chunk ID");
+            ChunkNotFound::InvalidID(chunk.id().to_string())
+        })?)
+    }
+
     pub fn find_workers(
         &self,
         dataset: &DatasetId,

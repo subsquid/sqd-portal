@@ -7397,7 +7397,7 @@ dependencies = [
 [[package]]
 name = "sqd-assignments"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=2c360df#2c360df3798ec29ee2872bc25de7409d8b09f9a2"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=e430030#e4300305e5b0762f3ae6e45f42f7643b211d16ad"
 dependencies = [
  "anyhow",
  "crypto_box",
@@ -7499,7 +7499,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "anyhow",
  "async-compression",
