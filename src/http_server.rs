@@ -4,7 +4,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use axum::http::{HeaderValue, Method};
 use axum::{
     async_trait,
-    body::Body,
+    body::{self, Body},
     extract::{FromRequest, FromRequestParts, Path, Query, Request},
     http::{header, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -132,6 +132,15 @@ pub async fn run_server(
         )
         .route("/metrics", get(get_metrics))
         .route("/ready", get(get_readiness))
+        // SQL Query Engine
+        .route(
+            "/sql/query",
+            post(sql_query).endpoint("/sql/query"),
+        )
+        .route(
+            "/sql/metadata",
+            post(sql_metadata).endpoint("/sql/metadata"),
+        )
         .route_layer(axum::middleware::from_fn(logging::middleware))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
@@ -1003,6 +1012,32 @@ fn forward_response(response: reqwest::Response) -> axum::response::Response {
     }
     let body = Body::from_stream(response.bytes_stream());
     builder.body(body).unwrap()
+}
+
+async fn sql_query(
+    _task_manager: Extension<Arc<TaskManager>>,
+    _network: Extension<Arc<NetworkClient>>,
+    _config: Extension<Arc<Config>>,
+    _query: body::Bytes,
+) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "".to_string(),
+    )
+    .into_response()
+}
+
+async fn sql_metadata(
+    _task_manager: Extension<Arc<TaskManager>>,
+    _network: Extension<Arc<NetworkClient>>,
+    _config: Extension<Arc<Config>>,
+    _query: body::Bytes,
+) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "".to_string(),
+    )
+    .into_response()
 }
 
 const FINALIZED_NUMBER_HEADER: &str = "x-sqd-finalized-head-number";

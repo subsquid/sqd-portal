@@ -21,6 +21,8 @@ mod hotblocks;
 mod http_server;
 mod metrics;
 mod network;
+#[cfg(feature = "sql")]
+mod sql;
 mod types;
 mod utils;
 
