@@ -41,6 +41,9 @@ use crate::{
     utils::logging,
 };
 
+#[cfg(feature = "sql")]
+use crate::sql;
+
 pub async fn run_server(
     task_manager: Arc<TaskManager>,
     network_client: Arc<NetworkClient>,
@@ -131,16 +134,15 @@ pub async fn run_server(
             get(get_debug_block).endpoint("/block/debug"),
         )
         .route("/metrics", get(get_metrics))
-        .route("/ready", get(get_readiness))
-        // SQL Query Engine
-        .route(
-            "/sql/query",
-            post(sql_query).endpoint("/sql/query"),
-        )
-        .route(
-            "/sql/metadata",
-            post(sql_metadata).endpoint("/sql/metadata"),
-        )
+        .route("/ready", get(get_readiness));
+
+    // SQL Query Engine
+    #[cfg(feature = "sql")]
+    let app = app
+        .route("/sql/query", post(sql_query).endpoint("/sql/query"))
+        .route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
+
+    let app = app
         .route_layer(axum::middleware::from_fn(logging::middleware))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
@@ -1014,6 +1016,7 @@ fn forward_response(response: reqwest::Response) -> axum::response::Response {
     builder.body(body).unwrap()
 }
 
+#[cfg(feature = "sql")]
 async fn sql_query(
     _task_manager: Extension<Arc<TaskManager>>,
     _network: Extension<Arc<NetworkClient>>,
@@ -1027,17 +1030,24 @@ async fn sql_query(
     .into_response()
 }
 
+#[cfg(feature = "sql")]
 async fn sql_metadata(
     _task_manager: Extension<Arc<TaskManager>>,
-    _network: Extension<Arc<NetworkClient>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
     _config: Extension<Arc<Config>>,
-    _query: body::Bytes,
-) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "".to_string(),
-    )
-    .into_response()
+) -> Result<axum::Json<sql::metadata::Metadata>, (StatusCode, axum::Json<GenericError>)> {
+    sql::get_all_metadata(network)
+        .await
+        .map(|md| md.into())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                GenericError {
+                    message: e.to_string(),
+                }
+                .into(),
+            )
+        })
 }
 
 const FINALIZED_NUMBER_HEADER: &str = "x-sqd-finalized-head-number";

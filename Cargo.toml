@@ -4,7 +4,7 @@ version = "0.8.7"
 edition = "2021"
 
 [features]
-sql = ["dep:prost", "dep:substrait"]
+sql = ["dep:once_cell", "dep:prost", "dep:substrait"]
 
 [dependencies]
 anyhow = "1"
@@ -26,6 +26,7 @@ lazy_static = "1.4.0"
 libz-ng-sys = "1.1.23"
 num-rational = "0.4"
 num-traits = "0.2.19"
+once_cell = { version = "1.21", optional = true }
 prometheus-client = "0.23"
 prost = { version = "0.13.4", optional = true }
 rand = "0.9.2"
