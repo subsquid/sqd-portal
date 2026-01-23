@@ -4,7 +4,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use axum::http::{HeaderValue, Method};
 use axum::{
     async_trait,
-    body::{self, Body},
+    body::Body,
     extract::{FromRequest, FromRequestParts, Path, Query, Request},
     http::{header, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -43,6 +43,8 @@ use crate::{
 
 #[cfg(feature = "sql")]
 use crate::sql;
+#[cfg(feature = "sql")]
+use axum::body;
 
 pub async fn run_server(
     task_manager: Arc<TaskManager>,
@@ -1032,9 +1034,7 @@ async fn sql_query(
 
 #[cfg(feature = "sql")]
 async fn sql_metadata(
-    _task_manager: Extension<Arc<TaskManager>>,
     Extension(network): Extension<Arc<NetworkClient>>,
-    _config: Extension<Arc<Config>>,
 ) -> Result<axum::Json<sql::metadata::Metadata>, (StatusCode, axum::Json<GenericError>)> {
     sql::get_all_metadata(network)
         .await

@@ -1,5 +1,3 @@
-// This module duplicates work in
-// https://github.com/subsquid/data/blob/master/crates/query/src/query
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -9,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::datasets::DatasetConfig;
 
+// In the long run, we can just add schemas to the NetworkClient;
+// I keep them here for the moment not to pollute the code
+// with SQL-specific (and experimental) stuff.
 pub static SCHEMAS: Lazy<HashMap<String, Schema>> = Lazy::new(schemas_or_die);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -125,7 +126,8 @@ pub fn map_datasets_on_schemas(datasets: &[DatasetConfig]) -> Result<Metadata, S
 }
 
 fn schemas_or_die() -> HashMap<String, Schema> {
-    read_schemas("schemas.json").expect("cannot read schemas")
+    let path = std::env::var("SCHEMAS").unwrap_or("./schemas.json".to_string());
+    read_schemas(&path).expect("cannot read schemas")
 }
 
 fn read_schemas(path: &str) -> Result<HashMap<String, Schema>, SchemaErr> {
