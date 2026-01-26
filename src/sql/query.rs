@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::Arc;
 
 use axum::body;
 use prost::{DecodeError, Message};
@@ -7,8 +9,10 @@ use substrait::proto::Plan;
 use thiserror;
 
 use crate::sql::rewrite_target;
+use crate::types::DatasetId;
+use crate::network::NetworkClient;
 
-use sql_query_plan::plan::{self, Source, TargetPlan};
+use sql_query_plan::plan::{self, Source, TargetPlan, FieldRange};
 
 #[derive(Debug, thiserror::Error)]
 pub enum QueryErr {
@@ -68,6 +72,44 @@ pub fn get_sources(
 // - find chunk
 // - advance range behind last block in chunk (can I use next_chunk)?
 // - etc.
+pub fn get_chunks(
+    src: &Source, 
+    dataset_id: &DatasetId,
+    network: &Arc<NetworkClient>,
+) -> Result<Vec<String>, QueryErr> {
+    let mut chunks = HashSet::new();
+    for range in &src.blocks {
+        if let FieldRange::BlockNumber(r) = range {
+            let range = Range {
+                start: r.start as u64,
+                end: r.end as u64,
+            };
+            get_chunks_for_range(network, dataset_id, &range, &mut chunks)?;
+        } else {
+            continue;
+        }
+    }
+    Ok(chunks.into_iter().collect())
+}
+
+pub fn get_chunks_for_range(
+    network: &Arc<NetworkClient>, 
+    dataset_id: &DatasetId,
+    range: &Range<u64>, 
+    chunks: &mut HashSet<String>,
+) -> Result<(), QueryErr> {
+    if let Ok(chunk) = network.find_chunk(dataset_id, range.start) {
+        chunks.insert(chunk.to_string());
+        let mut chunk_start = chunk.first_block;
+        while chunk_start < range.end {
+           if let Some(chunk) = network.next_chunk(dataset_id, &chunk) {
+               chunks.insert(chunk.to_string());
+           }
+            
+        }
+    }
+    Ok(())
+}
 
 // get workers
 // new function find workers per chunk (no derivation through block)

@@ -1025,7 +1025,7 @@ async fn sql_query(
     _config: Extension<Arc<Config>>,
     query: body::Bytes,
 ) -> Result<axum::Json<sql::query::SqlQueryResponse>, (StatusCode, axum::Json<GenericError>)> {
-    sql::query(query, network)
+    sql::query(query, &network)
         .await
         .map(|res| res.into())
         .map_err(|e| {

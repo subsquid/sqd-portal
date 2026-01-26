@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
+use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 use crate::datasets::DatasetConfig;
+use crate::types::DatasetId;
 
 // In the long run, we should add schemas to the NetworkClient;
 // I keep them here for the moment not to pollute the code
@@ -95,6 +97,12 @@ pub enum SchemaErr {
     IoError(#[from] std::io::Error),
     #[error("Schema not found: {0}")]
     SchemaNotFound(String),
+}
+
+// We should use "bucket_name"
+pub fn schema_name_to_dataset_id(schema: &str) -> DatasetId {
+    let s = format!("s3://{}", schema.replace("_", "-"));
+    DatasetId::from_url(&s)
 }
 
 pub fn map_datasets_on_schemas(datasets: &[DatasetConfig]) -> Result<Metadata, SchemaErr> {

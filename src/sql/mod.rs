@@ -44,7 +44,7 @@ pub async fn get_all_metadata(network: Arc<NetworkClient>) -> Result<Metadata, S
 
 pub async fn query(
     request: body::Bytes,
-    network: Arc<NetworkClient>
+    network: &Arc<NetworkClient>
 ) -> Result<SqlQueryResponse, SqlErr> {
     let query_id = format!("sql-{}", Uuid::new_v4().to_string());
     let mut ctx = plan::TraversalContext::new(
@@ -59,8 +59,8 @@ pub async fn query(
     )? {
         let sql = query::compile_sql(&src, &ctx)?;
         let blocks = query::unwrap_field_ranges(&src.blocks);
-
-        // get chunks
+        let dataset_id = metadata::schema_name_to_dataset_id(&src.schema_name);
+        let chunks = query::get_chunks(&src, &dataset_id, network)?;
         // get workers
     }
 
