@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::datasets::DatasetConfig;
 
-// In the long run, we can just add schemas to the NetworkClient;
+// In the long run, we should add schemas to the NetworkClient;
 // I keep them here for the moment not to pollute the code
 // with SQL-specific (and experimental) stuff.
 pub static SCHEMAS: Lazy<HashMap<String, Schema>> = Lazy::new(schemas_or_die);

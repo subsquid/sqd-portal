@@ -1021,15 +1021,23 @@ fn forward_response(response: reqwest::Response) -> axum::response::Response {
 #[cfg(feature = "sql")]
 async fn sql_query(
     _task_manager: Extension<Arc<TaskManager>>,
-    _network: Extension<Arc<NetworkClient>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
     _config: Extension<Arc<Config>>,
-    _query: body::Bytes,
-) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "".to_string(),
-    )
-    .into_response()
+    query: body::Bytes,
+) -> Result<axum::Json<sql::query::SqlQueryResponse>, (StatusCode, axum::Json<GenericError>)> {
+    sql::query(query, network)
+        .await
+        .map(|res| res.into())
+        .map_err(|e| {
+            (
+                // differentiate error handling
+                StatusCode::INTERNAL_SERVER_ERROR,
+                GenericError {
+                    message: e.to_string(),
+                }
+                .into(),
+            )
+        })
 }
 
 #[cfg(feature = "sql")]
