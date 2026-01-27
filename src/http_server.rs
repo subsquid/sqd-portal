@@ -1022,15 +1022,14 @@ fn forward_response(response: reqwest::Response) -> axum::response::Response {
 
 #[cfg(feature = "sql")]
 async fn sql_query(
-    _task_manager: Extension<Arc<TaskManager>>,
     Extension(network): Extension<Arc<NetworkClient>>,
-    _config: Extension<Arc<Config>>,
     query: body::Bytes,
 ) -> Result<axum::Json<sql::query::SqlQueryResponse>, (StatusCode, axum::Json<GenericError>)> {
     sql::query(query, &network)
         .await
         .map(|res| res.into())
         .map_err(|e| {
+            tracing::warn!("cannot query data: {:?}", e);
             (
                 // differentiate error handling
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1045,10 +1044,10 @@ async fn sql_query(
 #[cfg(feature = "sql")]
 async fn sql_metadata(
     Extension(network): Extension<Arc<NetworkClient>>,
-) -> Result<axum::Json<sql::metadata::Metadata>, (StatusCode, axum::Json<GenericError>)> {
+) -> Result<axum::Json<Vec<sql::metadata::Dataset>>, (StatusCode, axum::Json<GenericError>)> {
     sql::get_all_metadata(network)
         .await
-        .map(|md| md.into())
+        .map(|md| md.datasets.into())
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

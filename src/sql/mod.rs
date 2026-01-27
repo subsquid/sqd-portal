@@ -16,6 +16,7 @@ use crate::network::NetworkClient;
 use axum::body;
 
 use thiserror;
+use tracing;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -44,11 +45,17 @@ pub async fn query(
     let mut ctx = plan::TraversalContext::new(plan::Options::default());
     let mut tables = Vec::new();
     for src in query::get_sources(request, &mut ctx)? {
+        tracing::info!("processing table {}", src.table_name);
         let sql = query::compile_sql(&src, &ctx)?;
+        tracing::info!("Derived SQL '{sql}'");
         let blocks = query::unwrap_field_ranges(&src.blocks);
+        tracing::info!("{} block ranges", blocks.len());
         let dataset_id = metadata::schema_name_to_dataset_id(&src.schema_name);
+        tracing::info!("dataset: {dataset_id}");
         let chunks = query::get_chunks(&dataset_id, &blocks, network)?;
+        tracing::info!("{} chunks", chunks.len());
         let workers = query::get_workers(&dataset_id, &sql, &chunks, network)?;
+        tracing::info!("{} workers", workers.len());
         tables.push(TableItem {
             schema_name: src.schema_name.to_string(),
             table_name: src.table_name.to_string(),

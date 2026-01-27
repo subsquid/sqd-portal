@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use substrait::proto::Plan;
 use thiserror;
 
-use crate::network::NetworkClient;
+use crate::network::{NetworkClient, ChunkNotFound};
 use crate::sql::rewrite_target;
 use crate::types::{BlockNumber, DatasetId};
 
@@ -22,6 +22,8 @@ pub enum QueryErr {
     Planning(#[from] plan::PlanErr),
     #[error("cannot compile rewritten plan: {0}")]
     RewriteTarget(#[from] rewrite_target::RewriteTargetErr),
+    #[error("no worker available for chunk: {0}")]
+    NoChunk(#[from] ChunkNotFound),
     #[error("no worker available for chunk: {0}")]
     NoWorker(String),
 }
@@ -87,13 +89,24 @@ pub fn get_chunks_for_range(
     range: &Range<u64>,
     chunks: &mut HashMap<String, BlockNumber>,
 ) -> Result<(), QueryErr> {
-    if let Ok(chunk) = network.find_chunk(dataset_id, range.start) {
-        chunks.insert(chunk.to_string(), chunk.first_block);
-        let mut chunk_start = chunk.first_block;
-        while chunk_start < range.end {
-            if let Some(chunk) = network.next_chunk(dataset_id, &chunk) {
-                chunk_start = chunk.first_block;
-                chunks.insert(chunk.to_string(), chunk.first_block);
+    match network.find_chunk(dataset_id, range.start) {
+        Err(e) => tracing::info!(
+            "no chunks found for {}: {:?}",
+            range.start,
+            e,
+        ),
+        Ok(chunk) => {
+            chunks.insert(chunk.to_string(), chunk.first_block);
+            let mut previous = chunk;
+            loop {
+                if let Some(chunk) = network.next_chunk(dataset_id, &previous) {
+                    if chunk.first_block < range.end {
+                        chunks.insert(chunk.to_string(), chunk.first_block);
+                        previous = chunk;
+                        continue;
+                    }
+                }
+                break;
             }
         }
     }

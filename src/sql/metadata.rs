@@ -98,6 +98,10 @@ pub fn schema_name_to_dataset_id(schema: &str) -> DatasetId {
     DatasetId::from_url(&s)
 }
 
+pub fn bucket_to_schema_name(bucket: &str) -> String {
+    bucket.replace("-", "_").to_string()
+}
+
 pub fn map_datasets_on_schemas(datasets: &[DatasetConfig]) -> Result<Metadata, SchemaErr> {
     let mut ds = Vec::new();
     for d in datasets {
@@ -110,15 +114,15 @@ pub fn map_datasets_on_schemas(datasets: &[DatasetConfig]) -> Result<Metadata, S
             .get(kind)
             .ok_or(SchemaErr::SchemaNotFound(d.kind.to_string()))?;
         ds.push(Dataset {
-            name: d.default_name.to_string(),
+            name: bucket_to_schema_name(&d.default_name),
             bucket_name: d.default_name.to_string(),
             schema: schema.clone(),
             stats: Stats {
-                num_blocks: 0,
-                tx_per_block: 0,
-                logs_per_block: 0,
-                traces_per_block: 0,
-                diffs_per_block: 0,
+                num_blocks: 1000000,
+                tx_per_block: 150,
+                logs_per_block: 250,
+                traces_per_block: 250,
+                diffs_per_block: 100,
             },
         });
     }
