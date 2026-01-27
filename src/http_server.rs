@@ -29,7 +29,9 @@ use crate::datasets::DatasetConfig;
 use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::types::Compression;
-use crate::utils::conversion::{collect_to_string, join_gzip_default, json_lines_to_json, recompress_gzip};
+use crate::utils::conversion::{
+    collect_to_string, join_gzip_default, json_lines_to_json, recompress_gzip,
+};
 use crate::utils::internal_query::{build_blocknumber_query, find_block_in_chunk};
 use crate::utils::logging::MethodRouterExt;
 use crate::{
@@ -409,7 +411,7 @@ async fn run_stream_internal(
                 Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
                 Compression::Zstd => Body::from_stream(
                     stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))),
-                )
+                ),
             };
             res.header(header::CONTENT_TYPE, "application/jsonl")
                 .header(header::CONTENT_ENCODING, compression.content_encoding())

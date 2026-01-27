@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -8,11 +8,11 @@ use serde::{Deserialize, Serialize};
 use substrait::proto::Plan;
 use thiserror;
 
-use crate::sql::rewrite_target;
-use crate::types::DatasetId;
 use crate::network::NetworkClient;
+use crate::sql::rewrite_target;
+use crate::types::{BlockNumber, DatasetId};
 
-use sql_query_plan::plan::{self, Source, TargetPlan, FieldRange};
+use sql_query_plan::plan::{self, Source, TargetPlan};
 
 #[derive(Debug, thiserror::Error)]
 pub enum QueryErr {
@@ -22,6 +22,8 @@ pub enum QueryErr {
     Planning(#[from] plan::PlanErr),
     #[error("cannot compile rewritten plan: {0}")]
     RewriteTarget(#[from] rewrite_target::RewriteTargetErr),
+    #[error("no worker available for chunk: {0}")]
+    NoWorker(String),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -51,7 +53,7 @@ pub struct TableChunk {
 }
 
 pub fn get_sources(
-    request: body::Bytes, 
+    request: body::Bytes,
     ctx: &mut plan::TraversalContext,
 ) -> Result<Vec<Source>, QueryErr> {
     let plan = Plan::decode(request)?;
@@ -67,52 +69,70 @@ pub fn get_sources(
     Ok(res)
 }
 
-// get_chunks
-// use find chunk in a loop for block ranges:
-// - find chunk
-// - advance range behind last block in chunk (can I use next_chunk)?
-// - etc.
 pub fn get_chunks(
-    src: &Source, 
     dataset_id: &DatasetId,
+    blocks: &[Range<u64>],
     network: &Arc<NetworkClient>,
-) -> Result<Vec<String>, QueryErr> {
-    let mut chunks = HashSet::new();
-    for range in &src.blocks {
-        if let FieldRange::BlockNumber(r) = range {
-            let range = Range {
-                start: r.start as u64,
-                end: r.end as u64,
-            };
-            get_chunks_for_range(network, dataset_id, &range, &mut chunks)?;
-        } else {
-            continue;
-        }
+) -> Result<HashMap<String, BlockNumber>, QueryErr> {
+    let mut chunks = HashMap::new();
+    for range in blocks {
+        get_chunks_for_range(network, dataset_id, range, &mut chunks)?;
     }
-    Ok(chunks.into_iter().collect())
+    Ok(chunks)
 }
 
 pub fn get_chunks_for_range(
-    network: &Arc<NetworkClient>, 
+    network: &Arc<NetworkClient>,
     dataset_id: &DatasetId,
-    range: &Range<u64>, 
-    chunks: &mut HashSet<String>,
+    range: &Range<u64>,
+    chunks: &mut HashMap<String, BlockNumber>,
 ) -> Result<(), QueryErr> {
     if let Ok(chunk) = network.find_chunk(dataset_id, range.start) {
-        chunks.insert(chunk.to_string());
+        chunks.insert(chunk.to_string(), chunk.first_block);
         let mut chunk_start = chunk.first_block;
         while chunk_start < range.end {
-           if let Some(chunk) = network.next_chunk(dataset_id, &chunk) {
-               chunks.insert(chunk.to_string());
-           }
-            
+            if let Some(chunk) = network.next_chunk(dataset_id, &chunk) {
+                chunk_start = chunk.first_block;
+                chunks.insert(chunk.to_string(), chunk.first_block);
+            }
         }
     }
     Ok(())
 }
 
-// get workers
-// new function find workers per chunk (no derivation through block)
+pub fn get_workers(
+    dataset_id: &DatasetId,
+    sql: &str,
+    chunks: &HashMap<String, BlockNumber>,
+    network: &Arc<NetworkClient>,
+) -> Result<Vec<TableWorker>, QueryErr> {
+    let mut workers: HashMap<String, Vec<TableChunk>> = HashMap::new();
+    for (chunk, block) in chunks.into_iter() {
+        // it would be convenient to search for workers directly by chunk;
+        // here we search for the chunk again. Should be implemented in NetworkClient.
+        if let Ok(peer_id) = network.find_worker(dataset_id, *block, false) {
+            let tch = TableChunk {
+                sql: sql.to_string(),
+                chunk_id: chunk.to_string(),
+            };
+            workers
+                .entry(peer_id.to_string())
+                .and_modify(|v| v.push(tch.clone()))
+                .or_insert(vec![tch]);
+        } else {
+            return Err(QueryErr::NoWorker(chunk.to_string()));
+        }
+    }
+    let mut tws = Vec::new();
+    for (peer_id, chunks) in workers.into_iter() {
+        tws.push(TableWorker {
+            peer_id: peer_id.to_string(),
+            chunks: chunks,
+        });
+    }
+
+    Ok(tws)
+}
 
 pub fn unwrap_field_ranges(frs: &[plan::FieldRange]) -> Vec<Range<u64>> {
     let mut v = Vec::new();
@@ -128,10 +148,6 @@ pub fn unwrap_field_ranges(frs: &[plan::FieldRange]) -> Vec<Range<u64>> {
     v
 }
 
-pub fn compile_sql(
-    src: &Source, 
-    ctx: &plan::TraversalContext,
-) -> Result<String, QueryErr> {
+pub fn compile_sql(src: &Source, ctx: &plan::TraversalContext) -> Result<String, QueryErr> {
     Ok(rewrite_target::compile_sql(src, ctx)?)
 }
-

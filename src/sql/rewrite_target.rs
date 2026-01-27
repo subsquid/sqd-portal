@@ -2,8 +2,8 @@
 //! This is the implementation of Target Plan for the portal.
 use std::collections::HashMap;
 use substrait::proto::{
-    Expression, FunctionArgument, Rel, expression, expression::RexType,
-    expression::field_reference, expression::literal::LiteralType, function_argument::ArgType,
+    expression, expression::field_reference, expression::literal::LiteralType, expression::RexType,
+    function_argument::ArgType, Expression, FunctionArgument, Rel,
 };
 
 use crate::sql::extractor;

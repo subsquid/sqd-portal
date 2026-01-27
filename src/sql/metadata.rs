@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
-use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -9,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::datasets::DatasetConfig;
 use crate::types::DatasetId;
 
-// In the long run, we should add schemas to the NetworkClient;
+// We should add schemas to the NetworkClient;
 // I keep them here for the moment not to pollute the code
 // with SQL-specific (and experimental) stuff.
 pub static SCHEMAS: Lazy<HashMap<String, Schema>> = Lazy::new(schemas_or_die);
@@ -81,14 +80,6 @@ pub struct Stats {
     pub diffs_per_block: u64,
 }
 
-impl Metadata {
-    pub fn empty() -> Metadata {
-        Metadata {
-            datasets: Vec::with_capacity(0),
-        }
-    } 
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaErr {
     #[error("JSON parse error: {0}")]
@@ -99,7 +90,9 @@ pub enum SchemaErr {
     SchemaNotFound(String),
 }
 
-// We should use "bucket_name"
+// We should use "bucket_name" -
+// The datasets and their schemas should be kept as part of the program state,
+// so that we can retrieve data from them at any time.
 pub fn schema_name_to_dataset_id(schema: &str) -> DatasetId {
     let s = format!("s3://{}", schema.replace("_", "-"));
     DatasetId::from_url(&s)

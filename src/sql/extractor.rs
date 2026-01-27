@@ -4,12 +4,12 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 use substrait::proto::{
-    Expression, expression, expression::field_reference, expression::literal::LiteralType,
+    expression, expression::field_reference, expression::literal::LiteralType, Expression,
 };
 
 use sql_query_plan::plan::*;
 
-use crate::sql::rewrite_target::{RewriteTargetErr, RewriteTargetResult, rewrite_err};
+use crate::sql::rewrite_target::{rewrite_err, RewriteTargetErr, RewriteTargetResult};
 
 static UNIVERSE: Range<i128> = Range {
     start: i128::MIN,
@@ -123,7 +123,11 @@ fn min_and_max(items: &[i128]) -> (i128, i128) {
         }
     }
 
-    if mn > mx { (mx, mn) } else { (mn, mx) }
+    if mn > mx {
+        (mx, mn)
+    } else {
+        (mn, mx)
+    }
 }
 
 fn ranges_from_compare(
