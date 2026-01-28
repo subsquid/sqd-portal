@@ -126,10 +126,18 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    let peer_id = network_client_builder.peer_id();
+    sentry::configure_scope(|scope| {
+        scope.set_user(Some(sentry::User {
+            id: Some(peer_id.to_string()),
+            ..Default::default()
+        }));
+    });
+
     let mut metrics_registry = Registry::with_labels(
         vec![(
             Cow::Borrowed("portal_id"),
-            Cow::Owned(network_client_builder.peer_id().to_string()),
+            Cow::Owned(peer_id.to_string()),
         )]
         .into_iter(),
     );
