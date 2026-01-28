@@ -170,6 +170,7 @@ impl RewriteTarget {
 
             let rf = if rf.is_some() { rf.unwrap() } else { None };
 
+            // and: extract blocks and add them to ranges!
             if lf.is_some() && rf.is_none() {
                 add_expression_to_filter(tctx, &mut sources[r], lf.as_ref().unwrap())?;
             } else if lf.is_none() && rf.is_some() {

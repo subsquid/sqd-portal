@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
+use std::ops::Range;
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,18 @@ pub struct Stats {
     pub diffs_per_block: u64,
 }
 
+impl Default for Stats {
+    fn default() -> Self {
+        Stats {
+            num_blocks: 0,
+            tx_per_block: 0,
+            logs_per_block: 0,
+            traces_per_block: 0,
+            diffs_per_block: 0,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaErr {
     #[error("JSON parse error: {0}")]
@@ -88,6 +101,76 @@ pub enum SchemaErr {
     IoError(#[from] std::io::Error),
     #[error("Schema not found: {0}")]
     SchemaNotFound(String),
+}
+
+pub fn compute_stats(dataset: &DatasetId, table: &str, blocks: &[Range<u64>]) -> u64 {
+    let stats = get_dataset_stats(dataset).unwrap_or_default();
+
+    let total_blocks = blocks.iter().fold(0, |t, b| {
+        if b.start < b.end {
+            t + (b.end - b.start)
+        } else {
+            t
+        }
+    });
+
+    let total_blocks = if total_blocks == 0 {
+        stats.num_blocks
+    } else {
+        total_blocks
+    };
+
+    std::cmp::min(
+        u32::MAX as u64,
+        total_blocks
+            * match table_type(table) {
+                TableType::Block => 1,
+                TableType::Tx => stats.tx_per_block,
+                TableType::Log => stats.logs_per_block,
+                TableType::Trace => stats.traces_per_block,
+                TableType::Diff => stats.diffs_per_block,
+                TableType::Unknown => 0,
+            },
+    )
+}
+
+#[derive(Debug, Clone)]
+pub enum TableType {
+    Block,
+    Tx,
+    Log,
+    Trace,
+    Diff,
+    Unknown,
+}
+
+pub fn table_type(name: &str) -> TableType {
+    if name.to_lowercase().contains("block") {
+        return TableType::Block;
+    }
+    if name.to_lowercase().contains("transaction") {
+        return TableType::Tx;
+    }
+    if name.to_lowercase().contains("log") {
+        return TableType::Log;
+    }
+    if name.to_lowercase().contains("trace") {
+        return TableType::Trace;
+    }
+    if name.to_lowercase().contains("diff") {
+        return TableType::Diff;
+    }
+    TableType::Unknown
+}
+
+pub fn get_dataset_stats(_dataset: &DatasetId) -> Option<Stats> {
+    Some(Stats {
+        num_blocks: 1000000,
+        tx_per_block: 150,
+        logs_per_block: 250,
+        traces_per_block: 250,
+        diffs_per_block: 100,
+    })
 }
 
 // We should use "bucket_name" -
