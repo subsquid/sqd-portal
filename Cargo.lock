@@ -7611,6 +7611,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqd-contract-client"
+version = "1.2.1"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=e27cb7b#e27cb7b07760ffe77c19d399ed137dedcc0f4148"
+dependencies = [
+ "async-trait",
+ "clap",
+ "ethers",
+ "futures 0.3.31",
+ "libp2p",
+ "log",
+ "num-rational",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio 1.48.0",
+ "tokio-stream",
+ "url",
+]
+
+[[package]]
 name = "sqd-messages"
 version = "2.1.0"
 source = "git+https://github.com/subsquid/sqd-network.git?rev=2c360df#2c360df3798ec29ee2872bc25de7409d8b09f9a2"
@@ -7650,7 +7670,7 @@ dependencies = [
  "prometheus-client",
  "prost 0.13.4",
  "serde",
- "sqd-contract-client",
+ "sqd-contract-client 1.2.1 (git+https://github.com/subsquid/sqd-network.git?rev=2c360df)",
  "sqd-messages",
  "thiserror 1.0.69",
  "tokio 1.48.0",
@@ -7708,7 +7728,7 @@ dependencies = [
  "serde_with",
  "serde_yaml",
  "sqd-assignments",
- "sqd-contract-client",
+ "sqd-contract-client 1.2.1 (git+https://github.com/subsquid/sqd-network.git?rev=e27cb7b)",
  "sqd-messages",
  "sqd-network-transport",
  "sqd-primitives",
