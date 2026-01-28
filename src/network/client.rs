@@ -72,7 +72,7 @@ pub struct NetworkClient {
     transport_handle: PortalTransportHandle,
     network_state: NetworkState,
     datasets: Arc<RwLock<Datasets>>,
-    contract_client: Box<dyn ContractClient>,
+    contract_client: Option<Box<dyn ContractClient>>,
     chain_update_interval: Duration,
     assignment_update_interval: Duration,
     local_peer_id: PeerId,
@@ -107,7 +107,7 @@ impl NetworkClientBuilder {
             transport_builder,
         } = self;
 
-        let contract_client = transport_builder.contract_client();
+        let contract_client = None; //transport_builder.contract_client();
         let local_peer_id = transport_builder.local_peer_id();
         let keypair = transport_builder.keypair();
 
@@ -194,7 +194,7 @@ impl NetworkClient {
     ) -> Result<(), JoinError> {
         let this = Arc::clone(&self);
         let token = cancellation_token.child_token();
-        let chain_updates_fut = tokio::spawn(async move { this.run_chain_updates(token).await });
+        //let chain_updates_fut = tokio::spawn(async move { this.run_chain_updates(token).await });
 
         let this = Arc::clone(&self);
         let token = cancellation_token.child_token();
@@ -205,10 +205,13 @@ impl NetworkClient {
         let token = cancellation_token.child_token();
         let logs_loop_fut = tokio::spawn(async move { this.run_logs_loop(token).await });
 
-        tokio::try_join!(chain_updates_fut, assignments_loop_fut, logs_loop_fut)?;
+        tokio::try_join!(//chain_updates_fut,
+                         assignments_loop_fut,
+                         logs_loop_fut)?;
         Ok(())
     }
 
+    /*
     async fn fetch_blockchain_state(
         &self,
     ) -> Result<
@@ -304,6 +307,7 @@ impl NetworkClient {
             }
         }
     }
+    */
 
     async fn run_assignments_loop(&self, cancellation_token: CancellationToken) {
         let mut timer =

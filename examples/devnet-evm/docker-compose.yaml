@@ -14,12 +14,15 @@ services:
       --verify-tx-root
       --verify-logs-bloom
       --block-cache-size 10
+    ports:
+      - "3000:3000"
     # --verify-receipts-root
     # --verify-block-hash
 
   # Loads full blocks from hotblocks-service and provides query API over it
   hotblocks-db:
-    image: subsquid/data-hotblocks:latest
+#    image: subsquid/data-hotblocks:latest
+    image: subsquid/data-hotblocks:local
     environment:
       RUST_LOG: "info"
     command: >

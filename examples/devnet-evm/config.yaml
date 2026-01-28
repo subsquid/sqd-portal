@@ -2,7 +2,7 @@ my-devnet:
   kind: evm
   retention_strategy:
     FromBlock:
-      number: 0
+      number: 24296915
     # or
     # Head: 500
   data_sources:
