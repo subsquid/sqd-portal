@@ -48,7 +48,6 @@ pub async fn query(
         tracing::info!("processing table {}", src.table_name);
         let sql = query::compile_sql(&src, &ctx)?;
         tracing::info!("Derived SQL '{sql}'");
-        tracing::info!("{} blocks: ", src.blocks.len());
         let blocks = query::unwrap_field_ranges(&src.blocks);
         tracing::info!("{} block ranges", blocks.len());
         let dataset_id = metadata::schema_name_to_dataset_id(&src.schema_name);

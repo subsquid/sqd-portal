@@ -45,6 +45,7 @@ pub fn extract_blocks(
         }
         tracing::debug!("Extracting from {}.{}: ", src.schema_name, src.table_name);
         let xtr = ExtractorExprTransformer {};
+        let filter = src.filter.as_ref().unwrap_or(filter);
         let _ = match xtr.transform_expr(filter, &src, tctx)? {
             Extractor::Op(o, l, r) => match ranges_from_extractor(&o, &l, &r, &mut src.blocks)? {
                 Some(x) => src.blocks.push(x),

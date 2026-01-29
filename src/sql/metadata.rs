@@ -166,9 +166,9 @@ pub fn table_type(name: &str) -> TableType {
 pub fn get_dataset_stats(_dataset: &DatasetId) -> Option<Stats> {
     Some(Stats {
         num_blocks: 1000000,
-        tx_per_block: 150,
-        logs_per_block: 250,
-        traces_per_block: 250,
+        tx_per_block: 75,
+        logs_per_block: 150,
+        traces_per_block: 100,
         diffs_per_block: 100,
     })
 }
