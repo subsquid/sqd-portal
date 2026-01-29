@@ -81,14 +81,15 @@ pub struct Stats {
     pub diffs_per_block: u64,
 }
 
+// stats are still faked
 impl Default for Stats {
     fn default() -> Self {
         Stats {
-            num_blocks: 0,
-            tx_per_block: 0,
-            logs_per_block: 0,
-            traces_per_block: 0,
-            diffs_per_block: 0,
+            num_blocks: 1000000,
+            tx_per_block: 50,
+            logs_per_block: 150,
+            traces_per_block: 100,
+            diffs_per_block: 100,
         }
     }
 }
@@ -134,6 +135,8 @@ pub fn compute_stats(dataset: &DatasetId, table: &str, blocks: &[Range<u64>]) ->
     )
 }
 
+// Again, this is still dataset-oriented,
+// not generic schema
 #[derive(Debug, Clone)]
 pub enum TableType {
     Block,
@@ -164,13 +167,7 @@ pub fn table_type(name: &str) -> TableType {
 }
 
 pub fn get_dataset_stats(_dataset: &DatasetId) -> Option<Stats> {
-    Some(Stats {
-        num_blocks: 1000000,
-        tx_per_block: 75,
-        logs_per_block: 150,
-        traces_per_block: 100,
-        diffs_per_block: 100,
-    })
+    None
 }
 
 // We should use "bucket_name" -
@@ -200,19 +197,15 @@ pub fn map_datasets_on_schemas(datasets: &[DatasetConfig]) -> Result<Metadata, S
             name: bucket_to_schema_name(&d.default_name),
             bucket_name: d.default_name.to_string(),
             schema: schema.clone(),
-            stats: Stats {
-                num_blocks: 1000000,
-                tx_per_block: 150,
-                logs_per_block: 250,
-                traces_per_block: 250,
-                diffs_per_block: 100,
-            },
+            stats: Stats::default(),
         });
     }
 
     Ok(Metadata { datasets: ds })
 }
 
+// This will not be one document in the future,
+// but a repository from where relevant parts are retrieved.
 fn schemas_or_die() -> HashMap<String, Schema> {
     let path = std::env::var("SCHEMAS").unwrap_or("./schemas.json".to_string());
     read_schemas(&path).expect("cannot read schemas")
