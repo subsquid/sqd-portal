@@ -113,7 +113,9 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
 
     // Initialize Sentry before tracing to integrate them
-    let _sentry_guard = setup_sentry(&args.config, &args);
+    if args.config.sentry_is_enabled { 
+        let _sentry_guard = setup_sentry(&args.config, &args);
+    }
     setup_tracing(args.json_log, args.log_span_durations);
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
@@ -142,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
             Cow::Owned(peer_id.to_string()),
         )]
         .into_iter(),
-    );
+    ); 
     metrics::register_metrics(metrics_registry.sub_registry_with_prefix("portal"));
     sqd_network_transport::metrics::register_metrics(
         metrics_registry.sub_registry_with_prefix("transport"),

@@ -3,8 +3,11 @@ datasets:
 
 max_chunks_per_stream: 1000
 max_parallel_streams: 10000
-    
+
+assignments_url: localhost:9090/
+sentry_is_enabled: false
+  
 # DO NOT CHANGE BELOW THIS LINE. CLOUD API WILL NOT WORK
-sqd_network:
-  datasets: https://cdn.subsquid.io/sqd-network/datasets.yml
-  serve: "all"
+#sqd_network:
+#  datasets: https://cdn.subsquid.io/sqd-network/datasets.yml
+#  serve: "all"
