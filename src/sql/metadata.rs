@@ -59,6 +59,8 @@ pub struct Field {
     pub nullable: bool,
 }
 
+// Types are still simplistic. A bit more machinery is needed,
+// in particular for complex types.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LogicalType {
@@ -71,7 +73,7 @@ pub enum LogicalType {
 }
 
 // This is dataset-oriented
-// but should be generic in the future
+// but should be generic in the future.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Stats {
     pub num_blocks: u64,
@@ -136,7 +138,7 @@ pub fn compute_stats(dataset: &DatasetId, table: &str, blocks: &[Range<u64>]) ->
 }
 
 // Again, this is still dataset-oriented,
-// not generic schema
+// not generic schema.
 #[derive(Debug, Clone)]
 pub enum TableType {
     Block,
@@ -170,9 +172,9 @@ pub fn get_dataset_stats(_dataset: &DatasetId) -> Option<Stats> {
     None
 }
 
-// We should use "bucket_name" -
-// The datasets and their schemas should be kept as part of the program state,
-// so that we can retrieve data from them at any time.
+// We should use "bucket_name":
+// datasets with schemas and stats should be kept as part of the program state,
+// so that we can retrieve them at any time.
 pub fn schema_name_to_dataset_id(schema: &str) -> DatasetId {
     let s = format!("s3://{}", schema.replace("_", "-"));
     DatasetId::from_url(&s)
@@ -205,7 +207,8 @@ pub fn map_datasets_on_schemas(datasets: &[DatasetConfig]) -> Result<Metadata, S
 }
 
 // This will not be one document in the future,
-// but a repository from where relevant parts are retrieved.
+// but a repository from where relevant parts are retrieved
+// or subscribed (in case of stats).
 fn schemas_or_die() -> HashMap<String, Schema> {
     let path = std::env::var("SCHEMAS").unwrap_or("./schemas.json".to_string());
     read_schemas(&path).expect("cannot read schemas")

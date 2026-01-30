@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use sql_query_plan::plan;
@@ -46,11 +47,23 @@ pub async fn query(
     let mut tables = Vec::new();
     for src in query::get_sources(request, &mut ctx)? {
         let sql = query::compile_sql(&src, &ctx)?;
+        tracing::info!("Derived SQL '{sql}'");
         let blocks = query::unwrap_field_ranges(&src.blocks);
         let dataset_id = metadata::schema_name_to_dataset_id(&src.schema_name);
-        let chunks = query::get_chunks(&dataset_id, &blocks, network)?;
+        // no blocks means no filters
+        let chunks = if blocks.is_empty() {
+            query::get_chunks(
+                &dataset_id,
+                &vec![Range {
+                    start: 0,
+                    end: u64::MAX,
+                }],
+                network,
+            )?
+        } else {
+            query::get_chunks(&dataset_id, &blocks, network)?
+        };
         let workers = query::get_workers(&dataset_id, &sql, &chunks, network)?;
-        tracing::info!("Derived SQL '{sql}'");
         tracing::info!(
             "For table '{}' {} chunks on {} workers",
             src.table_name,

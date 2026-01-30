@@ -747,27 +747,23 @@ mod test {
     use std::ops::Range;
     use substrait::proto::Plan;
 
-    static JSON_PLAN_BLOCK_COLS: &str =
-        include_str!("../../../resources/block_plain_with_cols.json");
-    static JSON_PLAN_BLOCK_SORT: &str =
-        include_str!("../../../resources/block_simple_with_sort.json");
-    static JSON_PLAN_BLOCK_OR: &str = include_str!("../../../resources/block_plain_with_or.json");
-    static JSON_PLAN_BLOCK_NOT: &str = include_str!("../../../resources/block_plain_with_not.json");
-    static JSON_PLAN_BLOCK_IN: &str = include_str!("../../../resources/block_plain_with_in.json");
-    static JSON_PLAN_BLOCK_COOL_JOIN: &str =
-        include_str!("../../../resources/block_simple_join.json");
-    static JSON_PLAN_BLOCK_SQD_JOIN: &str =
-        include_str!("../../../resources/block_remote_join2.json");
+    static JSON_PLAN_BLOCK_COLS: &str = include_str!("../../resources/block_plain_with_cols.json");
+    static JSON_PLAN_BLOCK_SORT: &str = include_str!("../../resources/block_simple_with_sort.json");
+    static JSON_PLAN_BLOCK_OR: &str = include_str!("../../resources/block_plain_with_or.json");
+    static JSON_PLAN_BLOCK_NOT: &str = include_str!("../../resources/block_plain_with_not.json");
+    static JSON_PLAN_BLOCK_IN: &str = include_str!("../../resources/block_plain_with_in.json");
+    static JSON_PLAN_BLOCK_COOL_JOIN: &str = include_str!("../../resources/block_simple_join.json");
+    static JSON_PLAN_BLOCK_SQD_JOIN: &str = include_str!("../../resources/block_remote_join2.json");
     static JSON_BLOCK_SQD_AND_LOCAL_JOIN: &str =
-        include_str!("../../../resources/block_tx_local_join.json");
+        include_str!("../../resources/block_tx_local_join.json");
     static JSON_BLOCK_SQD_AND_LOCAL_JOIN2: &str =
-        include_str!("../../../resources/block_tx_local_join2.json");
+        include_str!("../../resources/block_tx_local_join2.json");
     static JSON_BLOCK_TX_JOIN_WITH_OR: &str =
-        include_str!("../../../resources/block_tx_join_with_or.json");
+        include_str!("../../resources/block_tx_join_with_or.json");
     static JSON_BLOCK_TX_JOIN_WITH_NOT: &str =
-        include_str!("../../../resources/block_tx_join_with_not.json");
+        include_str!("../../resources/block_tx_join_with_not.json");
     static JSON_BLOCK_TX_JOIN_WITH_WHERE_ON_TX: &str =
-        include_str!("../../../resources/block_tx_join_with_where_on_tx.json");
+        include_str!("../../resources/block_tx_join_with_where_on_tx.json");
 
     fn make_block_example_with_cols() -> Plan {
         serde_json::from_str(JSON_PLAN_BLOCK_COLS).unwrap()
@@ -1068,14 +1064,10 @@ mod test {
 
             assert_eq!(
                 src.blocks,
-                if src.table_name == "block" {
-                    vec![FieldRange::BlockNumber(Range {
-                        start: 217710084,
-                        end: 217710087,
-                    })]
-                } else {
-                    vec![]
-                }
+                vec![FieldRange::BlockNumber(Range {
+                    start: 217710084,
+                    end: 217710087,
+                })]
             );
         }
     }
@@ -1264,14 +1256,10 @@ mod test {
 
             assert_eq!(
                 src.blocks,
-                if src.table_name == "transactions" {
-                    vec![FieldRange::BlockNumber(Range {
-                        start: 217710084,
-                        end: 217710087,
-                    })]
-                } else {
-                    vec![]
-                }
+                vec![FieldRange::BlockNumber(Range {
+                    start: 217710084,
+                    end: 217710087,
+                })]
             );
         }
     }
