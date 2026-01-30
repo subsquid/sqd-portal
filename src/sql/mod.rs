@@ -50,7 +50,9 @@ pub async fn query(
         tracing::info!("Derived SQL '{sql}'");
         let blocks = query::unwrap_field_ranges(&src.blocks);
         let dataset_id = metadata::schema_name_to_dataset_id(&src.schema_name);
-        // no blocks means no filters
+        // No blocks means no filters.
+        // A method in network client to get
+        // all chunks of a dataset would be more efficient.
         let chunks = if blocks.is_empty() {
             query::get_chunks(
                 &dataset_id,
