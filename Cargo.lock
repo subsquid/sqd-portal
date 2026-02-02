@@ -7763,6 +7763,7 @@ dependencies = [
 [[package]]
 name = "sql_query_plan"
 version = "0.1.0"
+source = "git+https://github.com/subsquid/qplan.git?rev=2e61b51#2e61b514054e377d58be46dc8166543a9475ba81"
 dependencies = [
  "chrono",
  "futures 0.3.31",

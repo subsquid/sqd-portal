@@ -4,7 +4,7 @@ version = "0.8.7"
 edition = "2021"
 
 [features]
-sql = ["dep:once_cell", "dep:prost", "dep:substrait"]
+sql = ["dep:once_cell", "dep:prost", "dep:substrait", "dep:sql_query_plan"]
 
 [dependencies]
 anyhow = "1"
@@ -67,6 +67,5 @@ sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", r
 sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "90a91d94", features = ["serde"] }
 sqd-query = { git = "https://github.com/subsquid/data.git", rev = "90a91d94" }
 
-# sql_query_plan = { git = "https://github.com/subsquid/qplan.git", rev = "2e61b51" }
-sql_query_plan = { path = "/home/ts/sqd/sql-sqd-prototype/components/qplan" }
+sql_query_plan = { git = "https://github.com/subsquid/qplan.git", rev = "2e61b51", optional = true }
 
