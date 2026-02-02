@@ -14,6 +14,9 @@ use crate::types::DatasetId;
 // with SQL-specific (and experimental) stuff.
 pub static SCHEMAS: Lazy<HashMap<String, Schema>> = Lazy::new(schemas_or_die);
 
+const DEFAULT_SCHEMAS_JSON: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/schemas.json"));
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Metadata {
@@ -210,13 +213,19 @@ pub fn map_datasets_on_schemas(datasets: &[DatasetConfig]) -> Result<Metadata, S
 // but a repository from where relevant parts are retrieved
 // or subscribed (in case of stats).
 fn schemas_or_die() -> HashMap<String, Schema> {
-    let path = std::env::var("SCHEMAS").unwrap_or("./schemas.json".to_string());
-    read_schemas(&path).expect("cannot read schemas")
+    if let Ok(path) = std::env::var("SCHEMAS") {
+        read_schemas(&path)
+            .unwrap_or_else(|e| panic!("cannot read schemas from {}: {}", path, e))
+    } else {
+        // Fallback to embedded default
+        read_schemas_from_str(DEFAULT_SCHEMAS_JSON)
+            .expect("cannot read embedded schemas")
+    }
 }
 
 fn read_schemas(path: &str) -> Result<HashMap<String, Schema>, SchemaErr> {
     let f = File::open(path)?;
-    let rd = BufReader::new(f);
+    let rd = BufReader::new(f);  
     let schemas: Vec<Schema> = serde_json::from_reader(rd)?;
     let mut m = HashMap::new();
     for schema in &schemas {
