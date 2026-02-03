@@ -4,6 +4,7 @@ version = "0.8.8"
 edition = "2021"
 
 [features]
+default = ["sql"]
 sql = ["dep:once_cell", "dep:prost", "dep:substrait", "dep:sql_query_plan"]
 
 [dependencies]

@@ -223,6 +223,15 @@ fn schemas_or_die() -> HashMap<String, Schema> {
     }
 }
 
+fn read_schemas_from_str(path: &str) -> Result<HashMap<String, Schema>, SchemaErr> {
+    let schemas: Vec<Schema> = serde_json::from_str(path)?;
+    let mut m = HashMap::new();
+    for schema in &schemas {
+        m.insert(schema.name.to_string(), schema.clone());
+    }
+    Ok(m)
+}
+
 fn read_schemas(path: &str) -> Result<HashMap<String, Schema>, SchemaErr> {
     let f = File::open(path)?;
     let rd = BufReader::new(f);  

@@ -122,10 +122,10 @@ pub fn get_workers(
         // here we search for the chunk again. Should be implemented in NetworkClient.
         for w in network.get_workers(dataset_id, *block) {
             let w = w.peer_id.to_string();
-            if COMPATIBLE_WORKERS.binary_search(&w.as_str()).is_ok() {
+            //if COMPATIBLE_WORKERS.binary_search(&w.as_str()).is_ok() {
                 wrk = Some(w);
                 break;
-            }
+            //}
         }
         if let Some(peer_id) = wrk {
             let tch = TableChunk {
