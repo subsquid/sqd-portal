@@ -106,6 +106,10 @@ pub async fn run_server(
         )
         // Backward compatibility routes
         .route(
+            "/datasets/:dataset/finalized-stream/height",
+            get(get_height).endpoint("/height"),
+        )
+        .route(
             "/datasets/:dataset/archival-stream/height",
             get(get_height).endpoint("/height"),
         )
