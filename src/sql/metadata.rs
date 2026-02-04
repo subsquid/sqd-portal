@@ -13,6 +13,10 @@ use crate::types::DatasetId;
 // I keep them here for the moment not to pollute the code
 // with SQL-specific (and experimental) stuff.
 pub static SCHEMAS: Lazy<HashMap<String, Schema>> = Lazy::new(schemas_or_die);
+const DEFAULT_SCHEMAS_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/schemas.json",
+));
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -211,12 +215,10 @@ pub fn map_datasets_on_schemas(datasets: &[DatasetConfig]) -> Result<Metadata, S
 // or subscribed (in case of stats).
 fn schemas_or_die() -> HashMap<String, Schema> {
     if let Ok(path) = std::env::var("SCHEMAS") {
-        read_schemas(&path)
-            .unwrap_or_else(|e| panic!("cannot read schemas from {}: {}", path, e))
+        read_schemas(&path).unwrap_or_else(|e| panic!("cannot read schemas from {}: {}", path, e))
     } else {
         // Fallback to embedded default
-        read_schemas_from_str(DEFAULT_SCHEMAS_JSON)
-            .expect("cannot read embedded schemas")
+        read_schemas_from_str(DEFAULT_SCHEMAS_JSON).expect("cannot read embedded schemas")
     }
 }
 
@@ -227,8 +229,6 @@ fn read_schemas_from_str(path: &str) -> Result<HashMap<String, Schema>, SchemaEr
         m.insert(schema.name.to_string(), schema.clone());
     }
     Ok(m)
-}
-
 }
 
 fn read_schemas(path: &str) -> Result<HashMap<String, Schema>, SchemaErr> {
