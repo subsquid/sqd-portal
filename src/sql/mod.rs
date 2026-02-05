@@ -46,6 +46,7 @@ pub async fn query(
     let mut ctx = plan::TraversalContext::new(plan::Options::default());
     let mut tables = Vec::new();
     for src in query::get_sources(request, &mut ctx)? {
+        tracing::trace!("Source: {src:?}");
         let sql = query::compile_sql(&src, &ctx)?;
         tracing::info!("Derived SQL '{sql}'");
         let blocks = query::unwrap_field_ranges(&src.blocks);
