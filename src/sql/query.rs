@@ -99,23 +99,34 @@ pub fn get_chunks_for_range(
     dataset_id: &DatasetId,
     range: &Range<u64>,
     chunks: &mut HashMap<String, BlockNumber>,
-) -> Result<(), QueryErr> {
-    match network.find_chunk(dataset_id, range.start) {
-        Err(e) => tracing::info!("no chunks found for {}: {:?}", range.start, e),
+) -> Result<(), QueryErr> { 
+    tracing::debug!("get chunks for range: {dataset_id} {range:?} {chunks:?}");
+    let chunk = match network.find_chunk(dataset_id, range.start) {
+        Err(ChunkNotFound::BeforeFirst { first_block })
+            if (first_block >= range.start) && ( first_block <= range.end ) => {
+            network.find_chunk(dataset_id, first_block)
+                   .expect("first_block must be present")
+        }
+        Err(e) => {
+            tracing::info!("no chunks found for {}: {:?}", range.start, e);
+            return Ok(())
+        }
         Ok(chunk) => {
-            chunks.insert(chunk.to_string(), chunk.first_block);
-            let mut previous = chunk;
-            loop {
-                if let Some(chunk) = network.next_chunk(dataset_id, &previous) {
-                    if chunk.first_block < range.end {
-                        chunks.insert(chunk.to_string(), chunk.first_block);
-                        previous = chunk;
-                        continue;
-                    }
-                }
-                break;
+            chunk
+        }
+    };
+
+    chunks.insert(chunk.to_string(), chunk.first_block);
+    let mut previous = chunk;
+    loop {
+        if let Some(chunk) = network.next_chunk(dataset_id, &previous) {
+            if chunk.first_block < range.end {
+                chunks.insert(chunk.to_string(), chunk.first_block);
+                previous = chunk;
+                continue;
             }
         }
+        break;
     }
     Ok(())
 }
