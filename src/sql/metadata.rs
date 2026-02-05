@@ -234,7 +234,7 @@ fn read_schemas_from_str(path: &str) -> Result<HashMap<String, Schema>, SchemaEr
 
 fn read_schemas(path: &str) -> Result<HashMap<String, Schema>, SchemaErr> {
     let f = File::open(path)?;
-    let rd = BufReader::new(f);  
+    let rd = BufReader::new(f);
     let schemas: Vec<Schema> = serde_json::from_reader(rd)?;
     let mut m = HashMap::new();
     for schema in &schemas {

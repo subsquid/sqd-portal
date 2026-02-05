@@ -144,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
             Cow::Owned(peer_id.to_string()),
         )]
         .into_iter(),
-    ); 
+    );
     metrics::register_metrics(metrics_registry.sub_registry_with_prefix("portal"));
     sqd_network_transport::metrics::register_metrics(
         metrics_registry.sub_registry_with_prefix("transport"),
