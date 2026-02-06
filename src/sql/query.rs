@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
 use std::ops::Range;
 use std::sync::Arc;
 
 use axum::body;
+use once_cell::sync::Lazy;
 use prost::{DecodeError, Message};
 use serde::{Deserialize, Serialize};
 use substrait::proto::Plan;
@@ -26,6 +29,14 @@ pub enum QueryErr {
     NoChunk(#[from] ChunkNotFound),
     #[error("no worker available for chunk: {0}")]
     NoWorker(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorkerErr {
+    #[error("cannot read file: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("cannot read embedded workers: {0}")]
+    JsonError(#[from] serde_json::Error),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -122,7 +133,7 @@ pub fn get_workers(
         // here we search for the chunk again. Should be implemented in NetworkClient.
         for w in network.get_workers(dataset_id, *block) {
             let w = w.peer_id.to_string();
-            if COMPATIBLE_WORKERS.binary_search(&w.as_str()).is_ok() {
+            if COMPATIBLE_WORKERS.binary_search(&w).is_ok() {
                 wrk = Some(w);
                 break;
             }
@@ -172,7 +183,26 @@ pub fn compile_sql(src: &Source, ctx: &plan::TraversalContext) -> Result<String,
 // These are workers I happen to know to support the SQL API;
 // without this workaround a lot of queries fail because of
 // network errors - which is inconvenient.
-static COMPATIBLE_WORKERS: &[&str] = &[
+const DEFAULT_COMPATIBLE_WORKERS_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/workers.json",
+));
+
+static COMPATIBLE_WORKERS: Lazy<Vec<String>> = Lazy::new(|| {
+    if let Ok(path) = std::env::var("SQL_COMPATIBLE_WORKERS") {
+        read_workers_from_file(&path)
+            .unwrap_or_else(|e| panic!("cannot read compatible workder from {path}: {:?},", e))
+    } else {
+        serde_json::from_str(DEFAULT_COMPATIBLE_WORKERS_JSON).expect("cannot read embedded schemas")
+    }
+});
+
+fn read_workers_from_file(path: &str) -> Result<Vec<String>, WorkerErr> {
+    let rd = BufReader::new(File::open(path)?);
+    Ok(serde_json::from_reader(rd)?)
+}
+
+/*
     "12D3KooW9tTukw24wSZLUWoyAHsDHKmnEmRbiDv9TGNp5hLnFvaA",
     "12D3KooW9yQws9oxjj6aAAKov8zb69ZVj5UEBzFh6sD4srTNfQFb",
     "12D3KooWAtiaMNKiT1MTnugK7orXFGpyBFZTWF5gYFEUTEGeakvP",
@@ -244,3 +274,4 @@ static COMPATIBLE_WORKERS: &[&str] = &[
     "12D3KooWSDFxeb9DhC4kbSppBs77143dFWt9wkk3khTQjfd7tP94",
     "12D3KooWSyNaBqC5TMvCT7EATtgxCpM5vm9GCVtRCmCtKC3qbdrz",
 ];
+*/
