@@ -1,0 +1,789 @@
+[
+{
+    "name": "solana",
+    "tables": [
+        {
+            "name": "blocks",
+            "schema": {
+                "fields": [
+                    {
+                        "name": "number",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "hash",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "parent_number",
+                        "type": "integer",
+                        "nullable": true
+                    },
+                    {
+                        "name": "parent_hash",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "height",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "timestamp",
+                        "type": "timestamp",
+                        "nullable": false
+                    }
+                ],
+                "primaryKey": ["number"]
+            }
+        },
+        {
+            "name": "transactions",
+            "schema": {
+                "fields": [
+                    {
+                        "name": "block_number",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "transaction_index",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "version",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "account_keys",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "address_table_lookups",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "num_readonly_signed_accounts",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "num_readonly_unsigned_accounts",
+                        "type":  "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "num_required_signatures",
+                        "type":  "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "recent_blockhash",
+                        "type":  "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "signatures",
+                        "type":  "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "err",
+                        "type":  "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "compute_units_consumed",
+                        "type":  "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "fee",
+                        "type":  "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "loaded_addresses",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "has_dropped_log_messages",
+                        "type": "bool",
+                        "nullable": false
+                    },
+                    {
+                        "name": "fee_payer",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "account_keys_size",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "address_table_lookups_size",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "signatures_size",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "loaded_addresses_size",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "accounts_bloom",
+                        "type": "blob",
+                        "nullable": false
+                    }
+                ],
+                "primaryKey": []
+            }
+        }
+    ]
+},
+{
+    "name": "evm",
+    "tables": [
+        {
+            "name": "blocks",
+            "schema": {
+                "fields": [
+                    {
+                        "name": "number",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "hash",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "parent_hash",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "nonce",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "sha3_uncles",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "logs_bloom",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "transactions_root",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "state_root",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "receipts_root",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "mix_hash",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "miner",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "difficulty",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "total_difficulty",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "extra_data",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "size",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "gas_limit",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "gas_used",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "timestamp",
+                        "type": "timestamp",
+                        "nullable": false
+                    },
+                    {
+                        "name": "base_fee_per_gas",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "extra_data_size",
+                        "type": "integer",
+                        "nullable": true
+                    }
+                ],
+                "primaryKey": []
+            }
+        },
+        {
+            "name": "transactions",
+            "schema": {
+                "fields": [
+                    {
+                        "name": "block_number",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "from",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "gas",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "gas_price",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "max_fee_per_gas",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "max_priority_fee_per_gas",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "hash",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "input",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "nonce",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "to",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "transaction_index",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "value",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "v",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "r",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "s",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "y_parity",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "chain_id",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "sighash",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "gas_used",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "cumulative_gas_used",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "effective_gas_price",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "contract_address",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "type",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "status",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "input_size",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "_idx",
+                        "type": "integer",
+                        "nullable": false
+                    }
+                ],
+                "primaryKey": []
+            }
+        },
+        {
+            "name": "logs",
+            "schema": {
+                "fields": [
+                    {
+                        "name": "_idx",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "block_number",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "log_index",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "transaction_index",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "transaction_hash",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "address",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "data",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "topic0",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "topic1",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "topic2",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "topic3",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "data_size",
+                        "type": "integer",
+                        "nullable": false
+                    }
+                ],
+                "primaryKey": []
+            }
+        },
+        {
+            "name": "traces",
+            "schema": {
+                "fields": [
+                    {
+                        "name": "_idx",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "block_number",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "transaction_index",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "trace_address",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "subtraces",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "type",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "error",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "revert_reason",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "create_from",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "create_value",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "create_gas",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "create_init",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "create_result_gas_used",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "create_result_code",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "create_result_address",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "call_from",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "call_to",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "call_value",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "call_gas",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "call_input",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "call_sighash",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "call_type",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "call_result_gas_used",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "call_result_output",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "suicide_address",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "suicide_refund_address",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "suicide_balance",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "reward_author",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "reward_value",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "reward_type",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "create_init_size",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "create_result_code_size",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "call_input_size",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "call_result_output_size",
+                        "type": "integer",
+                        "nullable": false
+                    }
+                ],
+                "primaryKey": []
+            }
+        },
+        {
+            "name": "statediffs",
+            "schema": {
+                "fields": [
+                    {
+                        "name": "_idx",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "block_number",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "transaction_index",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "address",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "key",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "kind",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "prev",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "next",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "prev_size",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "next_size",
+                        "type": "integer",
+                        "nullable": false
+                    }
+                ],
+                "primaryKey": []
+            }
+        }
+    ]
+},
+{
+    "name": "hyperliquid",
+    "tables": [
+        {
+            "name": "blocks",
+            "schema": {
+                "fields": [
+                    {
+                        "name": "number",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "hash",
+                        "type": "varchar",
+                        "nullable": false
+                    },
+                    {
+                        "name": "proposer",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "block_time",
+                        "type": "timestamp",
+                        "nullable": false
+                    }
+                ],
+                "primaryKey": ["number"]
+            }
+        },
+        {
+            "name": "transactions",
+            "schema": {
+                "fields": [
+                    {
+                        "name": "block_number",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "transaction_index",
+                        "type": "integer",
+                        "nullable": false
+                    },
+                    {
+                        "name": "user",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "actions",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "actions_size",
+                        "type": "integer",
+                        "nullable": true
+                    },
+                    {
+                        "name": "raw_tx_hash",
+                        "type": "varchar",
+                        "nullable": true
+                    },
+                    {
+                        "name": "error",
+                        "type": "varchar",
+                        "nullable": true
+                    }
+                ],
+                "primaryKey": ["number"]
+            }
+        }
+    ]
+}
+]

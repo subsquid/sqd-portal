@@ -29,7 +29,9 @@ use crate::datasets::DatasetConfig;
 use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::types::Compression;
-use crate::utils::conversion::{collect_to_string, join_gzip_default, json_lines_to_json, recompress_gzip};
+use crate::utils::conversion::{
+    collect_to_string, join_gzip_default, json_lines_to_json, recompress_gzip,
+};
 use crate::utils::internal_query::{build_blocknumber_query, find_block_in_chunk};
 use crate::utils::logging::MethodRouterExt;
 use crate::{
@@ -40,6 +42,11 @@ use crate::{
     types::{ChunkId, DatasetId, GenericError, ParsedQuery, RequestError, StreamRequest},
     utils::logging,
 };
+
+#[cfg(feature = "sql")]
+use crate::sql;
+#[cfg(feature = "sql")]
+use axum::body;
 
 pub async fn run_server(
     task_manager: Arc<TaskManager>,
@@ -135,7 +142,15 @@ pub async fn run_server(
             get(get_debug_block).endpoint("/block/debug"),
         )
         .route("/metrics", get(get_metrics))
-        .route("/ready", get(get_readiness))
+        .route("/ready", get(get_readiness));
+
+    // SQL Query Engine
+    #[cfg(feature = "sql")]
+    let app = app
+        .route("/sql/query", post(sql_query).endpoint("/sql/query"))
+        .route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
+
+    let app = app
         .route_layer(axum::middleware::from_fn(logging::middleware))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
@@ -400,7 +415,7 @@ async fn run_stream_internal(
                 Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
                 Compression::Zstd => Body::from_stream(
                     stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))),
-                )
+                ),
             };
             res.header(header::CONTENT_TYPE, "application/jsonl")
                 .header(header::CONTENT_ENCODING, compression.content_encoding())
@@ -1007,6 +1022,45 @@ fn forward_response(response: reqwest::Response) -> axum::response::Response {
     }
     let body = Body::from_stream(response.bytes_stream());
     builder.body(body).unwrap()
+}
+
+#[cfg(feature = "sql")]
+async fn sql_query(
+    Extension(network): Extension<Arc<NetworkClient>>,
+    query: body::Bytes,
+) -> Result<axum::Json<sql::query::SqlQueryResponse>, (StatusCode, axum::Json<GenericError>)> {
+    sql::query(query, &network)
+        .await
+        .map(|res| res.into())
+        .map_err(|e| {
+            tracing::warn!("cannot query data: {:?}", e);
+            (
+                // differentiate error handling
+                StatusCode::INTERNAL_SERVER_ERROR,
+                GenericError {
+                    message: e.to_string(),
+                }
+                .into(),
+            )
+        })
+}
+
+#[cfg(feature = "sql")]
+async fn sql_metadata(
+    Extension(network): Extension<Arc<NetworkClient>>,
+) -> Result<axum::Json<Vec<sql::metadata::Dataset>>, (StatusCode, axum::Json<GenericError>)> {
+    sql::get_all_metadata(network)
+        .await
+        .map(|md| md.datasets.into())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                GenericError {
+                    message: e.to_string(),
+                }
+                .into(),
+            )
+        })
 }
 
 const FINALIZED_NUMBER_HEADER: &str = "x-sqd-finalized-head-number";
