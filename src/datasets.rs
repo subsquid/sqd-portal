@@ -24,42 +24,33 @@ pub struct DatasetConfig {
     pub network_id: Option<DatasetId>,
     pub hotblocks: Option<RealTimeConfig>,
     pub kind: String,
+    pub metadata: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
-struct NetworkDatasetSummary {
-    dataset_id: DatasetId,
-    kind: Option<String>,
-}
-
-type DatasetsMapping = BTreeMap<String, NetworkDatasetSummary>;
+type DatasetsMapping = BTreeMap<String, DatasetId>;
 
 impl Datasets {
     pub async fn load(config: &Config) -> anyhow::Result<Self> {
-        let mapping = load_mapping(&config.sqd_network.datasets_url).await?;
-        Self::parse(config, mapping)
+        let (mapping, metadata) = tokio::join!(
+            load_mapping(&config.sqd_network.datasets_url),
+            load_metadata(config.sqd_network.metadata_url.as_deref()),
+        );
+        Self::parse(config, mapping?, metadata?)
     }
 
-    fn parse(config: &Config, mapping: DatasetsMapping) -> anyhow::Result<Self> {
+    fn parse(
+        config: &Config,
+        mapping: DatasetsMapping,
+        mut metadata: MetadataMapping,
+    ) -> anyhow::Result<Self> {
         let mut datasets: Vec<DatasetConfig> = Vec::new();
         let mut alias_to_index = BTreeMap::new();
         let mut id_to_default_name = BTreeMap::new();
         for (default_name, ds) in config.datasets.clone() {
-            let (network_id, net_ds) = match &ds.sqd_network {
-                Some(DatasetRef::Id(id)) => {
-                    let entry = mapping.get(&default_name);
-                    (Some(id.clone()), entry)
-                }
-                Some(DatasetRef::Name(name)) => {
-                    let entry = mapping.get(name);
-                    let id = entry.map(|d| d.dataset_id.clone());
-                    (id, entry)
-                }
-                None => {
-                    let entry = mapping.get(&default_name);
-                    let id = entry.map(|d| d.dataset_id.clone());
-                    (id, entry)
-                }
+            let network_id = match &ds.sqd_network {
+                Some(DatasetRef::Id(id)) => Some(id.clone()),
+                Some(DatasetRef::Name(name)) => mapping.get(name).cloned(),
+                None => mapping.get(&default_name).cloned(),
             };
 
             let index = datasets.len();
@@ -87,10 +78,19 @@ impl Datasets {
                     });
             }
 
+            let ds_metadata = metadata
+                .remove(&default_name)
+                .unwrap_or(serde_json::Value::Null);
+            let metadata_kind = ds_metadata
+                .as_object()
+                .and_then(|o| o.get("kind"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
             let kind = ds
                 .kind
                 .or_else(|| ds.real_time.as_ref().and_then(|r| r.kind.clone()))
-                .or_else(|| net_ds.as_ref().and_then(|s| s.kind.clone()))
+                .or(metadata_kind)
                 .ok_or_else(|| anyhow::anyhow!("Unknown kind for dataset {default_name}"))?;
 
             datasets.push(DatasetConfig {
@@ -98,30 +98,35 @@ impl Datasets {
                 aliases: ds.aliases,
                 network_id,
                 hotblocks: ds.real_time,
-                kind: kind,
+                kind,
+                metadata: ds_metadata,
             });
         }
 
         if let ServeMode::All = config.sqd_network.serve {
             // Add all datasets from the mapping that are not already present
-            for (name, ds) in mapping {
+            for (name, dataset_id) in mapping {
                 if let Entry::Vacant(entry) = alias_to_index.entry(name.clone()) {
                     entry.insert(datasets.len());
 
-                    let kind = ds
-                        .kind
-                        .ok_or_else(|| anyhow::anyhow!("Unknown kind for dataset {name}"))?
-                        .clone();
+                    let ds_metadata = metadata.remove(&name).unwrap_or(serde_json::Value::Null);
+                    let kind = ds_metadata
+                        .as_object()
+                        .and_then(|o| o.get("kind"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| anyhow::anyhow!("Unknown kind for dataset {name}"))?;
 
                     datasets.push(DatasetConfig {
                         default_name: name.clone(),
                         aliases: Vec::new(),
-                        network_id: Some(ds.dataset_id.clone()),
+                        network_id: Some(dataset_id.clone()),
                         hotblocks: None,
-                        kind: kind,
+                        kind,
+                        metadata: ds_metadata,
                     });
 
-                    if let Entry::Vacant(entry) = id_to_default_name.entry(ds.dataset_id) {
+                    if let Entry::Vacant(entry) = id_to_default_name.entry(dataset_id) {
                         entry.insert(name);
                     }
                 }
@@ -175,52 +180,47 @@ struct NetworkDatasets {
 struct NetworkDataset {
     id: String,
     name: String,
-    kind: Option<String>,
+}
+
+async fn load_yaml<T: serde::de::DeserializeOwned>(url: &str) -> anyhow::Result<T> {
+    if let Some(path) = url.strip_prefix("file://") {
+        tracing::debug!("Loading local file from {}", path);
+        let file =
+            File::open(path).with_context(|| format!("failed to open file {path}"))?;
+        let reader = BufReader::new(file);
+        serde_yaml::from_reader(reader).with_context(|| format!("failed to parse {path}"))
+    } else {
+        tracing::debug!("Fetching remote file from {}", url);
+        let response = reqwest::get(url).await?;
+        let text = response.text().await?;
+        serde_yaml::from_str(&text).with_context(|| format!("failed to parse {url}"))
+    }
 }
 
 async fn load_mapping(url: &str) -> anyhow::Result<DatasetsMapping> {
-    let file = load_networks(url).await?;
-    let mapping = parse_network_datasets(file.clone())?;
-    tracing::debug!("Datasets file loaded, {} datasets found", mapping.len());
-    Ok(mapping)
-}
-
-fn parse_network_datasets(file: NetworkDatasets) -> anyhow::Result<DatasetsMapping> {
+    let file: NetworkDatasets = load_yaml(url).await?;
     let mut datasets = BTreeMap::new();
     for dataset in file.sqd_network_datasets {
-        let summary = NetworkDatasetSummary {
-            dataset_id: DatasetId::from_url(&dataset.id),
-            kind: dataset.kind.clone(),
-        };
-        datasets.insert(dataset.name.clone(), summary);
+        datasets.insert(dataset.name.clone(), DatasetId::from_url(&dataset.id));
     }
+    tracing::debug!("Datasets file loaded, {} datasets found", datasets.len());
     Ok(datasets)
 }
 
-async fn load_networks(url: &str) -> anyhow::Result<NetworkDatasets> {
-    if let Some(path) = url.strip_prefix("file://") {
-        load_local_file(path)
-    } else {
-        fetch_remote_file(url).await
-    }
+type MetadataMapping = BTreeMap<String, serde_json::Value>;
+
+#[derive(Deserialize)]
+struct MetadataFile {
+    datasets: MetadataMapping,
 }
 
-async fn fetch_remote_file(url: &str) -> anyhow::Result<NetworkDatasets> {
-    tracing::debug!("Fetching remote file from {}", url);
-
-    let response = reqwest::get(url).await?;
-    let text = response.text().await?;
-
-    serde_yaml::from_str(&text).with_context(|| format!("failed to parse dataset {url}"))
-}
-
-fn load_local_file(full_path: &str) -> anyhow::Result<NetworkDatasets> {
-    tracing::debug!("Loading local file from {}", full_path);
-
-    let file = File::open(full_path).with_context(|| format!("failed to open file {full_path}"))?;
-    let reader = BufReader::new(file);
-
-    serde_yaml::from_reader(reader).with_context(|| format!("failed to parse dataset {full_path}"))
+async fn load_metadata(url: Option<&str>) -> anyhow::Result<MetadataMapping> {
+    let Some(url) = url else {
+        return Ok(BTreeMap::new());
+    };
+    let file: MetadataFile = load_yaml(url).await?;
+    tracing::debug!("Metadata loaded, {} datasets found", file.datasets.len());
+    Ok(file.datasets)
 }
 
 #[cfg(test)]
@@ -233,6 +233,8 @@ mod tests {
                 && self.aliases == other.aliases
                 && self.hotblocks.is_some() == other.hotblocks.is_some()
                 && self.network_id == other.network_id
+                && self.kind == other.kind
+                && self.metadata == other.metadata
         }
     }
     impl Eq for DatasetConfig {}
@@ -288,37 +290,30 @@ mod tests {
         let mapping = [
             (
                 "ethereum-mainnet".to_owned(),
-                NetworkDatasetSummary {
-                    dataset_id: DatasetId::from_url("s3://ethereum-mainnet-1"),
-                    kind: Some("shall_be_overwritten_by_config".to_string()),
-                },
+                DatasetId::from_url("s3://ethereum-mainnet-1"),
             ),
             (
                 "eth-main".to_owned(),
-                NetworkDatasetSummary {
-                    dataset_id: DatasetId::from_url("s3://ethereum-mainnet-2"),
-                    kind: Some("evm".to_string()),
-                },
+                DatasetId::from_url("s3://ethereum-mainnet-2"),
             ),
             (
                 "solana-mainnet".to_owned(),
-                NetworkDatasetSummary {
-                    dataset_id: DatasetId::from_url("s3://solana-mainnet"),
-                    kind: Some("solana".to_string()),
-                },
+                DatasetId::from_url("s3://solana-mainnet"),
             ),
             (
                 "arbitrum-one".to_owned(),
-                NetworkDatasetSummary {
-                    dataset_id: DatasetId::from_url("s3://arbitrum-one"),
-                    kind: Some("evm".to_string()),
-                },
+                DatasetId::from_url("s3://arbitrum-one"),
             ),
         ]
         .into_iter()
         .collect::<BTreeMap<_, _>>();
 
-        let datasets = Datasets::parse(&config, mapping).unwrap();
+        let metadata: MetadataMapping = serde_json::from_value(serde_json::json!({
+            "arbitrum-one": { "kind": "evm", "display_name": "Arbitrum One" }
+        }))
+        .unwrap();
+
+        let datasets = Datasets::parse(&config, mapping, metadata).unwrap();
 
         let beta_meta = datasets.get("beta").unwrap();
         let sol_meta = datasets.get("solana").unwrap();
@@ -339,6 +334,7 @@ mod tests {
                 hotblocks: None,
                 network_id: Some(DatasetId::from_url("s3://solana-mainnet-2")),
                 kind: "solana".to_string(),
+                metadata: serde_json::Value::Null,
             }
         );
 
@@ -350,6 +346,7 @@ mod tests {
                 hotblocks: Some(hotblocks_config.clone()),
                 network_id: Some(DatasetId::from_url("s3://solana-mainnet")),
                 kind: "solana".to_string(),
+                metadata: serde_json::Value::Null,
             }
         );
 
@@ -361,6 +358,7 @@ mod tests {
                 hotblocks: None,
                 network_id: Some(DatasetId::from_url("s3://ethereum-mainnet-1")),
                 kind: "evm".to_string(),
+                metadata: serde_json::Value::Null,
             }
         );
 
@@ -372,6 +370,7 @@ mod tests {
                 hotblocks: Some(hotblocks_config),
                 network_id: None,
                 kind: "solana".to_string(),
+                metadata: serde_json::Value::Null,
             }
         );
 
@@ -383,6 +382,7 @@ mod tests {
                 hotblocks: None,
                 network_id: Some(DatasetId::from_url("s3://solana-mainnet")),
                 kind: "solana".to_string(),
+                metadata: serde_json::Value::Null,
             }
         );
 
@@ -394,6 +394,7 @@ mod tests {
                 hotblocks: None,
                 network_id: None,
                 kind: "empty".to_string(),
+                metadata: serde_json::Value::Null,
             }
         );
 
@@ -456,23 +457,17 @@ mod tests {
         let mapping = [
             (
                 "ethereum-mainnet".to_owned(),
-                NetworkDatasetSummary {
-                    dataset_id: DatasetId::from_url("s3://ethereum-mainnet-1"),
-                    kind: Some("evm".to_string()),
-                },
+                DatasetId::from_url("s3://ethereum-mainnet-1"),
             ),
             (
                 "arbitrum-one".to_owned(),
-                NetworkDatasetSummary {
-                    dataset_id: DatasetId::from_url("s3://arbitrum-one"),
-                    kind: Some("evm".to_string()),
-                },
+                DatasetId::from_url("s3://arbitrum-one"),
             ),
         ]
         .into_iter()
         .collect::<BTreeMap<_, _>>();
 
-        let datasets = Datasets::parse(&config, mapping).unwrap();
+        let datasets = Datasets::parse(&config, mapping, BTreeMap::new()).unwrap();
 
         // In manual mode, only explicitly configured datasets should be available
         assert!(datasets.get("ethereum-mainnet").is_some());
