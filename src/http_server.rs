@@ -479,11 +479,23 @@ async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl In
     axum::Json(res).into_response()
 }
 
-async fn get_datasets(Extension(network): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
+#[derive(serde::Deserialize)]
+struct MetadataQuery {
+    #[serde(default)]
+    field: Vec<String>,
+}
+
+async fn get_datasets(
+    axum_extra::extract::Query(query): axum_extra::extract::Query<MetadataQuery>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+) -> impl IntoResponse {
     let datasets = network.datasets().read();
     let res: Vec<AvailableDatasetApiResponse> = datasets
         .iter()
-        .map(|metadata| metadata.clone().into())
+        .map(|d| {
+            let resp: AvailableDatasetApiResponse = d.clone().into();
+            resp.with_fields(&query.field)
+        })
         .collect();
 
     axum::Json(res)

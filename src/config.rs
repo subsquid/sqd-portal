@@ -95,6 +95,9 @@ pub struct SqdNetworkConfig {
     #[serde(rename = "datasets")]
     pub datasets_url: String,
 
+    #[serde(rename = "metadata")]
+    pub metadata_url: Option<String>,
+
     #[serde(default)]
     pub serve: ServeMode,
 }
