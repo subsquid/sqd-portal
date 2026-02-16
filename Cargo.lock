@@ -7570,7 +7570,7 @@ dependencies = [
 [[package]]
 name = "sqd-assignments"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=e430030#e4300305e5b0762f3ae6e45f42f7643b211d16ad"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=020e5e9#020e5e9da5b05101c956cba79a57bcc6760266f1"
 dependencies = [
  "anyhow",
  "crypto_box",
@@ -7594,7 +7594,7 @@ dependencies = [
 [[package]]
 name = "sqd-contract-client"
 version = "1.2.1"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=2c360df#2c360df3798ec29ee2872bc25de7409d8b09f9a2"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=020e5e9#020e5e9da5b05101c956cba79a57bcc6760266f1"
 dependencies = [
  "async-trait",
  "clap",
@@ -7604,6 +7604,7 @@ dependencies = [
  "log",
  "num-rational",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio 1.48.0",
  "tokio-stream",
@@ -7613,7 +7614,7 @@ dependencies = [
 [[package]]
 name = "sqd-messages"
 version = "2.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=2c360df#2c360df3798ec29ee2872bc25de7409d8b09f9a2"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=020e5e9#020e5e9da5b05101c956cba79a57bcc6760266f1"
 dependencies = [
  "bytemuck",
  "flate2",
@@ -7629,7 +7630,7 @@ dependencies = [
 [[package]]
 name = "sqd-network-transport"
 version = "3.0.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=2c360df#2c360df3798ec29ee2872bc25de7409d8b09f9a2"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=020e5e9#020e5e9da5b05101c956cba79a57bcc6760266f1"
 dependencies = [
  "anyhow",
  "async-trait",
