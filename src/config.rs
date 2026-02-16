@@ -88,6 +88,9 @@ pub struct Config {
 
     #[serde(default = "default_sentry_sampling_rate")]
     pub sentry_sampling_rate: f32,
+
+    #[serde(default = "default_true")]
+    pub sentry_is_enabled: bool
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

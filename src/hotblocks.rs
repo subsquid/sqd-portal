@@ -42,8 +42,8 @@ pub enum HotblocksErr {
     Request(#[from] reqwest::Error),
 }
 
-pub async fn build_server(config: &Config) -> anyhow::Result<HotblocksHandle> {
-    tracing::info!("Initializing hotblocks storage");
+pub async fn build_client(config: &Config) -> anyhow::Result<HotblocksHandle> {
+    tracing::info!("Initializing hotblocks client");
 
     let mut urls = BTreeMap::new();
     for (default_name, dataset) in config.datasets.iter() {
