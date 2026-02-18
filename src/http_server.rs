@@ -1028,39 +1028,27 @@ fn forward_response(response: reqwest::Response) -> axum::response::Response {
 async fn sql_query(
     Extension(network): Extension<Arc<NetworkClient>>,
     query: body::Bytes,
-) -> Result<axum::Json<sql::query::SqlQueryResponse>, (StatusCode, axum::Json<GenericError>)> {
-    sql::query(query, &network)
-        .await
-        .map(|res| res.into())
-        .map_err(|e| {
+) -> impl axum::response::IntoResponse {
+    match sql::query(query, &network).await {
+        Ok(res) => axum::Json(res).into_response(),
+        Err(e) => {
             tracing::warn!("cannot query data: {:?}", e);
-            (
-                // differentiate error handling
-                StatusCode::INTERNAL_SERVER_ERROR,
-                GenericError {
-                    message: e.to_string(),
-                }
-                .into(),
-            )
-        })
+            e.into_response()
+        }
+    }
 }
 
 #[cfg(feature = "sql")]
 async fn sql_metadata(
     Extension(network): Extension<Arc<NetworkClient>>,
-) -> Result<axum::Json<Vec<sql::metadata::Dataset>>, (StatusCode, axum::Json<GenericError>)> {
-    sql::get_all_metadata(network)
-        .await
-        .map(|md| md.datasets.into())
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                GenericError {
-                    message: e.to_string(),
-                }
-                .into(),
-            )
-        })
+) -> impl axum::response::IntoResponse {
+    match sql::get_all_metadata(network).await {
+        Ok(md) => axum::Json(md.datasets).into_response(),
+        Err(e) => {
+            tracing::warn!("cannot fetch metadata: {:?}", e);
+            e.into_response()
+        }
+    }
 }
 
 const FINALIZED_NUMBER_HEADER: &str = "x-sqd-finalized-head-number";

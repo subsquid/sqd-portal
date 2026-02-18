@@ -5,6 +5,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use axum::body;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use once_cell::sync::Lazy;
 use prost::{DecodeError, Message};
 use serde::{Deserialize, Serialize};
@@ -13,7 +15,7 @@ use thiserror;
 
 use crate::network::{ChunkNotFound, NetworkClient};
 use crate::sql::rewrite_target;
-use crate::types::{BlockNumber, DatasetId};
+use crate::types::{BlockNumber, DatasetId, GenericError};
 
 use sql_query_plan::plan::{self, Source, TargetPlan};
 
@@ -29,6 +31,27 @@ pub enum QueryErr {
     NoChunk(#[from] ChunkNotFound),
     #[error("no worker available for chunk: {0}")]
     NoWorker(String),
+    #[error("internal error: {0}")]
+    InternalError(String),
+}
+
+impl IntoResponse for QueryErr {
+    fn into_response(self) -> Response {
+        match self {
+            QueryErr::InternalError(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(GenericError { message: msg }),
+            )
+                .into_response(),
+            err => (
+                StatusCode::BAD_REQUEST,
+                axum::Json(GenericError {
+                    message: err.to_string(),
+                }),
+            )
+                .into_response(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -100,22 +123,41 @@ pub fn get_chunks_for_range(
     range: &Range<u64>,
     chunks: &mut HashMap<String, BlockNumber>,
 ) -> Result<(), QueryErr> {
-    match network.find_chunk(dataset_id, range.start) {
-        Err(e) => tracing::info!("no chunks found for {}: {:?}", range.start, e),
-        Ok(chunk) => {
-            chunks.insert(chunk.to_string(), chunk.first_block);
-            let mut previous = chunk;
-            loop {
-                if let Some(chunk) = network.next_chunk(dataset_id, &previous) {
-                    if chunk.first_block < range.end {
-                        chunks.insert(chunk.to_string(), chunk.first_block);
-                        previous = chunk;
-                        continue;
-                    }
-                }
-                break;
+    tracing::debug!("get chunks for range: {dataset_id} {range:?} {chunks:?}");
+    let chunk = match network.find_chunk(dataset_id, range.start) {
+        Err(ChunkNotFound::BeforeFirst { first_block })
+            if (first_block >= range.start) && (first_block <= range.end) =>
+        {
+            network.find_chunk(dataset_id, first_block).map_err(|e| {
+                tracing::error!(
+                    "first_block {} must be present but not found: {:?}",
+                    first_block,
+                    e
+                );
+                QueryErr::InternalError(format!(
+                    "expected first_block {} to be present: {:?}",
+                    first_block, e
+                ))
+            })?
+        }
+        Err(e) => {
+            tracing::info!("no chunks found for {}: {:?}", range.start, e);
+            return Ok(());
+        }
+        Ok(chunk) => chunk,
+    };
+
+    chunks.insert(chunk.to_string(), chunk.first_block);
+    let mut previous = chunk;
+    loop {
+        if let Some(chunk) = network.next_chunk(dataset_id, &previous) {
+            if chunk.first_block < range.end {
+                chunks.insert(chunk.to_string(), chunk.first_block);
+                previous = chunk;
+                continue;
             }
         }
+        break;
     }
     Ok(())
 }

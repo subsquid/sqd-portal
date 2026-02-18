@@ -1,6 +1,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use sql_query_plan::plan;
 
 mod extractor;
@@ -13,6 +15,7 @@ use query::{QueryErr, SqlQueryResponse, TableItem};
 
 use crate::datasets;
 use crate::network::NetworkClient;
+use crate::types::GenericError;
 
 use axum::body;
 
@@ -26,6 +29,21 @@ pub enum SqlErr {
     QueryErr(#[from] QueryErr),
     #[error("cannot serialize metadata: {0}")]
     Metadata(#[from] SchemaErr),
+}
+
+impl IntoResponse for SqlErr {
+    fn into_response(self) -> Response {
+        match self {
+            SqlErr::QueryErr(err) => err.into_response(),
+            SqlErr::Metadata(err) => (
+                StatusCode::BAD_REQUEST,
+                axum::Json(GenericError {
+                    message: err.to_string(),
+                }),
+            )
+                .into_response(),
+        }
+    }
 }
 
 pub async fn get_all_metadata(network: Arc<NetworkClient>) -> Result<Metadata, SqlErr> {
@@ -42,10 +60,11 @@ pub async fn query(
     request: body::Bytes,
     network: &Arc<NetworkClient>,
 ) -> Result<SqlQueryResponse, SqlErr> {
-    let query_id = format!("sql-{}", Uuid::new_v4().to_string());
+    let query_id = format!("sql-{}", Uuid::new_v4());
     let mut ctx = plan::TraversalContext::new(plan::Options::default());
     let mut tables = Vec::new();
     for src in query::get_sources(request, &mut ctx)? {
+        tracing::trace!("Source: {src:?}");
         let sql = query::compile_sql(&src, &ctx)?;
         tracing::info!("Derived SQL '{sql}'");
         let blocks = query::unwrap_field_ranges(&src.blocks);
@@ -56,7 +75,7 @@ pub async fn query(
         let chunks = if blocks.is_empty() {
             query::get_chunks(
                 &dataset_id,
-                &vec![Range {
+                &[Range {
                     start: 0,
                     end: u64::MAX,
                 }],
