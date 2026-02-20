@@ -418,6 +418,15 @@ impl NetworkClient {
         if lease {
             self.network_state.lease_worker(worker);
         }
+        metrics::QUERIES_RUNNING.inc();
+
+        let this = self.clone();
+        let guard = scopeguard::guard(worker, |worker: PeerId| {
+            // The result is no longer needed. Either another query has got the result first,
+            // or the stream has been dropped. In either case, consider the query outrun.
+            this.network_state.report_query_outrun(worker);
+            metrics::QUERIES_RUNNING.dec();
+        });
 
         let compression = match compression {
             Compression::Gzip => sqd_messages::Compression::Gzip,
@@ -450,18 +459,9 @@ impl NetworkClient {
         .await
         .unwrap();
 
-        metrics::QUERIES_RUNNING.inc();
         metrics::QUERIES_SENT
             .get_or_create(&vec![("worker".to_string(), worker.to_string())])
             .inc();
-
-        let this = self.clone();
-        let guard = scopeguard::guard(worker, |worker: PeerId| {
-            // The result is no longer needed. Either another query has got the result first,
-            // or the stream has been dropped. In either case, consider the query outrun.
-            this.network_state.report_query_outrun(worker);
-            metrics::QUERIES_RUNNING.dec();
-        });
 
         let query_start_time = Instant::now();
         let result = self

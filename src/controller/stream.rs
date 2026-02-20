@@ -68,9 +68,15 @@ struct PartialResult {
 }
 
 struct WorkerRequest {
-    resp: Pin<Box<dyn Future<Output = QueryResult> + Send>>,
+    resp: tokio::task::JoinHandle<QueryResult>,
     start_time: tokio::time::Instant,
     worker: PeerId,
+}
+
+impl Drop for WorkerRequest {
+    fn drop(&mut self) {
+        self.resp.abort();
+    }
 }
 
 impl StreamController {
@@ -162,6 +168,7 @@ impl StreamController {
             let Poll::Ready(response) = request.resp.poll_unpin(ctx) else {
                 return true;
             };
+            let response = response.unwrap();
             // This is intentionally measured when the result has been polled, not when it's ready.
             // If the stream is consumed slower than generated, this duration may get significantly higher than the response time.
             // This way the extra "follow up" queries won't be sent, saving on the number of queries.
@@ -453,7 +460,7 @@ impl StreamController {
             .in_current_span();
         self.stats.query_sent();
         Ok(WorkerRequest {
-            resp: tokio::spawn(fut).map(|r| r.unwrap()).boxed(),
+            resp: tokio::spawn(fut),
             start_time,
             worker,
         })
