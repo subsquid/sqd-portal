@@ -160,7 +160,7 @@ impl NetworkClientBuilder {
                     Ok(()) => {
                         client_handle.reset_height_updates(hotblocks.clone());
                     }
-                    Err(e) => tracing::warn!("Failed to update datasets mapping: {e:?}"),
+                    Err(e) => tracing::error!("Failed to update datasets mapping: {e:?}"),
                 }
             }
         });
