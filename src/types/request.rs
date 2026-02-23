@@ -61,6 +61,9 @@ impl ParsedQuery {
     pub fn without_parent_hash(&mut self) -> String {
         if self.without_parent_hash.is_none() {
             match self.parsed {
+                Query::Bitcoin(ref mut q) => {
+                    q.parent_block_hash = None;
+                }
                 Query::Eth(ref mut q) => {
                     q.parent_block_hash = None;
                 }
@@ -73,10 +76,10 @@ impl ParsedQuery {
                 Query::Fuel(ref mut q) => {
                     q.parent_block_hash = None;
                 }
-                Query::Hyperliquid(ref mut q) => {
+                Query::HyperliquidFills(ref mut q) => {
                     q.parent_block_hash = None;
                 }
-                Query::HyperliquidFills(ref mut q) => {
+                Query::HyperliquidReplicaCmds(ref mut q) => {
                     q.parent_block_hash = None;
                 }
             }
