@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -39,8 +42,8 @@ pub struct DownloadPermit {
 }
 
 impl DownloadScheduler {
-    pub fn new(config: CongestionConfig, initial_workers: u32) -> Self {
-        let max_reads = initial_workers.clamp(config.min_window, config.max_window);
+    pub fn new(config: CongestionConfig) -> Self {
+        let max_reads = config.max_window;
         Self {
             state: Mutex::new(SchedulerState {
                 active_reads: 0,
@@ -72,7 +75,14 @@ impl DownloadScheduler {
             state.waiters.insert(priority_key, tx);
             rx
         };
-        let _ = rx.await;
+        // Use cancellation-safe future: if this task is aborted after release()
+        // woke us (pre-incrementing active_reads) but before we create the permit,
+        // WaiterFuture::drop releases the reserved slot.
+        WaiterFuture {
+            rx: Some(rx),
+            scheduler: Arc::clone(self),
+        }
+        .await;
         DownloadPermit {
             scheduler: Arc::clone(self),
             outcome: Outcome::Neutral,
@@ -97,40 +107,57 @@ impl DownloadScheduler {
         self.state.lock().max_reads
     }
 
-    fn release(&self, outcome: Outcome) {
-        let mut state = self.state.lock();
-        state.active_reads = state.active_reads.saturating_sub(1);
+    pub fn read_timeout(&self) -> Duration {
+        Duration::from_secs(self.config.read_timeout_sec)
+    }
 
+    /// Signal congestion without holding a permit (e.g. transport errors before permit acquisition).
+    pub fn signal_congestion(&self) {
+        let mut state = self.state.lock();
+        Self::apply_congestion(&self.config, &mut state);
+    }
+
+    fn apply_outcome(config: &CongestionConfig, state: &mut SchedulerState, outcome: Outcome) {
         match outcome {
             Outcome::Success => {
                 state.successes_since_shrink += 1;
                 if state.successes_since_shrink >= state.max_reads {
-                    state.max_reads = (state.max_reads + 1).min(self.config.max_window);
+                    state.max_reads = (state.max_reads + 1).min(config.max_window);
                     state.successes_since_shrink = 0;
                     metrics::CONGESTION_WINDOW.set(state.max_reads as i64);
                 }
             }
             Outcome::Congestion => {
-                let now = Instant::now();
-                let min_interval =
-                    Duration::from_millis(self.config.min_shrink_interval_ms);
-                if now.duration_since(state.last_shrink) >= min_interval {
-                    let new_max = (state.max_reads as f64 * self.config.decrease_factor) as u32;
-                    state.max_reads = new_max.max(self.config.min_window);
-                    state.successes_since_shrink = 0;
-                    state.last_shrink = now;
-                    state.shrink_count += 1;
-                    metrics::CONGESTION_WINDOW.set(state.max_reads as i64);
-                    metrics::CONGESTION_SHRINKS.inc();
-                    tracing::debug!(
-                        "Congestion window shrunk to {} (shrink #{})",
-                        state.max_reads,
-                        state.shrink_count
-                    );
-                }
+                Self::apply_congestion(config, state);
             }
             Outcome::Neutral => {}
         }
+    }
+
+    fn apply_congestion(config: &CongestionConfig, state: &mut SchedulerState) {
+        let now = Instant::now();
+        let min_interval = Duration::from_millis(config.min_shrink_interval_ms);
+        if now.duration_since(state.last_shrink) >= min_interval {
+            let new_max = (state.max_reads as f64 * config.decrease_factor) as u32;
+            state.max_reads = new_max.max(config.min_window);
+            state.successes_since_shrink = 0;
+            state.last_shrink = now;
+            state.shrink_count += 1;
+            metrics::CONGESTION_WINDOW.set(state.max_reads as i64);
+            metrics::CONGESTION_SHRINKS.inc();
+            tracing::debug!(
+                "Congestion window shrunk to {} (shrink #{})",
+                state.max_reads,
+                state.shrink_count
+            );
+        }
+    }
+
+    fn release(&self, outcome: Outcome) {
+        let mut state = self.state.lock();
+        state.active_reads = state.active_reads.saturating_sub(1);
+
+        Self::apply_outcome(&self.config, &mut state, outcome);
 
         while state.active_reads < state.max_reads {
             let Some((_key, sender)) = state.waiters.pop_first() else {
@@ -148,6 +175,43 @@ impl DownloadScheduler {
 impl Drop for DownloadPermit {
     fn drop(&mut self) {
         self.scheduler.release(self.outcome);
+    }
+}
+
+/// Cancellation-safe wrapper around `oneshot::Receiver`.
+///
+/// When `release()` wakes a waiter, it pre-increments `active_reads` and sends
+/// on the channel. If the task is aborted between the send and the permit
+/// creation, this future's `Drop` detects the buffered value via `try_recv`
+/// and releases the reserved slot.
+struct WaiterFuture {
+    rx: Option<oneshot::Receiver<()>>,
+    scheduler: Arc<DownloadScheduler>,
+}
+
+impl Future for WaiterFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let rx = self.rx.as_mut().expect("polled after completion");
+        match Pin::new(rx).poll(cx) {
+            Poll::Ready(_) => {
+                self.rx = None;
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for WaiterFuture {
+    fn drop(&mut self) {
+        if let Some(mut rx) = self.rx.take() {
+            // Value was sent (slot reserved) but we never created the permit.
+            if rx.try_recv().is_ok() {
+                self.scheduler.release(Outcome::Neutral);
+            }
+        }
     }
 }
 
@@ -171,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn immediate_grant_under_window() {
-        let sched = Arc::new(DownloadScheduler::new(test_config(), 10));
+        let sched = Arc::new(DownloadScheduler::new(test_config()));
         let permit = sched.acquire(0).await;
         assert_eq!(sched.state.lock().active_reads, 1);
         drop(permit);
@@ -181,23 +245,31 @@ mod tests {
     #[tokio::test]
     async fn window_grows_after_enough_successes() {
         let config = CongestionConfig {
-            min_window: 5,
+            min_window: 2,
             max_window: 100,
             ..test_config()
         };
-        let sched = Arc::new(DownloadScheduler::new(config, 5));
-        let initial = sched.window_size();
-        for _ in 0..initial {
+        let sched = Arc::new(DownloadScheduler::new(config));
+
+        // Shrink the window first so there's room to grow
+        let mut permit = sched.acquire(0).await;
+        permit.outcome = Outcome::Congestion;
+        drop(permit);
+
+        let shrunk = sched.window_size();
+        assert!(shrunk < 100);
+
+        for _ in 0..shrunk {
             let mut permit = sched.acquire(0).await;
             permit.outcome = Outcome::Success;
             drop(permit);
         }
-        assert_eq!(sched.window_size(), initial + 1);
+        assert_eq!(sched.window_size(), shrunk + 1);
     }
 
     #[tokio::test]
     async fn window_shrinks_on_congestion() {
-        let sched = Arc::new(DownloadScheduler::new(test_config(), 10));
+        let sched = Arc::new(DownloadScheduler::new(test_config()));
         let initial = sched.window_size();
         let mut permit = sched.acquire(0).await;
         permit.outcome = Outcome::Congestion;
@@ -213,7 +285,7 @@ mod tests {
             max_window: 10,
             ..test_config()
         };
-        let sched = Arc::new(DownloadScheduler::new(config, 10));
+        let sched = Arc::new(DownloadScheduler::new(config));
         assert!((sched.utilization() - 0.0).abs() < f64::EPSILON);
         let _p1 = sched.acquire(0).await;
         assert!((sched.utilization() - 0.1).abs() < f64::EPSILON);
@@ -226,7 +298,7 @@ mod tests {
             max_window: 1,
             ..test_config()
         };
-        let sched = Arc::new(DownloadScheduler::new(config, 1));
+        let sched = Arc::new(DownloadScheduler::new(config));
 
         let blocker = sched.acquire(0).await;
 
@@ -266,7 +338,7 @@ mod tests {
             speculative_fraction: 0.2, // threshold = 80% of 10 = 8
             ..test_config()
         };
-        let sched = Arc::new(DownloadScheduler::new(config, 10));
+        let sched = Arc::new(DownloadScheduler::new(config));
 
         // With 0 active reads, there's capacity
         assert!(sched.has_speculative_capacity());
