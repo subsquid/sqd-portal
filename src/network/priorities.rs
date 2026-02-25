@@ -160,6 +160,14 @@ impl WorkersPool {
         });
     }
 
+    /// Reverse a lease without recording any outcome.
+    /// Used when a query is cancelled before being sent to the worker.
+    pub fn unlease(&mut self, worker: PeerId) {
+        self.modify(worker, |stats| {
+            stats.running_queries -= 1;
+        });
+    }
+
     pub fn success(&mut self, worker: PeerId) {
         self.modify(worker, |stats| {
             stats.running_queries -= 1;

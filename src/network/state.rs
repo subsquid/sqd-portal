@@ -86,6 +86,10 @@ impl NetworkState {
         self.pool.write().lease(worker);
     }
 
+    pub fn unlease_worker(&self, worker: PeerId) {
+        self.pool.write().unlease(worker);
+    }
+
     pub fn report_query_success(&self, worker: PeerId) {
         self.pool.write().success(worker);
     }

@@ -4,7 +4,7 @@ version = "0.10.0-rc1"
 edition = "2021"
 
 [features]
-sql = ["dep:once_cell", "dep:prost", "dep:substrait", "dep:sql_query_plan"]
+sql = ["dep:once_cell", "dep:substrait", "dep:sql_query_plan"]
 
 [dependencies]
 anyhow = "1"
@@ -29,7 +29,7 @@ num-rational = "0.4"
 num-traits = "0.2.19"
 once_cell = { version = "1.21", optional = true }
 prometheus-client = "0.23"
-prost = { version = "0.13.4", optional = true }
+prost = "0.13.4"
 rand = "0.9.2"
 reqwest = { version = "0.12.7", features = ["stream", "gzip", "json"] }
 scopeguard = "1.2"
@@ -60,10 +60,10 @@ proptest_async = { version = "0.2.1", default-features = false, features = ["tok
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
 
-sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "6b7821c", features = ["reader"] }
-sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "6b7821c", version = "1.2.1" }
-sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "6b7821c", version = "2.0.1", features = ["semver", "bitstring"] }
-sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "6b7821c", version = "3.0.0", features = ["portal", "metrics"] }
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "8585324", features = ["reader"] }
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "8585324", version = "1.2.1" }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "8585324", version = "2.0.1", features = ["semver", "bitstring"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "8585324", version = "3.0.0", features = ["portal", "metrics"] }
 
 sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "3c76f02f", features = ["serde"] }
 sqd-query = { git = "https://github.com/subsquid/data.git", rev = "3c76f02f" }
