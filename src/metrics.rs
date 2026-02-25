@@ -65,6 +65,10 @@ lazy_static::lazy_static! {
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 3.0, 20)));
     pub static ref STREAM_THROTTLED_RATIO: Histogram = Histogram::new(iter::empty());
 
+    pub static ref CONGESTION_WINDOW: Gauge = Default::default();
+    pub static ref CONGESTION_IN_FLIGHT: Gauge = Default::default();
+    pub static ref CONGESTION_SHRINKS: Counter = Default::default();
+
     static ref KNOWN_CHUNKS: Family<Labels, Gauge> = Default::default();
     static ref LAST_STORAGE_BLOCK: Family<Labels, Gauge> = Default::default();
 
@@ -268,6 +272,22 @@ pub fn register_metrics(registry: &mut Registry) {
         "stream_throttled_ratio",
         "Throttled time of completed streams relative to their duration",
         STREAM_THROTTLED_RATIO.clone(),
+    );
+
+    registry.register(
+        "congestion_window",
+        "Current congestion control window size",
+        CONGESTION_WINDOW.clone(),
+    );
+    registry.register(
+        "congestion_in_flight",
+        "Number of responses currently being read",
+        CONGESTION_IN_FLIGHT.clone(),
+    );
+    registry.register(
+        "congestion_shrinks",
+        "Number of times the congestion window was shrunk",
+        CONGESTION_SHRINKS.clone(),
     );
 
     registry.register(

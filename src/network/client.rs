@@ -17,13 +17,14 @@ use sqd_contract_client::{Client as ContractClient, ClientError, Network, PeerId
 use sqd_messages::{query_error, query_result, Query, QueryFinished, QueryOk};
 use sqd_network_transport::{
     get_agent_info, AgentInfo, Keypair, P2PTransportBuilder, PortalConfig, PortalTransportHandle,
-    QueryFailure, TransportArgs,
+    QueryFailure, StreamClientTimeout, TransportArgs,
 };
 use tracing::{debug_span, instrument, Instrument};
 
 use super::contracts_state::{self, ContractsState};
 use super::priorities::NoWorker;
 use super::{ChunkNotFound, NetworkState};
+use crate::controller::read_scheduler::{DownloadScheduler, Outcome};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::hotblocks::HotblocksHandle;
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
@@ -82,6 +83,7 @@ pub struct NetworkClient {
     logs_rx:
         UseOnce<sqd_network_transport::util::Receiver<Box<dyn FnOnce() -> QueryFinished + Send>>>,
     verify_responses: bool,
+    read_scheduler: Option<Arc<DownloadScheduler>>,
 }
 
 pub struct NetworkClientBuilder {
@@ -135,6 +137,14 @@ impl NetworkClientBuilder {
             config.priorities.clone(),
         );
 
+        let read_scheduler = if config.congestion.enabled {
+            let sched = Arc::new(DownloadScheduler::new(config.congestion.clone(), 0));
+            metrics::CONGESTION_WINDOW.set(sched.window_size() as i64);
+            Some(sched)
+        } else {
+            None
+        };
+
         let this = Arc::new(NetworkClient {
             chain_update_interval: config.chain_update_interval,
             assignment_update_interval: config.assignments_update_interval,
@@ -148,6 +158,7 @@ impl NetworkClientBuilder {
             logs_tx,
             logs_rx,
             verify_responses: config.verify_worker_responses,
+            read_scheduler,
         });
 
         this.reset_height_updates(hotblocks.clone());
@@ -410,6 +421,7 @@ impl NetworkClient {
         query: String,
         compression: Compression,
         lease: bool,
+        priority: Option<u64>,
     ) -> QueryResult {
         let query_id = generate_query_id();
         tracing::Span::current().record("query_id", &query_id);
@@ -419,13 +431,15 @@ impl NetworkClient {
             self.network_state.lease_worker(worker);
         }
         metrics::QUERIES_RUNNING.inc();
+        let _queries_running_guard = scopeguard::guard((), |()| {
+            metrics::QUERIES_RUNNING.dec();
+        });
 
         let this = self.clone();
-        let guard = scopeguard::guard(worker, |worker: PeerId| {
+        let outrun_guard = scopeguard::guard(worker, |worker: PeerId| {
             // The result is no longer needed. Either another query has got the result first,
             // or the stream has been dropped. In either case, consider the query outrun.
             this.network_state.report_query_outrun(worker);
-            metrics::QUERIES_RUNNING.dec();
         });
 
         let compression = match compression {
@@ -435,7 +449,7 @@ impl NetworkClient {
         let mut query = Query {
             dataset: chunk_id.dataset.to_url().to_owned(),
             query_id: query_id.clone(),
-            request_id: request_id,
+            request_id,
             query,
             block_range: Some(sqd_messages::Range {
                 begin: *block_range.start(),
@@ -464,13 +478,37 @@ impl NetworkClient {
             .inc();
 
         let query_start_time = Instant::now();
-        let result = self
-            .transport_handle
-            .send_query(worker, query)
-            .instrument(tracing::debug_span!("running_query"))
+
+        let send_and_wait = async {
+            let mut reader = self
+                .transport_handle
+                .send_query_request(worker, query)
+                .await?;
+            reader.wait_for_response().await?;
+            Ok(reader)
+        };
+        let reader = match send_and_wait
+            .instrument(tracing::debug_span!("send_query"))
+            .await
+        {
+            Ok(reader) => reader,
+            Err(failure) => {
+                scopeguard::ScopeGuard::into_inner(outrun_guard);
+                return Err(self.convert_query_failure(worker, failure));
+            }
+        };
+
+        let permit = match (&self.read_scheduler, priority) {
+            (Some(sched), Some(prio)) => Some(sched.acquire(prio).await),
+            _ => None,
+        };
+
+        let result = reader
+            .read_response()
+            .instrument(tracing::debug_span!("read_response"))
             .await;
-        scopeguard::ScopeGuard::into_inner(guard);
-        metrics::QUERIES_RUNNING.dec();
+
+        scopeguard::ScopeGuard::into_inner(outrun_guard);
         let query_time = query_start_time.elapsed();
 
         if let Some(logs_tx) = &self.logs_tx {
@@ -483,9 +521,45 @@ impl NetworkClient {
             }
         }
 
-        self.parse_query_result(worker, result)
-            .await
-            .inspect(|_| metrics::report_query_ok(query_time))
+        let parsed = self.parse_query_result(worker, result).await;
+
+        if let Some(mut permit) = permit {
+            permit.outcome = match &parsed {
+                Ok(_) => Outcome::Success,
+                Err(QueryError::Retriable(_)) => Outcome::Congestion,
+                _ => Outcome::Neutral,
+            };
+        }
+
+        parsed.inspect(|_| metrics::report_query_ok(query_time))
+    }
+
+    fn convert_query_failure(&self, peer_id: PeerId, failure: QueryFailure) -> QueryError {
+        match failure {
+            QueryFailure::InvalidRequest(e) => {
+                metrics::report_query_result(&peer_id, "invalid");
+                QueryError::Failure(format!("portal tried to send invalid request: {e}"))
+            }
+            QueryFailure::InvalidResponse(e) => {
+                metrics::report_query_result(&peer_id, "invalid");
+                self.network_state.report_query_error(peer_id);
+                QueryError::Retriable(format!("couldn't decode response: {e}"))
+            }
+            QueryFailure::Timeout(t) => {
+                metrics::report_query_result(&peer_id, "timeout");
+                self.network_state.report_query_failure(peer_id);
+                let msg = match t {
+                    StreamClientTimeout::Connect => "timed out connecting to the peer",
+                    StreamClientTimeout::Request => "timed out reading response",
+                };
+                QueryError::Retriable(msg.to_owned())
+            }
+            QueryFailure::TransportError(e) => {
+                metrics::report_query_result(&peer_id, "transport_error");
+                self.network_state.report_query_failure(peer_id);
+                QueryError::Retriable(format!("transport error: {e}"))
+            }
+        }
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -572,37 +646,7 @@ impl NetworkClient {
                 self.network_state.report_query_error(peer_id);
                 Err(QueryError::Retriable("unknown error message".to_string()))
             }
-            Err(QueryFailure::InvalidRequest(e)) => {
-                metrics::report_query_result(&peer_id, "invalid");
-                Err(QueryError::Failure(format!(
-                    "portal tried to send invalid request: {e}"
-                )))
-            }
-            Err(QueryFailure::InvalidResponse(e)) => {
-                metrics::report_query_result(&peer_id, "invalid");
-                self.network_state.report_query_error(peer_id);
-                Err(QueryError::Retriable(format!(
-                    "couldn't decode response: {e}"
-                )))
-            }
-            Err(QueryFailure::Timeout(t)) => {
-                metrics::report_query_result(&peer_id, "timeout");
-                self.network_state.report_query_failure(peer_id);
-                let msg = match t {
-                    sqd_network_transport::StreamClientTimeout::Connect => {
-                        "timed out connecting to the peer"
-                    }
-                    sqd_network_transport::StreamClientTimeout::Request => {
-                        "timed out reading response"
-                    }
-                };
-                Err(QueryError::Retriable(msg.to_owned()))
-            }
-            Err(QueryFailure::TransportError(e)) => {
-                metrics::report_query_result(&peer_id, "transport_error");
-                self.network_state.report_query_failure(peer_id);
-                Err(QueryError::Retriable(format!("transport error: {e}")))
-            }
+            Err(failure) => Err(self.convert_query_failure(peer_id, failure)),
         }
     }
 
@@ -697,6 +741,17 @@ impl NetworkClient {
                     }),
                 );
             }
+        }
+    }
+
+    pub fn download_utilization(&self) -> Option<f64> {
+        self.read_scheduler.as_ref().map(|s| s.utilization())
+    }
+
+    pub fn has_speculative_capacity(&self) -> bool {
+        match &self.read_scheduler {
+            Some(sched) => sched.has_speculative_capacity(),
+            None => true,
         }
     }
 }
