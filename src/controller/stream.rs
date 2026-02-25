@@ -192,20 +192,40 @@ impl StreamController {
         if let Some((response, duration, worker)) = result {
             if retriable(&response) && pending.tries_left > 0 {
                 pending.last_error = Some(
-                    RequestError::from_query_error(response.clone().unwrap_err(), worker)
-                        .to_string(),
+                    RequestError::from_query_error(
+                        response.as_ref().unwrap_err().clone(), worker
+                    ).to_string(),
                 );
-                tracing::debug!("Retrying request: {:?}", response);
+                tracing::debug!("Retrying request: {:?}", response.unwrap_err());
                 retry = true;
             } else {
                 self.timeouts.observe(duration);
+                let transfer_info = response.as_ref().ok().map(|s| {
+                    let throughput = if s.transfer_time.as_secs_f64() > 0.0 {
+                        (s.response_size as f64 / (1024.0 * 1024.0)) / s.transfer_time.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    (s.ttfb, s.transfer_time, s.response_size, throughput)
+                });
                 slot.state = parse_response(response, &slot.data_range.range, worker);
-                tracing::debug!(
-                    "Got result ({}) in {}ms from {}",
-                    short_code(&slot.state),
-                    duration.as_millis(),
-                    worker
-                );
+                if let Some((ttfb, transfer_time, size, throughput)) = transfer_info {
+                    tracing::debug!(
+                        "Got result ({}) in {}ms from {}, {:.1} KB, ttfb={ttfb:.1?}, \
+                         transfer={transfer_time:.1?}, throughput={throughput:.2} MB/s",
+                        short_code(&slot.state),
+                        duration.as_millis(),
+                        worker,
+                        size as f64 / 1024.0,
+                    );
+                } else {
+                    tracing::debug!(
+                        "Got result ({}) in {}ms from {}",
+                        short_code(&slot.state),
+                        duration.as_millis(),
+                        worker
+                    );
+                }
                 return true;
             }
         }
@@ -584,7 +604,7 @@ impl PendingRequests {
 
 fn parse_response(response: QueryResult, range: &BlockRange, worker: PeerId) -> RequestState {
     let result = match response {
-        Ok(result) => result,
+        Ok(success) => success.ok,
         Err(e) => return RequestState::Done(Err(RequestError::from_query_error(e, worker))),
     };
 
@@ -630,6 +650,7 @@ fn retriable(result: &QueryResult) -> bool {
         Err(QueryError::RateLimitExceeded) => true,
     }
 }
+
 
 fn short_code(result: &RequestState) -> &'static str {
     match result {

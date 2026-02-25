@@ -768,7 +768,7 @@ async fn execute_query(
         None,
     );
     let result = match fut.await {
-        Ok(result) => result,
+        Ok(success) => success.ok,
         Err(err) => return RequestError::from_query_error(err, worker_id).into_response(),
     };
     match json_lines_to_json(&result.data) {
