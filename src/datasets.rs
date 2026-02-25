@@ -83,6 +83,8 @@ impl Datasets {
                 .unwrap_or(serde_json::Value::Null);
             let metadata_kind = ds_metadata
                 .as_object()
+                .and_then(|o| o.get("metadata"))
+                .and_then(|v| v.as_object())
                 .and_then(|o| o.get("kind"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
@@ -112,6 +114,8 @@ impl Datasets {
                     let ds_metadata = metadata.remove(&name).unwrap_or(serde_json::Value::Null);
                     let kind = ds_metadata
                         .as_object()
+                        .and_then(|o| o.get("metadata"))
+                        .and_then(|v| v.as_object())
                         .and_then(|o| o.get("kind"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
@@ -309,7 +313,7 @@ mod tests {
         .collect::<BTreeMap<_, _>>();
 
         let metadata: MetadataMapping = serde_json::from_value(serde_json::json!({
-            "arbitrum-one": { "kind": "evm", "display_name": "Arbitrum One" }
+            "arbitrum-one": { "metadata": { "kind": "evm", "display_name": "Arbitrum One" } }
         }))
         .unwrap();
 
