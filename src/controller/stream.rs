@@ -17,8 +17,8 @@ use crate::{
     controller::timeouts::TimeoutManager,
     network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult},
     types::{
-        BlockRange, ChunkId, StreamRequest, DataChunk, QueryError, RequestError, ResponseChunk,
-        SendQueryError,
+        BlockRange, ChunkId, DataChunk, QueryError, RequestError, ResponseChunk, SendQueryError,
+        StreamRequest,
     },
     utils::{logging::StreamStats, SlidingArray},
 };
@@ -34,6 +34,8 @@ pub struct StreamController {
     stats: StreamStats,
     span: tracing::Span,
     last_error: Option<String>,
+    stream_index: u64,
+    priority_stride: u64,
 }
 
 pub struct DataRange {
@@ -80,7 +82,12 @@ impl Drop for WorkerRequest {
 }
 
 impl StreamController {
-    pub fn new(request: StreamRequest, network: Arc<NetworkClient>) -> Result<Self, RequestError> {
+    pub fn new(
+        request: StreamRequest,
+        network: Arc<NetworkClient>,
+        stream_index: u64,
+        priority_stride: u64,
+    ) -> Result<Self, RequestError> {
         let first_block = request.query.first_block();
 
         let first_chunk = match network.find_chunk(&request.dataset_id, first_block) {
@@ -112,6 +119,8 @@ impl StreamController {
             stats: StreamStats::new(),
             span: tracing::Span::current(),
             last_error: None,
+            stream_index,
+            priority_stride,
         })
     }
 
@@ -224,10 +233,11 @@ impl StreamController {
         }
 
         if retry {
+            let is_speculative = !pending.requests.is_empty();
             tracing::debug!("Handling retry, {} tries left", pending.tries_left);
             assert!(pending.tries_left > 0);
             pending.tries_left -= 1;
-            match self.send_query(&slot.data_range) {
+            match self.send_query(&slot.data_range, is_speculative) {
                 Ok(worker_request) => {
                     pending.set_timeout(self.timeouts.current_timeout());
                     pending.requests.push(worker_request);
@@ -391,7 +401,7 @@ impl StreamController {
             .intersect_with(&range.range)
             .expect("Chunk doesn't contain requested data");
         let range = range.with_range(block_range);
-        let mut pending = match self.send_query(&range) {
+        let mut pending = match self.send_query(&range, false) {
             Ok(request) => PendingRequests::new(
                 request,
                 self.timeouts.current_timeout(),
@@ -414,6 +424,9 @@ impl StreamController {
                     err,
                 ))
             }
+            Err(SendQueryError::CongestionLimitReached) => {
+                unreachable!("Congestion limit reached for a non-speculative query");
+            }
         };
         assert!(pending.timeout.poll_unpin(ctx).is_pending());
         Ok(Slot {
@@ -422,7 +435,11 @@ impl StreamController {
         })
     }
 
-    fn send_query(&mut self, range: &DataRange) -> Result<WorkerRequest, SendQueryError> {
+    fn send_query(
+        &mut self,
+        range: &DataRange,
+        is_speculative: bool,
+    ) -> Result<WorkerRequest, SendQueryError> {
         let worker =
             match self
                 .network
@@ -433,7 +450,8 @@ impl StreamController {
                 Err(NoWorker::Backoff(until)) => return Err(SendQueryError::Backoff(until)),
             };
         tracing::debug!(
-            "Sending query for chunk {} ({}-{}) to worker {}",
+            "Sending {}query for chunk {} ({}-{}) to worker {}",
+            if is_speculative { "extra " } else { "" },
             range.chunk_index,
             range.range.start(),
             range.range.end(),
@@ -445,6 +463,13 @@ impl StreamController {
             self.request.query.without_parent_hash()
         };
         let start_time = tokio::time::Instant::now();
+
+        let priority = self.stream_index * self.priority_stride + range.chunk_index as u64;
+
+        if is_speculative && !self.network.has_speculative_capacity() {
+            return Err(SendQueryError::CongestionLimitReached);
+        }
+
         let fut = self
             .network
             .clone()
@@ -456,8 +481,10 @@ impl StreamController {
                 query,
                 self.request.compression,
                 false,
+                Some(priority),
             )
             .in_current_span();
+
         self.stats.query_sent();
         Ok(WorkerRequest {
             resp: tokio::spawn(fut),

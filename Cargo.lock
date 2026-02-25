@@ -7570,7 +7570,7 @@ dependencies = [
 [[package]]
 name = "sqd-assignments"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=020e5e9#020e5e9da5b05101c956cba79a57bcc6760266f1"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=6b7821c#6b7821c3a0bf7df12de610b4652bfd759042a6fa"
 dependencies = [
  "anyhow",
  "crypto_box",
@@ -7594,7 +7594,7 @@ dependencies = [
 [[package]]
 name = "sqd-contract-client"
 version = "1.2.1"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=020e5e9#020e5e9da5b05101c956cba79a57bcc6760266f1"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=6b7821c#6b7821c3a0bf7df12de610b4652bfd759042a6fa"
 dependencies = [
  "async-trait",
  "clap",
@@ -7614,7 +7614,7 @@ dependencies = [
 [[package]]
 name = "sqd-messages"
 version = "2.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=020e5e9#020e5e9da5b05101c956cba79a57bcc6760266f1"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=6b7821c#6b7821c3a0bf7df12de610b4652bfd759042a6fa"
 dependencies = [
  "bytemuck",
  "flate2",
@@ -7630,7 +7630,7 @@ dependencies = [
 [[package]]
 name = "sqd-network-transport"
 version = "3.0.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=020e5e9#020e5e9da5b05101c956cba79a57bcc6760266f1"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=6b7821c#6b7821c3a0bf7df12de610b4652bfd759042a6fa"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7673,7 +7673,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.8.10"
+version = "0.9.0-rc1"
 dependencies = [
  "anyhow",
  "async-compression",

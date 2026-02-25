@@ -157,6 +157,8 @@ async fn main() -> anyhow::Result<()> {
     let task_manager = Arc::new(TaskManager::new(
         network_client.clone(),
         config.max_parallel_streams,
+        config.congestion.headroom_threshold,
+        config.congestion.priority_stride,
     ));
 
     let cancellation_token = CancellationToken::new();

@@ -83,6 +83,9 @@ pub struct Config {
     #[serde(default)]
     pub use_gzjoin: bool,
 
+    #[serde(default)]
+    pub congestion: CongestionConfig,
+
     #[serde(default = "default_sentry_dsn")]
     pub sentry_dsn: String,
 
@@ -191,6 +194,36 @@ fn default_sentry_sampling_rate() -> f32 {
 
 fn default_sentry_dsn() -> String {
     "https://b74e352d92a89dc36c3e6064284669af@o1149243.ingest.us.sentry.io/4510617125191680".into()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CongestionConfig {
+    pub min_window: u32,
+    pub max_window: u32,
+    pub decrease_factor: f64,
+    pub speculative_fraction: f64,
+    pub min_shrink_interval_ms: u64,
+    pub read_timeout_sec: u64,
+    pub headroom_threshold: f64,
+    pub priority_stride: u64,
+    pub enabled: bool,
+}
+
+impl Default for CongestionConfig {
+    fn default() -> Self {
+        Self {
+            min_window: 10,
+            max_window: 500,
+            decrease_factor: 0.75,
+            speculative_fraction: 0.1,
+            min_shrink_interval_ms: 2000,
+            read_timeout_sec: 1,
+            headroom_threshold: 0.95,
+            priority_stride: 100,
+            enabled: true,
+        }
+    }
 }
 
 fn parse_hostname<'de, D>(deserializer: D) -> Result<String, D::Error>

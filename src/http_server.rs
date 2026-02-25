@@ -747,6 +747,7 @@ async fn execute_query(
         query.into_string(),
         Compression::Gzip,
         true,
+        None,
     );
     let result = match fut.await {
         Ok(result) => result,
