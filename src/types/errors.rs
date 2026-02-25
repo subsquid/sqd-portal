@@ -45,6 +45,8 @@ pub enum SendQueryError {
     NoWorkers,
     #[error("the rate limit has been exceeded for all workers")]
     Backoff(Instant),
+    #[error("too many parallel worker requests")]
+    CongestionLimitReached,
 }
 
 impl RequestError {
