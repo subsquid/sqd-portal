@@ -104,6 +104,10 @@ pub async fn run_server(
             get(get_dataset_state).endpoint("/state"),
         )
         .route(
+            "/datasets/:dataset",
+            get(get_dataset_metadata.clone()).endpoint("/dataset"),
+        )
+        .route(
             "/datasets/:dataset/metadata",
             get(get_dataset_metadata).endpoint("/metadata"),
         )
@@ -479,11 +483,23 @@ async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl In
     axum::Json(res).into_response()
 }
 
-async fn get_datasets(Extension(network): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
+#[derive(serde::Deserialize)]
+struct MetadataQuery {
+    #[serde(default, rename = "expand[]")]
+    expand: Vec<String>,
+}
+
+async fn get_datasets(
+    axum_extra::extract::Query(query): axum_extra::extract::Query<MetadataQuery>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+) -> impl IntoResponse {
     let datasets = network.datasets().read();
     let res: Vec<AvailableDatasetApiResponse> = datasets
         .iter()
-        .map(|metadata| metadata.clone().into())
+        .map(|d| {
+            let resp: AvailableDatasetApiResponse = d.clone().into();
+            resp.with_fields(&query.expand)
+        })
         .collect();
 
     axum::Json(res)
@@ -497,6 +513,7 @@ async fn get_dataset_state(
 }
 
 async fn get_dataset_metadata(
+    axum_extra::extract::Query(query): axum_extra::extract::Query<MetadataQuery>,
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
     metadata: DatasetConfig,
@@ -512,7 +529,8 @@ async fn get_dataset_metadata(
     } else {
         None
     };
-    axum::Json(AvailableDatasetApiResponse::new(metadata, first_block))
+    let resp = AvailableDatasetApiResponse::new(metadata, first_block);
+    axum::Json(resp.with_fields(&query.expand))
 }
 
 #[derive(Debug, Clone, Serialize)]
