@@ -220,10 +220,11 @@ impl StreamController {
                     );
                 } else {
                     tracing::debug!(
-                        "Got result ({}) in {}ms from {}",
+                        "Got result ({}) in {}ms from {}: {}",
                         short_code(&slot.state),
                         duration.as_millis(),
-                        worker
+                        worker,
+                        error_message(&slot.state),
                     );
                 }
                 return true;
@@ -658,5 +659,12 @@ fn short_code(result: &RequestState) -> &'static str {
         RequestState::Done(Err(e)) => e.short_code(),
         RequestState::Partial(_) => "partial",
         RequestState::Pending(_) => "-",
+    }
+}
+
+fn error_message(result: &RequestState) -> String {
+    match result {
+        RequestState::Done(Err(e)) => e.to_string(),
+        _ => String::new(),
     }
 }
