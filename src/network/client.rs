@@ -592,7 +592,12 @@ impl NetworkClient {
         }
 
         let response_size = buf.len();
-        let parsed = self.parse_query_result(worker, result).await;
+        let throughput = if transfer_time.as_secs_f64() > 0.0 {
+            Some(response_size as f64 / transfer_time.as_secs_f64())
+        } else {
+            None
+        };
+        let parsed = self.parse_query_result(worker, result, throughput).await;
 
         parsed.inspect(|_| metrics::report_query_ok(query_time))
             .map(|ok| QuerySuccess { ok, ttfb, transfer_time, response_size })
@@ -642,6 +647,7 @@ impl NetworkClient {
         &self,
         peer_id: PeerId,
         result: Result<sqd_messages::QueryResult, QueryFailure>,
+        throughput: Option<f64>,
     ) -> Result<QueryOk, QueryError> {
         use query_error::Err;
 
@@ -666,14 +672,14 @@ impl NetworkClient {
                 match result {
                     query_result::Result::Ok(ok) => {
                         metrics::report_query_result(&peer_id, "ok");
-                        self.network_state.report_query_success(peer_id);
+                        self.network_state.report_query_success(peer_id, throughput);
                         Ok(ok)
                     }
                     query_result::Result::Err(sqd_messages::QueryError { err: Some(err) }) => {
                         match err {
                             Err::BadRequest(s) => {
                                 metrics::report_query_result(&peer_id, "bad_request");
-                                self.network_state.report_query_success(peer_id);
+                                self.network_state.report_query_success(peer_id, None);
                                 Err(QueryError::BadRequest(format!(
                                     "couldn't parse request: {s}"
                                 )))
@@ -688,13 +694,13 @@ impl NetworkClient {
                                 if let Some(block_ref) = parse_base_block_mismatch(&s) {
                                     // That's input validation rather than bad query response
                                     metrics::report_query_result(&peer_id, "block_mismatch");
-                                    self.network_state.report_query_success(peer_id);
+                                    self.network_state.report_query_success(peer_id, None);
                                     Err(QueryError::BaseBlockMismatch(block_ref))
                                 } else if s == "Response too large" {
                                     // Caused by the query covering too much data; the client
                                     // should narrow it down rather than retry against another worker
                                     metrics::report_query_result(&peer_id, "response_too_large");
-                                    self.network_state.report_query_success(peer_id);
+                                    self.network_state.report_query_success(peer_id, None);
                                     Err(QueryError::BadRequest(
                                         "the response for this block exceeds the size limit; \
                                          try narrowing the query to request only the necessary data"
@@ -717,7 +723,7 @@ impl NetworkClient {
                             }
                             Err::TooManyRequests(()) => {
                                 metrics::report_query_result(&peer_id, "too_many_requests");
-                                self.network_state.report_query_success(peer_id);
+                                self.network_state.report_query_success(peer_id, None);
                                 if retry_after_ms.is_none() {
                                     self.network_state
                                         .hint_backoff(peer_id, Duration::from_millis(100));
