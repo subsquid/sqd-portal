@@ -57,8 +57,11 @@ impl StorageClient {
         }
     }
 
-    pub fn has_assignment(&self) -> bool {
-        self.assignment.read().is_some()
+    pub fn num_workers(&self) -> usize {
+        self.assignment
+            .read()
+            .as_ref()
+            .map_or(0, |a| a.workers().len())
     }
 
     pub async fn try_update_assignment(&self) {

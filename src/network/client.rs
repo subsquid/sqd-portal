@@ -781,7 +781,9 @@ impl NetworkClient {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.network_state.dataset_storage.has_assignment()
+        let num_workers = self.network_state.dataset_storage.num_workers();
+        let active_connections = self.transport_handle.active_connections() as usize;
+        num_workers > 0 && active_connections >= num_workers * 3 / 4
     }
 
     fn signal_congestion(&self) {
