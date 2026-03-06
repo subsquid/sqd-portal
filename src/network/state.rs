@@ -90,8 +90,8 @@ impl NetworkState {
         self.pool.write().unlease(worker);
     }
 
-    pub fn report_query_success(&self, worker: PeerId) {
-        self.pool.write().success(worker);
+    pub fn report_query_success(&self, worker: PeerId, throughput: Option<f64>) {
+        self.pool.write().success(worker, throughput);
     }
 
     pub fn report_query_error(&self, worker: PeerId) {

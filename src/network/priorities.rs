@@ -1,4 +1,3 @@
-use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 use tokio::time::Instant;
@@ -12,9 +11,8 @@ pub type Priority = (PriorityGroup, u8, i64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum PriorityGroup {
     Best = 0,
-    Slow = 1,
-    Backoff = 2,
-    Unavailable = 3,
+    Backoff = 1,
+    Unavailable = 2,
 }
 
 #[derive(Debug)]
@@ -33,8 +31,6 @@ pub struct WorkersPool {
 #[serde(default)]
 pub struct PrioritiesConfig {
     pub max_queries_per_worker: u8,
-    pub window_ok_secs: u32,
-    pub window_slow_secs: u32,
     pub window_errors_secs: u32,
     pub window_timeouts_secs: u32,
 }
@@ -43,8 +39,6 @@ impl Default for PrioritiesConfig {
     fn default() -> Self {
         Self {
             max_queries_per_worker: 1,
-            window_ok_secs: 3,
-            window_slow_secs: 3,
             window_errors_secs: 30,
             // Timeouts are especially painful because they cause a 60s delay.
             window_timeouts_secs: 300,
@@ -54,24 +48,19 @@ impl Default for PrioritiesConfig {
 
 #[derive(Debug, Clone)]
 struct WorkerStats {
-    last_query: Instant,
     running_queries: u8,
     paused_until: Option<Instant>,
-    ok: EventCounter,
-    slow: EventCounter,
+    last_throughput: Option<f64>,
     server_errors: Cooldown,
     timeouts: Cooldown,
 }
 
 impl WorkerStats {
     fn new(config: &PrioritiesConfig) -> Self {
-        let now = Instant::now();
         Self {
-            last_query: now,
             running_queries: 0,
             paused_until: None,
-            ok: EventCounter::new(config.window_ok_secs, now),
-            slow: EventCounter::new(config.window_slow_secs, now),
+            last_throughput: None,
             server_errors: Cooldown::new(config.window_errors_secs),
             timeouts: Cooldown::new(config.window_timeouts_secs),
         }
@@ -92,23 +81,16 @@ impl WorkersPool {
         lease: bool,
     ) -> Result<PeerId, NoWorker> {
         let now = Instant::now();
-        let mut unknown_workers = Vec::new();
-        let best_known = workers
+        let (worker, best_priority) = workers
             .into_iter()
-            .filter_map(|peer_id| match self.workers.get(&peer_id) {
-                None => {
-                    unknown_workers.push(peer_id);
-                    None
-                }
-                Some(stats) => Some((peer_id, self.priority(stats, now))),
+            .map(|peer_id| {
+                let priority = self
+                    .workers
+                    .get(&peer_id)
+                    .map_or_else(Self::default_priority, |stats| self.priority(stats, now));
+                (peer_id, priority)
             })
-            .min_by_key(|&(_, priority)| priority);
-
-        let (worker, best_priority) = unknown_workers
-            // prefer new workers, randomly choosing one
-            .choose(&mut rand::rng())
-            .map(|peer_id| (*peer_id, (PriorityGroup::Best, 0, Instant::now())))
-            .or(best_known)
+            .min_by_key(|&(_, priority)| priority)
             .ok_or(NoWorker::AllUnavailable)?;
 
         tracing::trace!(
@@ -120,8 +102,15 @@ impl WorkersPool {
 
         match best_priority.0 {
             PriorityGroup::Unavailable => Err(NoWorker::AllUnavailable),
-            PriorityGroup::Backoff => Err(NoWorker::Backoff(best_priority.2)),
-            _ => {
+            PriorityGroup::Backoff => {
+                let until = self
+                    .workers
+                    .get(&worker)
+                    .and_then(|s| s.paused_until)
+                    .unwrap_or_else(Instant::now);
+                Err(NoWorker::Backoff(until))
+            }
+            PriorityGroup::Best => {
                 if lease {
                     self.lease(worker);
                 }
@@ -135,7 +124,7 @@ impl WorkersPool {
         workers: impl IntoIterator<Item = PeerId>,
     ) -> Vec<(PeerId, Priority)> {
         let now = Instant::now();
-        let default_priority = Self::default_serializable_priority();
+        let default_priority = Self::default_priority();
         let mut v: Vec<_> = workers
             .into_iter()
             .map(|peer_id| {
@@ -143,9 +132,7 @@ impl WorkersPool {
                     peer_id,
                     self.workers
                         .get(&peer_id)
-                        .map_or(default_priority, |stats| {
-                            self.serializable_priority(stats, now)
-                        }),
+                        .map_or(default_priority, |stats| self.priority(stats, now)),
                 )
             })
             .collect();
@@ -156,7 +143,6 @@ impl WorkersPool {
     pub fn lease(&mut self, worker: PeerId) {
         self.modify(worker, |stats| {
             stats.running_queries += 1;
-            stats.last_query = Instant::now();
         });
     }
 
@@ -168,10 +154,12 @@ impl WorkersPool {
         });
     }
 
-    pub fn success(&mut self, worker: PeerId) {
+    pub fn success(&mut self, worker: PeerId, throughput: Option<f64>) {
         self.modify(worker, |stats| {
             stats.running_queries -= 1;
-            stats.ok.observe(Instant::now());
+            if let Some(t) = throughput {
+                stats.last_throughput = Some(t);
+            }
         });
     }
 
@@ -194,7 +182,6 @@ impl WorkersPool {
     pub fn outrun(&mut self, worker: PeerId) {
         self.modify(worker, |stats| {
             stats.running_queries -= 1;
-            stats.slow.observe(Instant::now());
         });
     }
 
@@ -214,31 +201,30 @@ impl WorkersPool {
     }
 
     // Less is better
-    fn priority(&self, worker: &WorkerStats, now: Instant) -> (PriorityGroup, u8, Instant) {
+    fn priority(&self, worker: &WorkerStats, now: Instant) -> Priority {
         if let Some(paused_until) = worker.paused_until {
             if now < paused_until {
-                return (PriorityGroup::Backoff, worker.running_queries, paused_until);
+                // shorter remaining backoff = lower key = picked first among Backoff workers
+                let remaining_ms = (paused_until - now).as_millis() as i64;
+                return (PriorityGroup::Backoff, worker.running_queries, remaining_ms);
             }
         }
-        let penalty = if worker.server_errors.observed(now)
+        if worker.server_errors.observed(now)
             || worker.timeouts.observed(now)
             || worker.running_queries >= self.config.max_queries_per_worker
         {
-            PriorityGroup::Unavailable
-        } else if worker.slow.estimate(now) > worker.ok.estimate(now) {
-            PriorityGroup::Slow
-        } else {
-            PriorityGroup::Best
+            return (PriorityGroup::Unavailable, worker.running_queries, 0);
+        }
+        // Higher throughput = more negative key = picked first among Best workers.
+        // None = no data yet = 0, so unknown workers rank above any measured worker.
+        let throughput_key = match worker.last_throughput {
+            None => 0,
+            Some(t) => -(t as i64),
         };
-        (penalty, worker.running_queries, worker.last_query)
+        (PriorityGroup::Best, worker.running_queries, throughput_key)
     }
 
-    fn serializable_priority(&self, worker: &WorkerStats, now: Instant) -> Priority {
-        let (group, queries, time) = self.priority(worker, now);
-        (group, queries, -((now - time).as_secs() as i64))
-    }
-
-    fn default_serializable_priority() -> Priority {
+    fn default_priority() -> Priority {
         (PriorityGroup::Best, 0, 0)
     }
 }
@@ -267,47 +253,3 @@ impl Cooldown {
     }
 }
 
-/// A counter for the approximate number of events in the last `window` with constant memory usage.
-/// If `estimate` returned `n`, then the number of events observed in
-/// the last `2 * window` seconds is not more than `2 * n`.
-#[derive(Debug, Clone)]
-struct EventCounter {
-    window: u32,
-    last_time: Instant,
-    count: u32,
-    prev_count: u32,
-}
-
-impl EventCounter {
-    fn new(window: u32, now: Instant) -> Self {
-        Self {
-            window,
-            last_time: now,
-            count: 0,
-            prev_count: 0,
-        }
-    }
-
-    fn observe(&mut self, now: Instant) {
-        if (now - self.last_time).as_secs() > 2 * self.window as u64 {
-            self.prev_count = 0;
-            self.count = 0;
-            self.last_time = now;
-        } else if (now - self.last_time).as_secs() > self.window as u64 {
-            self.prev_count = self.count;
-            self.count = 0;
-            self.last_time = now;
-        }
-        self.count += 1;
-    }
-
-    fn estimate(&self, now: Instant) -> u32 {
-        if (now - self.last_time).as_secs() > 2 * self.window as u64 {
-            0
-        } else if (now - self.last_time).as_secs() > self.window as u64 {
-            self.count
-        } else {
-            std::cmp::max(self.prev_count, self.count)
-        }
-    }
-}
