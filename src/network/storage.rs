@@ -10,10 +10,8 @@ use crate::{
     datasets::Datasets,
     metrics,
     types::{api_types::DatasetState, BlockNumber, DataChunk, DatasetId},
-    utils::{Mutex, RwLock},
+    utils::RwLock,
 };
-
-type HeadUpdateCallback = Box<dyn FnMut(BlockRef) + Sync + Send>;
 
 pub struct StorageClient {
     assignment: RwLock<Option<Assignment>>,
@@ -21,7 +19,6 @@ pub struct StorageClient {
     latest_assignment_id: RwLock<Option<String>>,
     network_state_url: String,
     reqwest_client: reqwest::Client,
-    head_update_subscribers: Mutex<HashMap<DatasetId, HeadUpdateCallback>>,
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -57,10 +54,6 @@ impl StorageClient {
                 .user_agent(format!("SQD Portal/{}", env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap(),
-            head_update_subscribers: Mutex::new(
-                Default::default(),
-                "StorageClient::head_update_subscribers",
-            ),
         }
     }
 
@@ -163,20 +156,6 @@ impl StorageClient {
                     new_len - old_len,
                     dataset_id,
                 );
-            }
-
-            if let Some(callback) = self.head_update_subscribers.lock().get_mut(&dataset_id) {
-                if let Some(hash) = dataset.last_block_hash() {
-                    callback(BlockRef {
-                        number: dataset.last_block(),
-                        hash: hash.to_owned(),
-                    });
-                } else {
-                    tracing::warn!(
-                        "Dataset {} has no last block hash, cannot update head",
-                        dataset_id
-                    );
-                }
             }
 
             let dataset_name = self
@@ -311,16 +290,6 @@ impl StorageClient {
                 .map(|(peer_id, ranges)| (peer_id, sqd_messages::RangeSet::from(ranges)))
                 .collect(),
         })
-    }
-
-    pub fn subscribe_head_updates(&self, dataset_id: &DatasetId, callback: HeadUpdateCallback) {
-        self.head_update_subscribers
-            .lock()
-            .insert(dataset_id.clone(), callback);
-    }
-
-    pub fn unsubscribe_head_updates(&self) {
-        self.head_update_subscribers.lock().clear();
     }
 }
 
