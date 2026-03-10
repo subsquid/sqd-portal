@@ -10,7 +10,7 @@ use crate::{
     datasets::Datasets,
     metrics,
     types::{api_types::DatasetState, BlockNumber, DataChunk, DatasetId},
-    utils::{RwLock},
+    utils::RwLock,
 };
 
 pub struct StorageClient {

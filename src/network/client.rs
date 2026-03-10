@@ -150,9 +150,8 @@ impl NetworkClientBuilder {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(config.datasets_update_interval).await;
-                match Datasets::update(&datasets_copy, &config).await {
-                    Ok(()) => {}
-                    Err(e) => tracing::error!("Failed to update datasets mapping: {e:?}"),
+                if let Err(e) = Datasets::update(&datasets_copy, &config).await {
+                    tracing::error!("Failed to update datasets mapping: {e:?}")
                 }
             }
         });
