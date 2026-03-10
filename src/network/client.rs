@@ -568,12 +568,14 @@ impl NetworkClient {
             }
         };
 
-        scopeguard::ScopeGuard::into_inner(cancel_guard);
         let query_time = query_start_time.elapsed();
 
         let transfer_time = match read_result {
             Ok(t) => t,
-            Err(e) => return Err(self.convert_read_error(worker, e)),
+            Err(e) => {
+                scopeguard::ScopeGuard::into_inner(cancel_guard);
+                return Err(self.convert_read_error(worker, e));
+            }
         };
 
         // Phase 4: Decode protobuf + validate (no permit held, application errors don't affect congestion)
@@ -597,6 +599,7 @@ impl NetworkClient {
             None
         };
         let parsed = self.parse_query_result(worker, result, throughput).await;
+        scopeguard::ScopeGuard::into_inner(cancel_guard);
 
         parsed.inspect(|_| metrics::report_query_ok(query_time))
             .map(|ok| QuerySuccess { ok, ttfb, transfer_time, response_size })
@@ -606,7 +609,7 @@ impl NetworkClient {
         match failure {
             QueryFailure::InvalidRequest(e) => {
                 metrics::report_query_result(&peer_id, "invalid");
-                self.network_state.report_query_failure(peer_id);
+                self.network_state.report_query_success(peer_id, None);
                 QueryError::Failure(format!("portal tried to send invalid request: {e}"))
             }
             QueryFailure::InvalidResponse(e) => {
