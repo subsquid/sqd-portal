@@ -126,7 +126,6 @@ async fn main() -> anyhow::Result<()> {
         args.transport,
         config.clone(),
         datasets.clone(),
-        hotblocks.clone(),
     )
     .await?;
 
