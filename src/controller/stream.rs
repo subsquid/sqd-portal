@@ -515,6 +515,10 @@ impl StreamController {
         range: &DataRange,
         is_speculative: bool,
     ) -> Result<WorkerRequest, SendQueryError> {
+        if is_speculative && !self.network.has_speculative_capacity() {
+            return Err(SendQueryError::CongestionLimitReached);
+        }
+
         let worker =
             match self
                 .network
@@ -540,10 +544,6 @@ impl StreamController {
         let start_time = tokio::time::Instant::now();
 
         let priority = self.stream_index * self.priority_stride + range.chunk_index as u64;
-
-        if is_speculative && !self.network.has_speculative_capacity() {
-            return Err(SendQueryError::CongestionLimitReached);
-        }
 
         let fut = self
             .network
