@@ -25,7 +25,6 @@ use super::contracts_state::{self, ContractsState};
 use super::priorities::NoWorker;
 use super::{ChunkNotFound, NetworkState};
 use crate::datasets::{DatasetConfig, Datasets};
-use crate::hotblocks::HotblocksHandle;
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
 use crate::types::{BlockNumber, BlockRange, ChunkId, Compression, DataChunk};
 use crate::utils::{RwLock, UseOnce};
@@ -89,7 +88,6 @@ pub struct NetworkClientBuilder {
     network: Network,
     config: Arc<Config>,
     datasets: Arc<RwLock<Datasets>>,
-    hotblocks: Arc<HotblocksHandle>,
 }
 
 impl NetworkClientBuilder {
@@ -103,7 +101,6 @@ impl NetworkClientBuilder {
             network,
             config,
             datasets,
-            hotblocks,
             transport_builder,
         } = self;
 
@@ -150,17 +147,11 @@ impl NetworkClientBuilder {
             verify_responses: config.verify_worker_responses,
         });
 
-        this.reset_height_updates(hotblocks.clone());
-
-        let client_handle = this.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(config.datasets_update_interval).await;
-                match Datasets::update(&datasets_copy, &config).await {
-                    Ok(()) => {
-                        client_handle.reset_height_updates(hotblocks.clone());
-                    }
-                    Err(e) => tracing::error!("Failed to update datasets mapping: {e:?}"),
+                if let Err(e) = Datasets::update(&datasets_copy, &config).await {
+                    tracing::error!("Failed to update datasets mapping: {e:?}")
                 }
             }
         });
@@ -174,7 +165,6 @@ impl NetworkClient {
         args: TransportArgs,
         config: Arc<Config>,
         datasets: Arc<RwLock<Datasets>>,
-        hotblocks: Arc<HotblocksHandle>,
     ) -> anyhow::Result<NetworkClientBuilder> {
         let agent_into = get_agent_info!();
         let network = args.rpc.network;
@@ -183,7 +173,6 @@ impl NetworkClient {
             network,
             config,
             datasets,
-            hotblocks,
             transport_builder,
         })
     }
@@ -663,41 +652,6 @@ impl NetworkClient {
 
     pub fn is_ready(&self) -> bool {
         self.network_state.dataset_storage.has_assignment()
-    }
-
-    pub fn reset_height_updates(&self, hotblocks: Arc<HotblocksHandle>) {
-        let datasets = self.datasets.read();
-        self.network_state
-            .dataset_storage
-            .unsubscribe_head_updates();
-        for dataset in datasets.iter() {
-            if let (Some(dataset_id), Some(_)) = (&dataset.network_id, &dataset.hotblocks) {
-                let hotblocks = hotblocks.clone();
-                let name = dataset.default_name.clone();
-                tracing::info!(
-                    "Hotblocks storage for '{name}' set to track dataset height of '{dataset_id}'"
-                );
-                self.network_state.dataset_storage.subscribe_head_updates(
-                    dataset_id,
-                    Box::new(move |block| {
-                        let hotblocks = hotblocks.clone();
-                        let name = name.clone();
-                        tokio::spawn(async move {
-                            tracing::info!(
-                                "Cleaning hotblocks storage for '{name}' up to block {}",
-                                block.number
-                            );
-                            let res = hotblocks.retain_with_retries(&name, block.number + 1).await;
-                            if let Err(e) = res {
-                                tracing::warn!(
-                                    "Failed to clean hotblocks storage for '{name}': {e:?}"
-                                );
-                            }
-                        });
-                    }),
-                );
-            }
-        }
     }
 }
 
