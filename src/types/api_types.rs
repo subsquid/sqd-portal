@@ -8,14 +8,21 @@ use crate::{datasets::DatasetConfig, network};
 
 use super::{BlockNumber, DatasetId};
 
-#[derive(serde::Serialize)]
-pub(crate) struct AvailableDatasetApiResponse {
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct AvailableDatasetApiResponse {
+    ///The default name used to reference this dataset (e.g., ethereum-mainnet).
     pub dataset: String,
+    /// Alternative names for the dataset.
     pub aliases: Vec<String>,
+    /// Indicates if the dataset has real-time data.
     pub real_time: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<u64>)]
+    /// The block number of the first known block.
     pub start_block: Option<BlockNumber>,
+    /// Additional metadata fields, present only when requested via expand[]
     #[serde(flatten)]
+    #[schema(additional_properties, value_type = Object)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 

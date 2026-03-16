@@ -3,8 +3,9 @@ use std::time::{Duration, SystemTime};
 use num_rational::Ratio;
 use serde::Serialize;
 use sqd_contract_client::Worker;
+use utoipa::ToSchema;
 
-#[derive(Clone, PartialEq, Debug, Serialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     DataLoading,

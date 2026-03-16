@@ -13,13 +13,18 @@ use axum::{
 use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
 use serde_json::{json, Value};
+use serde::Serialize;
 use sqd_contract_client::PeerId;
+
+use crate::network::NoWorker;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::request_id::{
     MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::datasets::DatasetConfig;
 use crate::endpoints::{
@@ -28,7 +33,8 @@ use crate::endpoints::{
         run_archival_stream, run_archival_stream_restricted, run_finalized_stream, run_stream,
     },
 };
-use crate::hotblocks::HotblocksErr;
+use crate::hotblocks::{HotblocksErr, StreamMode};
+use crate::openapi::ApiDoc;
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::types::Compression;
 use crate::utils::conversion::json_lines_to_json;
@@ -38,7 +44,7 @@ use crate::{
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
     network::{NetworkClient, NoWorker},
-    types::{ChunkId, DatasetId, ParsedQuery, RequestError, StreamRequest},
+    types::{ChunkId, DatasetId, GenericError, ParsedQuery, RequestError, StreamRequest},
     utils::logging,
 };
 
@@ -145,7 +151,8 @@ pub async fn run_server(
             get(get_debug_block).endpoint("/block/debug"),
         )
         .route("/metrics", get(get_metrics))
-        .route("/ready", get(get_readiness));
+        .route("/ready", get(get_readiness))
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()));
 
     // SQL Query Engine
     #[cfg(feature = "sql")]
@@ -177,6 +184,21 @@ pub async fn run_server(
 /// Gets the archival head corresponding to the /archival-stream behaviour.
 ///
 /// The successful response is either "null" or a JSON object with "number" and "hash" fields.
+/// Get the archival head block
+///
+/// Returns the block number and hash of the current archival data head
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/archival-head",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    responses(
+        (status = 200, description = "Archival head block retrieved", body = Option<serde_json::Value>),
+        (status = 404, description = "Dataset has no archival data source"),
+    ),
+    tag = "head"
+)]
 async fn get_archival_head(
     Extension(network): Extension<Arc<NetworkClient>>,
     dataset: DatasetConfig,
@@ -205,6 +227,18 @@ async fn get_archival_head(
 /// Gets the finalized head corresponding to the /finalized-stream behaviour.
 ///
 /// The successful response is either "null" or a JSON object with "number" and "hash" fields.
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/finalized-head",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    responses(
+        (status = 200, description = "Finalized head block retrieved", body = Option<serde_json::Value>),
+        (status = 404, description = "Dataset has no data sources"),
+    ),
+    tag = "head"
+)]
 async fn get_finalized_head(
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
     Extension(network): Extension<Arc<NetworkClient>>,
@@ -241,6 +275,18 @@ async fn get_finalized_head(
 /// Otherwise, archival head is returned.
 ///
 /// The successful response is either "null" or a JSON object with "number" and "hash" fields.
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/head",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    responses(
+        (status = 200, description = "Head block retrieved", body = Option<serde_json::Value>),
+        (status = 404, description = "Dataset has no data sources"),
+    ),
+    tag = "head"
+)]
 async fn get_head(
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
     Extension(network): Extension<Arc<NetworkClient>>,
@@ -268,23 +314,304 @@ async fn get_head(
         .into_response()
 }
 
+/// Stream archival data with request restrictions applied
+///
+/// Streams blockchain data from the archival layer with rate limits and restrictions
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/archival-stream",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Archival data stream", content_type = "application/jsonl"),
+        (status = 400, description = "Invalid request parameters"),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "stream"
+)]
+async fn run_archival_stream_restricted(
+    task_manager: Extension<Arc<TaskManager>>,
+    network: Extension<Arc<NetworkClient>>,
+    config: Extension<Arc<Config>>,
+    dataset_id: DatasetId,
+    raw_request: StreamRequest,
+) -> Response {
+    let request = restrict_request(&config, raw_request);
+    run_archival_stream(task_manager, network, config, dataset_id, request).await
+}
+
+/// Stream archival data (debug mode without restrictions)
+///
+/// Streams blockchain data from the archival layer without request restrictions
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/archival-stream/debug",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Archival data stream", content_type = "application/jsonl"),
+        (status = 400, description = "Invalid request parameters"),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "stream"
+)]
+async fn run_archival_stream(
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(config): Extension<Arc<Config>>,
+    dataset_id: DatasetId,
+    mut request: StreamRequest,
+) -> Response {
+    let mut res = Response::builder();
+    res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
+    if let Some(head) = network.head(&dataset_id) {
+        // Don't use hotblocks data source at all for this endpoint
+        res = res
+            .header(FINALIZED_NUMBER_HEADER, head.number)
+            .header(FINALIZED_HASH_HEADER, head.hash)
+            .header(HEAD_NUMBER_HEADER, head.number);
+    }
+
+    request.dataset_id = dataset_id;
+    let compression = request.compression;
+
+    match task_manager.spawn_stream(request).await {
+        Ok(stream) => {
+            let body = match compression {
+                Compression::Gzip if config.use_gzjoin => {
+                    Body::from_stream(join_gzip_default(stream))
+                }
+                Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
+                Compression::Zstd => Body::from_stream(
+                    stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))),
+                ),
+            };
+            res.header(header::CONTENT_TYPE, "application/jsonl")
+                .header(header::CONTENT_ENCODING, compression.content_encoding())
+                .body(body)
+                .unwrap()
+        }
+        Err(RequestError::NoData) => {
+            // Delay request from this client for 5 seconds to avoid unnecessary retries
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            res.status(StatusCode::NO_CONTENT).body(().into()).unwrap()
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Stream real-time blockchain data
+///
+/// Streams blockchain data from the real-time data source
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/stream",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Real-time data stream", content_type = "application/jsonl"),
+        (status = 400, description = "Invalid request parameters"),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "stream"
+)]
+async fn run_stream(
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(config): Extension<Arc<Config>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    dataset: DatasetConfig,
+    request: StreamRequest,
+) -> Response {
+    run_stream_internal(
+        task_manager,
+        config,
+        network,
+        hotblocks,
+        dataset,
+        request,
+        StreamMode::RealTime,
+    )
+    .await
+}
+
+/// Stream finalized blockchain data
+///
+/// Streams blockchain data from the finalized data source
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/finalized-stream",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Finalized data stream", content_type = "application/jsonl"),
+        (status = 400, description = "Invalid request parameters"),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "stream"
+)]
+async fn run_finalized_stream(
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(config): Extension<Arc<Config>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    dataset: DatasetConfig,
+    request: StreamRequest,
+) -> Response {
+    run_stream_internal(
+        task_manager,
+        config,
+        network,
+        hotblocks,
+        dataset,
+        request,
+        StreamMode::Finalized,
+    )
+    .await
+}
+
+async fn run_stream_internal(
+    task_manager: Arc<TaskManager>,
+    config: Arc<Config>,
+    network: Arc<NetworkClient>,
+    hotblocks: Arc<HotblocksHandle>,
+    dataset: DatasetConfig,
+    request: StreamRequest,
+    mode: StreamMode,
+) -> Response {
+    let mut request = restrict_request(&config, request);
+
+    match dataset.network_id {
+        // Prefer data from the network
+        Some(dataset_id)
+            if network
+                .get_height(&dataset_id)
+                .is_some_and(|height| request.query.first_block() <= height) =>
+        {
+            let archival_head = network.head(&dataset_id);
+            let head_task = tokio::spawn({
+                let archival_head = archival_head.clone();
+                async move {
+                    let ds = &dataset.default_name;
+                    let head = match mode {
+                        StreamMode::RealTime => hotblocks.get_head(ds).await,
+                        StreamMode::Finalized => hotblocks.get_finalized_head(ds).await,
+                    };
+                    head.ok().or(archival_head.clone()).map(|b| b.number)
+                }
+            });
+
+            request.dataset_id = dataset_id;
+            let compression = request.compression;
+
+            let stream = match task_manager.spawn_stream(request).await {
+                Ok(stream) => stream,
+                Err(e) => return e.into_response(),
+            };
+
+            let mut res = Response::builder().header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
+            if let Some(head) = archival_head {
+                res = res.header(FINALIZED_NUMBER_HEADER, head.number);
+                res = res.header(FINALIZED_HASH_HEADER, head.hash);
+            }
+            if let Some(head) = head_task.await.unwrap() {
+                res = res.header(HEAD_NUMBER_HEADER, head);
+            }
+            let body = match compression {
+                Compression::Gzip if config.use_gzjoin => {
+                    Body::from_stream(join_gzip_default(stream))
+                }
+                Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
+                Compression::Zstd => Body::from_stream(
+                    stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))),
+                ),
+            };
+            res.header(header::CONTENT_TYPE, "application/jsonl")
+                .header(header::CONTENT_ENCODING, compression.content_encoding())
+                .body(body)
+                .unwrap()
+        }
+
+        // Then try hotblocks storage
+        // TODO: if the query is below the first hotblock, return 500 instead of 400
+        _ if dataset.hotblocks.is_some() => {
+            let mut res = forward_hotblocks_response(
+                hotblocks
+                    .stream(&dataset.default_name, &request.query.into_string(), mode)
+                    .await,
+            );
+
+            if res.status().is_success() {
+                res.headers_mut()
+                    .append(DATA_SOURCE_HEADER, DATA_SOURCE_REALTIME);
+            }
+            res
+        }
+        // If requested block is above the network height and there is no hotblocks storage, return 204
+        Some(dataset_id) => {
+            // Delay request from this client for 5 seconds to avoid unnecessary retries
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            let mut res = Response::builder();
+            res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
+            if let Some(head) = network.head(&dataset_id) {
+                res = res.header(FINALIZED_NUMBER_HEADER, head.number);
+                res = res.header(FINALIZED_HASH_HEADER, head.hash);
+                res = res.header(HEAD_NUMBER_HEADER, head.number);
+            }
+            res.status(StatusCode::NO_CONTENT).body(().into()).unwrap()
+        }
+        None => {
+            unreachable!(
+                "invalid dataset name should have been handled in the ClientRequest parser"
+            )
+        }
+    }
+}
+
+/// Get the current status of the portal
+///
+/// Responds with a JSON with human-readable information about the portal's state. The exact format may change.
+#[utoipa::path(
+    get,
+    path = "/status",
+    responses(
+        (status = 200, description = "Portal status retrieved successfully", body = StatusResponse,
+         example = json!({
+             "peer_id": "12D3KooWDJwsMFBEUxSUMxTKaBXLMvnn7pr9zsP73PMQrb9kPrtL",
+             "status": "registered",
+             "operator": "0xd1c2…11fa",
+             "current_epoch": {
+                 "number": 19619,
+                 "started_at": "2025-02-04T10:40:35+00:00",
+                 "ended_at": "2025-02-04T11:00:47+00:00",
+                 "duration_seconds": 1212
+             },
+             "sqd_locked": "100000",
+             "cu_per_epoch": "100000",
+             "workers": {
+                 "active_count": 1645,
+                 "rate_limit_per_worker": "0.04950495049504951"
+             },
+             "portal_version": "0.5.5"
+         })),
+    ),
+    tag = "status"
+)]
 async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
-    let status = client.get_status();
-
-    let Ok(mut res) = serde_json::to_value(status) else {
-        return axum::Json(json!({"error": "failed to serialize status"})).into_response();
+    let response = crate::openapi::StatusResponse {
+        portal_version: env!("CARGO_PKG_VERSION").to_string(),
+        status: client.get_status(),
     };
-
-    let Value::Object(ref mut map) = res else {
-        return axum::Json(json!({"error": "failed to serialize status"})).into_response();
-    };
-
-    map.insert(
-        "portal_version".into(),
-        Value::String(env!("CARGO_PKG_VERSION").into()),
-    );
-
-    axum::Json(res).into_response()
+    axum::Json(response).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -293,6 +620,33 @@ struct MetadataQuery {
     expand: Vec<String>,
 }
 
+/// List available datasets
+///
+/// Lists the existing datasets as a JSON array. See /metadata endpoint for the field description.
+#[utoipa::path(
+    get,
+    path = "/datasets",
+    params(
+        ("expand[]" = Option<Vec<String>>, Query, description = "Fields to expand in response"),
+    ),
+    responses(
+        (status = 200, description = "List of available datasets", body = Vec<AvailableDatasetApiResponse>,
+         example = json!([
+             {
+                 "dataset": "ethereum-mainnet",
+                 "aliases": ["eth-mainnet"],
+                 "real_time": false
+             },
+             {
+                 "dataset": "solana-mainnet",
+                 "aliases": [],
+                 "start_block": 250000000,
+                 "real_time": true
+             }
+         ])),
+    ),
+    tag = "datasets"
+)]
 async fn get_datasets(
     axum_extra::extract::Query(query): axum_extra::extract::Query<MetadataQuery>,
     Extension(network): Extension<Arc<NetworkClient>>,
@@ -309,6 +663,21 @@ async fn get_datasets(
     axum::Json(res)
 }
 
+/// Get the state of a specific dataset
+///
+/// Returns state information for the requested dataset
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/state",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    responses(
+        (status = 200, description = "Dataset state retrieved successfully", body = serde_json::Value),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "datasets"
+)]
 async fn get_dataset_state(
     dataset_id: DatasetId,
     Extension(network): Extension<Arc<NetworkClient>>,
@@ -316,6 +685,22 @@ async fn get_dataset_state(
     axum::Json(network.dataset_state(&dataset_id))
 }
 
+/// Get metadata for a specific dataset
+///
+/// Returns metadata including chain info, first block, and optional expanded fields
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/metadata",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+        ("expand[]" = Option<Vec<String>>, Query, description = "Fields to expand in response"),
+    ),
+    responses(
+        (status = 200, description = "Dataset metadata retrieved successfully", body = AvailableDatasetApiResponse),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "datasets"
+)]
 async fn get_dataset_metadata(
     axum_extra::extract::Query(query): axum_extra::extract::Query<MetadataQuery>,
     Extension(network): Extension<Arc<NetworkClient>>,
@@ -337,6 +722,23 @@ async fn get_dataset_metadata(
     axum::Json(resp.with_fields(&query.expand))
 }
 
+/// Get debug information for a specific block
+///
+/// Returns worker information for the given block
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/{block}/debug",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+        ("block" = u64, Path, description = "Block number"),
+    ),
+    responses(
+        (status = 200, description = "Debug information retrieved", body = serde_json::Value),
+        (status = 404, description = "Dataset or block not found"),
+    ),
+    tag = "debug"
+)]
+>>>>>>> efef0a6 (work in progress)
 async fn get_debug_block(
     Path((_dataset, block)): Path<(String, u64)>,
     dataset_id: DatasetId,
@@ -347,6 +749,17 @@ async fn get_debug_block(
     }))
 }
 
+/// Get information about all workers
+///
+/// Returns information about all available workers in the network
+#[utoipa::path(
+    get,
+    path = "/debug/workers",
+    responses(
+        (status = 200, description = "All worker information retrieved", body = serde_json::Value),
+    ),
+    tag = "debug"
+)]
 async fn get_all_workers(
     Extension(client): Extension<Arc<NetworkClient>>,
 ) -> axum::Json<serde_json::Value> {
@@ -355,6 +768,17 @@ async fn get_all_workers(
     }))
 }
 
+/// Get Prometheus metrics
+///
+/// Returns portal metrics in OpenMetrics format
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    responses(
+        (status = 200, description = "Metrics in OpenMetrics format", content_type = "application/openmetrics-text"),
+    ),
+    tag = "status"
+)]
 async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {
     lazy_static::lazy_static! {
         static ref HEADERS: HeaderMap = {
@@ -375,6 +799,18 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
     (HEADERS.clone(), buffer)
 }
 
+/// Check if the portal is ready to serve requests
+///
+/// Returns 200 if the portal is ready, 503 if not
+#[utoipa::path(
+    get,
+    path = "/ready",
+    responses(
+        (status = 200, description = "Portal is ready"),
+        (status = 503, description = "Portal is not ready"),
+    ),
+    tag = "status"
+)]
 async fn get_readiness(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
     if client.is_ready() {
         return (StatusCode::OK, "Ready").into_response();
@@ -383,6 +819,21 @@ async fn get_readiness(Extension(client): Extension<Arc<NetworkClient>>) -> impl
     (StatusCode::SERVICE_UNAVAILABLE, "Not ready").into_response()
 }
 
+/// Get the height of a dataset (deprecated)
+///
+/// Returns the current height of the dataset. This endpoint is deprecated and kept for backward compatibility.
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/height",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    responses(
+        (status = 200, description = "Height retrieved successfully", body = String),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "query"
+)]
 // Deprecated
 async fn get_height(
     Extension(network): Extension<Arc<NetworkClient>>,
@@ -398,6 +849,22 @@ async fn get_height(
     }
 }
 
+/// Get worker information for a block range (deprecated)
+///
+/// Returns worker information for the given dataset and block range. This endpoint is deprecated.
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/{start_block}/worker",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+        ("start_block" = u64, Path, description = "Starting block number"),
+    ),
+    responses(
+        (status = 200, description = "Worker information retrieved", body = serde_json::Value),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "debug"
+)]
 // Deprecated
 async fn get_worker(
     Path((dataset, start_block)): Path<(String, u64)>,
@@ -435,7 +902,25 @@ async fn get_worker(
         .into_response()
 }
 
-// Deprecated
+/// Execute a SQL query on the network
+///
+/// Executes a SQL query against a specific worker in the network
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset_id}/query/{worker_id}",
+    params(
+        ("dataset_id" = String, Path, description = "Dataset ID"),
+        ("worker_id" = String, Path, description = "Worker ID"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Query executed successfully", body = String),
+        (status = 400, description = "Invalid query"),
+        (status = 404, description = "Dataset or worker not found"),
+        (status = 503, description = "Service unavailable"),
+    ),
+    tag = "query"
+)]
 async fn execute_query(
     Path((dataset_id_encoded, worker_id)): Path<(String, PeerId)>,
     Extension(client): Extension<Arc<NetworkClient>>,

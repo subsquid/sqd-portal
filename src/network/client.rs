@@ -7,6 +7,7 @@ use num_rational::Ratio;
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use sqd_primitives::BlockRef;
+use utoipa::ToSchema;
 use tokio::task::JoinError;
 use tokio::time::Instant;
 use tokio::time::MissedTickBehavior;
@@ -21,7 +22,7 @@ use sqd_network_transport::{
 };
 use tracing::{debug_span, instrument, Instrument};
 
-use super::contracts_state::{self, ContractsState};
+use super::contracts_state::{ContractsState, Status};
 use super::priorities::NoWorker;
 use super::{ChunkNotFound, NetworkState};
 use crate::datasets::{DatasetConfig, Datasets};
@@ -41,7 +42,7 @@ const MAX_LOGS_CHUNK_SIZE: usize = 100;
 const CONCURRENT_LOGS: usize = 5;
 const LOGS_SENDING_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CurrentEpoch {
     pub number: u32,
     pub started_at: String,
@@ -49,16 +50,17 @@ pub struct CurrentEpoch {
     pub duration_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Workers {
     pub active_count: u64,
     pub rate_limit_per_worker: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct NetworkClientStatus {
+    #[schema(value_type = String)]
     pub peer_id: PeerId,
-    pub status: contracts_state::Status,
+    pub status: Status,
     pub operator: Option<String>,
     pub current_epoch: Option<CurrentEpoch>,
     pub sqd_locked: Option<String>,
@@ -627,7 +629,7 @@ impl NetworkClient {
         let started_at: DateTime<Utc> = state.current_epoch_started.into();
         let ended_at = started_at + ChronoDuration::seconds(epoch_secs as i64);
 
-        if state.status == contracts_state::Status::DataLoading {
+        if state.status == Status::DataLoading {
             NetworkClientStatus {
                 peer_id: self.local_peer_id,
                 status: state.status,

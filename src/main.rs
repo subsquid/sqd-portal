@@ -3,13 +3,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use config::Config;
-use controller::task_manager::TaskManager;
-use datasets::Datasets;
-use http_server::run_server;
-use network::NetworkClient;
 use prometheus_client::registry::Registry;
 use sqd_network_transport::TransportArgs;
+use sqd_portal::config::Config;
+use sqd_portal::controller::task_manager::TaskManager;
+use sqd_portal::datasets::Datasets;
+use sqd_portal::http_server::run_server;
+use sqd_portal::network::NetworkClient;
+use sqd_portal::utils::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::utils::RwLock;
@@ -139,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
     let mut metrics_registry = Registry::with_labels(
         vec![(Cow::Borrowed("portal_id"), Cow::Owned(peer_id.to_string()))].into_iter(),
     );
-    metrics::register_metrics(metrics_registry.sub_registry_with_prefix("portal"));
+    sqd_portal::metrics::register_metrics(metrics_registry.sub_registry_with_prefix("portal"));
     sqd_network_transport::metrics::register_metrics(
         metrics_registry.sub_registry_with_prefix("transport"),
     );

@@ -7,6 +7,7 @@ edition = "2021"
 sql = ["dep:once_cell", "dep:prost", "dep:substrait", "dep:sql_query_plan"]
 
 [dependencies]
+sqd-portal-client = { path = "./generated/portal-client" }
 anyhow = "1"
 async-compression = { version = "0.4.20", features = ["tokio", "gzip"] }
 async-stream = "0.3.5"
@@ -14,6 +15,8 @@ atomic_enum = { version = "0.3.0", features = ["cas"] }
 axum = { version = "0.7", features = ["http2"] }
 axum-extra = { version = "0.9", features = ["query"] }
 base64 = "0.22"
+utoipa = "4"
+utoipa-swagger-ui = { version = "6", features = ["axum"] }
 bimap = "0.6.3"
 bytes = "1.9"
 chrono = "0.4"
