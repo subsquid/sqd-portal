@@ -488,8 +488,6 @@ impl NetworkClient {
             .get_or_create(&vec![("worker".to_string(), worker.to_string())])
             .inc();
 
-        let query_start_time = Instant::now();
-
         // Phase 1: Send query, get raw stream back (hold permit while sending)
         let send_permit = match (&self.read_scheduler, priority) {
             (Some(sched), Some(prio)) => Some(sched.acquire(prio).await),
@@ -519,6 +517,7 @@ impl NetworkClient {
                 return Err(self.convert_query_failure(worker, failure));
             }
         };
+        let query_start_time = Instant::now();
 
         // Query was sent — from now on, cancellation means the worker was outrun.
         let this = self.clone();
