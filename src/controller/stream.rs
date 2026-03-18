@@ -59,7 +59,7 @@ enum RequestState {
 struct PendingRequests {
     requests: Vec<WorkerRequest>,
     tries_left: u8,
-    last_error: Option<String>,
+    errors: Vec<String>,
     timeout: Pin<Box<tokio::time::Sleep>>,
     timeout_duration: Duration,
 }
@@ -165,7 +165,7 @@ impl StreamController {
         result
     }
 
-    #[instrument(skip_all, level="trace", fields(chunk_index = slot.data_range.chunk_index))]
+    #[instrument(skip_all, level="debug", fields(chunk_index = slot.data_range.chunk_index))]
     fn poll_slot(&mut self, slot: &mut Slot, ctx: &mut Context<'_>) -> bool {
         let RequestState::Pending(pending) = &mut slot.state else {
             return false;
@@ -190,14 +190,30 @@ impl StreamController {
         });
 
         if let Some((response, duration, worker)) = result {
-            if retriable(&response) && pending.tries_left > 0 {
-                pending.last_error = Some(
+            if retriable(&response) {
+                pending.errors.push(
                     RequestError::from_query_error(
                         response.as_ref().unwrap_err().clone(), worker
                     ).to_string(),
                 );
-                tracing::debug!("Retrying request: {:?}", response.unwrap_err());
-                retry = true;
+                if pending.tries_left > 0 {
+                    tracing::debug!("Retrying request: {:?}", response.unwrap_err());
+                    retry = true;
+                } else {
+                    self.timeouts.observe(duration);
+                    let message = format!(
+                        "All query attempts failed: {}",
+                        pending.errors.join("; ")
+                    );
+                    tracing::debug!(
+                        "Got result (err) in {}ms from {}: {}",
+                        duration.as_millis(),
+                        worker,
+                        message,
+                    );
+                    slot.state = RequestState::Done(Err(RequestError::InternalError(message)));
+                    return true;
+                }
             } else {
                 self.timeouts.observe(duration);
                 let transfer_info = response.as_ref().ok().map(|s| {
@@ -243,8 +259,10 @@ impl StreamController {
                 }
             } else {
                 if pending.requests.is_empty() {
+                    let mut errors = std::mem::take(&mut pending.errors);
+                    errors.push("soft timeout exceeded".to_string());
                     slot.state = RequestState::Done(Err(RequestError::InternalError(
-                        "soft timeout exceeded".to_string(),
+                        format!("All query attempts failed: {}", errors.join("; "))
                     )));
                     return true;
                 } else {
@@ -273,15 +291,19 @@ impl StreamController {
                 Err(e) if !pending.requests.is_empty() => {
                     // wait for other requests to complete
                     tracing::debug!("Couldn't schedule retry: {e:?}");
-                    if pending.last_error.is_none() {
-                        pending.last_error =
-                            Some(format!("couldn't retry query after soft timeout: {e}"));
-                    }
+                    pending.errors.push(
+                        format!("couldn't retry query after soft timeout: {e}")
+                    );
                     pending.set_timeout(self.timeouts.current_timeout());
                 }
                 Err(e) => {
-                    let last_error = pending.last_error.take().unwrap_or_else(|| e.to_string());
-                    slot.state = RequestState::Done(Err(RequestError::InternalError(last_error)));
+                    let mut errors = std::mem::take(&mut pending.errors);
+                    errors.push(e.to_string());
+                    let message = format!(
+                        "All query attempts failed: {}",
+                        errors.join("; ")
+                    );
+                    slot.state = RequestState::Done(Err(RequestError::InternalError(message)));
                     return true;
                 }
             }
@@ -566,7 +588,7 @@ impl PendingRequests {
         Self {
             requests: vec![request],
             tries_left: retries,
-            last_error: None,
+            errors: Vec::new(),
             timeout: Box::pin(tokio::time::sleep(timeout)),
             timeout_duration: timeout,
         }
@@ -577,7 +599,7 @@ impl PendingRequests {
         Self {
             requests: vec![],
             tries_left: retries,
-            last_error: None,
+            errors: Vec::new(),
             timeout: Box::pin(tokio::time::sleep_until(until)),
             timeout_duration: timeout,
         }
