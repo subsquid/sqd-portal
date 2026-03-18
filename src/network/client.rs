@@ -51,6 +51,54 @@ enum ReadError {
     Transport(String),
 }
 
+type ResponseStream = Box<dyn futures::AsyncRead + Unpin + Send>;
+
+/// Tracks worker lease state across query phases.
+/// On task abort: unleases (before send) or reports outrun (after send).
+/// On normal completion: must be defused — error converters handle worker state.
+struct QueryGuard {
+    client: Arc<NetworkClient>,
+    worker: PeerId,
+    sent: bool,
+    defused: bool,
+}
+
+impl QueryGuard {
+    fn new(client: Arc<NetworkClient>, worker: PeerId, lease: bool) -> Self {
+        if lease {
+            client.network_state.lease_worker(worker);
+        }
+        metrics::QUERIES_RUNNING.inc();
+        Self {
+            client,
+            worker,
+            sent: false,
+            defused: false,
+        }
+    }
+
+    fn mark_sent(&mut self) {
+        self.sent = true;
+    }
+
+    fn defuse(&mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        metrics::QUERIES_RUNNING.dec();
+        if !self.defused {
+            if self.sent {
+                self.client.network_state.report_query_outrun(self.worker);
+            } else {
+                self.client.network_state.unlease_worker(self.worker);
+            }
+        }
+    }
+}
+
 const CHUNK_SIZE: usize = 1024 * 1024;
 const LOGS_QUEUE_SIZE: usize = 10000;
 const MAX_LOGS_CHUNK_SIZE: usize = 100;
@@ -433,28 +481,49 @@ impl NetworkClient {
         tracing::Span::current().record("query_id", &query_id);
         tracing::trace!("Sending query {query_id} to {worker}");
 
-        if lease {
-            self.network_state.lease_worker(worker);
-        }
-        metrics::QUERIES_RUNNING.inc();
-        let _queries_running_guard = scopeguard::guard((), |()| {
-            metrics::QUERIES_RUNNING.dec();
-        });
+        let mut guard = QueryGuard::new(Arc::clone(&self), worker, lease);
+        let query = self
+            .prepare_query(worker, &query_id, request_id, chunk_id, &block_range, query, compression)
+            .await;
+        let result = self.execute_query(worker, query, priority, &mut guard).await;
+        guard.defuse();
+        result
+    }
 
-        // Before the query is sent, cancellation should just unlease (no penalty).
-        // After Phase 1 succeeds, this is replaced with the outrun guard.
-        let this = self.clone();
-        let cancel_guard = scopeguard::guard(worker, |worker: PeerId| {
-            this.network_state.unlease_worker(worker);
-        });
+    async fn execute_query(
+        &self,
+        worker: PeerId,
+        query: Query,
+        priority: Option<u64>,
+        guard: &mut QueryGuard,
+    ) -> QueryResult {
+        let mut stream = self.send_to_transport(worker, query, priority).await?;
+        guard.mark_sent();
+        let network_start = Instant::now();
+        let mut buf = self.receive_first_byte(worker, &mut stream).await?;
+        let ttfb = network_start.elapsed();
+        let transfer_time = self.download_body(worker, &mut stream, &mut buf, priority).await?;
+        let query_time = network_start.elapsed();
+        self.finalize_response(worker, buf, ttfb, transfer_time, query_time).await
+    }
 
+    async fn prepare_query(
+        &self,
+        worker: PeerId,
+        query_id: &str,
+        request_id: String,
+        chunk_id: ChunkId,
+        block_range: &BlockRange,
+        query: String,
+        compression: Compression,
+    ) -> Query {
         let compression = match compression {
             Compression::Gzip => sqd_messages::Compression::Gzip,
             Compression::Zstd => sqd_messages::Compression::Zstd,
         } as i32;
         let mut query = Query {
             dataset: chunk_id.dataset.to_url().to_owned(),
-            query_id: query_id.clone(),
+            query_id: query_id.to_owned(),
             request_id,
             query,
             block_range: Some(sqd_messages::Range {
@@ -466,7 +535,7 @@ impl NetworkClient {
             signature: Default::default(),
             compression,
         };
-        let query = tokio::task::spawn_blocking({
+        tokio::task::spawn_blocking({
             let keypair = self.keypair.clone();
             move || {
                 query
@@ -477,18 +546,24 @@ impl NetworkClient {
         })
         .instrument(tracing::debug_span!("sign_query"))
         .await
-        .unwrap();
+        .unwrap()
+    }
 
+    async fn send_to_transport(
+        &self,
+        worker: PeerId,
+        query: Query,
+        priority: Option<u64>,
+    ) -> Result<ResponseStream, QueryError> {
         metrics::QUERIES_SENT
             .get_or_create(&vec![("worker".to_string(), worker.to_string())])
             .inc();
 
-        // Phase 1: Send query, get raw stream back (hold permit while sending)
         let send_permit = match (&self.read_scheduler, priority) {
             (Some(sched), Some(prio)) => Some(sched.acquire(prio).await),
             _ => None,
         };
-        let mut stream = match self
+        match self
             .transport_handle
             .send_query_request(worker, query)
             .instrument(tracing::debug_span!("send_query"))
@@ -498,7 +573,7 @@ impl NetworkClient {
                 if let Some(mut permit) = send_permit {
                     permit.outcome = Outcome::Success;
                 }
-                stream
+                Ok(stream)
             }
             Err(failure) => {
                 if let Some(mut permit) = send_permit {
@@ -508,43 +583,43 @@ impl NetworkClient {
                 } else if is_congestion_failure(&failure) {
                     self.signal_congestion();
                 }
-                scopeguard::ScopeGuard::into_inner(cancel_guard);
-                return Err(self.convert_query_failure(worker, failure));
+                Err(self.convert_query_failure(worker, failure))
             }
-        };
-        let query_start_time = Instant::now();
+        }
+    }
 
-        // Query was sent — from now on, cancellation means the worker was outrun.
-        let this = self.clone();
-        let cancel_guard = scopeguard::guard(
-            scopeguard::ScopeGuard::into_inner(cancel_guard),
-            |worker: PeerId| {
-                this.network_state.report_query_outrun(worker);
-            },
-        );
-
-        // Phase 2: Wait for first byte (no permit held, worker is processing)
+    async fn receive_first_byte(
+        &self,
+        worker: PeerId,
+        stream: &mut ResponseStream,
+    ) -> Result<Vec<u8>, QueryError> {
         let mut buf = Vec::with_capacity(1024 * 1024);
-        if let Err(failure) = wait_for_first_byte(&mut stream, &mut buf, self.transport_timeout)
+        wait_for_first_byte(stream, &mut buf, self.transport_timeout)
             .instrument(tracing::debug_span!("wait_first_byte"))
             .await
-        {
-            scopeguard::ScopeGuard::into_inner(cancel_guard);
-            if is_congestion_failure(&failure) {
-                self.signal_congestion();
-            }
-            return Err(self.convert_query_failure(worker, failure));
-        }
-        let ttfb = query_start_time.elapsed();
+            .map_err(|failure| {
+                if is_congestion_failure(&failure) {
+                    self.signal_congestion();
+                }
+                self.convert_query_failure(worker, failure)
+            })?;
+        Ok(buf)
+    }
 
-        // Phase 3: Read body
-        let read_result = match (&self.read_scheduler, priority) {
+    async fn download_body(
+        &self,
+        worker: PeerId,
+        stream: &mut ResponseStream,
+        buf: &mut Vec<u8>,
+        priority: Option<u64>,
+    ) -> Result<Duration, QueryError> {
+        let result = match (&self.read_scheduler, priority) {
             (Some(sched), Some(prio)) => {
                 read_response_with_permits(
                     sched,
                     prio,
-                    &mut stream,
-                    &mut buf,
+                    stream,
+                    buf,
                     sched.read_timeout(),
                     QUERY_RESULT_MAX_SIZE,
                 )
@@ -552,28 +627,22 @@ impl NetworkClient {
                 .await
             }
             _ => {
-                read_response_simple(
-                    &mut stream,
-                    &mut buf,
-                    self.transport_timeout,
-                    QUERY_RESULT_MAX_SIZE,
-                )
-                .instrument(tracing::debug_span!("read_response"))
-                .await
+                read_response_simple(stream, buf, self.transport_timeout, QUERY_RESULT_MAX_SIZE)
+                    .instrument(tracing::debug_span!("read_response"))
+                    .await
             }
         };
+        result.map_err(|e| self.convert_read_error(worker, e))
+    }
 
-        let query_time = query_start_time.elapsed();
-
-        let transfer_time = match read_result {
-            Ok(t) => t,
-            Err(e) => {
-                scopeguard::ScopeGuard::into_inner(cancel_guard);
-                return Err(self.convert_read_error(worker, e));
-            }
-        };
-
-        // Phase 4: Decode protobuf + validate (no permit held, application errors don't affect congestion)
+    async fn finalize_response(
+        &self,
+        worker: PeerId,
+        buf: Vec<u8>,
+        ttfb: Duration,
+        transfer_time: Duration,
+        query_time: Duration,
+    ) -> QueryResult {
         let result = sqd_messages::QueryResult::decode(buf.as_slice())
             .map_err(|e| QueryFailure::InvalidResponse(e.to_string()));
 
@@ -593,10 +662,9 @@ impl NetworkClient {
         } else {
             None
         };
-        let parsed = self.parse_query_result(worker, result, throughput).await;
-        scopeguard::ScopeGuard::into_inner(cancel_guard);
-
-        parsed.inspect(|_| metrics::report_query_ok(query_time))
+        self.parse_query_result(worker, result, throughput)
+            .await
+            .inspect(|_| metrics::report_query_ok(query_time))
             .map(|ok| QuerySuccess { ok, ttfb, transfer_time, response_size })
     }
 
