@@ -216,9 +216,9 @@ impl WorkersPool {
             return (PriorityGroup::Unavailable, worker.running_queries, 0);
         }
         // Higher throughput = more negative key = picked first among Best workers.
-        // None = no data yet = 0, so unknown workers rank above any measured worker.
+        // None = no data yet = -inf, so unknown workers rank above any measured worker.
         let throughput_key = match worker.last_throughput {
-            None => 0,
+            None => i64::MIN,
             Some(t) => -(t as i64),
         };
         (PriorityGroup::Best, worker.running_queries, throughput_key)
