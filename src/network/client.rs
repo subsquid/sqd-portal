@@ -458,6 +458,10 @@ impl NetworkClient {
         self.network_state.find_worker(dataset, block, lease)
     }
 
+    pub fn unlease_worker(&self, worker: PeerId) {
+        self.network_state.unlease_worker(worker);
+    }
+
     pub fn get_workers(&self, dataset: &DatasetId, block: u64) -> Vec<WorkerDebugInfo> {
         self.network_state.get_workers(dataset, block)
     }
@@ -889,13 +893,8 @@ impl NetworkClient {
         self.read_scheduler.as_ref().map(|s| s.utilization())
     }
 
-    pub fn has_speculative_capacity(&self) -> bool {
-        match &self.read_scheduler {
-            Some(sched) => sched.has_speculative_capacity(),
-            None => true,
-        }
-    }
 }
+
 
 fn is_congestion_failure(failure: &QueryFailure) -> bool {
     matches!(failure, QueryFailure::Timeout(_) | QueryFailure::TransportError(_))

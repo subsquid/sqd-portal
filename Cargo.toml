@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.10.0-rc3"
+version = "0.10.0-rc4"
 edition = "2021"
 
 [features]
