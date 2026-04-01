@@ -89,12 +89,6 @@ impl DownloadScheduler {
         }
     }
 
-    pub fn has_speculative_capacity(&self) -> bool {
-        let state = self.state.lock();
-        let threshold = (state.max_reads as f64 * (1.0 - self.config.speculative_fraction)) as u32;
-        state.active_reads < threshold
-    }
-
     pub fn utilization(&self) -> f64 {
         let state = self.state.lock();
         if state.max_reads == 0 {
@@ -330,32 +324,4 @@ mod tests {
         assert_eq!(second, "low");
     }
 
-    #[tokio::test]
-    async fn speculative_capacity_check() {
-        let config = CongestionConfig {
-            min_window: 10,
-            max_window: 10,
-            speculative_fraction: 0.2, // threshold = 80% of 10 = 8
-            ..test_config()
-        };
-        let sched = Arc::new(DownloadScheduler::new(config));
-
-        // With 0 active reads, there's capacity
-        assert!(sched.has_speculative_capacity());
-
-        // Fill up to 7 — still under threshold of 8
-        let mut permits = Vec::new();
-        for _ in 0..7 {
-            permits.push(sched.acquire(0).await);
-        }
-        assert!(sched.has_speculative_capacity());
-
-        // 8th read hits the threshold
-        permits.push(sched.acquire(0).await);
-        assert!(!sched.has_speculative_capacity());
-
-        // Drop one — back below threshold
-        permits.pop();
-        assert!(sched.has_speculative_capacity());
-    }
 }
