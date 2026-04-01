@@ -90,7 +90,10 @@ pub struct Config {
     pub sentry_sampling_rate: f32,
 
     #[serde(default = "default_true")]
-    pub sentry_is_enabled: bool
+    pub sentry_is_enabled: bool,
+
+    #[serde(default = "default_max_query_size")]
+    pub max_query_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +189,10 @@ fn default_assignments_update_interval() -> Duration {
 
 fn default_datasets_update_interval() -> Duration {
     Duration::from_secs(10 * 60)
+}
+
+fn default_max_query_size() -> u64 {
+    sqd_network_transport::protocol::MAX_RAW_QUERY_SIZE
 }
 
 fn default_sentry_sampling_rate() -> f32 {

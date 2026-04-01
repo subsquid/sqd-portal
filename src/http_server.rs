@@ -48,6 +48,9 @@ use crate::sql;
 #[cfg(feature = "sql")]
 use axum::body;
 
+#[derive(Clone, Copy)]
+struct MaxQuerySize(u64);
+
 pub async fn run_server(
     task_manager: Arc<TaskManager>,
     network_client: Arc<NetworkClient>,
@@ -162,6 +165,7 @@ pub async fn run_server(
             // This layer is added here to be applied before the request reaches trace layers
             SetRequestIdLayer::x_request_id(MakeRequestUuid::default()),
         )
+        .layer(Extension(MaxQuerySize(config.max_query_size)))
         .layer(Extension(task_manager))
         .layer(Extension(network_client))
         .layer(Extension(config))
@@ -936,14 +940,19 @@ where
 {
     type Rejection = Response;
 
-    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let Extension(MaxQuerySize(max_query_size)) = req
+            .extract_parts::<Extension<MaxQuerySize>>()
+            .await
+            .expect("MaxQuerySize extension should be set");
+
         let body: String = req
             .with_limited_body()
             .extract()
             .await
             .map_err(IntoResponse::into_response)?;
 
-        if body.len() as u64 > sqd_network_transport::protocol::MAX_RAW_QUERY_SIZE {
+        if body.len() as u64 > max_query_size {
             return Err(RequestError::BadRequest("Query is too large".to_string()).into_response());
         }
 
