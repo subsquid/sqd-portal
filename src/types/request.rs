@@ -13,6 +13,7 @@ pub struct StreamRequest {
     pub timeout_quantile: f32,
     pub retries: u8,
     pub compression: Compression,
+    pub skip_parent_hash_validation: bool,
 }
 
 #[derive(Debug, Clone)]

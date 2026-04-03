@@ -893,10 +893,7 @@ where
 
         let compression = determine_compression_format(req.headers());
 
-        let mut query: ParsedQuery = req.extract().await.map_err(IntoResponse::into_response)?;
-        if config.skip_parent_hash_validation {
-            query.remove_parent_hash();
-        }
+        let query: ParsedQuery = req.extract().await.map_err(IntoResponse::into_response)?;
 
         Ok(StreamRequest {
             dataset_id: DatasetId::from_url("-"), // will be filled later, if the request goes to the network
@@ -908,6 +905,7 @@ where
             timeout_quantile,
             retries,
             compression,
+            skip_parent_hash_validation: config.skip_parent_hash_validation,
         })
     }
 }
@@ -1016,6 +1014,7 @@ fn build_request(
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
         compression: Compression::Gzip,
+        skip_parent_hash_validation: false,
     }
 }
 

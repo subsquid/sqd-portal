@@ -33,7 +33,7 @@ impl TaskManager {
 
     pub async fn spawn_stream(
         self: Arc<Self>,
-        request: StreamRequest,
+        mut request: StreamRequest,
     ) -> Result<impl Stream<Item = ResponseChunk>, RequestError> {
         let running_tasks = self.running_tasks.fetch_add(1, Ordering::Relaxed);
         if running_tasks >= self.max_tasks {
@@ -48,6 +48,10 @@ impl TaskManager {
             metrics::ACTIVE_STREAMS.set(prev as i64 - 1);
             metrics::COMPLETED_STREAMS.inc();
         });
+
+        if request.skip_parent_hash_validation {
+            request.query.remove_parent_hash();
+        }
 
         let mut streamer = StreamController::new(request, self.network_client.clone())?;
         let first_chunk = streamer
