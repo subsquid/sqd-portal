@@ -83,6 +83,13 @@ pub struct Config {
     #[serde(default)]
     pub use_gzjoin: bool,
 
+    #[serde(default)]
+    pub ignore_deprecated_workers: bool,
+
+    /// Please avoid overriding this value. It may eventually become unsupported.
+    #[serde(default = "default_query_size_limit")]
+    pub query_size_limit: u64,
+
     #[serde(default = "default_sentry_dsn")]
     pub sentry_dsn: String,
 
@@ -186,6 +193,10 @@ fn default_assignments_update_interval() -> Duration {
 
 fn default_datasets_update_interval() -> Duration {
     Duration::from_secs(10 * 60)
+}
+
+fn default_query_size_limit() -> u64 {
+    sqd_network_transport::protocol::MAX_RAW_QUERY_SIZE
 }
 
 fn default_sentry_sampling_rate() -> f32 {

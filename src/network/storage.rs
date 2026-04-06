@@ -19,6 +19,7 @@ pub struct StorageClient {
     latest_assignment_id: RwLock<Option<String>>,
     network_state_url: String,
     reqwest_client: reqwest::Client,
+    ignore_deprecated_workers: bool,
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -54,7 +55,12 @@ impl StorageClient {
                 .user_agent(format!("SQD Portal/{}", env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap(),
+            ignore_deprecated_workers: false,
         }
+    }
+
+    pub fn ignore_deprecated_workers(&mut self) {
+        self.ignore_deprecated_workers = true;
     }
 
     pub fn has_assignment(&self) -> bool {
@@ -219,6 +225,11 @@ impl StorageClient {
             .filter_map(|idx| {
                 let w = assignment.get_worker_by_index(idx);
                 if w.status() == sqd_assignments::WorkerStatus::UnsupportedVersion {
+                    return None;
+                }
+                if self.ignore_deprecated_workers
+                    && w.status() == sqd_assignments::WorkerStatus::DeprecatedVersion
+                {
                     return None;
                 }
                 w.peer_id()

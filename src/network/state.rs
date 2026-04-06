@@ -31,6 +31,10 @@ impl NetworkState {
         }
     }
 
+    pub fn ignore_deprecated_workers(&mut self) {
+        self.dataset_storage.ignore_deprecated_workers();
+    }
+
     pub async fn try_update_assignment(&self) {
         self.dataset_storage.try_update_assignment().await;
     }
