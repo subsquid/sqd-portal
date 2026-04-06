@@ -934,14 +934,19 @@ where
 {
     type Rejection = Response;
 
-    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let Extension(config) = req
+            .extract_parts::<Extension<Arc<Config>>>()
+            .await
+            .map_err(IntoResponse::into_response)?;
+
         let body: String = req
             .with_limited_body()
             .extract()
             .await
             .map_err(IntoResponse::into_response)?;
 
-        if body.len() as u64 > sqd_network_transport::protocol::MAX_RAW_QUERY_SIZE {
+        if body.len() as u64 > config.query_size_limit {
             return Err(RequestError::BadRequest("Query is too large".to_string()).into_response());
         }
 
