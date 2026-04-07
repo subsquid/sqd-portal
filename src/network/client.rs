@@ -684,7 +684,7 @@ pub fn timestamp_now_ms() -> u64 {
 /// "unexpected base block: expected 0xabc..., but got 12345#0xdef..."
 /// we would like to have this manually parsed till
 /// https://linear.app/sqd-ai/issue/NET-248/correctly-propagate-all-errors-from-the-query-engine
-/// is realised to all workers
+/// is released to all workers
 fn parse_base_block_mismatch(s: &str) -> Option<BlockRef> {
     let after_got = s
         .strip_prefix("unexpected base block: expected ")?
