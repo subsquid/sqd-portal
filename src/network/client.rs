@@ -527,7 +527,7 @@ impl NetworkClient {
                             Err::ServerError(s) => {
                                 if let Some(block_ref) = parse_base_block_mismatch(&s) {
                                     // That's input validation rather than bad query response
-                                    metrics::report_query_result(&peer_id, "block_missmatch");
+                                    metrics::report_query_result(&peer_id, "block_mismatch");
                                     self.network_state.report_query_success(peer_id);
                                     Err(QueryError::BaseBlockMismatch(block_ref))
                                 } else {
