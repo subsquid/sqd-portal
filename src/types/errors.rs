@@ -21,6 +21,8 @@ pub enum RequestError {
     RateLimitExceeded,
     #[error("Service is overloaded, please try again later")]
     BusyFor(Duration),
+    #[error("Base block mismatch")]
+    BaseBlockMismatch(sqd_primitives::BlockRef),
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -33,6 +35,8 @@ pub enum QueryError {
     Failure(String),
     #[error("rate limit exceeded")]
     RateLimitExceeded,
+    #[error("base block mismatch")]
+    BaseBlockMismatch(sqd_primitives::BlockRef),
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -52,6 +56,7 @@ impl RequestError {
             }
             QueryError::Failure(s) => RequestError::Failure(format!("worker {worker} failed: {s}")),
             QueryError::RateLimitExceeded => RequestError::RateLimitExceeded,
+            QueryError::BaseBlockMismatch(block_ref) => RequestError::BaseBlockMismatch(block_ref),
         }
     }
 }
@@ -91,6 +96,13 @@ impl axum::response::IntoResponse for RequestError {
                 format!("All query attempts failed, last error: {e}"),
             )
                 .into_response(),
+
+            Self::BaseBlockMismatch(block_ref) => {
+                let body = serde_json::json!({
+                    "previousBlocks": [block_ref],
+                });
+                return (StatusCode::CONFLICT, axum::Json(body)).into_response();
+            }
         };
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -108,6 +120,7 @@ impl RequestError {
             Self::InternalError(_) => "internal_error",
             Self::Failure(_) => "failure",
             Self::Unavailable | Self::BusyFor(_) | Self::RateLimitExceeded => "overloaded",
+            Self::BaseBlockMismatch(_) => "base_block_mismatch",
         }
     }
 }

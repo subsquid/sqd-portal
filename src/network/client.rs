@@ -525,9 +525,16 @@ impl NetworkClient {
                                 Err(QueryError::Retriable(s))
                             }
                             Err::ServerError(s) => {
-                                metrics::report_query_result(&peer_id, "server_error");
-                                self.network_state.report_query_error(peer_id);
-                                Err(QueryError::Failure(s))
+                                if let Some(block_ref) = parse_base_block_mismatch(&s) {
+                                    // That's input validation rather than bad query response
+                                    metrics::report_query_result(&peer_id, "block_missmatch");
+                                    self.network_state.report_query_success(peer_id);
+                                    Err(QueryError::BaseBlockMismatch(block_ref))
+                                } else {
+                                    metrics::report_query_result(&peer_id, "server_error");
+                                    self.network_state.report_query_error(peer_id);
+                                    Err(QueryError::Failure(s))
+                                }
                             }
                             Err::ServerOverloaded(()) => {
                                 metrics::report_query_result(&peer_id, "server_overloaded");
@@ -671,4 +678,55 @@ pub fn timestamp_now_ms() -> u64 {
         .as_millis()
         .try_into()
         .expect("not that far in the future")
+}
+
+/// Parses error messages like:
+/// "unexpected base block: expected 0xabc..., but got 12345#0xdef..."
+/// we would like to have this manually parsed till
+/// https://linear.app/sqd-ai/issue/NET-248/correctly-propagate-all-errors-from-the-query-engine
+/// is realised to all workers
+fn parse_base_block_mismatch(s: &str) -> Option<BlockRef> {
+    let after_got = s
+        .strip_prefix("unexpected base block: expected ")?
+        .split(", but got ")
+        .nth(1)?;
+    let (number_str, hash) = after_got.split_once('#')?;
+    let number = number_str.parse().ok()?;
+    Some(BlockRef {
+        number,
+        hash: hash.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_base_block_mismatch_valid() {
+        let msg = "unexpected base block: expected 0x8e1f85e345e0752737699a43a07713515b97287c21b30a240e91dbfbbf1006ab, but got 24799999#0x151e093f39962caed11a903e118d74712dbf7ee18e6107224f519831b5079af8";
+        let result = parse_base_block_mismatch(msg).unwrap();
+        assert_eq!(result.number, 24799999);
+        assert_eq!(
+            result.hash,
+            "0x151e093f39962caed11a903e118d74712dbf7ee18e6107224f519831b5079af8"
+        );
+    }
+
+    #[test]
+    fn parse_base_block_mismatch_different_error() {
+        assert!(parse_base_block_mismatch("some other server error").is_none());
+    }
+
+    #[test]
+    fn parse_base_block_mismatch_malformed_no_hash() {
+        let msg = "unexpected base block: expected 0xabc, but got 12345";
+        assert!(parse_base_block_mismatch(msg).is_none());
+    }
+
+    #[test]
+    fn parse_base_block_mismatch_malformed_no_number() {
+        let msg = "unexpected base block: expected 0xabc, but got #0xdef";
+        assert!(parse_base_block_mismatch(msg).is_none());
+    }
 }

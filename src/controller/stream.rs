@@ -601,6 +601,7 @@ fn retriable(result: &QueryResult) -> bool {
         Err(QueryError::Retriable(_)) => true,
         Err(QueryError::Failure(_)) => false,
         Err(QueryError::RateLimitExceeded) => true,
+        Err(QueryError::BaseBlockMismatch(_)) => false,
     }
 }
 
