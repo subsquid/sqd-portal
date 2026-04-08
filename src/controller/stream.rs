@@ -69,7 +69,7 @@ use tracing::{instrument, Instrument};
 
 use crate::{
     controller::timeouts::TimeoutManager,
-    network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult},
+    network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult, WorkerLease},
     types::{
         BlockRange, ChunkId, DataChunk, QueryError, RequestError, ResponseChunk, SendQueryError,
         StreamRequest,
@@ -143,8 +143,7 @@ enum WorkerRequest {
 }
 
 struct ReservedWorker {
-    peer_id: PeerId,
-    network: Arc<NetworkClient>,
+    lease: Option<WorkerLease>,
 }
 
 struct RunningWorkerRequest {
@@ -156,12 +155,6 @@ struct RunningWorkerRequest {
 struct FinishedWorkerRequest {
     result: QueryResult,
     worker: PeerId,
-}
-
-impl Drop for ReservedWorker {
-    fn drop(&mut self) {
-        self.network.unlease_worker(self.peer_id);
-    }
 }
 
 impl Drop for RunningWorkerRequest {
@@ -380,7 +373,11 @@ impl StreamController {
             for req in &mut pending.requests {
                 if let WorkerRequest::NotStarted(worker) = req {
                     let is_speculative = num_running > 0;
-                    let request = self.send_query(&slot.data_range, worker.peer_id, is_speculative);
+                    let lease = worker
+                        .lease
+                        .take()
+                        .expect("worker lease should only be used once");
+                    let request = self.send_query(&slot.data_range, lease, is_speculative);
                     *req = WorkerRequest::Running(request);
                     pending.set_timeout(self.timeouts.current_timeout(), ctx);
                     break;
@@ -482,7 +479,6 @@ impl StreamController {
         result
     }
 
-    #[instrument(skip_all, level = "trace")]
     fn try_fill_slots(&mut self, ctx: &mut Context<'_>) {
         if let Some(Slot {
             state: RequestState::Paused(_),
@@ -569,13 +565,12 @@ impl StreamController {
 
         let attempts = 1 + self.request.retries as usize;
         match self.pre_lease_workers(&data_range, attempts) {
-            Ok(workers) => {
+            Ok(leases) => {
                 let mut slot = Slot {
                     data_range,
                     state: RequestState::Pending(PendingRequests::new(
-                        workers,
+                        leases,
                         self.timeouts.current_timeout(),
-                        Arc::clone(&self.network),
                     )),
                 };
                 self.poll_slot(&mut slot, ctx);
@@ -604,18 +599,15 @@ impl StreamController {
         &mut self,
         range: &DataRange,
         count: usize,
-    ) -> Result<Vec<PeerId>, SendQueryError> {
+    ) -> Result<Vec<WorkerLease>, SendQueryError> {
         let mut workers = Vec::with_capacity(count);
         for _ in 0..count {
             match self
                 .network
-                .find_worker(&self.request.dataset_id, *range.range.start(), true)
+                .find_worker(&self.request.dataset_id, *range.range.start())
             {
                 Ok(w) => workers.push(w),
                 Err(e) => {
-                    for w in workers {
-                        self.network.unlease_worker(w);
-                    }
                     return Err(match e {
                         NoWorker::AllUnavailable => SendQueryError::NoWorkers,
                         NoWorker::Backoff(until) => SendQueryError::Backoff(until),
@@ -630,7 +622,7 @@ impl StreamController {
     fn send_query(
         &mut self,
         range: &DataRange,
-        worker: PeerId,
+        lease: WorkerLease,
         is_speculative: bool,
     ) -> RunningWorkerRequest {
         tracing::debug!(
@@ -639,7 +631,7 @@ impl StreamController {
             range.chunk_index,
             range.range.start(),
             range.range.end(),
-            worker,
+            lease,
         );
         let query = if *range.range.start() == self.request.query.first_block() {
             self.request.query.to_string()
@@ -650,17 +642,17 @@ impl StreamController {
 
         let priority = self.stream_index * self.priority_stride + range.chunk_index as u64;
 
+        let worker = lease.worker();
         let fut = self
             .network
             .clone()
             .query_worker(
-                worker,
+                lease,
                 self.request.request_id.to_string(),
                 ChunkId::new(self.request.dataset_id.clone(), range.chunk),
                 range.range.clone(),
                 query,
                 self.request.compression,
-                false,
                 Some(priority),
             )
             .in_current_span();
@@ -729,19 +721,15 @@ impl PausedState {
 }
 
 impl PendingRequests {
-    fn new(
-        workers: impl IntoIterator<Item = PeerId>,
-        timeout: Duration,
-        network: Arc<NetworkClient>,
-    ) -> Self {
+    fn new(leases: impl IntoIterator<Item = WorkerLease>, timeout: Duration) -> Self {
         Self {
-            requests: workers
+            requests: leases
                 .into_iter()
-                .map(|w| {
-                    WorkerRequest::NotStarted(ReservedWorker {
-                        peer_id: w,
-                        network: network.clone(),
-                    })
+                .map(|lease| {
+                    let peer_id = lease.worker();
+                    let result = WorkerRequest::NotStarted(ReservedWorker { lease: Some(lease) });
+                    tracing::trace!("Reserved worker {}", peer_id);
+                    result
                 })
                 .collect(),
             timeout: Box::pin(tokio::time::sleep(timeout)),
