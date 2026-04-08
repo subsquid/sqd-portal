@@ -333,28 +333,8 @@ impl StreamController {
         }
 
         if should_retry {
-            // The last query attempt timed out, give up
-            let mut errors = Vec::with_capacity(pending.requests.len());
-            for request in pending.requests.drain(..) {
-                let error = match request {
-                    WorkerRequest::NotStarted(_) => unreachable!("all queries are already running"),
-                    WorkerRequest::Finished(f) => {
-                        RequestError::from_query_error(f.result.unwrap_err().clone(), f.worker)
-                            .to_string()
-                    }
-                    WorkerRequest::Running(r) => {
-                        format!(
-                            "query to worker {} timed out after {}ms",
-                            r.worker,
-                            r.start_time.elapsed().as_millis()
-                        )
-                    }
-                };
-                errors.push(error);
-            }
-            let message = format!("All query attempts failed: {}", errors.join("; "));
-            slot.state = RequestState::Done(Err(RequestError::InternalError(message)));
-            return UpdateStatus::Updated;
+            // The last query attempt timed out, wait for the rest to complete
+            assert!(num_running > 0);
         }
 
         UpdateStatus::NotUpdated
