@@ -894,7 +894,7 @@ where
             .map_err(IntoResponse::into_response)?;
         let (_, alias) = args
             .first()
-            .ok_or((StatusCode::NOT_FOUND, "not enough arguments".to_string()).into_response())?;
+            .ok_or((StatusCode::NOT_FOUND, "not enough arguments").into_response())?;
         let Extension(network) = parts
             .extract::<Extension<Arc<NetworkClient>>>()
             .await
