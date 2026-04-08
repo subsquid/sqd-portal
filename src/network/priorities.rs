@@ -232,6 +232,6 @@ impl Cooldown {
 
     fn observed(&self, now: Instant) -> bool {
         self.last_observed
-            .map_or(false, |last| (now - last).as_secs() < self.seconds as u64)
+            .is_some_and(|last| (now - last).as_secs() < self.seconds as u64)
     }
 }
