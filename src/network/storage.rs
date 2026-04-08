@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::ErrorKind, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 use sqd_assignments::Assignment;
@@ -128,8 +128,7 @@ impl StorageClient {
             .await?
             .error_for_status()?;
         let stream = response.bytes_stream();
-        let reader =
-            StreamReader::new(stream.map_err(|e| std::io::Error::new(ErrorKind::Other, e)));
+        let reader = StreamReader::new(stream.map_err(std::io::Error::other));
         let mut buf = Vec::new();
         let mut decoder = GzipDecoder::new(reader);
         decoder
@@ -182,10 +181,10 @@ impl StorageClient {
         let chunk = assignment
             .find_chunk(dataset, block)
             .map_err(|e| convert_chunk_not_found(e, assignment, dataset))?;
-        Ok(chunk.id().parse().map_err(|e| {
+        chunk.id().parse().map_err(|e| {
             tracing::warn!(error = %e, "Failed to parse chunk ID");
             ChunkNotFound::InvalidID(chunk.id().to_string())
-        })?)
+        })
     }
 
     pub fn find_chunk_by_timestamp(
@@ -199,10 +198,10 @@ impl StorageClient {
         let chunk = assignment
             .find_chunk_by_timestamp(dataset, ts)
             .map_err(|e| convert_chunk_not_found(e, assignment, dataset))?;
-        Ok(chunk.id().parse().map_err(|e| {
+        chunk.id().parse().map_err(|e| {
             tracing::warn!(error = %e, "Failed to parse chunk ID");
             ChunkNotFound::InvalidID(chunk.id().to_string())
-        })?)
+        })
     }
 
     pub fn find_workers(

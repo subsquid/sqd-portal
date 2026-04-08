@@ -35,8 +35,8 @@ impl TimeoutManager {
         if durations.len() < WINDOW_SIZE {
             return DEFAULT_TIMEOUT;
         }
-        let kth = ((durations.len() as f32 * self.quantile).floor() as usize)
-            .min(durations.len() - 1);
+        let kth =
+            ((durations.len() as f32 * self.quantile).floor() as usize).min(durations.len() - 1);
         // TODO: optimize time complexity
         durations.sort();
         durations[kth]

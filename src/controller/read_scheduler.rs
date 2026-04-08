@@ -45,15 +45,18 @@ impl DownloadScheduler {
     pub fn new(config: CongestionConfig) -> Self {
         let max_reads = config.max_window;
         Self {
-            state: Mutex::new(SchedulerState {
-                active_reads: 0,
-                max_reads,
-                successes_since_shrink: 0,
-                last_shrink: Instant::now(),
-                shrink_count: 0,
-                waiters: BTreeMap::new(),
-                next_seq: 0,
-            }, "DownloadScheduler::state"),
+            state: Mutex::new(
+                SchedulerState {
+                    active_reads: 0,
+                    max_reads,
+                    successes_since_shrink: 0,
+                    last_shrink: Instant::now(),
+                    shrink_count: 0,
+                    waiters: BTreeMap::new(),
+                    next_seq: 0,
+                },
+                "DownloadScheduler::state",
+            ),
             config,
         }
     }
@@ -323,5 +326,4 @@ mod tests {
             .unwrap();
         assert_eq!(second, "low");
     }
-
 }

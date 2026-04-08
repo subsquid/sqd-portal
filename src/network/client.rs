@@ -873,7 +873,7 @@ async fn wait_for_first_byte(
     };
     tokio::time::timeout(timeout, fut)
         .await
-        .unwrap_or_else(|_| Err(QueryFailure::Timeout(StreamClientTimeout::Request)))
+        .unwrap_or(Err(QueryFailure::Timeout(StreamClientTimeout::Request)))
 }
 
 /// Returns the cumulative time spent in actual reads (excludes permit wait time).

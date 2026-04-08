@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
 
     // Initialize Sentry before tracing to integrate them
-    if args.config.sentry_is_enabled { 
+    if args.config.sentry_is_enabled {
         let _sentry_guard = setup_sentry(&args.config, &args);
     }
     setup_tracing(args.json_log, args.log_span_durations);
@@ -122,12 +122,8 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(args.config);
     let hotblocks = Arc::new(hotblocks::build_client(&config).await?);
-    let network_client_builder = NetworkClient::builder(
-        args.transport,
-        config.clone(),
-        datasets.clone(),
-    )
-    .await?;
+    let network_client_builder =
+        NetworkClient::builder(args.transport, config.clone(), datasets.clone()).await?;
 
     let peer_id = network_client_builder.peer_id();
     sentry::configure_scope(|scope| {
@@ -138,11 +134,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let mut metrics_registry = Registry::with_labels(
-        vec![(
-            Cow::Borrowed("portal_id"),
-            Cow::Owned(peer_id.to_string()),
-        )]
-        .into_iter(),
+        vec![(Cow::Borrowed("portal_id"), Cow::Owned(peer_id.to_string()))].into_iter(),
     );
     metrics::register_metrics(metrics_registry.sub_registry_with_prefix("portal"));
     sqd_network_transport::metrics::register_metrics(
