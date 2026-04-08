@@ -168,7 +168,7 @@ fn default_max_buffer_size() -> usize {
 }
 
 fn default_default_retries() -> u8 {
-    7
+    1
 }
 
 fn default_default_timeout_quantile() -> f32 {

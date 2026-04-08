@@ -75,11 +75,7 @@ impl WorkersPool {
         }
     }
 
-    pub fn pick(
-        &mut self,
-        workers: impl IntoIterator<Item = PeerId>,
-        lease: bool,
-    ) -> Result<PeerId, NoWorker> {
+    pub fn pick(&mut self, workers: impl IntoIterator<Item = PeerId>) -> Result<PeerId, NoWorker> {
         let now = Instant::now();
         let (worker, best_priority) = workers
             .into_iter()
@@ -111,9 +107,7 @@ impl WorkersPool {
                 Err(NoWorker::Backoff(until))
             }
             PriorityGroup::Best => {
-                if lease {
-                    self.lease(worker);
-                }
+                self.lease(worker);
                 Ok(worker)
             }
         }
@@ -146,8 +140,6 @@ impl WorkersPool {
         });
     }
 
-    /// Reverse a lease without recording any outcome.
-    /// Used when a query is cancelled before being sent to the worker.
     pub fn unlease(&mut self, worker: PeerId) {
         self.modify(worker, |stats| {
             stats.running_queries -= 1;
@@ -156,7 +148,6 @@ impl WorkersPool {
 
     pub fn success(&mut self, worker: PeerId, throughput: Option<f64>) {
         self.modify(worker, |stats| {
-            stats.running_queries -= 1;
             if let Some(t) = throughput {
                 stats.last_throughput = Some(t);
             }
@@ -166,7 +157,6 @@ impl WorkersPool {
     // Query error has been returned from the worker
     pub fn error(&mut self, worker: PeerId) {
         self.modify(worker, |stats| {
-            stats.running_queries -= 1;
             stats.server_errors.observe(Instant::now());
         });
     }
@@ -174,14 +164,7 @@ impl WorkersPool {
     // Query could not be processed, e.g. because the worker couldn't be reached
     pub fn failure(&mut self, worker: PeerId) {
         self.modify(worker, |stats| {
-            stats.running_queries -= 1;
             stats.timeouts.observe(Instant::now());
-        });
-    }
-
-    pub fn outrun(&mut self, worker: PeerId) {
-        self.modify(worker, |stats| {
-            stats.running_queries -= 1;
         });
     }
 
@@ -252,4 +235,3 @@ impl Cooldown {
             .map_or(false, |last| (now - last).as_secs() < self.seconds as u64)
     }
 }
-
