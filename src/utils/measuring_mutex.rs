@@ -49,7 +49,6 @@ impl<'a, T> std::ops::DerefMut for MeasuringMutexGuard<'a, T> {
 impl<'a, T> Drop for MeasuringMutexGuard<'a, T> {
     fn drop(&mut self) {
         let duration = self.start.elapsed();
-        tracing::trace!("Lock {} held for: {:?}", self.name, duration);
         crate::metrics::report_mutex_held_duration(
             self.name,
             duration,

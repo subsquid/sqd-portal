@@ -58,7 +58,6 @@ impl<'a, T> std::ops::Deref for MeasuringRwLockReadGuard<'a, T> {
 impl<'a, T> Drop for MeasuringRwLockReadGuard<'a, T> {
     fn drop(&mut self) {
         let duration = self.start.elapsed();
-        tracing::trace!("Read lock {} held for: {:?}", self.name, duration);
         crate::metrics::report_mutex_held_duration(
             self.name,
             duration,
@@ -84,7 +83,6 @@ impl<'a, T> std::ops::DerefMut for MeasuringRwLockWriteGuard<'a, T> {
 impl<'a, T> Drop for MeasuringRwLockWriteGuard<'a, T> {
     fn drop(&mut self) {
         let duration = self.start.elapsed();
-        tracing::trace!("Write lock {} held for: {:?}", self.name, duration);
         crate::metrics::report_mutex_held_duration(
             self.name,
             duration,
