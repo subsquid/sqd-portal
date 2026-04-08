@@ -24,7 +24,7 @@ use tracing::{debug_span, instrument, Instrument};
 
 use super::contracts_state::{self, ContractsState};
 use super::priorities::NoWorker;
-use super::{ChunkNotFound, NetworkState};
+use super::{ChunkNotFound, NetworkState, WorkerLease};
 use crate::controller::read_scheduler::{DownloadScheduler, Outcome, Priority};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
@@ -53,49 +53,18 @@ enum ReadError {
 
 type ResponseStream = Box<dyn futures::AsyncRead + Unpin + Send>;
 
-/// Tracks worker lease state across query phases.
-/// On task abort: unleases (before send) or reports outrun (after send).
-/// On normal completion: must be defused — error converters handle worker state.
-struct QueryGuard {
-    client: Arc<NetworkClient>,
-    worker: PeerId,
-    sent: bool,
-    defused: bool,
-}
+struct QueryGuard {}
 
 impl QueryGuard {
-    fn new(client: Arc<NetworkClient>, worker: PeerId, lease: bool) -> Self {
-        if lease {
-            client.network_state.lease_worker(worker);
-        }
+    fn new() -> Self {
         metrics::QUERIES_RUNNING.inc();
-        Self {
-            client,
-            worker,
-            sent: false,
-            defused: false,
-        }
-    }
-
-    fn mark_sent(&mut self) {
-        self.sent = true;
-    }
-
-    fn defuse(&mut self) {
-        self.defused = true;
+        Self {}
     }
 }
 
 impl Drop for QueryGuard {
     fn drop(&mut self) {
         metrics::QUERIES_RUNNING.dec();
-        if !self.defused {
-            if self.sent {
-                self.client.network_state.report_query_outrun(self.worker);
-            } else {
-                self.client.network_state.unlease_worker(self.worker);
-            }
-        }
     }
 }
 
@@ -447,18 +416,12 @@ impl NetworkClient {
         self.network_state.dataset_storage.head(dataset)
     }
 
-    pub fn find_worker(
-        &self,
-        dataset: &DatasetId,
-        block: u64,
-        lease: bool,
-    ) -> Result<PeerId, NoWorker> {
-        let worker = self.network_state.find_worker(dataset, block, lease);
-        worker
+    pub fn find_worker(&self, dataset: &DatasetId, block: u64) -> Result<WorkerLease, NoWorker> {
+        self.network_state.find_worker(dataset, block)
     }
 
-    pub fn unlease_worker(&self, worker: PeerId) {
-        self.network_state.unlease_worker(worker);
+    pub fn reserve_worker(&self, worker: PeerId) -> Option<WorkerLease> {
+        self.network_state.reserve_worker(worker)
     }
 
     pub fn get_workers(&self, dataset: &DatasetId, block: u64) -> Vec<WorkerDebugInfo> {
@@ -476,25 +439,32 @@ impl NetworkClient {
     #[instrument(skip_all, level = "debug", fields(query_id))]
     pub async fn query_worker(
         self: Arc<Self>,
-        worker: PeerId,
+        lease: WorkerLease,
         request_id: String,
         chunk_id: ChunkId,
         block_range: BlockRange,
         query: String,
         compression: Compression,
-        lease: bool,
         priority: Option<u64>,
     ) -> QueryResult {
         let query_id = generate_query_id();
+        let worker = lease.worker();
         tracing::Span::current().record("query_id", &query_id);
         tracing::trace!("Sending query {query_id} to {worker}");
 
-        let mut guard = QueryGuard::new(Arc::clone(&self), worker, lease);
+        let _guard = QueryGuard::new();
         let query = self
-            .prepare_query(worker, &query_id, request_id, chunk_id, &block_range, query, compression)
+            .prepare_query(
+                worker,
+                &query_id,
+                request_id,
+                chunk_id,
+                &block_range,
+                query,
+                compression,
+            )
             .await;
-        let result = self.execute_query(worker, query, priority, &mut guard).await;
-        guard.defuse();
+        let result = self.execute_query(worker, query, priority).await;
         result
     }
 
@@ -503,16 +473,17 @@ impl NetworkClient {
         worker: PeerId,
         query: Query,
         priority: Option<u64>,
-        guard: &mut QueryGuard,
     ) -> QueryResult {
         let mut stream = self.send_to_transport(worker, query, priority).await?;
-        guard.mark_sent();
         let network_start = Instant::now();
         let mut buf = self.receive_first_byte(worker, &mut stream).await?;
         let ttfb = network_start.elapsed();
-        let transfer_time = self.download_body(worker, &mut stream, &mut buf, priority).await?;
+        let transfer_time = self
+            .download_body(worker, &mut stream, &mut buf, priority)
+            .await?;
         let query_time = network_start.elapsed();
-        self.finalize_response(worker, buf, ttfb, transfer_time, query_time).await
+        self.finalize_response(worker, buf, ttfb, transfer_time, query_time)
+            .await
     }
 
     async fn prepare_query(
@@ -673,7 +644,12 @@ impl NetworkClient {
         self.parse_query_result(worker, result, throughput)
             .await
             .inspect(|_| metrics::report_query_ok(query_time))
-            .map(|ok| QuerySuccess { ok, ttfb, transfer_time, response_size })
+            .map(|ok| QuerySuccess {
+                ok,
+                ttfb,
+                transfer_time,
+                response_size,
+            })
     }
 
     fn convert_query_failure(&self, peer_id: PeerId, failure: QueryFailure) -> QueryError {
@@ -891,12 +867,13 @@ impl NetworkClient {
     pub fn download_utilization(&self) -> Option<f64> {
         self.read_scheduler.as_ref().map(|s| s.utilization())
     }
-
 }
 
-
 fn is_congestion_failure(failure: &QueryFailure) -> bool {
-    matches!(failure, QueryFailure::Timeout(_) | QueryFailure::TransportError(_))
+    matches!(
+        failure,
+        QueryFailure::Timeout(_) | QueryFailure::TransportError(_)
+    )
 }
 
 async fn wait_for_first_byte(
