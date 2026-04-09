@@ -42,7 +42,10 @@ pub enum HotblocksErr {
     Request(#[from] reqwest::Error),
 }
 
-pub async fn build_client(config: &Config) -> anyhow::Result<HotblocksHandle> {
+pub async fn build_client(
+    config: &Config,
+    client_id: Option<String>,
+) -> anyhow::Result<HotblocksHandle> {
     tracing::info!("Initializing hotblocks client");
 
     let mut urls = BTreeMap::new();
@@ -59,14 +62,21 @@ pub async fn build_client(config: &Config) -> anyhow::Result<HotblocksHandle> {
         }
     }
 
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_gzip()
         .no_deflate()
         .no_brotli()
         .no_zstd()
-        .connect_timeout(Duration::from_secs(1))
-        .build()?;
+        .connect_timeout(Duration::from_secs(1));
+
+    if let Some(id) = client_id {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-sqd-client-id", id.parse().expect("valid header value"));
+        builder = builder.default_headers(headers);
+    }
+
+    let client = builder.build()?;
 
     Ok(HotblocksHandle { client, urls })
 }

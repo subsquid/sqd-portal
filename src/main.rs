@@ -46,6 +46,10 @@ pub struct Cli {
 
     #[arg(long, env, hide(true))]
     pub log_span_durations: bool,
+
+    /// Client ID sent to hotblocks service via x-sqd-client-id header
+    #[arg(long, env)]
+    pub client_id: Option<String>,
 }
 
 #[cfg(not(target_env = "msvc"))]
@@ -121,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
 
     let config = Arc::new(args.config);
-    let hotblocks = Arc::new(hotblocks::build_client(&config).await?);
+    let hotblocks = Arc::new(hotblocks::build_client(&config, args.client_id).await?);
     let network_client_builder = NetworkClient::builder(
         args.transport,
         config.clone(),
