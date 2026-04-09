@@ -42,10 +42,7 @@ pub enum HotblocksErr {
     Request(#[from] reqwest::Error),
 }
 
-pub async fn build_client(
-    config: &Config,
-    client_id: Option<String>,
-) -> anyhow::Result<HotblocksHandle> {
+pub async fn build_client(config: &Config) -> anyhow::Result<HotblocksHandle> {
     tracing::info!("Initializing hotblocks client");
 
     let mut urls = BTreeMap::new();
@@ -70,9 +67,12 @@ pub async fn build_client(
         .no_zstd()
         .connect_timeout(Duration::from_secs(1));
 
-    if let Some(id) = client_id {
+    if let Some(client_id) = &config.client_id {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("x-sqd-client-id", id.parse().expect("valid header value"));
+        let val = client_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Failed to parse client id: {}", e))?;
+        headers.insert("x-sqd-client-id", val);
         builder = builder.default_headers(headers);
     }
 
