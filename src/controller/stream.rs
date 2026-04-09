@@ -439,7 +439,7 @@ impl StreamController {
             range.range.end(),
             worker,
         );
-        let query = if range.chunk_index == 0 {
+        let query = if *range.range.start() == self.request.query.first_block() {
             self.request.query.to_string()
         } else {
             self.request.query.without_parent_hash()
