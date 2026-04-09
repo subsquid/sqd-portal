@@ -59,14 +59,24 @@ pub async fn build_client(config: &Config) -> anyhow::Result<HotblocksHandle> {
         }
     }
 
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_gzip()
         .no_deflate()
         .no_brotli()
         .no_zstd()
-        .connect_timeout(Duration::from_secs(1))
-        .build()?;
+        .connect_timeout(Duration::from_secs(1));
+
+    if let Some(client_id) = &config.client_id {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let val = client_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Failed to parse client id: {}", e))?;
+        headers.insert("x-sqd-client-id", val);
+        builder = builder.default_headers(headers);
+    }
+
+    let client = builder.build()?;
 
     Ok(HotblocksHandle { client, urls })
 }
