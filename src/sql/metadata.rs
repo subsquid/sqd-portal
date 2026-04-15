@@ -52,6 +52,7 @@ pub struct Table {
 pub struct TableSchema {
     pub fields: Vec<Field>,
     pub primary_key: Vec<String>,
+    pub search_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -108,6 +109,22 @@ pub enum SchemaErr {
     IoError(#[from] std::io::Error),
     #[error("Schema not found: {0}")]
     SchemaNotFound(String),
+}
+
+pub fn get_dataset_table_search_keys(dataset: &str, table: &str) -> Vec<String> {
+    SCHEMAS
+    .get(dataset)
+    .map(|ds| {
+        let mut v = Vec::with_capacity(0);
+        for t in &ds.tables { // tables should live in a map
+            if t.name == table {
+                v = t.schema.search_keys.clone();
+                tracing::info!("Search Keys for {table}: {:?}", v);
+                break;
+            }
+        }
+        v
+    }).unwrap_or(Vec::with_capacity(0))
 }
 
 pub fn compute_stats(dataset: &DatasetId, table: &str, blocks: &[Range<u64>]) -> u64 {

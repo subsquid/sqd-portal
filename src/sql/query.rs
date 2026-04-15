@@ -14,7 +14,10 @@ use substrait::proto::Plan;
 use thiserror;
 
 use crate::network::{ChunkNotFound, NetworkClient};
-use crate::sql::rewrite_target;
+use crate::sql::{ extractor, rewrite_target };
+use crate::sql::extractor::{
+    block_type, custom_type, timestamp_type,
+};
 use crate::types::{BlockNumber, DatasetId, GenericError};
 
 use sql_query_plan::plan::{self, Source, TargetPlan};
@@ -204,15 +207,23 @@ pub fn get_workers(
     Ok(tws)
 }
 
-pub fn unwrap_field_ranges(frs: &[plan::FieldRange]) -> Vec<Range<u64>> {
+pub fn unwrap_field_ranges(ft: extractor::FieldType, frs: &[plan::FieldRange]) -> Vec<Range<u64>> {
     let mut v = Vec::new();
     for fr in frs {
         match fr {
-            plan::FieldRange::BlockNumber(r) => v.push(Range {
+            plan::FieldRange::BlockNumber(r) if ft == block_type() => v.push(Range {
                 start: r.start as u64,
                 end: r.end as u64,
             }),
-            _ => continue, // TODO: timestamps to blocks
+            plan::FieldRange::Custom(s, r) if ft == custom_type(&s) => v.push(Range {
+                start: r.start as u64,
+                end: r.end as u64,
+            }),
+            plan::FieldRange::Timestamp(r) if ft == timestamp_type() => v.push(Range {
+                start: r.start as u64,
+                end: r.end as u64,
+            }),
+            _ => continue,
         }
     }
     v

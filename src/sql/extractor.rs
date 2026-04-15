@@ -10,6 +10,7 @@ use substrait::proto::{
 use sql_query_plan::plan::*;
 
 use crate::sql::rewrite_target::{rewrite_err, RewriteTargetErr, RewriteTargetResult};
+use crate::sql::metadata;
 
 static UNIVERSE: Range<i128> = Range {
     start: i128::MIN,
@@ -30,6 +31,7 @@ fn extract_range_from_field<'a>(f: &'a FieldRange) -> &'a Range<i128> {
     match f {
         &FieldRange::BlockNumber(ref r) => r,
         &FieldRange::Timestamp(ref r) => r,
+        &FieldRange::Custom(_, ref r) => r,
     }
 }
 
@@ -44,6 +46,10 @@ pub fn extract_blocks(
             continue;
         }
         tracing::debug!("Extracting from {}.{}: ", src.schema_name, src.table_name);
+        src.keys = metadata::get_dataset_table_search_keys(
+            &src.schema_name,
+            &src.table_name
+        );
         let xtr = ExtractorExprTransformer {};
         let filter = src.filter.as_ref().unwrap_or(filter);
         let _ = match xtr.transform_expr(filter, &src, tctx)? {
@@ -68,6 +74,19 @@ pub fn extract_blocks(
 pub enum FieldType {
     BlockNumber,
     Timestamp,
+    Custom(String),
+}
+
+pub fn block_type() -> FieldType {
+    FieldType::BlockNumber
+}
+
+pub fn timestamp_type() -> FieldType {
+    FieldType::Timestamp
+}
+
+pub fn custom_type(fname: &str) -> FieldType {
+    FieldType::Custom(fname.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,10 +123,11 @@ fn ranges_from_list(
         end: if mx < i128::MAX { mx + 1 } else { i128::MAX },
     };
 
-    if field == &FieldType::BlockNumber {
-        Ok(Some(FieldRange::BlockNumber(r)))
-    } else {
-        Ok(None)
+    match field {
+        // Timestamp!
+        FieldType::BlockNumber => Ok(Some(FieldRange::BlockNumber(r))),
+        FieldType::Custom(n) => Ok(Some(FieldRange::Custom(n.to_string(), r))),
+        _ => Ok(None),
     }
 }
 
@@ -167,12 +187,10 @@ fn ranges_from_compare(
         op => rewrite_err(format!("operator {:?} is not a comparison", op)),
     }?;
 
-    if t == FieldType::BlockNumber {
-        Ok(Some(FieldRange::BlockNumber(r)))
-    } else if t == FieldType::Timestamp {
-        Ok(Some(FieldRange::Timestamp(r)))
-    } else {
-        rewrite_err("unexpected field type".to_string())
+    match t {
+        FieldType::BlockNumber => Ok(Some(FieldRange::BlockNumber(r))),
+        FieldType::Timestamp => Ok(Some(FieldRange::Timestamp(r))),
+        FieldType::Custom(n) => Ok(Some(FieldRange::Custom(n.to_string(), r))),
     }
 }
 
@@ -316,11 +334,13 @@ fn range_union(
         match t {
             FieldType::BlockNumber => Ok(Some(FieldRange::BlockNumber(Range { start: s, end: e }))),
             FieldType::Timestamp => Ok(Some(FieldRange::Timestamp(Range { start: s, end: e }))),
+            FieldType::Custom(n) => Ok(Some(FieldRange::Custom(n.to_string(), Range { start: s, end: e }))),
         }
     } else {
         match t {
             FieldType::BlockNumber => Ok(Some(FieldRange::BlockNumber(UNIVERSE.clone()))),
             FieldType::Timestamp => Ok(Some(FieldRange::Timestamp(UNIVERSE.clone()))),
+            FieldType::Custom(n) => Ok(Some(FieldRange::Custom(n.to_string(), UNIVERSE.clone()))),
         }
     }
 }
@@ -354,6 +374,7 @@ fn range_intersect(
         match t {
             FieldType::BlockNumber => return Ok(Some(FieldRange::BlockNumber(EMPTY.clone()))),
             FieldType::Timestamp => return Ok(Some(FieldRange::Timestamp(EMPTY.clone()))),
+            FieldType::Custom(n) => return Ok(Some(FieldRange::Custom(n.to_string(), EMPTY.clone()))),
         }
     }
 
@@ -365,11 +386,13 @@ fn range_intersect(
         match t {
             FieldType::BlockNumber => Ok(Some(FieldRange::BlockNumber(Range { start: s, end: e }))),
             FieldType::Timestamp => Ok(Some(FieldRange::Timestamp(Range { start: s, end: e }))),
+            FieldType::Custom(n) => Ok(Some(FieldRange::Custom(n.to_string(), Range { start: s, end: e }))),
         }
     } else {
         match t {
             FieldType::BlockNumber => Ok(Some(FieldRange::BlockNumber(EMPTY.clone()))),
             FieldType::Timestamp => Ok(Some(FieldRange::Timestamp(EMPTY.clone()))),
+            FieldType::Custom(n) => Ok(Some(FieldRange::Custom(n.to_string(), EMPTY.clone()))),
         }
     }
 }
@@ -387,11 +410,17 @@ fn get_raw_ranges(
         (Some(FieldRange::Timestamp(l)), None) => {
             return Ok((FieldType::Timestamp, Some(l.clone()), None));
         }
+        (Some(FieldRange::Custom(n, l)), None) => {
+            return Ok((FieldType::Custom(n.to_string()), Some(l.clone()), None));
+        }
         (None, Some(FieldRange::BlockNumber(r))) => {
             return Ok((FieldType::BlockNumber, None, Some(r.clone())));
         }
         (None, Some(FieldRange::Timestamp(r))) => {
             return Ok((FieldType::Timestamp, None, Some(r.clone())));
+        }
+        (None, Some(FieldRange::Custom(n, r))) => {
+            return Ok((FieldType::Custom(n.to_string()), None, Some(r.clone())));
         }
         _ => (),
     };
@@ -411,6 +440,9 @@ fn get_raw_ranges(
         }
         (FieldRange::Timestamp(l), FieldRange::Timestamp(r)) => {
             Ok((FieldType::Timestamp, Some(l.clone()), Some(r.clone())))
+        }
+        (FieldRange::Custom(n, l), FieldRange::Custom(_, r)) => {
+            Ok((FieldType::Custom(n.to_string()), Some(l.clone()), Some(r.clone())))
         }
         (_, _) => Ok((FieldType::BlockNumber, None, None)),
     }
@@ -505,6 +537,8 @@ impl ExprTransformer<Extractor, RewriteTargetErr> for ExtractorExprTransformer {
                             Ok(Extractor::Field(FieldType::BlockNumber))
                         } else if TIMESTAMP_FIELD_NAMES.contains(&src.fields[i].as_str()) {
                             Ok(Extractor::Field(FieldType::Timestamp))
+                        } else if src.keys.contains(&src.fields[i]) {
+                            Ok(Extractor::Field(FieldType::Custom(src.fields[i].to_string())))
                         } else {
                             Ok(Extractor::Empty)
                         }
@@ -580,7 +614,8 @@ impl ExprTransformer<Extractor, RewriteTargetErr> for ExtractorExprTransformer {
 fn extract_string_literal(s: &str) -> Extractor {
     match s.parse::<DateTime<Utc>>() {
         Ok(dt) => Extractor::Literal(dt.timestamp() as i128),
-        _ => Extractor::Empty,
+        // _ => Extractor::Literal(filter::hash_key(s) as i128),
+        _ => todo!(),
     }
 }
 
@@ -595,6 +630,10 @@ mod test {
 
     fn timestamp() -> Extractor {
         Extractor::Field(FieldType::Timestamp)
+    }
+
+    fn custom(name: &str) -> Extractor {
+        Extractor::Field(FieldType::Custom(name.to_string()))
     }
 
     fn int_literal(n: i128) -> Extractor {
@@ -1183,5 +1222,64 @@ mod test {
         );
 
         assert_eq!(ranges, vec![]);
+    }
+
+    #[test]
+    fn test_and_two_compares_custom() {
+        let mut ranges = Vec::new();
+        let left = Box::new(binary_op(Ext::GE, custom("some_field"), int_literal(123456789)));
+        let right = Box::new(binary_op(Ext::LE, custom("some_field"), int_literal(123456792)));
+
+        let have = ranges_from_extractor(&Ext::And, &left, &right, &mut ranges)
+            .expect("cannot reduce extractor to ranges");
+
+        assert_eq!(
+            have,
+            Some(FieldRange::Custom("some_field".to_string(), Range {
+                start: 123456789,
+                end: 123456793,
+            }))
+        );
+
+        assert_eq!(ranges, vec![]);
+    }
+
+    #[test]
+    fn test_and_two_compares_custom_no_buddy() {
+        let mut ranges = Vec::new();
+        let left = Box::new(binary_op(Ext::GE, custom("some_field"), int_literal(123456789)));
+        let right = Box::new(binary_op(Ext::LE, custom("other_field"), int_literal(123456792)));
+
+        let have = ranges_from_extractor(&Ext::And, &left, &right, &mut ranges)
+            .expect("cannot reduce extractor to ranges");
+
+        assert_eq!(have, None);
+        assert_eq!(ranges, vec![
+            FieldRange::Custom("some_field".to_string(), Range {
+                start: 123456789,
+                end: i128::MAX,
+            }),
+            FieldRange::Custom("other_field".to_string(), Range {
+                start: i128::MIN,
+                end: 123456793,
+            }),
+        ]);
+    }
+
+    #[test]
+    fn test_one_compare_custom() {
+        let left = Box::new(custom("some_field"));
+        let right = Box::new(int_literal(123456789));
+
+        let have = ranges_from_compare(&Ext::EQ, &left, &right)
+            .expect("cannot reduce extractor to ranges");
+
+        assert_eq!(
+            have,
+            Some(FieldRange::Custom("some_field".to_string(), Range {
+                start: 123456789,
+                end: 123456790,
+            }))
+        );
     }
 }

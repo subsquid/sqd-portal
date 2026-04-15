@@ -143,20 +143,8 @@ impl RewriteTarget {
 
             let l = l.unwrap();
             let r = r.unwrap();
-
             let ls = &sources[l];
             let rs = &sources[r];
-
-            if extract_field_from_join(join, &ls, tctx) != Extractor::Field(FieldType::BlockNumber)
-            {
-                continue;
-            }
-
-            if extract_field_from_join(join, &rs, tctx) != Extractor::Field(FieldType::BlockNumber)
-            {
-                continue;
-            }
-
             let lf = ls
                 .filter
                 .as_ref()
@@ -276,12 +264,14 @@ fn extract_sources_from_join(
 }
 
 fn extract_field_from_join(join: &Expression, s: &Source, tctx: &TraversalContext) -> Extractor {
-    let xtr = extractor::ExtractorExprTransformer {};
+    let xtr = extractor::ExtractorExprTransformer;
     match xtr.transform_expr(join, s, tctx) {
         Ok(field @ Extractor::Field(FieldType::BlockNumber)) => field,
         Ok(Extractor::Op(Ext::EQ, left, right)) => match (&*left, &*right) {
             (Extractor::Field(FieldType::BlockNumber), _) => *left,
+            (Extractor::Field(FieldType::Custom(_)), _) => *left,
             (_, Extractor::Field(FieldType::BlockNumber)) => *right,
+            (_, Extractor::Field(FieldType::Custom(_))) => *right,
             _ => Extractor::Empty,
         },
         _ => Extractor::Empty,

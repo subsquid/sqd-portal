@@ -16,6 +16,9 @@ use query::{QueryErr, SqlQueryResponse, TableItem};
 use crate::datasets;
 use crate::network::NetworkClient;
 use crate::types::GenericError;
+use crate::sql::extractor::{
+    block_type, custom_type,
+};
 
 use axum::body;
 
@@ -67,7 +70,8 @@ pub async fn query(
         tracing::trace!("Source: {src:?}");
         let sql = query::compile_sql(&src, &ctx)?;
         tracing::info!("Derived SQL '{sql}'");
-        let blocks = query::unwrap_field_ranges(&src.blocks);
+        let blocks = query::unwrap_field_ranges(block_type(), &src.blocks);
+        let customs = query::unwrap_field_ranges(custom_type(""), &src.blocks); // run on chunks!
         let dataset_id = metadata::schema_name_to_dataset_id(&src.schema_name);
         // No blocks means no filters.
         // A method in network client to get

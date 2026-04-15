@@ -68,5 +68,5 @@ sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", r
 sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "b10a969", features = ["serde"] }
 sqd-query = { git = "https://github.com/subsquid/data.git", rev = "b10a969" }
 
-sql_query_plan = { git = "https://github.com/subsquid/qplan.git", rev = "2e61b51", optional = true }
+sql_query_plan = { git = "https://github.com/subsquid/qplan.git", branch = "sql-filters", optional = true }
 
