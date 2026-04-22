@@ -119,7 +119,6 @@ impl WorkersPool {
         metrics::report_worker_picked(&worker, &format!("{:?}", best_priority.0));
 
         match best_priority.0 {
-            PriorityGroup::Unavailable => Err(NoWorker::AllUnavailable),
             PriorityGroup::Backoff => Err(NoWorker::Backoff(best_priority.2)),
             _ => {
                 if lease {
@@ -301,5 +300,40 @@ impl EventCounter {
         } else {
             std::cmp::max(self.prev_count, self.count)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_unavailable_worker_as_last_resort() {
+        let mut pool = WorkersPool::new(PrioritiesConfig::default());
+        let w1 = PeerId::random();
+        let w2 = PeerId::random();
+
+        pool.lease(w1);
+        pool.error(w1);
+
+        pool.lease(w2);
+        pool.failure(w2);
+
+        let result = pool.pick([w1, w2], true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn pick_healthy_worker_over_unavailable() {
+        let mut pool = WorkersPool::new(PrioritiesConfig::default());
+        let w_bad = PeerId::random();
+        let w_good = PeerId::random();
+
+        pool.lease(w_bad);
+        pool.error(w_bad);
+
+        let result = pool.pick([w_bad, w_good], true);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), w_good);
     }
 }
