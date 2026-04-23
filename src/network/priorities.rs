@@ -13,8 +13,9 @@ pub type Priority = (PriorityGroup, u8, i64);
 pub enum PriorityGroup {
     Best = 0,
     Slow = 1,
-    Backoff = 2,
-    Unavailable = 3,
+    Unavailable = 2,
+    Backoff = 3,
+    Busy = 4,
 }
 
 #[derive(Debug)]
@@ -119,6 +120,7 @@ impl WorkersPool {
         metrics::report_worker_picked(&worker, &format!("{:?}", best_priority.0));
 
         match best_priority.0 {
+            PriorityGroup::Busy => Err(NoWorker::AllUnavailable),
             PriorityGroup::Backoff => Err(NoWorker::Backoff(best_priority.2)),
             _ => {
                 if lease {
@@ -211,10 +213,9 @@ impl WorkersPool {
                 return (PriorityGroup::Backoff, worker.running_queries, paused_until);
             }
         }
-        let penalty = if worker.server_errors.observed(now)
-            || worker.timeouts.observed(now)
-            || worker.running_queries >= self.config.max_queries_per_worker
-        {
+        let penalty = if worker.running_queries >= self.config.max_queries_per_worker {
+            PriorityGroup::Busy
+        } else if worker.server_errors.observed(now) || worker.timeouts.observed(now) {
             PriorityGroup::Unavailable
         } else if worker.slow.estimate(now) > worker.ok.estimate(now) {
             PriorityGroup::Slow
@@ -335,5 +336,17 @@ mod tests {
         let result = pool.pick([w_bad, w_good], true);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), w_good);
+    }
+
+    #[test]
+    fn reject_busy_worker() {
+        let mut pool = WorkersPool::new(PrioritiesConfig::default());
+        let w1 = PeerId::random();
+
+        pool.lease(w1);
+
+        let result = pool.pick([w1], true);
+        assert_eq!(pool.config.max_queries_per_worker, 1);
+        assert!(matches!(result, Err(NoWorker::AllUnavailable)));
     }
 }
