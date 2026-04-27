@@ -13,8 +13,9 @@ pub type Priority = (PriorityGroup, u8, i64);
 pub enum PriorityGroup {
     Best = 0,
     Slow = 1,
-    Backoff = 2,
-    Unavailable = 3,
+    Penalized = 2,
+    Backoff = 3,
+    Busy = 4,
 }
 
 #[derive(Debug)]
@@ -119,7 +120,7 @@ impl WorkersPool {
         metrics::report_worker_picked(&worker, &format!("{:?}", best_priority.0));
 
         match best_priority.0 {
-            PriorityGroup::Unavailable => Err(NoWorker::AllUnavailable),
+            PriorityGroup::Busy => Err(NoWorker::AllUnavailable),
             PriorityGroup::Backoff => Err(NoWorker::Backoff(best_priority.2)),
             _ => {
                 if lease {
@@ -212,11 +213,10 @@ impl WorkersPool {
                 return (PriorityGroup::Backoff, worker.running_queries, paused_until);
             }
         }
-        let penalty = if worker.server_errors.observed(now)
-            || worker.timeouts.observed(now)
-            || worker.running_queries >= self.config.max_queries_per_worker
-        {
-            PriorityGroup::Unavailable
+        let penalty = if worker.running_queries >= self.config.max_queries_per_worker {
+            PriorityGroup::Busy
+        } else if worker.server_errors.observed(now) || worker.timeouts.observed(now) {
+            PriorityGroup::Penalized
         } else if worker.slow.estimate(now) > worker.ok.estimate(now) {
             PriorityGroup::Slow
         } else {
@@ -301,5 +301,52 @@ impl EventCounter {
         } else {
             std::cmp::max(self.prev_count, self.count)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_penalized_worker_as_last_resort() {
+        let mut pool = WorkersPool::new(PrioritiesConfig::default());
+        let w1 = PeerId::random();
+        let w2 = PeerId::random();
+
+        pool.lease(w1);
+        pool.error(w1);
+
+        pool.lease(w2);
+        pool.failure(w2);
+
+        let result = pool.pick([w1, w2], true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn pick_healthy_worker_over_penalized() {
+        let mut pool = WorkersPool::new(PrioritiesConfig::default());
+        let w_bad = PeerId::random();
+        let w_good = PeerId::random();
+
+        pool.lease(w_bad);
+        pool.error(w_bad);
+
+        let result = pool.pick([w_bad, w_good], true);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), w_good);
+    }
+
+    #[test]
+    fn reject_busy_worker() {
+        let mut pool = WorkersPool::new(PrioritiesConfig::default());
+        let w1 = PeerId::random();
+
+        pool.lease(w1);
+
+        let result = pool.pick([w1], true);
+        assert_eq!(pool.config.max_queries_per_worker, 1);
+        assert!(matches!(result, Err(NoWorker::AllUnavailable)));
     }
 }
