@@ -13,7 +13,7 @@ pub type Priority = (PriorityGroup, u8, i64);
 pub enum PriorityGroup {
     Best = 0,
     Slow = 1,
-    Unavailable = 2,
+    Penalized = 2,
     Backoff = 3,
     Busy = 4,
 }
@@ -216,7 +216,7 @@ impl WorkersPool {
         let penalty = if worker.running_queries >= self.config.max_queries_per_worker {
             PriorityGroup::Busy
         } else if worker.server_errors.observed(now) || worker.timeouts.observed(now) {
-            PriorityGroup::Unavailable
+            PriorityGroup::Penalized
         } else if worker.slow.estimate(now) > worker.ok.estimate(now) {
             PriorityGroup::Slow
         } else {
@@ -309,7 +309,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pick_unavailable_worker_as_last_resort() {
+    fn pick_penalized_worker_as_last_resort() {
         let mut pool = WorkersPool::new(PrioritiesConfig::default());
         let w1 = PeerId::random();
         let w2 = PeerId::random();
@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_healthy_worker_over_unavailable() {
+    fn pick_healthy_worker_over_penalized() {
         let mut pool = WorkersPool::new(PrioritiesConfig::default());
         let w_bad = PeerId::random();
         let w_good = PeerId::random();
