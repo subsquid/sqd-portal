@@ -37,7 +37,8 @@
                         "nullable": false
                     }
                 ],
-                "primaryKey": ["number"]
+                "primaryKey": ["number"],
+                "searchKeys": ["number"]
             }
         },
         {
@@ -150,7 +151,8 @@
                         "nullable": false
                     }
                 ],
-                "primaryKey": []
+                "primaryKey": [],
+                "searchKeys": ["block_number"]
             }
         }
     ]
@@ -263,7 +265,8 @@
                         "nullable": true
                     }
                 ],
-                "primaryKey": []
+                "primaryKey": [],
+                "searchKeys": []
             }
         },
         {
@@ -401,7 +404,8 @@
                         "nullable": false
                     }
                 ],
-                "primaryKey": []
+                "primaryKey": [],
+                "searchKeys": []
             }
         },
         {
@@ -469,7 +473,8 @@
                         "nullable": false
                     }
                 ],
-                "primaryKey": []
+                "primaryKey": [],
+                "searchKeys": []
             }
         },
         {
@@ -647,7 +652,8 @@
                         "nullable": false
                     }
                 ],
-                "primaryKey": []
+                "primaryKey": [],
+                "searchKeys": []
             }
         },
         {
@@ -705,7 +711,8 @@
                         "nullable": false
                     }
                 ],
-                "primaryKey": []
+                "primaryKey": [],
+                "searchKeys": []
             }
         }
     ]
@@ -738,7 +745,8 @@
                         "nullable": false
                     }
                 ],
-                "primaryKey": ["number"]
+                "primaryKey": ["number"],
+                "searchKeys": ["number"]
             }
         },
         {
@@ -781,7 +789,8 @@
                         "nullable": true
                     }
                 ],
-                "primaryKey": ["number"]
+                "primaryKey": ["number"],
+                "searchKeys": []
             }
         }
     ]
