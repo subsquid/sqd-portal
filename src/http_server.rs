@@ -12,7 +12,7 @@ use axum::{
     Extension, RequestExt, Router,
 };
 use bytes::Bytes;
-use futures::{pin_mut, StreamExt};
+use futures::StreamExt;
 use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
 use serde::Serialize;
@@ -25,14 +25,12 @@ use tower_http::request_id::{
     MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
 
+use crate::block_number_by_timestamp;
 use crate::datasets::DatasetConfig;
 use crate::hotblocks::{HotblocksErr, StreamMode};
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::types::Compression;
-use crate::utils::conversion::{
-    collect_to_string, join_gzip_default, json_lines_to_json, recompress_gzip,
-};
-use crate::utils::internal_query::{build_blocknumber_query, find_block_in_chunk};
+use crate::utils::conversion::{join_gzip_default, json_lines_to_json, recompress_gzip};
 use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
@@ -544,93 +542,21 @@ async fn get_blocknumber_by_timestamp(
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
+    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
     dataset: DatasetConfig,
 ) -> Result<axum::Json<BlockNumberResponse>, (StatusCode, axum::Json<GenericError>)> {
-    let ts = timestamp * 1000; // milliseconds
-    let dataset_id = dataset
-        .network_id
-        .expect("invalid dataset name should have been handled in request parser");
-
-    let Ok(chunk) = network.find_chunk_by_timestamp(&dataset_id, ts) else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            GenericError {
-                message: "No chunk found for timestamp".to_string(),
-            }
-            .into(),
-        ));
-    };
-
-    let Ok(pquery) = build_blocknumber_query(&dataset.kind, chunk.first_block, chunk.last_block)
-    else {
-        tracing::warn!("cannot build blocknumber query for {}", dataset_id);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            GenericError {
-                message: format!("Cannot build timestamp query for {dataset_id}"),
-            }
-            .into(),
-        ));
-    };
-
-    let request = build_request(
+    block_number_by_timestamp::resolve(
+        timestamp,
+        &req,
+        &network,
+        &task_manager,
         &config,
-        req.header_value().to_str().unwrap_or(""),
-        pquery,
-        dataset_id.clone(),
-        dataset.default_name.clone(),
-        Some(1),
-    );
-
-    let stream = match task_manager.spawn_stream(request).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            tracing::warn!("spawn stream error: {:?}", e);
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                GenericError {
-                    message: "SQD Network error".to_string(),
-                }
-                .into(),
-            ));
-        }
-    };
-
-    pin_mut!(stream);
-
-    let js = collect_to_string(
-        stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result))),
+        &hotblocks,
+        &dataset,
     )
-    .await;
-
-    if let Err(e) = js {
-        tracing::warn!("stream processing error: {:?}", e);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            GenericError {
-                message: "stream processing error".to_string(),
-            }
-            .into(),
-        ));
-    };
-
-    let js = js.unwrap();
-
-    let n = match find_block_in_chunk(timestamp, &js) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!("cannot find blocknumber in chunk: {:?}", e);
-            return Err((
-                StatusCode::NOT_FOUND,
-                GenericError {
-                    message: "block not in chunk".to_string(),
-                }
-                .into(),
-            ));
-        }
-    };
-
-    Ok(BlockNumberResponse { block_number: n }.into())
+    .await
+    .map(|n| BlockNumberResponse { block_number: n }.into())
+    .map_err(block_number_by_timestamp::BlockNumberLookupError::into_response)
 }
 
 async fn get_debug_block(
@@ -998,28 +924,6 @@ fn restrict_request(config: &Config, request: StreamRequest) -> StreamRequest {
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
         ..request
-    }
-}
-
-fn build_request(
-    config: &Config,
-    req_id: &str,
-    pq: ParsedQuery,
-    did: DatasetId,
-    dname: String,
-    max_chunks: Option<usize>,
-) -> StreamRequest {
-    StreamRequest {
-        query: pq,
-        dataset_id: did,
-        dataset_name: dname,
-        request_id: req_id.to_string(),
-        buffer_size: config.max_buffer_size,
-        max_chunks: max_chunks,
-        timeout_quantile: config.default_timeout_quantile,
-        retries: config.default_retries,
-        compression: Compression::Gzip,
-        skip_parent_hash_validation: false,
     }
 }
 

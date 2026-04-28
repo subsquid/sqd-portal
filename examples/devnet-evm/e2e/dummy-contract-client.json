@@ -1,0 +1,12 @@
+{
+  "current_epoch": 1,
+  "current_epoch_start": 1700000000,
+  "epoch_length_secs": 3600,
+  "workers": [],
+  "portals": [],
+  "portal_clusters": [],
+  "worker_ids": {},
+  "portal_compute_units": {},
+  "portal_uses_default_strategy": {},
+  "portal_sqd_locked": {}
+}

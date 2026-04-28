@@ -1,0 +1,15 @@
+hostname: http://0.0.0.0:8000
+use_gzjoin: true
+sqd_network:
+  datasets: file://examples/devnet-evm/e2e/empty-network-datasets.yml
+  serve: manual
+datasets:
+  base-mainnet:
+    kind: evm
+    aliases: ["base"]
+    real_time:
+      url: http://127.0.0.1:19090
+priorities:
+  window_ok_secs: 60
+  window_slow_secs: 60
+  window_errors_secs: 120
