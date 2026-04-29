@@ -57,14 +57,15 @@ pub async fn resolve(
     dataset: &DatasetConfig,
 ) -> Result<u64, BlockNumberLookupError> {
     get_blocknumber_by_timestamp_inner(
-        timestamp,
         dataset.network_id.is_some(),
         dataset.hotblocks.is_some(),
-        |_| async {
-            let dataset_id = dataset
-                .network_id
-                .as_ref()
-                .expect("archive lookup should be called only for archival datasets");
+        || async {
+            let Some(dataset_id) = dataset.network_id.as_ref() else {
+                return Err(BlockNumberLookupError::NotFound(
+                    "No archive configured for dataset".to_string(),
+                ));
+            };
+
             get_archival_blocknumber_by_timestamp(
                 timestamp,
                 req,
@@ -76,7 +77,7 @@ pub async fn resolve(
             )
             .await
         },
-        |_| async { get_hotblocks_blocknumber_by_timestamp(timestamp, hotblocks, dataset).await },
+        || async { get_hotblocks_blocknumber_by_timestamp(timestamp, hotblocks, dataset).await },
     )
     .await
 }
@@ -87,21 +88,25 @@ async fn get_blocknumber_by_timestamp_inner<
     HotblocksLookup,
     HotblocksFuture,
 >(
-    timestamp: u64,
     has_archive: bool,
     has_hotblocks: bool,
     archive_lookup: ArchiveLookup,
     hotblocks_lookup: HotblocksLookup,
 ) -> Result<u64, BlockNumberLookupError>
 where
-    ArchiveLookup: FnOnce(u64) -> ArchiveFuture,
+    ArchiveLookup: FnOnce() -> ArchiveFuture,
     ArchiveFuture: Future<Output = Result<u64, BlockNumberLookupError>>,
-    HotblocksLookup: FnOnce(u64) -> HotblocksFuture,
+    HotblocksLookup: FnOnce() -> HotblocksFuture,
     HotblocksFuture: Future<Output = Result<u64, BlockNumberLookupError>>,
 {
-    tracing::info!("has archive {has_archive} and hotblocks {has_hotblocks}");
+    tracing::debug!(
+        has_archive,
+        has_hotblocks,
+        "resolving block number by timestamp"
+    );
+
     if has_archive {
-        match archive_lookup(timestamp).await {
+        match archive_lookup().await {
             Ok(n) => return Ok(n),
             Err(BlockNumberLookupError::NotFound(_)) => {}
             Err(e) => return Err(e),
@@ -109,11 +114,11 @@ where
     }
 
     if has_hotblocks {
-        return hotblocks_lookup(timestamp).await;
+        return hotblocks_lookup().await;
     }
 
     Err(BlockNumberLookupError::NotFound(
-        "No chunk found for timestamp".to_string(),
+        "No block found for timestamp".to_string(),
     ))
 }
 
@@ -126,7 +131,9 @@ async fn get_archival_blocknumber_by_timestamp(
     dataset: &DatasetConfig,
     dataset_id: &DatasetId,
 ) -> Result<u64, BlockNumberLookupError> {
-    let ts = timestamp * 1000; // milliseconds
+    let ts = timestamp
+        .checked_mul(1000) // milliseconds
+        .ok_or_else(|| BlockNumberLookupError::Internal("timestamp overflow".to_string()))?;
     let chunk = network
         .find_chunk_by_timestamp(dataset_id, ts)
         .map_err(|_| {
@@ -165,16 +172,11 @@ async fn get_archival_blocknumber_by_timestamp(
     let js = collect_to_string(
         stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result))),
     )
-    .await;
-
-    if let Err(e) = js {
+    .await
+    .map_err(|e| {
         tracing::warn!("stream processing error: {:?}", e);
-        return Err(BlockNumberLookupError::Internal(
-            "stream processing error".to_string(),
-        ));
-    };
-
-    let js = js.unwrap();
+        BlockNumberLookupError::Internal("stream processing error".to_string())
+    })?;
 
     find_block_in_chunk(timestamp, &js).map_err(|e| {
         tracing::warn!("cannot find blocknumber in chunk: {:?}", e);
@@ -257,8 +259,12 @@ async fn collect_hotblocks_stream(response: reqwest::Response) -> anyhow::Result
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
     let bytes = response.bytes().await?;
 
+    decode_hotblocks_stream_body(is_gzip, bytes.as_ref())
+}
+
+fn decode_hotblocks_stream_body(is_gzip: bool, bytes: &[u8]) -> anyhow::Result<String> {
     if is_gzip || bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut decoder = flate2::read::GzDecoder::new(bytes);
         let mut decoded = String::new();
         std::io::Read::read_to_string(&mut decoder, &mut decoded)?;
         return Ok(decoded);
@@ -296,6 +302,9 @@ mod tests {
         Arc,
     };
 
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+
     use super::*;
 
     #[tokio::test]
@@ -304,20 +313,18 @@ mod tests {
         let hotblocks_calls = Arc::new(AtomicUsize::new(0));
 
         let result = get_blocknumber_by_timestamp_inner(
-            1_700_000_000,
             true,
             true,
             {
                 let archive_calls = archive_calls.clone();
-                |timestamp| async move {
+                || async move {
                     archive_calls.fetch_add(1, Ordering::Relaxed);
-                    assert_eq!(timestamp, 1_700_000_000);
                     Ok(42)
                 }
             },
             {
                 let hotblocks_calls = hotblocks_calls.clone();
-                |_| async move {
+                || async move {
                     hotblocks_calls.fetch_add(1, Ordering::Relaxed);
                     Ok(43)
                 }
@@ -337,14 +344,12 @@ mod tests {
         let hotblocks_calls = Arc::new(AtomicUsize::new(0));
 
         let result = get_blocknumber_by_timestamp_inner(
-            1_700_000_001,
             true,
             true,
             {
                 let archive_calls = archive_calls.clone();
-                |timestamp| async move {
+                || async move {
                     archive_calls.fetch_add(1, Ordering::Relaxed);
-                    assert_eq!(timestamp, 1_700_000_001);
                     Err(BlockNumberLookupError::NotFound(
                         "No chunk found for timestamp".to_string(),
                     ))
@@ -352,9 +357,8 @@ mod tests {
             },
             {
                 let hotblocks_calls = hotblocks_calls.clone();
-                |timestamp| async move {
+                || async move {
                     hotblocks_calls.fetch_add(1, Ordering::Relaxed);
-                    assert_eq!(timestamp, 1_700_000_001);
                     Ok(84)
                 }
             },
@@ -373,21 +377,19 @@ mod tests {
         let hotblocks_calls = Arc::new(AtomicUsize::new(0));
 
         let result = get_blocknumber_by_timestamp_inner(
-            1_700_000_002,
             false,
             true,
             {
                 let archive_calls = archive_calls.clone();
-                |_| async move {
+                || async move {
                     archive_calls.fetch_add(1, Ordering::Relaxed);
                     Ok(42)
                 }
             },
             {
                 let hotblocks_calls = hotblocks_calls.clone();
-                |timestamp| async move {
+                || async move {
                     hotblocks_calls.fetch_add(1, Ordering::Relaxed);
-                    assert_eq!(timestamp, 1_700_000_002);
                     Ok(168)
                 }
             },
@@ -398,5 +400,53 @@ mod tests {
         assert_eq!(result, 168);
         assert_eq!(archive_calls.load(Ordering::Relaxed), 0);
         assert_eq!(hotblocks_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn decode_hotblocks_stream_body_accepts_plain_utf8() {
+        let body = b"{\"header\":{\"number\":100}}\n";
+
+        assert_eq!(
+            decode_hotblocks_stream_body(false, body).unwrap(),
+            "{\"header\":{\"number\":100}}\n"
+        );
+    }
+
+    #[test]
+    fn decode_hotblocks_stream_body_accepts_gzip_by_header() {
+        let body = gzip(b"{\"header\":{\"number\":100}}\n");
+
+        assert_eq!(
+            decode_hotblocks_stream_body(true, &body).unwrap(),
+            "{\"header\":{\"number\":100}}\n"
+        );
+    }
+
+    #[test]
+    fn decode_hotblocks_stream_body_accepts_gzip_by_magic_bytes() {
+        let body = gzip(b"{\"header\":{\"number\":101}}\n");
+
+        assert_eq!(
+            decode_hotblocks_stream_body(false, &body).unwrap(),
+            "{\"header\":{\"number\":101}}\n"
+        );
+    }
+
+    #[test]
+    fn decode_hotblocks_stream_body_rejects_invalid_utf8() {
+        let err = decode_hotblocks_stream_body(false, &[0xff]).unwrap_err();
+
+        assert!(err.to_string().contains("invalid utf-8"));
+    }
+
+    #[test]
+    fn decode_hotblocks_stream_body_rejects_invalid_gzip() {
+        assert!(decode_hotblocks_stream_body(true, b"not gzip").is_err());
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
     }
 }
