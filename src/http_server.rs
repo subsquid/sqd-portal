@@ -428,8 +428,30 @@ async fn run_stream_internal(
         }
 
         // Then try hotblocks storage
-        // TODO: if the query is below the first hotblock, return 500 instead of 400
         _ if dataset.hotblocks.is_some() => {
+            if let Some(dataset_id) = &dataset.network_id {
+                if let Some(height) = network.get_height(dataset_id) {
+                    let first_block = request.query.first_block();
+                    if first_block > height {
+                        // Only convert a hotblocks gap to delayed 204 when status exposes the
+                        // retained range. If status has no data or cannot be fetched, preserve
+                        // the old behavior and let hotblocks answer the stream request.
+                        if let Ok(status) = hotblocks.get_status(&dataset.default_name).await {
+                            if let Some(data) = status.data {
+                                if is_hotblocks_gap(first_block, height, data.first_block) {
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                    return Response::builder()
+                                        .header(DATA_SOURCE_HEADER, DATA_SOURCE_REALTIME)
+                                        .status(StatusCode::NO_CONTENT)
+                                        .body(().into())
+                                        .unwrap();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut res = forward_hotblocks_response(
                 hotblocks
                     .stream(&dataset.default_name, &request.query.into_string(), mode)
@@ -462,6 +484,10 @@ async fn run_stream_internal(
             )
         }
     }
+}
+
+fn is_hotblocks_gap(first_block: u64, archival_height: u64, hotblocks_first_block: u64) -> bool {
+    first_block > archival_height && first_block < hotblocks_first_block
 }
 
 async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
@@ -1079,3 +1105,38 @@ const HEAD_NUMBER_HEADER: &str = "x-sqd-head-number";
 const DATA_SOURCE_HEADER: &str = "x-sqd-data-source";
 const DATA_SOURCE_NETWORK: HeaderValue = HeaderValue::from_static("network");
 const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static("real_time");
+
+#[cfg(test)]
+mod tests {
+    use super::is_hotblocks_gap;
+
+    #[test]
+    fn hotblocks_gap_detects_missing_blocks_after_archival_height() {
+        assert!(is_hotblocks_gap(101, 100, 105));
+    }
+
+    #[test]
+    fn hotblocks_gap_does_not_apply_at_archival_height() {
+        assert!(!is_hotblocks_gap(100, 100, 105));
+    }
+
+    #[test]
+    fn hotblocks_gap_does_not_apply_before_archival_height() {
+        assert!(!is_hotblocks_gap(99, 100, 105));
+    }
+
+    #[test]
+    fn hotblocks_gap_does_not_apply_at_first_hotblock() {
+        assert!(!is_hotblocks_gap(105, 100, 105));
+    }
+
+    #[test]
+    fn hotblocks_gap_does_not_apply_after_first_hotblock() {
+        assert!(!is_hotblocks_gap(200, 100, 105));
+    }
+
+    #[test]
+    fn hotblocks_gap_requires_actual_gap_between_sources() {
+        assert!(!is_hotblocks_gap(101, 100, 101));
+    }
+}
