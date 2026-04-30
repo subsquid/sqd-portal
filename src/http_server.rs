@@ -429,27 +429,16 @@ async fn run_stream_internal(
 
         // Then try hotblocks storage
         _ if dataset.hotblocks.is_some() => {
-            if let Some(dataset_id) = &dataset.network_id {
-                if let Some(height) = network.get_height(dataset_id) {
-                    let first_block = request.query.first_block();
-                    if first_block > height {
-                        // Only convert a hotblocks gap to delayed 204 when status exposes the
-                        // retained range. If status has no data or cannot be fetched, preserve
-                        // the old behavior and let hotblocks answer the stream request.
-                        if let Ok(status) = hotblocks.get_status(&dataset.default_name).await {
-                            if let Some(data) = status.data {
-                                if is_hotblocks_gap(first_block, height, data.first_block) {
-                                    tokio::time::sleep(Duration::from_secs(5)).await;
-                                    return Response::builder()
-                                        .header(DATA_SOURCE_HEADER, DATA_SOURCE_REALTIME)
-                                        .status(StatusCode::NO_CONTENT)
-                                        .body(().into())
-                                        .unwrap();
-                                }
-                            }
-                        }
-                    }
-                }
+            if should_treat_as_hotblocks_gap(
+                &network,
+                &hotblocks,
+                dataset.network_id.as_ref(),
+                &dataset.default_name,
+                request.query.first_block(),
+            )
+            .await
+            {
+                return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
             }
 
             let mut res = forward_hotblocks_response(
@@ -466,9 +455,6 @@ async fn run_stream_internal(
         }
         // If requested block is above the network height and there is no hotblocks storage, return 204
         Some(dataset_id) => {
-            // Delay request from this client for 5 seconds to avoid unnecessary retries
-            tokio::time::sleep(Duration::from_secs(5)).await;
-
             let mut res = Response::builder();
             res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
             if let Some(head) = network.head(&dataset_id) {
@@ -476,7 +462,7 @@ async fn run_stream_internal(
                 res = res.header(FINALIZED_HASH_HEADER, head.hash);
                 res = res.header(HEAD_NUMBER_HEADER, head.number);
             }
-            res.status(StatusCode::NO_CONTENT).body(().into()).unwrap()
+            delayed_no_content_response_with_builder(res).await
         }
         None => {
             unreachable!(
@@ -486,8 +472,56 @@ async fn run_stream_internal(
     }
 }
 
+async fn should_treat_as_hotblocks_gap(
+    network: &NetworkClient,
+    hotblocks: &HotblocksHandle,
+    dataset_id: Option<&DatasetId>,
+    dataset_name: &str,
+    first_block: u64,
+) -> bool {
+    let Some(dataset_id) = dataset_id else {
+        return false;
+    };
+    let Some(height) = network.get_height(dataset_id) else {
+        return false;
+    };
+    if first_block <= height {
+        return false;
+    }
+
+    // Only convert a hotblocks gap to delayed 204 when status exposes the
+    // retained range. If status has no data or cannot be fetched, preserve
+    // the old behavior and let hotblocks answer the stream request.
+    let Ok(status) = hotblocks.get_status(dataset_name).await else {
+        return false;
+    };
+    let Some(data) = status.data else {
+        return false;
+    };
+
+    is_hotblocks_gap(first_block, height, data.first_block)
+}
+
 fn is_hotblocks_gap(first_block: u64, archival_height: u64, hotblocks_first_block: u64) -> bool {
     first_block > archival_height && first_block < hotblocks_first_block
+}
+
+async fn delayed_no_content_response(data_source: HeaderValue) -> Response {
+    delayed_no_content_response_with_builder(
+        Response::builder().header(DATA_SOURCE_HEADER, data_source),
+    )
+    .await
+}
+
+async fn delayed_no_content_response_with_builder(
+    builder: axum::http::response::Builder,
+) -> Response {
+    // Delay request from this client for 5 seconds to avoid unnecessary retries.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    builder
+        .status(StatusCode::NO_CONTENT)
+        .body(().into())
+        .unwrap()
 }
 
 async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
