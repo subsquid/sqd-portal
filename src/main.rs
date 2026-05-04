@@ -14,10 +14,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::utils::RwLock;
 
-mod block_number_by_timestamp;
 mod config;
 mod controller;
 mod datasets;
+mod endpoints;
 mod hotblocks;
 mod http_server;
 mod metrics;

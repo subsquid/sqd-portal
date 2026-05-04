@@ -1,6 +1,10 @@
 use std::{future::Future, sync::Arc};
 
-use axum::http::{header, StatusCode};
+use axum::{
+    extract::Path,
+    http::{header, StatusCode},
+    Extension,
+};
 use futures::{pin_mut, StreamExt};
 use tower_http::request_id::RequestId;
 
@@ -16,6 +20,34 @@ use crate::{
         internal_query::{build_blocknumber_query, find_block_in_chunk},
     },
 };
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct BlockNumberResponse {
+    block_number: u64,
+}
+
+pub(crate) async fn get_blocknumber_by_timestamp(
+    Path((_, timestamp)): Path<(DatasetId, u64)>,
+    Extension(req): Extension<RequestId>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(config): Extension<Arc<Config>>,
+    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    dataset: DatasetConfig,
+) -> Result<axum::Json<BlockNumberResponse>, (StatusCode, axum::Json<GenericError>)> {
+    resolve(
+        timestamp,
+        &req,
+        &network,
+        &task_manager,
+        &config,
+        &hotblocks,
+        &dataset,
+    )
+    .await
+    .map(|n| BlockNumberResponse { block_number: n }.into())
+    .map_err(BlockNumberLookupError::into_response)
+}
 
 /// Failure modes for resolving a block number by timestamp.
 ///
@@ -228,10 +260,7 @@ async fn get_hotblocks_blocknumber_by_timestamp(
     .await
 }
 
-async fn get_hotblocks_blocknumber_by_timestamp_inner<
-    StreamLookup,
-    StreamFuture,
->(
+async fn get_hotblocks_blocknumber_by_timestamp_inner<StreamLookup, StreamFuture>(
     timestamp: u64,
     kind: &str,
     dataset_name: &str,
@@ -257,14 +286,13 @@ where
         ));
     }
 
-    let pquery = build_blocknumber_query(kind, data.first_block, data.last_block)
-        .map_err(|e| {
-            tracing::warn!("cannot build hotblocks blocknumber query: {:?}", e);
-            BlockNumberLookupError::Internal(format!(
-                "Cannot build timestamp query for {}",
-                dataset_name
-            ))
-        })?;
+    let pquery = build_blocknumber_query(kind, data.first_block, data.last_block).map_err(|e| {
+        tracing::warn!("cannot build hotblocks blocknumber query: {:?}", e);
+        BlockNumberLookupError::Internal(format!(
+            "Cannot build timestamp query for {}",
+            dataset_name
+        ))
+    })?;
 
     let js = stream_lookup(pquery.into_string()).await?;
 
@@ -437,8 +465,8 @@ mod tests {
                 fake_status(),
                 fake_stream,
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             100
         );
         assert_eq!(
@@ -449,8 +477,8 @@ mod tests {
                 fake_status(),
                 fake_stream,
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             101
         );
         assert!(matches!(
@@ -522,14 +550,12 @@ mod tests {
                 first_block: 100,
                 last_block: 101,
                 last_block_hash:
-                    "0x0202020202020202020202020202020202020202020202020202020202020202"
-                        .to_string(),
+                    "0x0202020202020202020202020202020202020202020202020202020202020202".to_string(),
                 last_block_timestamp: Some(1_700_000_012),
                 finalized_head: Some(BlockRef {
                     number: 101,
-                    hash:
-                        "0x0202020202020202020202020202020202020202020202020202020202020202"
-                            .to_string(),
+                    hash: "0x0202020202020202020202020202020202020202020202020202020202020202"
+                        .to_string(),
                 }),
             }),
         }
@@ -544,9 +570,9 @@ mod tests {
         }
 
         Ok(concat!(
-                "{\"header\":{\"number\":100,\"timestamp\":1700000000}}\n",
-                "{\"header\":{\"number\":101,\"timestamp\":1700000012}}\n"
-            )
-            .to_string())
+            "{\"header\":{\"number\":100,\"timestamp\":1700000000}}\n",
+            "{\"header\":{\"number\":101,\"timestamp\":1700000012}}\n"
+        )
+        .to_string())
     }
 }
