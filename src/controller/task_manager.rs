@@ -10,7 +10,7 @@ use tracing_futures::Instrument;
 use crate::{
     metrics,
     network::NetworkClient,
-    types::{StreamRequest, RequestError, ResponseChunk},
+    types::{RequestError, ResponseChunk, StreamRequest},
 };
 
 use super::stream::StreamController;

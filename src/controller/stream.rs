@@ -17,8 +17,8 @@ use crate::{
     controller::timeouts::TimeoutManager,
     network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult},
     types::{
-        BlockRange, ChunkId, StreamRequest, DataChunk, QueryError, RequestError, ResponseChunk,
-        SendQueryError,
+        BlockRange, ChunkId, DataChunk, QueryError, RequestError, ResponseChunk, SendQueryError,
+        StreamRequest,
     },
     utils::{logging::StreamStats, SlidingArray},
 };

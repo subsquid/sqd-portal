@@ -428,13 +428,31 @@ async fn run_stream_internal(
         }
 
         // Then try hotblocks storage
-        // TODO: if the query is below the first hotblock, return 500 instead of 400
         _ if dataset.hotblocks.is_some() => {
-            let mut res = forward_hotblocks_response(
-                hotblocks
-                    .stream(&dataset.default_name, &request.query.into_string(), mode)
-                    .await,
-            );
+            let first_block = request.query.first_block();
+            let hotblocks_response = hotblocks
+                .stream(&dataset.default_name, &request.query.into_string(), mode)
+                .await;
+
+            let mut res = match hotblocks_response {
+                Ok(response) => {
+                    if !response.status().is_success()
+                        && should_treat_as_hotblocks_gap(
+                            &network,
+                            &hotblocks,
+                            dataset.network_id.as_ref(),
+                            &dataset.default_name,
+                            first_block,
+                        )
+                        .await
+                    {
+                        return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
+                    }
+
+                    forward_response(response)
+                }
+                Err(e) => forward_hotblocks_response(Err(e)),
+            };
 
             if res.status().is_success() {
                 res.headers_mut()
@@ -444,9 +462,6 @@ async fn run_stream_internal(
         }
         // If requested block is above the network height and there is no hotblocks storage, return 204
         Some(dataset_id) => {
-            // Delay request from this client for 5 seconds to avoid unnecessary retries
-            tokio::time::sleep(Duration::from_secs(5)).await;
-
             let mut res = Response::builder();
             res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
             if let Some(head) = network.head(&dataset_id) {
@@ -454,7 +469,7 @@ async fn run_stream_internal(
                 res = res.header(FINALIZED_HASH_HEADER, head.hash);
                 res = res.header(HEAD_NUMBER_HEADER, head.number);
             }
-            res.status(StatusCode::NO_CONTENT).body(().into()).unwrap()
+            delayed_no_content_response_with_builder(res).await
         }
         None => {
             unreachable!(
@@ -462,6 +477,58 @@ async fn run_stream_internal(
             )
         }
     }
+}
+
+async fn should_treat_as_hotblocks_gap(
+    network: &NetworkClient,
+    hotblocks: &HotblocksHandle,
+    dataset_id: Option<&DatasetId>,
+    dataset_name: &str,
+    first_block: u64,
+) -> bool {
+    let Some(dataset_id) = dataset_id else {
+        return false;
+    };
+    let Some(height) = network.get_height(dataset_id) else {
+        return false;
+    };
+    if first_block <= height {
+        return false;
+    }
+
+    // Only convert a hotblocks gap to delayed 204 when status exposes the
+    // retained range. If status has no data or cannot be fetched, preserve
+    // the old behavior and let hotblocks answer the stream request.
+    let Ok(status) = hotblocks.get_status(dataset_name).await else {
+        return false;
+    };
+    let Some(data) = status.data else {
+        return false;
+    };
+
+    is_hotblocks_gap(first_block, height, data.first_block)
+}
+
+fn is_hotblocks_gap(first_block: u64, archival_height: u64, hotblocks_first_block: u64) -> bool {
+    first_block > archival_height && first_block < hotblocks_first_block
+}
+
+async fn delayed_no_content_response(data_source: HeaderValue) -> Response {
+    delayed_no_content_response_with_builder(
+        Response::builder().header(DATA_SOURCE_HEADER, data_source),
+    )
+    .await
+}
+
+async fn delayed_no_content_response_with_builder(
+    builder: axum::http::response::Builder,
+) -> Response {
+    // Delay request from this client for 5 seconds to avoid unnecessary retries.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    builder
+        .status(StatusCode::NO_CONTENT)
+        .body(().into())
+        .unwrap()
 }
 
 async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
@@ -1079,3 +1146,38 @@ const HEAD_NUMBER_HEADER: &str = "x-sqd-head-number";
 const DATA_SOURCE_HEADER: &str = "x-sqd-data-source";
 const DATA_SOURCE_NETWORK: HeaderValue = HeaderValue::from_static("network");
 const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static("real_time");
+
+#[cfg(test)]
+mod tests {
+    use super::is_hotblocks_gap;
+
+    #[test]
+    fn hotblocks_gap_detects_missing_blocks_after_archival_height() {
+        assert!(is_hotblocks_gap(101, 100, 105));
+    }
+
+    #[test]
+    fn hotblocks_gap_does_not_apply_at_archival_height() {
+        assert!(!is_hotblocks_gap(100, 100, 105));
+    }
+
+    #[test]
+    fn hotblocks_gap_does_not_apply_before_archival_height() {
+        assert!(!is_hotblocks_gap(99, 100, 105));
+    }
+
+    #[test]
+    fn hotblocks_gap_does_not_apply_at_first_hotblock() {
+        assert!(!is_hotblocks_gap(105, 100, 105));
+    }
+
+    #[test]
+    fn hotblocks_gap_does_not_apply_after_first_hotblock() {
+        assert!(!is_hotblocks_gap(200, 100, 105));
+    }
+
+    #[test]
+    fn hotblocks_gap_requires_actual_gap_between_sources() {
+        assert!(!is_hotblocks_gap(101, 100, 101));
+    }
+}

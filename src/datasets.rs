@@ -189,8 +189,7 @@ struct NetworkDataset {
 async fn load_yaml<T: serde::de::DeserializeOwned>(url: &str) -> anyhow::Result<T> {
     if let Some(path) = url.strip_prefix("file://") {
         tracing::debug!("Loading local file from {}", path);
-        let file =
-            File::open(path).with_context(|| format!("failed to open file {path}"))?;
+        let file = File::open(path).with_context(|| format!("failed to open file {path}"))?;
         let reader = BufReader::new(file);
         serde_yaml::from_reader(reader).with_context(|| format!("failed to parse {path}"))
     } else {
