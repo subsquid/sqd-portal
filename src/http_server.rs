@@ -429,23 +429,30 @@ async fn run_stream_internal(
 
         // Then try hotblocks storage
         _ if dataset.hotblocks.is_some() => {
-            if should_treat_as_hotblocks_gap(
-                &network,
-                &hotblocks,
-                dataset.network_id.as_ref(),
-                &dataset.default_name,
-                request.query.first_block(),
-            )
-            .await
-            {
-                return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
-            }
+            let first_block = request.query.first_block();
+            let hotblocks_response = hotblocks
+                .stream(&dataset.default_name, &request.query.into_string(), mode)
+                .await;
 
-            let mut res = forward_hotblocks_response(
-                hotblocks
-                    .stream(&dataset.default_name, &request.query.into_string(), mode)
-                    .await,
-            );
+            let mut res = match hotblocks_response {
+                Ok(response) => {
+                    if !response.status().is_success()
+                        && should_treat_as_hotblocks_gap(
+                            &network,
+                            &hotblocks,
+                            dataset.network_id.as_ref(),
+                            &dataset.default_name,
+                            first_block,
+                        )
+                        .await
+                    {
+                        return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
+                    }
+
+                    forward_response(response)
+                }
+                Err(e) => forward_hotblocks_response(Err(e)),
+            };
 
             if res.status().is_success() {
                 res.headers_mut()
