@@ -8,7 +8,7 @@ use crate::{
     config::Config,
     controller::task_manager::TaskManager,
     datasets::DatasetConfig,
-    hotblocks::{HotblocksHandle, StreamMode},
+    hotblocks::{HotblocksHandle, Status, StreamMode},
     network::NetworkClient,
     types::{Compression, DatasetId, GenericError, ParsedQuery, StreamRequest},
     utils::{
@@ -197,6 +197,51 @@ async fn get_hotblocks_blocknumber_by_timestamp(
             BlockNumberLookupError::Unavailable("Hotblocks status error".to_string())
         })?;
 
+    get_hotblocks_blocknumber_by_timestamp_inner(
+        timestamp,
+        &dataset.kind,
+        &dataset.default_name,
+        status,
+        |query| async move {
+            let response = hotblocks
+                .stream(&dataset.default_name, &query, StreamMode::RealTime)
+                .await
+                .map_err(|e| {
+                    tracing::warn!("hotblocks stream error: {:?}", e);
+                    BlockNumberLookupError::Unavailable("Hotblocks stream error".to_string())
+                })?;
+
+            let status = response.status();
+            if !status.is_success() {
+                tracing::warn!("hotblocks stream failed with status {}", status);
+                return Err(BlockNumberLookupError::Unavailable(format!(
+                    "Hotblocks stream failed with status {status}"
+                )));
+            }
+
+            collect_hotblocks_stream(response).await.map_err(|e| {
+                tracing::warn!("hotblocks stream processing error: {:?}", e);
+                BlockNumberLookupError::Internal("hotblocks stream processing error".to_string())
+            })
+        },
+    )
+    .await
+}
+
+async fn get_hotblocks_blocknumber_by_timestamp_inner<
+    StreamLookup,
+    StreamFuture,
+>(
+    timestamp: u64,
+    kind: &str,
+    dataset_name: &str,
+    status: Status,
+    stream_lookup: StreamLookup,
+) -> Result<u64, BlockNumberLookupError>
+where
+    StreamLookup: FnOnce(String) -> StreamFuture,
+    StreamFuture: Future<Output = Result<String, BlockNumberLookupError>>,
+{
     let Some(data) = status.data else {
         return Err(BlockNumberLookupError::NotFound(
             "No hotblocks found for timestamp".to_string(),
@@ -212,39 +257,16 @@ async fn get_hotblocks_blocknumber_by_timestamp(
         ));
     }
 
-    let pquery = build_blocknumber_query(&dataset.kind, data.first_block, data.last_block)
+    let pquery = build_blocknumber_query(kind, data.first_block, data.last_block)
         .map_err(|e| {
             tracing::warn!("cannot build hotblocks blocknumber query: {:?}", e);
             BlockNumberLookupError::Internal(format!(
                 "Cannot build timestamp query for {}",
-                dataset.default_name
+                dataset_name
             ))
         })?;
 
-    let response = hotblocks
-        .stream(
-            &dataset.default_name,
-            &pquery.into_string(),
-            StreamMode::RealTime,
-        )
-        .await
-        .map_err(|e| {
-            tracing::warn!("hotblocks stream error: {:?}", e);
-            BlockNumberLookupError::Unavailable("Hotblocks stream error".to_string())
-        })?;
-
-    let status = response.status();
-    if !status.is_success() {
-        tracing::warn!("hotblocks stream failed with status {}", status);
-        return Err(BlockNumberLookupError::Unavailable(format!(
-            "Hotblocks stream failed with status {status}"
-        )));
-    }
-
-    let js = collect_hotblocks_stream(response).await.map_err(|e| {
-        tracing::warn!("hotblocks stream processing error: {:?}", e);
-        BlockNumberLookupError::Internal("hotblocks stream processing error".to_string())
-    })?;
+    let js = stream_lookup(pquery.into_string()).await?;
 
     find_block_in_chunk(timestamp, &js).map_err(|e| {
         tracing::warn!("cannot find blocknumber in hotblocks: {:?}", e);
@@ -303,7 +325,10 @@ mod tests {
     };
 
     use flate2::{write::GzEncoder, Compression};
+    use sqd_primitives::BlockRef;
     use std::io::Write;
+
+    use crate::hotblocks::StatusData;
 
     use super::*;
 
@@ -402,6 +427,45 @@ mod tests {
         assert_eq!(hotblocks_calls.load(Ordering::Relaxed), 1);
     }
 
+    #[tokio::test]
+    async fn hotblocks_lookup_uses_status_and_stream_query() {
+        assert_eq!(
+            get_hotblocks_blocknumber_by_timestamp_inner(
+                1_700_000_000,
+                "evm",
+                "base-mainnet",
+                fake_status(),
+                fake_stream,
+            )
+                .await
+                .unwrap(),
+            100
+        );
+        assert_eq!(
+            get_hotblocks_blocknumber_by_timestamp_inner(
+                1_700_000_005,
+                "evm",
+                "base-mainnet",
+                fake_status(),
+                fake_stream,
+            )
+                .await
+                .unwrap(),
+            101
+        );
+        assert!(matches!(
+            get_hotblocks_blocknumber_by_timestamp_inner(
+                1_700_009_999,
+                "evm",
+                "base-mainnet",
+                fake_status(),
+                fake_stream,
+            )
+            .await,
+            Err(BlockNumberLookupError::NotFound(_))
+        ));
+    }
+
     #[test]
     fn decode_hotblocks_stream_body_accepts_plain_utf8() {
         let body = b"{\"header\":{\"number\":100}}\n";
@@ -448,5 +512,41 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn fake_status() -> Status {
+        Status {
+            kind: "evm".to_string(),
+            retention_strategy: serde_json::json!({"Head": 20}),
+            data: Some(StatusData {
+                first_block: 100,
+                last_block: 101,
+                last_block_hash:
+                    "0x0202020202020202020202020202020202020202020202020202020202020202"
+                        .to_string(),
+                last_block_timestamp: Some(1_700_000_012),
+                finalized_head: Some(BlockRef {
+                    number: 101,
+                    hash:
+                        "0x0202020202020202020202020202020202020202020202020202020202020202"
+                            .to_string(),
+                }),
+            }),
+        }
+    }
+
+    async fn fake_stream(body: String) -> Result<String, BlockNumberLookupError> {
+        let query: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if query["fromBlock"] != 100 || query["toBlock"] != 101 {
+            return Err(BlockNumberLookupError::Internal(format!(
+                "unexpected query range: {query}"
+            )));
+        }
+
+        Ok(concat!(
+                "{\"header\":{\"number\":100,\"timestamp\":1700000000}}\n",
+                "{\"header\":{\"number\":101,\"timestamp\":1700000012}}\n"
+            )
+            .to_string())
     }
 }
