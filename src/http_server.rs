@@ -1,7 +1,6 @@
-use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use axum::http::{HeaderValue, Method};
+use axum::http::Method;
 use axum::{
     async_trait,
     body::Body,
@@ -11,11 +10,8 @@ use axum::{
     routing::{get, post},
     Extension, RequestExt, Router,
 };
-use bytes::Bytes;
-use futures::StreamExt;
 use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
-use serde::Serialize;
 use serde_json::{json, Value};
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
@@ -25,19 +21,24 @@ use tower_http::request_id::{
     MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
 
-use crate::block_number_by_timestamp;
 use crate::datasets::DatasetConfig;
-use crate::hotblocks::{HotblocksErr, StreamMode};
+use crate::endpoints::{
+    block_number_by_timestamp::get_blocknumber_by_timestamp,
+    stream::{
+        run_archival_stream, run_archival_stream_restricted, run_finalized_stream, run_stream,
+    },
+};
+use crate::hotblocks::HotblocksErr;
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::types::Compression;
-use crate::utils::conversion::{join_gzip_default, json_lines_to_json, recompress_gzip};
+use crate::utils::conversion::json_lines_to_json;
 use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
     network::{NetworkClient, NoWorker},
-    types::{ChunkId, DatasetId, GenericError, ParsedQuery, RequestError, StreamRequest},
+    types::{ChunkId, DatasetId, ParsedQuery, RequestError, StreamRequest},
     utils::logging,
 };
 
@@ -267,268 +268,6 @@ async fn get_head(
         .into_response()
 }
 
-async fn run_archival_stream_restricted(
-    task_manager: Extension<Arc<TaskManager>>,
-    network: Extension<Arc<NetworkClient>>,
-    config: Extension<Arc<Config>>,
-    dataset_id: DatasetId,
-    raw_request: StreamRequest,
-) -> Response {
-    let request = restrict_request(&config, raw_request);
-    run_archival_stream(task_manager, network, config, dataset_id, request).await
-}
-
-async fn run_archival_stream(
-    Extension(task_manager): Extension<Arc<TaskManager>>,
-    Extension(network): Extension<Arc<NetworkClient>>,
-    Extension(config): Extension<Arc<Config>>,
-    dataset_id: DatasetId,
-    mut request: StreamRequest,
-) -> Response {
-    let mut res = Response::builder();
-    res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
-    if let Some(head) = network.head(&dataset_id) {
-        // Don't use hotblocks data source at all for this endpoint
-        res = res
-            .header(FINALIZED_NUMBER_HEADER, head.number)
-            .header(FINALIZED_HASH_HEADER, head.hash)
-            .header(HEAD_NUMBER_HEADER, head.number);
-    }
-
-    request.dataset_id = dataset_id;
-    let compression = request.compression;
-
-    match task_manager.spawn_stream(request).await {
-        Ok(stream) => {
-            let body = match compression {
-                Compression::Gzip if config.use_gzjoin => {
-                    Body::from_stream(join_gzip_default(stream))
-                }
-                Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
-                Compression::Zstd => Body::from_stream(
-                    stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))),
-                ),
-            };
-            res.header(header::CONTENT_TYPE, "application/jsonl")
-                .header(header::CONTENT_ENCODING, compression.content_encoding())
-                .body(body)
-                .unwrap()
-        }
-        Err(RequestError::NoData) => {
-            // Delay request from this client for 5 seconds to avoid unnecessary retries
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            res.status(StatusCode::NO_CONTENT).body(().into()).unwrap()
-        }
-        Err(e) => e.into_response(),
-    }
-}
-
-async fn run_stream(
-    Extension(task_manager): Extension<Arc<TaskManager>>,
-    Extension(config): Extension<Arc<Config>>,
-    Extension(network): Extension<Arc<NetworkClient>>,
-    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
-    dataset: DatasetConfig,
-    request: StreamRequest,
-) -> Response {
-    run_stream_internal(
-        task_manager,
-        config,
-        network,
-        hotblocks,
-        dataset,
-        request,
-        StreamMode::RealTime,
-    )
-    .await
-}
-
-async fn run_finalized_stream(
-    Extension(task_manager): Extension<Arc<TaskManager>>,
-    Extension(config): Extension<Arc<Config>>,
-    Extension(network): Extension<Arc<NetworkClient>>,
-    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
-    dataset: DatasetConfig,
-    request: StreamRequest,
-) -> Response {
-    run_stream_internal(
-        task_manager,
-        config,
-        network,
-        hotblocks,
-        dataset,
-        request,
-        StreamMode::Finalized,
-    )
-    .await
-}
-
-async fn run_stream_internal(
-    task_manager: Arc<TaskManager>,
-    config: Arc<Config>,
-    network: Arc<NetworkClient>,
-    hotblocks: Arc<HotblocksHandle>,
-    dataset: DatasetConfig,
-    request: StreamRequest,
-    mode: StreamMode,
-) -> Response {
-    let mut request = restrict_request(&config, request);
-
-    match dataset.network_id {
-        // Prefer data from the network
-        Some(dataset_id)
-            if network
-                .get_height(&dataset_id)
-                .is_some_and(|height| request.query.first_block() <= height) =>
-        {
-            let archival_head = network.head(&dataset_id);
-            let head_task = tokio::spawn({
-                let archival_head = archival_head.clone();
-                async move {
-                    let ds = &dataset.default_name;
-                    let head = match mode {
-                        StreamMode::RealTime => hotblocks.get_head(ds).await,
-                        StreamMode::Finalized => hotblocks.get_finalized_head(ds).await,
-                    };
-                    head.ok().or(archival_head.clone()).map(|b| b.number)
-                }
-            });
-
-            request.dataset_id = dataset_id;
-            let compression = request.compression;
-
-            let stream = match task_manager.spawn_stream(request).await {
-                Ok(stream) => stream,
-                Err(e) => return e.into_response(),
-            };
-
-            let mut res = Response::builder().header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
-            if let Some(head) = archival_head {
-                res = res.header(FINALIZED_NUMBER_HEADER, head.number);
-                res = res.header(FINALIZED_HASH_HEADER, head.hash);
-            }
-            if let Some(head) = head_task.await.unwrap() {
-                res = res.header(HEAD_NUMBER_HEADER, head);
-            }
-            let body = match compression {
-                Compression::Gzip if config.use_gzjoin => {
-                    Body::from_stream(join_gzip_default(stream))
-                }
-                Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
-                Compression::Zstd => Body::from_stream(
-                    stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))),
-                ),
-            };
-            res.header(header::CONTENT_TYPE, "application/jsonl")
-                .header(header::CONTENT_ENCODING, compression.content_encoding())
-                .body(body)
-                .unwrap()
-        }
-
-        // Then try hotblocks storage
-        _ if dataset.hotblocks.is_some() => {
-            let first_block = request.query.first_block();
-            let hotblocks_response = hotblocks
-                .stream(&dataset.default_name, &request.query.into_string(), mode)
-                .await;
-
-            let mut res = match hotblocks_response {
-                Ok(response) => {
-                    if !response.status().is_success()
-                        && should_treat_as_hotblocks_gap(
-                            &network,
-                            &hotblocks,
-                            dataset.network_id.as_ref(),
-                            &dataset.default_name,
-                            first_block,
-                        )
-                        .await
-                    {
-                        return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
-                    }
-
-                    forward_response(response)
-                }
-                Err(e) => forward_hotblocks_response(Err(e)),
-            };
-
-            if res.status().is_success() {
-                res.headers_mut()
-                    .append(DATA_SOURCE_HEADER, DATA_SOURCE_REALTIME);
-            }
-            res
-        }
-        // If requested block is above the network height and there is no hotblocks storage, return 204
-        Some(dataset_id) => {
-            let mut res = Response::builder();
-            res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
-            if let Some(head) = network.head(&dataset_id) {
-                res = res.header(FINALIZED_NUMBER_HEADER, head.number);
-                res = res.header(FINALIZED_HASH_HEADER, head.hash);
-                res = res.header(HEAD_NUMBER_HEADER, head.number);
-            }
-            delayed_no_content_response_with_builder(res).await
-        }
-        None => {
-            unreachable!(
-                "invalid dataset name should have been handled in the ClientRequest parser"
-            )
-        }
-    }
-}
-
-async fn should_treat_as_hotblocks_gap(
-    network: &NetworkClient,
-    hotblocks: &HotblocksHandle,
-    dataset_id: Option<&DatasetId>,
-    dataset_name: &str,
-    first_block: u64,
-) -> bool {
-    let Some(dataset_id) = dataset_id else {
-        return false;
-    };
-    let Some(height) = network.get_height(dataset_id) else {
-        return false;
-    };
-    if first_block <= height {
-        return false;
-    }
-
-    // Only convert a hotblocks gap to delayed 204 when status exposes the
-    // retained range. If status has no data or cannot be fetched, preserve
-    // the old behavior and let hotblocks answer the stream request.
-    let Ok(status) = hotblocks.get_status(dataset_name).await else {
-        return false;
-    };
-    let Some(data) = status.data else {
-        return false;
-    };
-
-    is_hotblocks_gap(first_block, height, data.first_block)
-}
-
-fn is_hotblocks_gap(first_block: u64, archival_height: u64, hotblocks_first_block: u64) -> bool {
-    first_block > archival_height && first_block < hotblocks_first_block
-}
-
-async fn delayed_no_content_response(data_source: HeaderValue) -> Response {
-    delayed_no_content_response_with_builder(
-        Response::builder().header(DATA_SOURCE_HEADER, data_source),
-    )
-    .await
-}
-
-async fn delayed_no_content_response_with_builder(
-    builder: axum::http::response::Builder,
-) -> Response {
-    // Delay request from this client for 5 seconds to avoid unnecessary retries.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    builder
-        .status(StatusCode::NO_CONTENT)
-        .body(().into())
-        .unwrap()
-}
-
 async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
     let status = client.get_status();
 
@@ -596,34 +335,6 @@ async fn get_dataset_metadata(
     };
     let resp = AvailableDatasetApiResponse::new(metadata, first_block);
     axum::Json(resp.with_fields(&query.expand))
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct BlockNumberResponse {
-    block_number: u64,
-}
-
-async fn get_blocknumber_by_timestamp(
-    Path((_, timestamp)): Path<(DatasetId, u64)>,
-    Extension(req): Extension<RequestId>,
-    Extension(network): Extension<Arc<NetworkClient>>,
-    Extension(task_manager): Extension<Arc<TaskManager>>,
-    Extension(config): Extension<Arc<Config>>,
-    Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
-    dataset: DatasetConfig,
-) -> Result<axum::Json<BlockNumberResponse>, (StatusCode, axum::Json<GenericError>)> {
-    block_number_by_timestamp::resolve(
-        timestamp,
-        &req,
-        &network,
-        &task_manager,
-        &config,
-        &hotblocks,
-        &dataset,
-    )
-    .await
-    .map(|n| BlockNumberResponse { block_number: n }.into())
-    .map_err(block_number_by_timestamp::BlockNumberLookupError::into_response)
 }
 
 async fn get_debug_block(
@@ -978,23 +689,9 @@ where
     }
 }
 
-fn restrict_request(config: &Config, request: StreamRequest) -> StreamRequest {
-    let max_chunks = match (request.max_chunks, config.max_chunks_per_stream) {
-        (Some(requested), Some(limit)) => Some(requested.min(limit)),
-        (Some(requested), None) => Some(requested),
-        (None, Some(limit)) => Some(limit),
-        (None, None) => None,
-    };
-    StreamRequest {
-        buffer_size: request.buffer_size.min(config.max_buffer_size),
-        max_chunks,
-        timeout_quantile: config.default_timeout_quantile,
-        retries: config.default_retries,
-        ..request
-    }
-}
-
-fn forward_hotblocks_response(response: Result<reqwest::Response, HotblocksErr>) -> Response {
+pub(crate) fn forward_hotblocks_response(
+    response: Result<reqwest::Response, HotblocksErr>,
+) -> Response {
     match response {
         Ok(response) => forward_response(response),
         Err(HotblocksErr::UnknownDataset) => {
@@ -1008,7 +705,7 @@ fn forward_hotblocks_response(response: Result<reqwest::Response, HotblocksErr>)
     }
 }
 
-fn forward_response(response: reqwest::Response) -> axum::response::Response {
+pub(crate) fn forward_response(response: reqwest::Response) -> axum::response::Response {
     let mut builder = Response::builder().status(response.status());
     for (key, value) in response.headers() {
         builder = builder.header(key, value);
@@ -1041,47 +738,5 @@ async fn sql_metadata(
             tracing::warn!("cannot fetch metadata: {:?}", e);
             e.into_response()
         }
-    }
-}
-
-const FINALIZED_NUMBER_HEADER: &str = "x-sqd-finalized-head-number";
-const FINALIZED_HASH_HEADER: &str = "x-sqd-finalized-head-hash";
-const HEAD_NUMBER_HEADER: &str = "x-sqd-head-number";
-const DATA_SOURCE_HEADER: &str = "x-sqd-data-source";
-const DATA_SOURCE_NETWORK: HeaderValue = HeaderValue::from_static("network");
-const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static("real_time");
-
-#[cfg(test)]
-mod tests {
-    use super::is_hotblocks_gap;
-
-    #[test]
-    fn hotblocks_gap_detects_missing_blocks_after_archival_height() {
-        assert!(is_hotblocks_gap(101, 100, 105));
-    }
-
-    #[test]
-    fn hotblocks_gap_does_not_apply_at_archival_height() {
-        assert!(!is_hotblocks_gap(100, 100, 105));
-    }
-
-    #[test]
-    fn hotblocks_gap_does_not_apply_before_archival_height() {
-        assert!(!is_hotblocks_gap(99, 100, 105));
-    }
-
-    #[test]
-    fn hotblocks_gap_does_not_apply_at_first_hotblock() {
-        assert!(!is_hotblocks_gap(105, 100, 105));
-    }
-
-    #[test]
-    fn hotblocks_gap_does_not_apply_after_first_hotblock() {
-        assert!(!is_hotblocks_gap(200, 100, 105));
-    }
-
-    #[test]
-    fn hotblocks_gap_requires_actual_gap_between_sources() {
-        assert!(!is_hotblocks_gap(101, 100, 101));
     }
 }
