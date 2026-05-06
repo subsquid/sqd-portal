@@ -13,7 +13,7 @@ use crate::{
     config::Config,
     controller::task_manager::TaskManager,
     datasets::DatasetConfig,
-    hotblocks::{HotblocksHandle, StreamMode},
+    hotblocks::{traceless_key, HotblocksHandle, StreamMode},
     http_server::{forward_hotblocks_response, forward_response},
     network::NetworkClient,
     types::{Compression, DatasetId, RequestError, StreamRequest},
@@ -119,6 +119,19 @@ async fn run_stream_internal(
 ) -> Response {
     let request = restrict_request(&config, request);
 
+    // Use the traceless hotblocks variant when the query doesn't need traces/statediffs
+    let hotblocks_name = if dataset
+        .hotblocks
+        .as_ref()
+        .and_then(|r| r.dataset_traceless.as_ref())
+        .is_some()
+        && request.query.is_traceless()
+    {
+        traceless_key(&dataset.default_name)
+    } else {
+        dataset.default_name.clone()
+    };
+
     match dataset.network_id.clone() {
         Some(dataset_id)
             if network
@@ -130,15 +143,15 @@ async fn run_stream_internal(
                 config,
                 network,
                 hotblocks,
-                dataset,
                 request,
                 mode,
                 dataset_id,
+                hotblocks_name,
             )
             .await
         }
         _ if dataset.hotblocks.is_some() => {
-            stream_from_hotblocks(network, hotblocks, dataset, request, mode).await
+            stream_from_hotblocks(network, hotblocks, dataset, request, mode, hotblocks_name).await
         }
         Some(dataset_id) => stream_after_network_head(&network, dataset_id).await,
         None => {
@@ -154,19 +167,18 @@ async fn stream_from_network(
     config: Arc<Config>,
     network: Arc<NetworkClient>,
     hotblocks: Arc<HotblocksHandle>,
-    dataset: DatasetConfig,
     mut request: StreamRequest,
     mode: StreamMode,
     dataset_id: DatasetId,
+    hotblocks_name: String,
 ) -> Response {
     let archival_head = network.head(&dataset_id);
     let head_task = tokio::spawn({
         let archival_head = archival_head.clone();
         async move {
-            let ds = &dataset.default_name;
             let head = match mode {
-                StreamMode::RealTime => hotblocks.get_head(ds).await,
-                StreamMode::Finalized => hotblocks.get_finalized_head(ds).await,
+                StreamMode::RealTime => hotblocks.get_head(&hotblocks_name).await,
+                StreamMode::Finalized => hotblocks.get_finalized_head(&hotblocks_name).await,
             };
             head.ok().or(archival_head.clone()).map(|b| b.number)
         }
@@ -201,10 +213,11 @@ async fn stream_from_hotblocks(
     dataset: DatasetConfig,
     request: StreamRequest,
     mode: StreamMode,
+    hotblocks_name: String,
 ) -> Response {
     let first_block = request.query.first_block();
     let hotblocks_response = hotblocks
-        .stream(&dataset.default_name, &request.query.into_string(), mode)
+        .stream(&hotblocks_name, &request.query.into_string(), mode)
         .await;
 
     let mut res = match hotblocks_response {
@@ -214,7 +227,7 @@ async fn stream_from_hotblocks(
                     &network,
                     &hotblocks,
                     dataset.network_id.as_ref(),
-                    &dataset.default_name,
+                    &hotblocks_name,
                     first_block,
                 )
                 .await

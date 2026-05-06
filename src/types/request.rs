@@ -48,6 +48,15 @@ impl ParsedQuery {
         self.parsed.last_block()
     }
 
+    /// Returns `true` when the query does not need traces or statediffs,
+    /// meaning it can be served by a traceless dataset.
+    pub fn is_traceless(&self) -> bool {
+        match &self.parsed {
+            Query::Eth(q) => !q.requires_traces() && !q.requires_statediffs(),
+            _ => false,
+        }
+    }
+
     pub fn intersect_with(&self, range: &BlockRange) -> Option<BlockRange> {
         let begin = std::cmp::max(*range.start(), self.first_block());
         let end = if let Some(last_block) = self.last_block() {
@@ -81,6 +90,9 @@ impl ParsedQuery {
                     q.parent_block_hash = None;
                 }
                 Query::HyperliquidReplicaCmds(ref mut q) => {
+                    q.parent_block_hash = None;
+                }
+                Query::Tron(ref mut q) => {
                     q.parent_block_hash = None;
                 }
             }

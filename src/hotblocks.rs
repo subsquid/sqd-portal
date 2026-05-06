@@ -6,8 +6,13 @@ use crate::config::Config;
 
 pub struct HotblocksHandle {
     pub client: reqwest::Client,
-    // Datasets are referenced by their default name in the config
+    // Datasets are referenced by their default name in the config.
+    // Traceless variants are stored under the key returned by `traceless_key`.
     pub urls: BTreeMap<String, String>,
+}
+
+pub fn traceless_key(default_name: &str) -> String {
+    format!("{default_name}#traceless")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +61,16 @@ pub async fn build_client(config: &Config) -> anyhow::Result<HotblocksHandle> {
                 .join(remote_name)
                 .unwrap();
             urls.insert(default_name.clone(), url.into());
+
+            if let Some(traceless_name) = &hotblocks.dataset_traceless {
+                let traceless_url = hotblocks
+                    .url
+                    .join("datasets/")
+                    .unwrap()
+                    .join(traceless_name)
+                    .unwrap();
+                urls.insert(traceless_key(default_name), traceless_url.into());
+            }
         }
     }
 

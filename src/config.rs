@@ -138,6 +138,8 @@ pub struct RealTimeConfig {
     pub url: Url,
     // By default use the dataset name as in the config key
     pub dataset: Option<String>,
+    // If set, queries that don't require traces or statediffs are routed here
+    pub dataset_traceless: Option<String>,
     // By default use the kind in config
     pub kind: Option<String>,
 }
