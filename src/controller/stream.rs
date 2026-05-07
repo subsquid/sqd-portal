@@ -56,6 +56,7 @@
 #![allow(unstable_name_collisions)]
 
 use std::{
+    collections::VecDeque,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -83,7 +84,7 @@ const MAX_IDLE_TIME: Duration = Duration::from_millis(1000);
 pub struct StreamController {
     request: StreamRequest,
     network: Arc<NetworkClient>,
-    buffer: SlidingArray<Slot>,
+    buffer: SlidingArray<ChunkSlot>,
     next_chunk: Option<DataChunk>,
     timeouts: TimeoutManager,
     stats: StreamStats,
@@ -105,6 +106,10 @@ struct Slot {
     state: RequestState,
 }
 
+struct ChunkSlot {
+    parts: VecDeque<Slot>,
+}
+
 enum RequestState {
     /// Couldn't find enough workers now.
     /// Retry whenever the stream is polled, or give up if this is the first slot.
@@ -114,8 +119,9 @@ enum RequestState {
     Paused(PausedState),
     /// Workers are allocated and queries to some of them are running. Waiting for the results.
     Pending(PendingRequests),
-    /// We've got a successful result from one of the workers but it didn't cover the whole chunk range.
-    /// A continuation request should be sent once we feed this result to the client.
+    /// We've got a successful result from one of the workers but it didn't cover the whole chunk
+    /// range. Depending on request settings, a continuation request is either scheduled eagerly
+    /// while polling or later when this result is fed to the client.
     Partial(PartialResult),
     /// Either a successful result has been received, or all the attempts have failed.
     Done(Result<ResponseChunk, RequestError>),
@@ -242,8 +248,8 @@ impl StreamController {
         // extract this field to be able to pass both its values and `&mut self` to the method
         let mut buffer = std::mem::take(&mut self.buffer);
         let mut updated = false;
-        for slot in buffer.iter_mut() {
-            updated |= self.poll_slot(slot, ctx).updated();
+        for chunk_slot in buffer.iter_mut() {
+            updated |= self.poll_chunk_slot(chunk_slot, ctx).updated();
         }
         self.buffer = buffer;
 
@@ -253,7 +259,7 @@ impl StreamController {
                 self.buffer
                     .data()
                     .iter()
-                    .map(|s| s.state.debug_symbol())
+                    .map(ChunkSlot::debug_symbol)
                     .collect::<String>()
             );
         }
@@ -268,6 +274,58 @@ impl StreamController {
         }
 
         result
+    }
+
+    fn poll_chunk_slot(
+        &mut self,
+        chunk_slot: &mut ChunkSlot,
+        ctx: &mut Context<'_>,
+    ) -> UpdateStatus {
+        let mut updated = false;
+        let mut idx = 0;
+        while idx < chunk_slot.parts.len() {
+            let slot_updated = {
+                // `idx` is bounded by the loop condition and this loop only appends new parts.
+                // If the invariant is ever broken, stop polling this chunk for now; the stream
+                // will be polled again and the debug assertion will point to the scheduling bug.
+                let Some(slot) = chunk_slot.parts.get_mut(idx) else {
+                    debug_assert!(false, "chunk part index should be in bounds");
+                    break;
+                };
+                self.poll_slot(slot, ctx).updated()
+            };
+            updated |= slot_updated;
+
+            if self.request.eager_continuations {
+                let next_data_range = {
+                    // Same invariant as above: no part is removed while polling a chunk slot.
+                    let Some(slot) = chunk_slot.parts.get_mut(idx) else {
+                        debug_assert!(false, "chunk part index should be in bounds");
+                        break;
+                    };
+                    slot.take_partial_continuation()
+                };
+                if let Some(next_data_range) = next_data_range {
+                    let next_slot = match self.start_querying_chunk(next_data_range, ctx) {
+                        Ok(slot) => slot,
+                        Err((slot, e)) => {
+                            tracing::debug!("Couldn't schedule continuation request: {e:?}");
+                            slot
+                        }
+                    };
+                    chunk_slot.parts.push_back(next_slot);
+                    updated = true;
+                }
+            }
+
+            idx += 1;
+        }
+
+        if updated {
+            UpdateStatus::Updated
+        } else {
+            UpdateStatus::NotUpdated
+        }
     }
 
     #[instrument(skip_all, level="debug", fields(chunk_index = slot.data_range.chunk_index))]
@@ -486,12 +544,22 @@ impl StreamController {
         &mut self,
         ctx: &mut Context<'_>,
     ) -> Poll<Option<Result<ResponseChunk, RequestError>>> {
-        let Some(slot) = self.buffer.pop_front() else {
-            return Poll::Ready(None);
+        let (mut chunk_slot, slot) = loop {
+            let Some(mut chunk_slot) = self.buffer.pop_front() else {
+                return Poll::Ready(None);
+            };
+            if let Some(slot) = chunk_slot.parts.pop_front() {
+                break (chunk_slot, slot);
+            }
         };
         let chunk_index = slot.data_range.chunk_index;
         let (result, read_range) = match slot.state {
-            RequestState::Done(result) => (Poll::Ready(Some(result)), slot.data_range.range),
+            RequestState::Done(result) => {
+                if !chunk_slot.parts.is_empty() {
+                    self.buffer.push_front(chunk_slot);
+                }
+                (Poll::Ready(Some(result)), slot.data_range.range)
+            }
             RequestState::NoWorkers => {
                 // We don't know how long we'll have to wait, so give up immediately
                 return Poll::Ready(Some(Err(RequestError::Unavailable)));
@@ -506,13 +574,15 @@ impl StreamController {
                     self.stats.throttled(duration);
                 }
                 let range = slot.data_range.range.clone();
-                self.buffer.push_front(slot);
+                chunk_slot.parts.push_front(slot);
+                self.buffer.push_front(chunk_slot);
                 (Poll::Pending, range)
             }
             RequestState::Pending(_) => {
                 // The query is still running, keep waiting
                 let range = slot.data_range.range.clone();
-                self.buffer.push_front(slot);
+                chunk_slot.parts.push_front(slot);
+                self.buffer.push_front(chunk_slot);
                 (Poll::Pending, range)
             }
             RequestState::Partial(PartialResult { data, next_range }) => {
@@ -527,7 +597,8 @@ impl StreamController {
                         slot
                     }
                 };
-                self.buffer.push_front(slot);
+                chunk_slot.parts.push_front(slot);
+                self.buffer.push_front(chunk_slot);
                 (Poll::Ready(Some(Ok(data))), read_range)
             }
         };
@@ -551,7 +622,7 @@ impl StreamController {
         if let Some(Slot {
             state: RequestState::Paused(_),
             ..
-        }) = self.buffer.back()
+        }) = self.buffer.back().and_then(ChunkSlot::back)
         {
             // Either the amount of compute units is low or the network is overloaded.
             // Don't send new queries until the existing ones complete.
@@ -577,7 +648,7 @@ impl StreamController {
             ) {
                 Ok(slot) => {
                     let paused = slot.is_paused();
-                    self.buffer.push_back(slot);
+                    self.buffer.push_back(ChunkSlot::new(slot));
                     self.next_chunk = self.get_next_chunk(&chunk);
                     if paused {
                         break;
@@ -590,7 +661,7 @@ impl StreamController {
                     if self.buffer.len() == 0 {
                         // Couldn't schedule a new request with no ongoing requests
                         // Return the error immediately
-                        self.buffer.push_back(slot);
+                        self.buffer.push_back(ChunkSlot::new(slot));
                     }
                     self.last_error = Some(e.to_string());
                     self.next_chunk = Some(chunk);
@@ -780,6 +851,45 @@ impl DataRange {
 impl Slot {
     fn is_paused(&self) -> bool {
         matches!(&self.state, RequestState::Paused(_))
+    }
+
+    fn take_partial_continuation(&mut self) -> Option<DataRange> {
+        let RequestState::Partial(_) = self.state else {
+            return None;
+        };
+
+        let state = std::mem::replace(&mut self.state, RequestState::NoWorkers);
+        let RequestState::Partial(PartialResult { data, next_range }) = state else {
+            unreachable!("slot state was checked to be partial")
+        };
+
+        let read_range = BlockRange::new(*self.data_range.range.start(), *next_range.start() - 1);
+        let next_data_range = self.data_range.clone().with_range(next_range);
+        self.data_range = self.data_range.clone().with_range(read_range);
+        self.state = RequestState::Done(Ok(data));
+        Some(next_data_range)
+    }
+}
+
+impl ChunkSlot {
+    fn new(slot: Slot) -> Self {
+        Self {
+            parts: VecDeque::from([slot]),
+        }
+    }
+
+    fn back(&self) -> Option<&Slot> {
+        self.parts.back()
+    }
+
+    fn debug_symbol(&self) -> char {
+        if self.parts.len() > 1 {
+            return '*';
+        }
+        self.parts
+            .front()
+            .map(|slot| slot.state.debug_symbol())
+            .unwrap_or('_')
     }
 }
 

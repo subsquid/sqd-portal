@@ -94,6 +94,9 @@ pub struct Config {
     #[serde(default)]
     pub use_gzjoin: bool,
 
+    #[serde(default = "default_true")]
+    pub eager_continuations: bool,
+
     #[serde(default)]
     pub ignore_deprecated_workers: bool,
 
