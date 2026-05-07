@@ -308,7 +308,8 @@ impl StreamController {
                     slot.take_partial_continuation_if_eager(self.request.eager_continuations)
                 };
                 if let Some(next_data_range) = next_data_range {
-                    let status = self.schedule_continuation(chunk_slot, next_data_range, false, ctx);
+                    let status =
+                        self.schedule_continuation(chunk_slot, next_data_range, false, ctx);
                     updated |= status.updated();
                 }
             }
