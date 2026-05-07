@@ -303,7 +303,7 @@ impl StreamController {
                         debug_assert!(false, "chunk part index should be in bounds");
                         break;
                     };
-                    slot.take_partial_continuation()
+                    slot.take_partial_continuation_if_eager(self.request.eager_continuations)
                 };
                 if let Some(next_data_range) = next_data_range {
                     let next_slot = match self.start_querying_chunk(next_data_range, ctx) {
@@ -776,11 +776,7 @@ impl StreamController {
             range.range.end(),
             lease,
         );
-        let query = if *range.range.start() == self.request.query.first_block() {
-            self.request.query.to_string()
-        } else {
-            self.request.query.without_parent_hash()
-        };
+        let query = query_for_range(&mut self.request.query, &range.range);
         let start_time = tokio::time::Instant::now();
 
         let priority = self.stream_index * self.priority_stride + range.chunk_index as u32;
@@ -851,6 +847,10 @@ impl DataRange {
 impl Slot {
     fn is_paused(&self) -> bool {
         matches!(&self.state, RequestState::Paused(_))
+    }
+
+    fn take_partial_continuation_if_eager(&mut self, eager: bool) -> Option<DataRange> {
+        eager.then(|| self.take_partial_continuation()).flatten()
     }
 
     fn take_partial_continuation(&mut self) -> Option<DataRange> {
@@ -991,6 +991,14 @@ fn parse_response(
     state
 }
 
+fn query_for_range(query: &mut crate::types::ParsedQuery, range: &BlockRange) -> String {
+    if *range.start() == query.first_block() {
+        query.to_string()
+    } else {
+        query.without_parent_hash()
+    }
+}
+
 fn retriable(result: &QueryResult) -> bool {
     match result {
         Ok(_) => false,
@@ -1008,5 +1016,137 @@ fn short_code(result: &RequestState) -> &'static str {
         RequestState::Done(Err(e)) => e.short_code(),
         RequestState::Partial(_) => "partial",
         RequestState::Pending(_) | RequestState::Paused(_) | RequestState::NoWorkers => "-",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use crate::types::ParsedQuery;
+
+    use super::*;
+
+    fn test_chunk() -> DataChunk {
+        DataChunk::from_str("0000000000/0000000100-0000000200-abcde").unwrap()
+    }
+
+    fn data_range(start: u64, end: u64) -> DataRange {
+        DataRange {
+            range: BlockRange::new(start, end),
+            chunk: test_chunk(),
+            chunk_index: 0,
+        }
+    }
+
+    fn partial_slot(start: u64, end: u64, last_returned: u64, data: &[u8]) -> Slot {
+        Slot {
+            data_range: data_range(start, end),
+            state: RequestState::Partial(PartialResult {
+                data: data.to_vec(),
+                next_range: BlockRange::new(last_returned + 1, end),
+            }),
+        }
+    }
+
+    #[test]
+    fn partial_slot_is_split_into_done_part_and_continuation_range() {
+        let mut slot = partial_slot(100, 200, 120, b"first");
+
+        let continuation = slot.take_partial_continuation().unwrap();
+
+        assert_eq!(slot.data_range.range, BlockRange::new(100, 120));
+        match slot.state {
+            RequestState::Done(Ok(data)) => assert_eq!(data, b"first"),
+            _ => panic!("partial data should become an emit-ready done state"),
+        }
+        assert_eq!(continuation.range, BlockRange::new(121, 200));
+        assert_eq!(continuation.chunk, test_chunk());
+        assert_eq!(continuation.chunk_index, 0);
+    }
+
+    #[test]
+    fn non_partial_slot_does_not_schedule_continuation() {
+        let mut slot = Slot {
+            data_range: data_range(100, 200),
+            state: RequestState::Done(Ok(b"complete".to_vec())),
+        };
+
+        assert!(slot.take_partial_continuation().is_none());
+        assert_eq!(slot.data_range.range, BlockRange::new(100, 200));
+        match slot.state {
+            RequestState::Done(Ok(data)) => assert_eq!(data, b"complete"),
+            _ => panic!("non-partial state should be preserved"),
+        }
+    }
+
+    #[test]
+    fn lazy_partial_slot_keeps_continuation_until_output_path() {
+        let mut slot = partial_slot(100, 200, 120, b"first");
+
+        assert!(slot.take_partial_continuation_if_eager(false).is_none());
+        assert_eq!(slot.data_range.range, BlockRange::new(100, 200));
+        match &slot.state {
+            RequestState::Partial(partial) => {
+                assert_eq!(partial.data, b"first");
+                assert_eq!(partial.next_range, BlockRange::new(121, 200));
+            }
+            _ => panic!("lazy path should keep partial state until it is emitted"),
+        }
+    }
+
+    #[test]
+    fn chunk_slot_keeps_completed_part_before_continuation() {
+        let mut chunk_slot = ChunkSlot::new(partial_slot(100, 200, 120, b"first"));
+        let continuation = chunk_slot
+            .parts
+            .front_mut()
+            .unwrap()
+            .take_partial_continuation()
+            .unwrap();
+        chunk_slot.parts.push_back(Slot {
+            data_range: continuation,
+            state: RequestState::NoWorkers,
+        });
+
+        assert_eq!(chunk_slot.parts.len(), 2);
+        assert_eq!(
+            chunk_slot.parts.front().unwrap().data_range.range,
+            BlockRange::new(100, 120)
+        );
+        assert_eq!(
+            chunk_slot.parts.back().unwrap().data_range.range,
+            BlockRange::new(121, 200)
+        );
+        assert!(matches!(
+            chunk_slot.parts.front().unwrap().state,
+            RequestState::Done(Ok(_))
+        ));
+        assert!(matches!(
+            chunk_slot.parts.back().unwrap().state,
+            RequestState::NoWorkers
+        ));
+    }
+
+    #[test]
+    fn first_range_uses_original_query_and_continuation_drops_parent_hash() {
+        let query_json = r#"{
+            "type": "evm",
+            "fromBlock": 100,
+            "parentBlockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "fields": {
+                "block": {
+                    "number": true
+                }
+            },
+            "includeAllBlocks": true
+        }"#;
+        let mut query = ParsedQuery::try_from(query_json.to_owned()).unwrap();
+
+        let first_query = query_for_range(&mut query, &BlockRange::new(100, 120));
+        let continuation_query = query_for_range(&mut query, &BlockRange::new(121, 200));
+
+        assert!(first_query.contains("parentBlockHash"));
+        assert!(!continuation_query.contains("parentBlockHash"));
     }
 }
