@@ -573,6 +573,7 @@ impl NetworkClient {
             }
             Err(QueryFailure::InvalidRequest(e)) => {
                 metrics::report_query_result(&peer_id, "invalid");
+                self.network_state.report_query_failure(peer_id);
                 Err(QueryError::Failure(format!(
                     "portal tried to send invalid request: {e}"
                 )))
