@@ -188,6 +188,11 @@ enum PendingSlotPoll {
     NotUpdated,
 }
 
+enum ContinuationPosition {
+    Front,
+    Back,
+}
+
 impl UpdateStatus {
     fn updated(&self) -> bool {
         matches!(self, UpdateStatus::Updated)
@@ -308,8 +313,12 @@ impl StreamController {
                     slot.take_partial_continuation_if_eager(self.request.eager_continuations)
                 };
                 if let Some(next_data_range) = next_data_range {
-                    let status =
-                        self.schedule_continuation(chunk_slot, next_data_range, false, ctx);
+                    let status = self.schedule_continuation(
+                        chunk_slot,
+                        next_data_range,
+                        ContinuationPosition::Back,
+                        ctx,
+                    );
                     updated |= status.updated();
                 }
             }
@@ -328,7 +337,7 @@ impl StreamController {
         &mut self,
         chunk_slot: &mut ChunkSlot,
         next_data_range: DataRange,
-        push_front: bool,
+        position: ContinuationPosition,
         ctx: &mut Context<'_>,
     ) -> UpdateStatus {
         let next_slot = match self.start_querying_chunk(next_data_range, ctx) {
@@ -338,10 +347,9 @@ impl StreamController {
                 slot
             }
         };
-        if push_front {
-            chunk_slot.parts.push_front(next_slot);
-        } else {
-            chunk_slot.parts.push_back(next_slot);
+        match position {
+            ContinuationPosition::Front => chunk_slot.parts.push_front(next_slot),
+            ContinuationPosition::Back => chunk_slot.parts.push_back(next_slot),
         }
         UpdateStatus::Updated
     }
@@ -608,7 +616,12 @@ impl StreamController {
                 let read_range =
                     BlockRange::new(*slot.data_range.range.start(), *next_range.start() - 1);
                 let next_data_range = slot.data_range.with_range(next_range);
-                let _ = self.schedule_continuation(&mut chunk_slot, next_data_range, true, ctx);
+                let _ = self.schedule_continuation(
+                    &mut chunk_slot,
+                    next_data_range,
+                    ContinuationPosition::Front,
+                    ctx,
+                );
                 self.buffer.push_front(chunk_slot);
                 (Poll::Ready(Some(Ok(data))), read_range)
             }
@@ -1172,18 +1185,44 @@ mod tests {
     }
 
     #[test]
-    fn chunk_slot_allows_many_parts() {
-        let mut chunk_slot = ChunkSlot::new(partial_slot(100, 200, 120, b"first"));
-        for i in 0..1000 {
+    fn chunk_slot_keeps_many_continuations_in_same_chunk_order() {
+        let mut chunk_slot = ChunkSlot::new(Slot {
+            data_range: data_range(100, 120),
+            state: RequestState::Done(Ok(b"first".to_vec())),
+        });
+        for i in 0..3 {
+            let start = 121 + i * 10;
             chunk_slot.parts.push_back(Slot {
                 data_range: DataRange {
-                    range: BlockRange::new(201 + i, 300 + i),
+                    range: BlockRange::new(start, start + 9),
                     chunk: test_chunk(),
-                    chunk_index: (i + 1) as usize,
+                    chunk_index: 0,
                 },
                 state: RequestState::NoWorkers,
             });
         }
-        assert_eq!(chunk_slot.parts.len(), 1001);
+
+        let ranges: Vec<_> = chunk_slot
+            .parts
+            .iter()
+            .map(|slot| slot.data_range.range.clone())
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                BlockRange::new(100, 120),
+                BlockRange::new(121, 130),
+                BlockRange::new(131, 140),
+                BlockRange::new(141, 150),
+            ]
+        );
+        assert!(chunk_slot
+            .parts
+            .iter()
+            .all(|slot| slot.data_range.chunk == test_chunk()));
+        assert!(chunk_slot
+            .parts
+            .iter()
+            .all(|slot| slot.data_range.chunk_index == 0));
     }
 }
