@@ -106,6 +106,8 @@ struct Slot {
     state: RequestState,
 }
 
+/// Represents a chunk's parts (possibly multiple consecutive DataRange requests).
+/// Invariant: the front contains the next part to emit (Done/Partial), newer continuations are appended to the back.
 struct ChunkSlot {
     parts: VecDeque<Slot>,
 }
@@ -306,15 +308,8 @@ impl StreamController {
                     slot.take_partial_continuation_if_eager(self.request.eager_continuations)
                 };
                 if let Some(next_data_range) = next_data_range {
-                    let next_slot = match self.start_querying_chunk(next_data_range, ctx) {
-                        Ok(slot) => slot,
-                        Err((slot, e)) => {
-                            tracing::debug!("Couldn't schedule continuation request: {e:?}");
-                            slot
-                        }
-                    };
-                    chunk_slot.parts.push_back(next_slot);
-                    updated = true;
+                    let status = self.schedule_continuation(chunk_slot, next_data_range, false, ctx);
+                    updated |= status.updated();
                 }
             }
 
@@ -326,6 +321,28 @@ impl StreamController {
         } else {
             UpdateStatus::NotUpdated
         }
+    }
+
+    fn schedule_continuation(
+        &mut self,
+        chunk_slot: &mut ChunkSlot,
+        next_data_range: DataRange,
+        push_front: bool,
+        ctx: &mut Context<'_>,
+    ) -> UpdateStatus {
+        let next_slot = match self.start_querying_chunk(next_data_range, ctx) {
+            Ok(slot) => slot,
+            Err((slot, e)) => {
+                tracing::debug!("Couldn't schedule continuation request: {e:?}");
+                slot
+            }
+        };
+        if push_front {
+            chunk_slot.parts.push_front(next_slot);
+        } else {
+            chunk_slot.parts.push_back(next_slot);
+        }
+        UpdateStatus::Updated
     }
 
     #[instrument(skip_all, level="debug", fields(chunk_index = slot.data_range.chunk_index))]
@@ -590,14 +607,7 @@ impl StreamController {
                 let read_range =
                     BlockRange::new(*slot.data_range.range.start(), *next_range.start() - 1);
                 let next_data_range = slot.data_range.with_range(next_range);
-                let slot = match self.start_querying_chunk(next_data_range, ctx) {
-                    Ok(slot) => slot,
-                    Err((slot, e)) => {
-                        tracing::debug!("Couldn't schedule continuation request: {e:?}");
-                        slot
-                    }
-                };
-                chunk_slot.parts.push_front(slot);
+                let _ = self.schedule_continuation(&mut chunk_slot, next_data_range, true, ctx);
                 self.buffer.push_front(chunk_slot);
                 (Poll::Ready(Some(Ok(data))), read_range)
             }
@@ -776,7 +786,7 @@ impl StreamController {
             range.range.end(),
             lease,
         );
-        let query = query_for_range(&mut self.request.query, &range.range);
+        let query = build_query_for_range(&mut self.request.query, &range.range);
         let start_time = tokio::time::Instant::now();
 
         let priority = self.stream_index * self.priority_stride + range.chunk_index as u32;
@@ -863,9 +873,19 @@ impl Slot {
             unreachable!("slot state was checked to be partial")
         };
 
-        let read_range = BlockRange::new(*self.data_range.range.start(), *next_range.start() - 1);
-        let next_data_range = self.data_range.clone().with_range(next_range);
-        self.data_range = self.data_range.clone().with_range(read_range);
+        // Clone the current data_range once and compute both the read_range and the next_data_range from it.
+        let old = self.data_range.clone();
+        let read_range = BlockRange::new(*old.range.start(), *next_range.start() - 1);
+        let next_data_range = DataRange {
+            range: next_range,
+            chunk: old.chunk.clone(),
+            chunk_index: old.chunk_index,
+        };
+        self.data_range = DataRange {
+            range: read_range,
+            chunk: old.chunk,
+            chunk_index: old.chunk_index,
+        };
         self.state = RequestState::Done(Ok(data));
         Some(next_data_range)
     }
@@ -991,7 +1011,7 @@ fn parse_response(
     state
 }
 
-fn query_for_range(query: &mut crate::types::ParsedQuery, range: &BlockRange) -> String {
+fn build_query_for_range(query: &mut crate::types::ParsedQuery, range: &BlockRange) -> String {
     if *range.start() == query.first_block() {
         query.to_string()
     } else {
@@ -1143,10 +1163,26 @@ mod tests {
         }"#;
         let mut query = ParsedQuery::try_from(query_json.to_owned()).unwrap();
 
-        let first_query = query_for_range(&mut query, &BlockRange::new(100, 120));
-        let continuation_query = query_for_range(&mut query, &BlockRange::new(121, 200));
+        let first_query = build_query_for_range(&mut query, &BlockRange::new(100, 120));
+        let continuation_query = build_query_for_range(&mut query, &BlockRange::new(121, 200));
 
         assert!(first_query.contains("parentBlockHash"));
         assert!(!continuation_query.contains("parentBlockHash"));
+    }
+
+    #[test]
+    fn chunk_slot_allows_many_parts() {
+        let mut chunk_slot = ChunkSlot::new(partial_slot(100, 200, 120, b"first"));
+        for i in 0..1000 {
+            chunk_slot.parts.push_back(Slot {
+                data_range: DataRange {
+                    range: BlockRange::new(201 + i, 300 + i),
+                    chunk: test_chunk(),
+                    chunk_index: (i + 1) as usize,
+                },
+                state: RequestState::NoWorkers,
+            });
+        }
+        assert_eq!(chunk_slot.parts.len(), 1001);
     }
 }
