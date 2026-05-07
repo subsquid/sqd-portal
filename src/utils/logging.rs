@@ -19,6 +19,7 @@ pub struct StreamStats {
     pub chunks_downloaded: u64,
     pub response_blocks: u64,
     pub response_bytes: u64,
+    pub max_chunk_parts: u64,
     pub start_time: Instant,
     pub last_log: Instant,
     pub throttled_for: Duration,
@@ -38,6 +39,7 @@ impl StreamStats {
             chunks_downloaded: 0,
             response_blocks: 0,
             response_bytes: 0,
+            max_chunk_parts: 1,
             start_time: now,
             last_log: now,
             throttled_for: Duration::from_secs(0),
@@ -54,6 +56,10 @@ impl StreamStats {
         self.response_bytes += bytes as u64;
     }
 
+    pub fn observe_chunk_parts(&mut self, parts: usize) {
+        self.max_chunk_parts = self.max_chunk_parts.max(parts as u64);
+    }
+
     pub fn throttled(&mut self, duration: Duration) {
         self.throttled_for += duration;
     }
@@ -63,6 +69,7 @@ impl StreamStats {
             tracing::info!(
                 queries_sent = self.queries_sent,
                 chunks_downloaded = self.chunks_downloaded,
+                max_chunk_parts = self.max_chunk_parts,
                 blocks_streamed = self.response_blocks,
                 bytes_streamed = self.response_bytes,
                 "Streaming..."
@@ -83,6 +90,7 @@ impl StreamStats {
             last_block = request.query.last_block(),
             queries_sent = self.queries_sent,
             chunks_downloaded = self.chunks_downloaded,
+            max_chunk_parts = self.max_chunk_parts,
             blocks_streamed = self.response_blocks,
             bytes_streamed = self.response_bytes,
             total_time = ?self.start_time.elapsed(),

@@ -351,6 +351,7 @@ impl StreamController {
             ContinuationPosition::Front => chunk_slot.parts.push_front(next_slot),
             ContinuationPosition::Back => chunk_slot.parts.push_back(next_slot),
         }
+        self.stats.observe_chunk_parts(chunk_slot.parts.len());
         UpdateStatus::Updated
     }
 
@@ -672,7 +673,9 @@ impl StreamController {
             ) {
                 Ok(slot) => {
                     let paused = slot.is_paused();
-                    self.buffer.push_back(ChunkSlot::new(slot));
+                    let chunk_slot = ChunkSlot::new(slot);
+                    self.stats.observe_chunk_parts(chunk_slot.parts.len());
+                    self.buffer.push_back(chunk_slot);
                     self.next_chunk = self.get_next_chunk(&chunk);
                     if paused {
                         break;
@@ -685,7 +688,9 @@ impl StreamController {
                     if self.buffer.len() == 0 {
                         // Couldn't schedule a new request with no ongoing requests
                         // Return the error immediately
-                        self.buffer.push_back(ChunkSlot::new(slot));
+                        let chunk_slot = ChunkSlot::new(slot);
+                        self.stats.observe_chunk_parts(chunk_slot.parts.len());
+                        self.buffer.push_back(chunk_slot);
                     }
                     self.last_error = Some(e.to_string());
                     self.next_chunk = Some(chunk);
