@@ -217,23 +217,23 @@ impl StreamController {
 
     #[instrument(skip_all, level="debug", fields(chunk_index = slot.data_range.chunk_index))]
     fn poll_slot(&mut self, slot: &mut Slot, ctx: &mut Context<'_>) -> UpdateStatus {
-        if !matches!(slot.state, RequestState::Pending(_)) {
-            return self.poll_deferred_slot(slot, ctx);
-        }
-
-        let result = {
-            let RequestState::Pending(pending) = &mut slot.state else {
-                unreachable!("checked above")
-            };
-            self.poll_pending_slot(&slot.data_range, pending, ctx)
-        };
-
-        match result {
-            PendingSlotPoll::Updated(state) => {
-                slot.state = state;
-                UpdateStatus::Updated
+        if let RequestState::Pending(pending) = &mut slot.state {
+            // Inline the logic from poll_pending_slot
+            match self.poll_worker_requests(&slot.data_range, pending, ctx) {
+                Ok(summary) => match self.advance_pending_slot(&slot.data_range, pending, summary, ctx) {
+                    PendingSlotPoll::Updated(state) => {
+                        slot.state = state;
+                        UpdateStatus::Updated
+                    }
+                    PendingSlotPoll::NotUpdated => UpdateStatus::NotUpdated,
+                },
+                Err(state) => {
+                    slot.state = state;
+                    UpdateStatus::Updated
+                }
             }
-            PendingSlotPoll::NotUpdated => UpdateStatus::NotUpdated,
+        } else {
+            self.poll_deferred_slot(slot, ctx)
         }
     }
 
@@ -261,18 +261,6 @@ impl StreamController {
                     UpdateStatus::Updated
                 }
             }
-        }
-    }
-
-    fn poll_pending_slot(
-        &mut self,
-        data_range: &DataRange,
-        pending: &mut PendingRequests,
-        ctx: &mut Context<'_>,
-    ) -> PendingSlotPoll {
-        match self.poll_worker_requests(data_range, pending, ctx) {
-            Ok(summary) => self.advance_pending_slot(data_range, pending, summary, ctx),
-            Err(state) => PendingSlotPoll::Updated(state),
         }
     }
 
@@ -314,7 +302,18 @@ impl StreamController {
                 };
                 summary.newly_finished += 1;
 
-                let response = response.expect("Worker query task shouldn't panic");
+                let response = match response {
+                    Ok(res) => res,
+                    Err(join_err) => {
+                        // Convert JoinError to QueryError::Failure and treat as finished error
+                        let err = QueryError::Failure(format!("Worker task join error: {join_err}"));
+                        *request = WorkerRequest::Finished(FinishedWorkerRequest {
+                            result: QueryResult::Err(err.clone()),
+                            worker: running.worker,
+                        });
+                        return Ok(());
+                    }
+                };
 
                 // This is intentionally measured when the result has been polled, not when it's ready.
                 // If the stream is consumed slower than generated, this duration may get
