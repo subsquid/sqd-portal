@@ -220,13 +220,15 @@ impl StreamController {
         if let RequestState::Pending(pending) = &mut slot.state {
             // Inline the logic from poll_pending_slot
             match self.poll_worker_requests(&slot.data_range, pending, ctx) {
-                Ok(summary) => match self.advance_pending_slot(&slot.data_range, pending, summary, ctx) {
-                    PendingSlotPoll::Updated(state) => {
-                        slot.state = state;
-                        UpdateStatus::Updated
+                Ok(summary) => {
+                    match self.advance_pending_slot(&slot.data_range, pending, summary, ctx) {
+                        PendingSlotPoll::Updated(state) => {
+                            slot.state = state;
+                            UpdateStatus::Updated
+                        }
+                        PendingSlotPoll::NotUpdated => UpdateStatus::NotUpdated,
                     }
-                    PendingSlotPoll::NotUpdated => UpdateStatus::NotUpdated,
-                },
+                }
                 Err(state) => {
                     slot.state = state;
                     UpdateStatus::Updated
@@ -306,7 +308,8 @@ impl StreamController {
                     Ok(res) => res,
                     Err(join_err) => {
                         // Convert JoinError to QueryError::Failure and treat as finished error
-                        let err = QueryError::Failure(format!("Worker task join error: {join_err}"));
+                        let err =
+                            QueryError::Failure(format!("Worker task join error: {join_err}"));
                         *request = WorkerRequest::Finished(FinishedWorkerRequest {
                             result: QueryResult::Err(err.clone()),
                             worker: running.worker,
