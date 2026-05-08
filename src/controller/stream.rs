@@ -426,7 +426,7 @@ impl StreamController {
         let worker =
             match self
                 .network
-                .find_worker(&self.request.dataset_id, *range.range.start(), true)
+                .find_worker(&self.request.dataset_id, *range.range.start(), false)
             {
                 Ok(worker) => worker,
                 Err(NoWorker::AllUnavailable) => return Err(SendQueryError::NoWorkers),
@@ -455,7 +455,7 @@ impl StreamController {
                 range.range.clone(),
                 query,
                 self.request.compression,
-                false,
+                true,
             )
             .in_current_span();
         self.stats.query_sent();
