@@ -117,6 +117,12 @@ struct ChunkSlot {
     active: Option<Slot>,
 }
 
+enum BufferedActiveSlot {
+    Nothing,
+    Completed,
+    Partial(DataRange),
+}
+
 enum RequestState {
     /// Couldn't find enough workers now.
     /// Retry whenever the stream is polled, or give up if this is the first slot.
@@ -293,23 +299,18 @@ impl StreamController {
         while let Some(slot) = chunk_slot.active.as_mut() {
             updated |= self.poll_slot(slot, ctx).updated();
 
-            if let Some(response) = slot.take_completed_response() {
-                chunk_slot.pending_responses.push_back(response);
-                chunk_slot.active = None;
-                updated = true;
-                break;
-            }
-
-            if self.request.eager_continuations {
-                if let Some((response, next_data_range)) = slot.take_partial_continuation() {
-                    chunk_slot.pending_responses.push_back(response);
+            match chunk_slot.buffer_active_response(self.request.eager_continuations) {
+                BufferedActiveSlot::Nothing => break,
+                BufferedActiveSlot::Completed => {
+                    updated = true;
+                    break;
+                }
+                BufferedActiveSlot::Partial(next_data_range) => {
                     self.schedule_continuation(chunk_slot, next_data_range, ctx);
                     updated = true;
                     continue;
                 }
             }
-
-            break;
         }
 
         if updated {
@@ -552,7 +553,7 @@ impl StreamController {
         &mut self,
         ctx: &mut Context<'_>,
     ) -> Poll<Option<Result<ResponseChunk, RequestError>>> {
-        let mut chunk_slot = loop {
+        let chunk_slot = loop {
             let Some(chunk_slot) = self.buffer.pop_front() else {
                 return Poll::Ready(None);
             };
@@ -561,11 +562,28 @@ impl StreamController {
             }
         };
 
-        if let Some(response) = chunk_slot.pending_responses.pop_front() {
-            if !chunk_slot.is_empty() {
-                self.buffer.push_front(chunk_slot);
+        let mut chunk_slot = match self.pop_buffered_response(chunk_slot) {
+            Ok(response) => return response,
+            Err(chunk_slot) => chunk_slot,
+        };
+
+        match chunk_slot.buffer_active_response(true) {
+            BufferedActiveSlot::Nothing => {}
+            BufferedActiveSlot::Completed => {
+                let response = self
+                    .pop_buffered_response(chunk_slot)
+                    .ok()
+                    .expect("completed active slot should have produced a buffered response");
+                return response;
             }
-            return self.emit_buffered_response(response);
+            BufferedActiveSlot::Partial(next_data_range) => {
+                self.schedule_continuation(&mut chunk_slot, next_data_range, ctx);
+                let response = self
+                    .pop_buffered_response(chunk_slot)
+                    .ok()
+                    .expect("partial active slot should have produced a buffered response");
+                return response;
+            }
         }
 
         let Some(slot) = chunk_slot.active.take() else {
@@ -573,11 +591,6 @@ impl StreamController {
         };
 
         match slot.state {
-            RequestState::Done(result) => self.emit_buffered_response(BufferedResponse {
-                chunk_index: slot.data_range.chunk_index,
-                read_range: slot.data_range.range,
-                result,
-            }),
             RequestState::NoWorkers => {
                 // We don't know how long we'll have to wait, so give up immediately
                 Poll::Ready(Some(Err(RequestError::Unavailable)))
@@ -601,21 +614,23 @@ impl StreamController {
                 self.buffer.push_front(chunk_slot);
                 Poll::Pending
             }
-            RequestState::Partial(PartialResult { data, next_range }) => {
-                // Return the partial result and schedule the continuation query
-                let chunk_index = slot.data_range.chunk_index;
-                let read_range =
-                    BlockRange::new(*slot.data_range.range.start(), *next_range.start() - 1);
-                let next_data_range = slot.data_range.with_range(next_range);
-                self.schedule_continuation(&mut chunk_slot, next_data_range, ctx);
-                self.buffer.push_front(chunk_slot);
-                self.emit_buffered_response(BufferedResponse {
-                    chunk_index,
-                    read_range,
-                    result: Ok(data),
-                })
+            RequestState::Done(_) | RequestState::Partial(_) => {
+                unreachable!("completed active slots should be buffered before emission")
             }
         }
+    }
+
+    fn pop_buffered_response(
+        &mut self,
+        mut chunk_slot: ChunkSlot,
+    ) -> Result<Poll<Option<Result<ResponseChunk, RequestError>>>, ChunkSlot> {
+        let Some(response) = chunk_slot.pending_responses.pop_front() else {
+            return Err(chunk_slot);
+        };
+        if !chunk_slot.is_empty() {
+            self.buffer.push_front(chunk_slot);
+        }
+        Ok(self.emit_buffered_response(response))
     }
 
     fn emit_buffered_response(
@@ -881,6 +896,8 @@ impl Slot {
             return None;
         };
 
+        // This slot is consumed by `ChunkSlot::buffer_active_response` immediately after this
+        // returns; `NoWorkers` is only a temporary placeholder for moving the partial state out.
         let state = std::mem::replace(&mut self.state, RequestState::NoWorkers);
         let RequestState::Done(result) = state else {
             unreachable!("slot state was checked to be done")
@@ -911,15 +928,12 @@ impl Slot {
             chunk: old.chunk.clone(),
             chunk_index: old.chunk_index,
         };
-        self.data_range = DataRange {
-            range: read_range,
-            chunk: old.chunk,
+
+        let response = BufferedResponse {
             chunk_index: old.chunk_index,
+            read_range,
+            result: Ok(data),
         };
-        self.state = RequestState::Done(Ok(data));
-        let response = self
-            .take_completed_response()
-            .expect("partial data should have become a completed response");
         Some((response, next_data_range))
     }
 }
@@ -942,6 +956,28 @@ impl ChunkSlot {
 
     fn num_parts(&self) -> usize {
         self.pending_responses.len() + usize::from(self.active.is_some())
+    }
+
+    fn buffer_active_response(&mut self, include_partial: bool) -> BufferedActiveSlot {
+        let Some(slot) = self.active.as_mut() else {
+            return BufferedActiveSlot::Nothing;
+        };
+
+        if let Some(response) = slot.take_completed_response() {
+            self.pending_responses.push_back(response);
+            self.active = None;
+            return BufferedActiveSlot::Completed;
+        }
+
+        if include_partial {
+            if let Some((response, next_data_range)) = slot.take_partial_continuation() {
+                self.pending_responses.push_back(response);
+                self.active = None;
+                return BufferedActiveSlot::Partial(next_data_range);
+            }
+        }
+
+        BufferedActiveSlot::Nothing
     }
 
     fn debug_symbol(&self) -> char {
