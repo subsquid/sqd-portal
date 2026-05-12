@@ -549,6 +549,12 @@ where
             .map_err(IntoResponse::into_response)?;
 
         let buffer_size = match params.get("buffer_size").map(|v| v.parse()) {
+            Some(Ok(0)) => {
+                return Err(RequestError::BadRequest(
+                    "buffer_size must be greater than 0".to_string(),
+                )
+                .into_response())
+            }
             Some(Ok(value)) => value,
             Some(Err(e)) => {
                 return Err(
@@ -584,6 +590,12 @@ where
         };
         let max_chunks = match params.get("max_chunks") {
             Some(value) => match value.parse() {
+                Ok(0) => {
+                    return Err(RequestError::BadRequest(
+                        "max_chunks must be greater than 0".to_string(),
+                    )
+                    .into_response())
+                }
                 Ok(value) => Some(value),
                 Err(e) => {
                     return Err(
