@@ -38,6 +38,7 @@ fn buckets(start: f64, count: usize) -> impl Iterator<Item = f64> {
 
 lazy_static::lazy_static! {
     pub static ref KNOWN_WORKERS: Gauge = Default::default();
+    pub static ref AVAILABLE_COMPUTE_UNITS: Gauge = Default::default();
 
     pub static ref HTTP_STATUS: Family<Labels, Counter> = Default::default();
     pub static ref HTTP_TTFB: Family<Labels, Histogram> =
@@ -223,6 +224,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "known_workers",
         "Number of workers seen in the network",
         KNOWN_WORKERS.clone(),
+    );
+    registry.register(
+        "available_compute_units",
+        "Compute units available to this portal per epoch",
+        AVAILABLE_COMPUTE_UNITS.clone(),
     );
     registry.register(
         "streams_active",

@@ -288,6 +288,7 @@ impl NetworkClient {
                 epoch_started,
                 compute_units_per_epoch,
             );
+            metrics::AVAILABLE_COMPUTE_UNITS.set(compute_units_per_epoch as i64);
 
             if epoch != current_epoch {
                 tracing::info!("Epoch {epoch} started");
