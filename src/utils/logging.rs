@@ -12,6 +12,7 @@ use tracing::Instrument;
 use crate::{metrics, types::StreamRequest};
 
 const LOG_INTERVAL: Duration = Duration::from_secs(5);
+const NO_DATA_SOURCE: &str = "none";
 
 pub struct StreamStats {
     pub queries_sent: u64,
@@ -111,6 +112,13 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         .get::<EndpointName>()
         .map(|e| e.0.clone())
         .unwrap_or_else(|| path.clone());
+    let data_source = response
+        .headers()
+        .get(crate::endpoints::stream::DATA_SOURCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(data_source_metric_label)
+        .unwrap_or(NO_DATA_SOURCE)
+        .to_owned();
 
     span.in_scope(|| {
         tracing::info!(
@@ -124,9 +132,22 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         );
     });
 
-    metrics::report_http_response(endpoint, response.status(), latency.as_secs_f64());
+    metrics::report_http_response(
+        endpoint,
+        response.status(),
+        data_source,
+        latency.as_secs_f64(),
+    );
 
     response
+}
+
+fn data_source_metric_label(data_source: &str) -> &str {
+    match data_source {
+        crate::endpoints::stream::DATA_SOURCE_REALTIME_METRIC => "hotblocks",
+        crate::endpoints::stream::DATA_SOURCE_NETWORK_METRIC => "network",
+        other => other,
+    }
 }
 
 pub trait MethodRouterExt {
@@ -139,6 +160,33 @@ where
 {
     fn endpoint(self, endpoint: impl Into<String>) -> Self {
         self.layer(EndpointAnnotationLayer::new(endpoint))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::data_source_metric_label;
+    use crate::endpoints::stream::{DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_REALTIME_METRIC};
+
+    #[test]
+    fn data_source_metric_label_keeps_network() {
+        assert_eq!(
+            data_source_metric_label(DATA_SOURCE_NETWORK_METRIC),
+            "network"
+        );
+    }
+
+    #[test]
+    fn data_source_metric_label_maps_real_time_to_hotblocks() {
+        assert_eq!(
+            data_source_metric_label(DATA_SOURCE_REALTIME_METRIC),
+            "hotblocks"
+        );
+    }
+
+    #[test]
+    fn data_source_metric_label_preserves_unrecognized_values() {
+        assert_eq!(data_source_metric_label("custom"), "custom");
     }
 }
 

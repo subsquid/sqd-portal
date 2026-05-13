@@ -189,7 +189,13 @@ async fn stream_from_network(
 
     let stream = match task_manager.spawn_stream(request).await {
         Ok(stream) => stream,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            let mut response = e.into_response();
+            response
+                .headers_mut()
+                .insert(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
+            return response;
+        }
     };
 
     let mut res = Response::builder().header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
@@ -240,10 +246,8 @@ async fn stream_from_hotblocks(
         Err(e) => forward_hotblocks_response(Err(e)),
     };
 
-    if res.status().is_success() {
-        res.headers_mut()
-            .append(DATA_SOURCE_HEADER, DATA_SOURCE_REALTIME);
-    }
+    res.headers_mut()
+        .insert(DATA_SOURCE_HEADER, DATA_SOURCE_REALTIME);
     res
 }
 
@@ -343,9 +347,11 @@ async fn delayed_no_content_response_with_builder(
 const FINALIZED_NUMBER_HEADER: &str = "x-sqd-finalized-head-number";
 const FINALIZED_HASH_HEADER: &str = "x-sqd-finalized-head-hash";
 const HEAD_NUMBER_HEADER: &str = "x-sqd-head-number";
-const DATA_SOURCE_HEADER: &str = "x-sqd-data-source";
-const DATA_SOURCE_NETWORK: HeaderValue = HeaderValue::from_static("network");
-const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static("real_time");
+pub(crate) const DATA_SOURCE_HEADER: &str = "x-sqd-data-source";
+pub(crate) const DATA_SOURCE_NETWORK_METRIC: &str = "network";
+pub(crate) const DATA_SOURCE_REALTIME_METRIC: &str = "real_time";
+const DATA_SOURCE_NETWORK: HeaderValue = HeaderValue::from_static(DATA_SOURCE_NETWORK_METRIC);
+const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static(DATA_SOURCE_REALTIME_METRIC);
 
 #[cfg(test)]
 mod tests {

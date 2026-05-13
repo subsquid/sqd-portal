@@ -3,6 +3,7 @@ use std::{future::Future, sync::Arc};
 use axum::{
     extract::Path,
     http::{header, StatusCode},
+    response::{IntoResponse, Response},
     Extension,
 };
 use futures::{pin_mut, StreamExt};
@@ -21,6 +22,8 @@ use crate::{
     },
 };
 
+use super::stream::{DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_REALTIME_METRIC};
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct BlockNumberResponse {
     block_number: u64,
@@ -34,7 +37,7 @@ pub(crate) async fn get_blocknumber_by_timestamp(
     Extension(config): Extension<Arc<Config>>,
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
     dataset: DatasetConfig,
-) -> Result<axum::Json<BlockNumberResponse>, (StatusCode, axum::Json<GenericError>)> {
+) -> Response {
     resolve(
         timestamp,
         &req,
@@ -45,8 +48,36 @@ pub(crate) async fn get_blocknumber_by_timestamp(
         &dataset,
     )
     .await
-    .map(|n| BlockNumberResponse { block_number: n }.into())
-    .map_err(BlockNumberLookupError::into_response)
+    .map(|resolved| {
+        (
+            [(DATA_SOURCE_HEADER, resolved.data_source.as_str())],
+            axum::Json(BlockNumberResponse {
+                block_number: resolved.block_number,
+            }),
+        )
+            .into_response()
+    })
+    .unwrap_or_else(BlockNumberLookupError::into_response)
+}
+
+pub struct ResolvedBlockNumber {
+    block_number: u64,
+    data_source: BlockNumberDataSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockNumberDataSource {
+    Network,
+    Hotblocks,
+}
+
+impl BlockNumberDataSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Network => DATA_SOURCE_NETWORK_METRIC,
+            Self::Hotblocks => DATA_SOURCE_REALTIME_METRIC,
+        }
+    }
 }
 
 /// Failure modes for resolving a block number by timestamp.
@@ -63,14 +94,14 @@ pub enum BlockNumberLookupError {
 
 impl BlockNumberLookupError {
     /// Convert a resolver error into the timestamp endpoint's HTTP response.
-    pub fn into_response(self) -> (StatusCode, axum::Json<GenericError>) {
+    pub fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
             Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
             Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
         };
 
-        (status, GenericError { message }.into())
+        (status, axum::Json(GenericError { message })).into_response()
     }
 }
 
@@ -87,7 +118,7 @@ pub async fn resolve(
     config: &Config,
     hotblocks: &HotblocksHandle,
     dataset: &DatasetConfig,
-) -> Result<u64, BlockNumberLookupError> {
+) -> Result<ResolvedBlockNumber, BlockNumberLookupError> {
     get_blocknumber_by_timestamp_inner(
         dataset.network_id.is_some(),
         dataset.hotblocks.is_some(),
@@ -124,7 +155,7 @@ async fn get_blocknumber_by_timestamp_inner<
     has_hotblocks: bool,
     archive_lookup: ArchiveLookup,
     hotblocks_lookup: HotblocksLookup,
-) -> Result<u64, BlockNumberLookupError>
+) -> Result<ResolvedBlockNumber, BlockNumberLookupError>
 where
     ArchiveLookup: FnOnce() -> ArchiveFuture,
     ArchiveFuture: Future<Output = Result<u64, BlockNumberLookupError>>,
@@ -139,14 +170,24 @@ where
 
     if has_archive {
         match archive_lookup().await {
-            Ok(n) => return Ok(n),
+            Ok(block_number) => {
+                return Ok(ResolvedBlockNumber {
+                    block_number,
+                    data_source: BlockNumberDataSource::Network,
+                })
+            }
             Err(BlockNumberLookupError::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
     }
 
     if has_hotblocks {
-        return hotblocks_lookup().await;
+        return hotblocks_lookup()
+            .await
+            .map(|block_number| ResolvedBlockNumber {
+                block_number,
+                data_source: BlockNumberDataSource::Hotblocks,
+            });
     }
 
     Err(BlockNumberLookupError::NotFound(
@@ -386,7 +427,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result, 42);
+        assert_eq!(result.block_number, 42);
+        assert_eq!(result.data_source, BlockNumberDataSource::Network);
         assert_eq!(archive_calls.load(Ordering::Relaxed), 1);
         assert_eq!(hotblocks_calls.load(Ordering::Relaxed), 0);
     }
@@ -419,7 +461,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result, 84);
+        assert_eq!(result.block_number, 84);
+        assert_eq!(result.data_source, BlockNumberDataSource::Hotblocks);
         assert_eq!(archive_calls.load(Ordering::Relaxed), 1);
         assert_eq!(hotblocks_calls.load(Ordering::Relaxed), 1);
     }
@@ -450,7 +493,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result, 168);
+        assert_eq!(result.block_number, 168);
+        assert_eq!(result.data_source, BlockNumberDataSource::Hotblocks);
         assert_eq!(archive_calls.load(Ordering::Relaxed), 0);
         assert_eq!(hotblocks_calls.load(Ordering::Relaxed), 1);
     }
