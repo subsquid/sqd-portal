@@ -101,10 +101,16 @@ pub fn report_backoff(worker: &PeerId) {
         .inc();
 }
 
-pub fn report_http_response(endpoint: String, status: StatusCode, seconds_to_first_byte: f64) {
+pub fn report_http_response(
+    endpoint: String,
+    status: StatusCode,
+    data_source: String,
+    seconds_to_first_byte: f64,
+) {
     let labels = vec![
         ("endpoint".to_owned(), endpoint.clone()),
         ("status".to_owned(), status.as_str().to_owned()),
+        ("data_source".to_owned(), data_source),
     ];
     HTTP_STATUS.get_or_create(&labels).inc();
     HTTP_TTFB

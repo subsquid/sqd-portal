@@ -12,6 +12,7 @@ use tracing::Instrument;
 use crate::{metrics, types::StreamRequest};
 
 const LOG_INTERVAL: Duration = Duration::from_secs(5);
+const NO_DATA_SOURCE: &str = "none";
 
 pub struct StreamStats {
     pub queries_sent: u64,
@@ -111,6 +112,17 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         .get::<EndpointName>()
         .map(|e| e.0.clone())
         .unwrap_or_else(|| path.clone());
+    let data_source = response
+        .headers()
+        .get(crate::endpoints::stream::DATA_SOURCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| match value {
+            crate::endpoints::stream::DATA_SOURCE_REALTIME_METRIC => "hotblocks",
+            crate::endpoints::stream::DATA_SOURCE_NETWORK_METRIC => "network",
+            other => other,
+        })
+        .unwrap_or(NO_DATA_SOURCE)
+        .to_owned();
 
     span.in_scope(|| {
         tracing::info!(
@@ -124,7 +136,12 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         );
     });
 
-    metrics::report_http_response(endpoint, response.status(), latency.as_secs_f64());
+    metrics::report_http_response(
+        endpoint,
+        response.status(),
+        data_source,
+        latency.as_secs_f64(),
+    );
 
     response
 }
