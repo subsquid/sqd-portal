@@ -114,9 +114,10 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
 
     // Initialize Sentry before tracing to integrate them
-    if args.config.sentry_is_enabled {
-        let _sentry_guard = setup_sentry(&args.config, &args);
-    }
+    let _sentry_guard = args
+        .config
+        .sentry_is_enabled
+        .then(|| setup_sentry(&args.config, &args));
     setup_tracing(args.json_log, args.log_span_durations);
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
