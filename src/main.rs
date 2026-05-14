@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         .config
         .sentry_is_enabled
         .then(|| setup_sentry(&args.config, &args));
+
     setup_tracing(args.json_log, args.log_span_durations);
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
