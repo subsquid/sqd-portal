@@ -534,6 +534,16 @@ impl NetworkClient {
                                     metrics::report_query_result(&peer_id, "block_mismatch");
                                     self.network_state.report_query_success(peer_id);
                                     Err(QueryError::BaseBlockMismatch(block_ref))
+                                } else if s == "Response too large" {
+                                    // Caused by the query covering too much data; the client
+                                    // should narrow it down rather than retry against another worker
+                                    metrics::report_query_result(&peer_id, "response_too_large");
+                                    self.network_state.report_query_success(peer_id);
+                                    Err(QueryError::BadRequest(
+                                        "the response for this block exceeds the size limit; \
+                                         try narrowing the query to request only the necessary data"
+                                            .to_owned(),
+                                    ))
                                 } else {
                                     metrics::report_query_result(&peer_id, "server_error");
                                     self.network_state.report_query_error(peer_id);
