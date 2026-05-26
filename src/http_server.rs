@@ -51,6 +51,7 @@ use crate::sql;
 #[cfg(feature = "sql")]
 use axum::body;
 
+#[allow(deprecated)]
 pub async fn run_server(
     task_manager: Arc<TaskManager>,
     network_client: Arc<NetworkClient>,
@@ -566,9 +567,9 @@ async fn get_readiness(Extension(client): Extension<Arc<NetworkClient>>) -> impl
         (status = 200, description = "Height retrieved successfully", body = String),
         (status = 404, description = "Dataset not found"),
     ),
-    tag = "query"
+    tag = "query",
 )]
-// Deprecated
+#[deprecated]
 async fn get_height(
     Extension(network): Extension<Arc<NetworkClient>>,
     Path(dataset): Path<String>,
@@ -597,9 +598,9 @@ async fn get_height(
         (status = 200, description = "Worker information retrieved", body = serde_json::Value),
         (status = 404, description = "Dataset not found"),
     ),
-    tag = "debug"
+    tag = "debug",
 )]
-// Deprecated
+#[deprecated]
 async fn get_worker(
     Path((dataset, start_block)): Path<(String, u64)>,
     dataset_id: DatasetId,
@@ -653,8 +654,9 @@ async fn get_worker(
         (status = 404, description = "Dataset or worker not found"),
         (status = 503, description = "Service unavailable"),
     ),
-    tag = "query"
+    tag = "query",
 )]
+#[deprecated]
 async fn execute_query(
     Path((dataset_id_encoded, worker_id)): Path<(String, PeerId)>,
     Extension(client): Extension<Arc<NetworkClient>>,
