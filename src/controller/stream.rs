@@ -1,3 +1,57 @@
+//! Streaming query controller.
+//!
+//! [`StreamController`] produces an ordered stream of response chunks for a
+//! client query that may span many dataset chunks. Internally it keeps a
+//! sliding buffer of in-flight per-chunk requests, drains the front in chunk
+//! order, and refills the back speculatively.
+//!
+//! ```text
+//!                        StreamController (impl futures::Stream)
+//!                                        │
+//!                                        ▼
+//!                               poll_next(ctx)  ◄────── HTTP handler awaits items
+//!                                        │
+//!             ┌──────────────────────────┼──────────────────────────┐
+//!             ▼                          ▼                          ▼
+//!      try_fill_slots          poll_slot (every slot)         pop_response
+//!      (FILL the back)         (ADVANCE state)                (DRAIN the front)
+//!             │                          │                          │
+//!             │                          │                          │
+//!             │   ┌──────────────────────┘                          │
+//!             │   │                                                 │
+//!             ▼   ▼                                                 ▼
+//!
+//!   ┌─────────────────────────────────────────────────────────┐    output to
+//!   │                  buffer: SlidingArray<Slot>             │    client (in
+//!   │                                                         │    chunk order)
+//!   │   front                                          back   │
+//!   │  ┌──────┐   ┌──────┐   ┌──────┐   ┌──────┐   ┌──────┐   │
+//!   │  │ Slot │ → │ Slot │ → │ Slot │ → │ Slot │ → │ Slot │   │
+//!   │  │chunk0│   │chunk1│   │chunk2│   │chunk3│   │chunk4│   │
+//!   │  └──────┘   └──────┘   └──────┘   └──────┘   └──────┘   │
+//!   │     ▲                                            ▲      │
+//!   │     │ pop_front                       push_back  │      │
+//!   │     │ (deliver this one next)        (start next │      │
+//!   │     │                                 chunk's    │      │
+//!   │     │                                 query)     │      │
+//!   └─────┴────────────────────────────────────────────┴──────┘
+//!                               ▲
+//!                               │
+//!                   Slot.state evolves through:
+//!                   ┌──────────┐ poll_slot   ┌──────────┐
+//!                   │ Pending  │────────────▶│  Done    │ ─ Ok(bytes) / Err
+//!                   │ (query   │             └──────────┘
+//!                   │  spawned)│             ┌──────────┐
+//!                   │          │────────────▶│ Partial  │ ─ has bytes for
+//!                   └──────────┘             │ (more to │   prefix; rest
+//!                        ▲                   │  fetch)  │   re-queried
+//!                        │                   └──────────┘
+//!                        │                         │
+//!                        └─────────────────────────┘
+//!                        continuation request fires
+//!                        on pop_response (next_range)
+//! ```
+
 #![allow(unstable_name_collisions)]
 
 use std::{

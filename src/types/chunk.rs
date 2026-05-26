@@ -15,7 +15,7 @@ const HASH_MAX_LEN: usize = 8;
 pub struct DataChunk {
     pub first_block: BlockNumber,
     pub last_block: BlockNumber,
-    pub top_dir: BlockNumber,
+    top_dir: BlockNumber,
     // TODO: use `SID` from the common library
     last_hash: [u8; HASH_MAX_LEN],
 }
