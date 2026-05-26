@@ -41,8 +41,9 @@ pub(crate) struct BlockNumberResponse {
     ),
     responses(
         (status = 200, description = "Block number resolved", body = crate::openapi::BlockNumberResponse),
-        (status = 404, description = "No block found for timestamp"),
-        (status = 503, description = "Upstream data source unavailable"),
+        (status = 404, description = "No block found for timestamp", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 503, description = "Upstream data source unavailable", body = ErrorResponse),
     ),
     tag = "query"
 )]
