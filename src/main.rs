@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use config::Config;
@@ -154,6 +156,20 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let cancellation_token = CancellationToken::new();
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let sigterm = {
+        use anyhow::Context;
+        use tokio::signal::unix::{signal, SignalKind};
+        signal(SignalKind::terminate()).context("install SIGTERM handler")?
+    };
+
+    tokio::spawn(watch_shutdown_signal(
+        sigterm,
+        shutting_down.clone(),
+        cancellation_token.clone(),
+        config.pre_drain_grace_period,
+    ));
+
     let (server_res, ()) = tokio::try_join!(
         tokio::spawn(run_server(
             task_manager,
@@ -162,10 +178,75 @@ async fn main() -> anyhow::Result<()> {
             args.http_listen,
             config.clone(),
             hotblocks,
+            shutting_down,
+            cancellation_token.clone(),
         )),
         network_client.run(cancellation_token),
     )?;
     server_res?;
 
     Ok(())
+}
+
+/// Awaits SIGTERM and runs the two-phase shutdown sequence.
+///
+/// See [`docs/GRACEFUL_SHUTDOWN.md`](../docs/GRACEFUL_SHUTDOWN.md) for the
+/// full lifecycle, timing rationale, and non-goals.
+async fn watch_shutdown_signal(
+    mut sigterm: tokio::signal::unix::Signal,
+    shutting_down: Arc<AtomicBool>,
+    cancel: CancellationToken,
+    pre_drain_grace: Duration,
+) {
+    sigterm.recv().await;
+    tracing::info!("SIGTERM received; starting shutdown sequence");
+    run_shutdown_sequence(shutting_down, cancel, pre_drain_grace).await;
+}
+
+async fn run_shutdown_sequence(
+    shutting_down: Arc<AtomicBool>,
+    cancel: CancellationToken,
+    pre_drain_grace: Duration,
+) {
+    shutting_down.store(true, Ordering::Relaxed);
+    tracing::info!("/ready will return 503 for {pre_drain_grace:?} before draining");
+    tokio::time::sleep(pre_drain_grace).await;
+    tracing::info!("Pre-drain grace elapsed; starting HTTP drain and stopping background tasks");
+    cancel.cancel();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_sequence_flips_flag_then_cancels_after_grace() {
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
+        let grace = Duration::from_secs(5);
+
+        let task = tokio::spawn(run_shutdown_sequence(
+            shutting_down.clone(),
+            cancel.clone(),
+            grace,
+        ));
+
+        // Yield to let the spawned task run up to the `sleep`.
+        tokio::task::yield_now().await;
+        assert!(
+            shutting_down.load(Ordering::Relaxed),
+            "flag flips immediately"
+        );
+        assert!(!cancel.is_cancelled(), "cancel held until grace elapses");
+
+        tokio::time::advance(grace - Duration::from_millis(1)).await;
+        assert!(
+            !cancel.is_cancelled(),
+            "cancel still pending just before grace"
+        );
+
+        tokio::time::advance(Duration::from_millis(2)).await;
+        task.await.expect("shutdown sequence completes");
+        assert!(cancel.is_cancelled(), "cancel fires after grace");
+    }
 }
