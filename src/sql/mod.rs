@@ -19,8 +19,6 @@ use crate::types::GenericError;
 
 use axum::body;
 
-use thiserror;
-use tracing;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -95,12 +93,9 @@ pub async fn query(
             schema_name: src.schema_name.to_string(),
             table_name: src.table_name.to_string(),
             approx_num_rows: metadata::compute_stats(&dataset_id, &src.table_name, &blocks),
-            workers: workers,
+            workers,
         });
     }
 
-    Ok(SqlQueryResponse {
-        query_id: query_id,
-        tables: tables,
-    })
+    Ok(SqlQueryResponse { query_id, tables })
 }

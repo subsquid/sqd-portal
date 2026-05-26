@@ -93,25 +93,23 @@ impl RewriteTarget {
     // TODO: does not need to be a method
     fn map_fields_on_sources(&self, sources: &[Source]) -> HashMap<usize, usize> {
         let mut m = HashMap::new();
-        let mut s = 0;
-        for src in sources.iter() {
+        for (s, src) in sources.iter().enumerate() {
             let l = src.projection.len();
             for i in src.first_field..src.first_field + l {
                 m.insert(i, s);
             }
-            s += 1;
         }
         m
     }
 
-    fn pushdown_all_filters(&self, sources: &mut Vec<Source>, filter: &Expression) {
+    fn pushdown_all_filters(&self, sources: &mut [Source], filter: &Expression) {
         sources[0].filter = Some(filter.clone());
     }
 
     fn pushdown_filters_per_source(
         &self,
         tctx: &TraversalContext,
-        sources: &mut Vec<Source>,
+        sources: &mut [Source],
         filter: &Expression,
     ) -> RewriteTargetResult<()> {
         for src in sources {
@@ -130,11 +128,11 @@ impl RewriteTarget {
     fn pushdown_join_conditions(
         &self,
         tctx: &TraversalContext,
-        sources: &mut Vec<Source>,
+        sources: &mut [Source],
     ) -> RewriteTargetResult<()> {
         let mut joins = Vec::new();
         self.get_joins(&mut joins);
-        let field_map = self.map_fields_on_sources(&sources);
+        let field_map = self.map_fields_on_sources(sources);
         for join in joins.iter() {
             let (l, r) = extract_sources_from_join(join, &field_map, &sources[0]);
             if l.is_none() || r.is_none() {
@@ -147,13 +145,11 @@ impl RewriteTarget {
             let ls = &sources[l];
             let rs = &sources[r];
 
-            if extract_field_from_join(join, &ls, tctx) != Extractor::Field(FieldType::BlockNumber)
-            {
+            if extract_field_from_join(join, ls, tctx) != Extractor::Field(FieldType::BlockNumber) {
                 continue;
             }
 
-            if extract_field_from_join(join, &rs, tctx) != Extractor::Field(FieldType::BlockNumber)
-            {
+            if extract_field_from_join(join, rs, tctx) != Extractor::Field(FieldType::BlockNumber) {
                 continue;
             }
 
@@ -254,21 +250,16 @@ fn extract_sources_from_join(
             (one, two)
         }
         Some(RexType::Selection(f)) => match &f.reference_type {
-            Some(field_reference::ReferenceType::DirectReference(s)) => {
-                if let Ok(r) = map_on_dirref(
-                    dummy,
-                    s,
-                    |_, r| {
-                        let i = r as usize;
-                        Ok((m.get(&i).map(|l| *l), None))
-                    },
-                    |m| rewrite_err(m),
-                ) {
-                    r
-                } else {
-                    (None, None)
-                }
-            }
+            Some(field_reference::ReferenceType::DirectReference(s)) => map_on_dirref(
+                dummy,
+                s,
+                |_, r| {
+                    let i = r as usize;
+                    Ok((m.get(&i).copied(), None))
+                },
+                rewrite_err,
+            )
+            .unwrap_or_default(),
             _ => (None, None),
         },
         _ => (None, None),
@@ -293,9 +284,9 @@ fn extract_block_number_compares_from_filter(
     src: &Source,
     tctx: &TraversalContext,
 ) -> Result<Pushdown, RewriteTargetErr> {
-    Ok(PushdownExprTransformer::new()
+    PushdownExprTransformer::new()
         .with_field_types(BLOCK_NUMBER_FIELD_NAMES)
-        .transform_expr(x, src, tctx)?)
+        .transform_expr(x, src, tctx)
 }
 
 fn add_expression_to_filter(
@@ -356,7 +347,7 @@ fn compile_projection_sql(src: &Source, _tctx: &TraversalContext) -> RewriteTarg
         // the only case with empty projection I'm aware of is count_star
         Ok(format!("\"{}\"", src.fields[0]))
     } else {
-        Ok(format!("{}", fields.join(", ")))
+        Ok(fields.join(", "))
     }
 }
 
@@ -490,13 +481,13 @@ impl PushdownExprTransformer {
                     }
                 } else if let Some(ff) = self.ff {
                     Ok(Some(ref_seg_from_ref(ff)))
-                } else if let Ok(_) = Self::get_field_index(src, f) {
+                } else if Self::get_field_index(src, f).is_ok() {
                     Ok(Some(r.clone()))
                 } else {
                     Ok(None)
                 }
             },
-            |m| rewrite_err(m),
+            rewrite_err,
         )
     }
 }
@@ -587,11 +578,11 @@ impl ExprTransformer<Pushdown, RewriteTargetErr> for PushdownExprTransformer {
         }
 
         let mine = if xs.len() == l {
-            Some(make_scalar_fun_from_other(&f, &xs))
-        } else if xs.len() > 0 {
+            Some(make_scalar_fun_from_other(f, &xs))
+        } else if !xs.is_empty() {
             let mut s = None;
             for x in &xs {
-                if let Some(f) = get_expr_if_scalar_fun(&x) {
+                if let Some(f) = get_expr_if_scalar_fun(x) {
                     s = Some(make_scalar_fun_from_other(&f, &f.arguments));
                 }
             }
@@ -628,7 +619,7 @@ impl ExprTransformer<Pushdown, RewriteTargetErr> for PushdownExprTransformer {
 
         let mut idx = 0;
         for o in &l.options {
-            if let Some(_) = self.transform_expr(o, source, tctx)? {
+            if (self.transform_expr(o, source, tctx)?).is_some() {
                 idx += 1;
             }
         }
@@ -677,12 +668,9 @@ impl ExprTransformer<String, RewriteTargetErr> for RewriteExprTransformer {
         f: &expression::FieldReference,
     ) -> Result<String, RewriteTargetErr> {
         match &f.reference_type {
-            Some(field_reference::ReferenceType::DirectReference(s)) => map_on_dirref(
-                source,
-                &s,
-                |s, i| Self::get_col_from_source(s, i),
-                |m| Self::err_producer(m),
-            ),
+            Some(field_reference::ReferenceType::DirectReference(s)) => {
+                map_on_dirref(source, s, Self::get_col_from_source, Self::err_producer)
+            }
             _ => rewrite_err("unsupported reference type".to_string()),
         }
     }
@@ -705,7 +693,7 @@ impl ExprTransformer<String, RewriteTargetErr> for RewriteExprTransformer {
         l: &expression::SingularOrList,
     ) -> Result<String, RewriteTargetErr> {
         let field = match &l.value {
-            Some(x) => self.transform_expr(&*x, source, tctx),
+            Some(x) => self.transform_expr(x, source, tctx),
             None => rewrite_err("no field in list expression".to_string()),
         }?;
 
@@ -731,7 +719,7 @@ fn connect_expr(fun: Ext, args: Vec<String>) -> RewriteTargetResult<String> {
         Ext::Sub if args.len() >= 2 => Ok(format!("({} - {})", args[0], args[1])),
         Ext::Mul if args.len() >= 2 => Ok(format!("({} * {})", args[0], args[1])),
         Ext::Div if args.len() >= 2 => Ok(format!("({} / {})", args[0], args[1])),
-        Ext::Not if args.len() >= 1 => Ok(format!("NOT({})", args[0])),
+        Ext::Not if !args.is_empty() => Ok(format!("NOT({})", args[0])),
         Ext::Unknown => Ok("".to_string()),
         unknown => rewrite_err(format!(
             "invalid or unknown function {:?} with {} args",
@@ -827,7 +815,7 @@ mod test {
             if !src.sqd {
                 continue;
             }
-            let have = compile_sql(&src, &mut tctx).expect("cannot compile target");
+            let have = compile_sql(&src, &tctx).expect("cannot compile target");
 
             assert_eq!(
                 have,
@@ -863,7 +851,7 @@ mod test {
             if !src.sqd {
                 continue;
             }
-            let have = compile_sql(&src, &mut tctx).expect("cannot compile target");
+            let have = compile_sql(&src, &tctx).expect("cannot compile target");
 
             assert_eq!(
                 have,
@@ -899,7 +887,7 @@ mod test {
             if !src.sqd {
                 continue;
             }
-            let have = compile_sql(&src, &mut tctx).expect("cannot compile target");
+            let have = compile_sql(&src, &tctx).expect("cannot compile target");
 
             assert_eq!(
                 have,
@@ -936,7 +924,7 @@ mod test {
             if !src.sqd {
                 continue;
             }
-            let have = compile_sql(&src, &mut tctx).expect("cannot compile target");
+            let have = compile_sql(&src, &tctx).expect("cannot compile target");
 
             assert_eq!(
                 have,
@@ -973,7 +961,7 @@ mod test {
             if !src.sqd {
                 continue;
             }
-            let have = compile_sql(&src, &mut tctx).expect("cannot compile target");
+            let have = compile_sql(&src, &tctx).expect("cannot compile target");
 
             assert_eq!(
                 have,
@@ -1007,7 +995,7 @@ mod test {
             if !src.sqd {
                 continue;
             }
-            let have = compile_sql(&src, &mut tctx).expect("cannot compile target");
+            let have = compile_sql(&src, &tctx).expect("cannot compile target");
 
             assert_eq!(
                 have,
@@ -1040,7 +1028,7 @@ mod test {
             .pushdown_filters(&mut tctx, &mut sources)
             .expect("cannot pushdown filters");
         for src in sources {
-            let have = compile_sql(&src, &mut tctx).expect("cannot compile target");
+            let have = compile_sql(&src, &tctx).expect("cannot compile target");
 
             assert_eq!(
                 have,
@@ -1086,7 +1074,7 @@ mod test {
             if !src.sqd {
                 continue;
             }
-            let have = compile_sql(&src, &mut tctx).expect("cannot compile target");
+            let have = compile_sql(&src, &tctx).expect("cannot compile target");
 
             assert_eq!(
                 have,
@@ -1123,7 +1111,7 @@ mod test {
             if !src.sqd {
                 continue;
             }
-            let have = compile_sql(&src, &mut tctx).expect("cannot compile target");
+            let have = compile_sql(&src, &tctx).expect("cannot compile target");
 
             assert_eq!(
                 have,

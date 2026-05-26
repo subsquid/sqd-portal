@@ -377,8 +377,7 @@ impl NetworkClient {
         block: u64,
         lease: bool,
     ) -> Result<PeerId, NoWorker> {
-        let worker = self.network_state.find_worker(dataset, block, lease);
-        worker
+        self.network_state.find_worker(dataset, block, lease)
     }
 
     pub fn get_workers(&self, dataset: &DatasetId, block: u64) -> Vec<WorkerDebugInfo> {
@@ -428,7 +427,7 @@ impl NetworkClient {
         let mut query = Query {
             dataset: chunk_id.dataset.to_url().to_owned(),
             query_id: query_id.clone(),
-            request_id: request_id,
+            request_id,
             query,
             block_range: Some(sqd_messages::Range {
                 begin: *block_range.start(),

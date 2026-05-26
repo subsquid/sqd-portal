@@ -66,7 +66,7 @@ impl FromStr for DataChunk {
         let top_dir = s[0..SLASH_POS].parse()?;
         let first_block = s[SLASH_POS + 1..SEP1_POS].parse()?;
         let last_block = s[SEP1_POS + 1..SEP2_POS].parse()?;
-        let hash_slice = s[SEP2_POS + 1..].as_bytes();
+        let hash_slice = &s.as_bytes()[SEP2_POS + 1..];
         let mut last_hash = [0; HASH_MAX_LEN];
         last_hash[..hash_slice.len()].copy_from_slice(hash_slice);
 

@@ -303,12 +303,9 @@ mod tests {
                 }
                 sleep(Duration::from_millis(millis)).await;
                 let mut locked_stream = local_stream.lock().await;
-                match locked_stream.next().await {
-                    Some(Ok(result)) => {
-                        local_vec.lock().await.extend(result);
-                    }
-                    _ => {}
-                };
+                if let Some(Ok(result)) = locked_stream.next().await {
+                    local_vec.lock().await.extend(result);
+                }
             });
             futures.push(future);
         }
@@ -350,12 +347,9 @@ mod tests {
                 }
                 sleep(Duration::from_millis(millis)).await;
                 let mut locked_stream = local_stream.lock().await;
-                match locked_stream.next().await {
-                    Some(Ok(result)) => {
-                        local_vec.lock().await.extend(result);
-                    }
-                    _ => {}
-                };
+                if let Some(Ok(result)) = locked_stream.next().await {
+                    local_vec.lock().await.extend(result);
+                }
             });
             futures.push(future);
         }

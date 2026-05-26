@@ -169,7 +169,7 @@ pub fn get_workers(
     network: &Arc<NetworkClient>,
 ) -> Result<Vec<TableWorker>, QueryErr> {
     let mut workers: HashMap<String, Vec<TableChunk>> = HashMap::new();
-    for (chunk, block) in chunks.into_iter() {
+    for (chunk, block) in chunks.iter() {
         let mut wrk = None;
         // it would be convenient to search for workers directly by chunk;
         // here we search for the chunk again. Should be implemented in NetworkClient.
@@ -197,7 +197,7 @@ pub fn get_workers(
     for (peer_id, chunks) in workers.into_iter() {
         tws.push(TableWorker {
             peer_id: peer_id.to_string(),
-            chunks: chunks,
+            chunks,
         });
     }
 
