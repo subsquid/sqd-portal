@@ -37,9 +37,9 @@ use super::stream::{DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_
     ),
     responses(
         (status = 200, description = "Block number resolved", body = BlockNumberResponse),
-        (status = 404, description = "No block found for timestamp", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
-        (status = 503, description = "Upstream data source unavailable", body = ErrorResponse),
+        (status = 404, description = "No block found for timestamp"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "Upstream data source unavailable"),
     ),
     tag = "query"
 )]
