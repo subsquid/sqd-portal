@@ -119,7 +119,7 @@ pub struct DatasetStateResponse {
     info(
         title = "SQD Portal API",
         description = "API for querying and streaming blockchain data from the SQD network",
-        version = "0.9.1",
+        version = "0.10.0",
     ),
     servers(
         (url = "http://localhost:8000", description = "Local development server"),
