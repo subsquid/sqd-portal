@@ -7,12 +7,12 @@ use num_rational::Ratio;
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use sqd_primitives::BlockRef;
-use utoipa::ToSchema;
 use tokio::task::JoinError;
 use tokio::time::Instant;
 use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
+use utoipa::ToSchema;
 
 use sqd_contract_client::{Client as ContractClient, ClientError, Network, PeerId, Worker};
 use sqd_messages::{query_error, query_result, Query, QueryFinished, QueryOk};
