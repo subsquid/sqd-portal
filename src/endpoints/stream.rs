@@ -31,7 +31,12 @@ use crate::{
     ),
     request_body = crate::openapi::StreamRequestBody,
     responses(
-        (status = 200, description = "Archival data stream", content_type = "application/jsonl"),
+        (status = 200, description = "Archival data stream", content_type = "application/jsonl",
+            headers(
+                ("X-Sqd-Finalized-Head-Number" = Option<u64>, description = "Finalized head block number"),
+                ("X-Sqd-Finalized-Head-Hash" = Option<String>, description = "Finalized head block hash"),
+                ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
+            )),
         (status = 204, description = "No new blocks available in the requested range"),
         (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
@@ -63,7 +68,12 @@ pub(crate) async fn run_archival_stream_restricted(
     ),
     request_body = crate::openapi::StreamRequestBody,
     responses(
-        (status = 200, description = "Archival data stream", content_type = "application/jsonl"),
+        (status = 200, description = "Archival data stream", content_type = "application/jsonl",
+            headers(
+                ("X-Sqd-Finalized-Head-Number" = Option<u64>, description = "Finalized head block number"),
+                ("X-Sqd-Finalized-Head-Hash" = Option<String>, description = "Finalized head block hash"),
+                ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
+            )),
         (status = 204, description = "No new blocks available in the requested range"),
         (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
@@ -121,7 +131,12 @@ pub(crate) async fn run_archival_stream(
     ),
     request_body = crate::openapi::StreamRequestBody,
     responses(
-        (status = 200, description = "Real-time data stream", content_type = "application/jsonl"),
+        (status = 200, description = "Real-time data stream", content_type = "application/jsonl",
+            headers(
+                ("X-Sqd-Finalized-Head-Number" = Option<u64>, description = "Finalized head block number"),
+                ("X-Sqd-Finalized-Head-Hash" = Option<String>, description = "Finalized head block hash"),
+                ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
+            )),
         (status = 204, description = "No new blocks available in the requested range"),
         (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
@@ -164,7 +179,12 @@ pub(crate) async fn run_stream(
     ),
     request_body = crate::openapi::StreamRequestBody,
     responses(
-        (status = 200, description = "Finalized data stream", content_type = "application/jsonl"),
+        (status = 200, description = "Finalized data stream", content_type = "application/jsonl",
+            headers(
+                ("X-Sqd-Finalized-Head-Number" = Option<u64>, description = "Finalized head block number"),
+                ("X-Sqd-Finalized-Head-Hash" = Option<String>, description = "Finalized head block hash"),
+                ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
+            )),
         (status = 204, description = "No new blocks available in the requested range"),
         (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
