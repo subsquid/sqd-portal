@@ -540,36 +540,47 @@ pub mod types {
         pub workers: ::std::option::Option<Workers>,
     }
 
-    ///Stream request body
+    ///Data query request body for stream endpoints.
+    ///Note: the full data query object accepts additional chain-specific
+    /// filter fields beyond those documented here. See the data query
+    /// specification for details.
     ///
     /// <details><summary>JSON schema</summary>
     ///
     /// ```json
     ///{
-    ///  "description": "Stream request body",
+    ///  "description": "Data query request body for stream endpoints.\nNote:
+    /// the full data query object accepts additional chain-specific filter
+    /// fields\nbeyond those documented here. See the data query specification
+    /// for details.",
     ///  "type": "object",
     ///  "required": [
-    ///    "query"
+    ///    "fromBlock"
     ///  ],
     ///  "properties": {
-    ///    "first_block": {
+    ///    "fromBlock": {
+    ///      "description": "The number of the first block to fetch (required)",
+    ///      "type": "integer",
+    ///      "format": "int64",
+    ///      "minimum": 0.0
+    ///    },
+    ///    "parentBlockHash": {
+    ///      "description": "Expected hash of the parent of the first requested
+    /// block (optional)",
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
+    ///    },
+    ///    "toBlock": {
+    ///      "description": "The number of the last block to fetch, inclusive
+    /// (optional)",
     ///      "type": [
     ///        "integer",
     ///        "null"
     ///      ],
     ///      "format": "int64",
     ///      "minimum": 0.0
-    ///    },
-    ///    "last_block": {
-    ///      "type": [
-    ///        "integer",
-    ///        "null"
-    ///      ],
-    ///      "format": "int64",
-    ///      "minimum": 0.0
-    ///    },
-    ///    "query": {
-    ///      "type": "string"
     ///    }
     ///  }
     ///}
@@ -577,11 +588,23 @@ pub mod types {
     /// </details>
     #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
     pub struct StreamRequestBody {
-        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
-        pub first_block: ::std::option::Option<i64>,
-        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
-        pub last_block: ::std::option::Option<i64>,
-        pub query: ::std::string::String,
+        ///The number of the first block to fetch (required)
+        #[serde(rename = "fromBlock")]
+        pub from_block: i64,
+        ///Expected hash of the parent of the first requested block (optional)
+        #[serde(
+            rename = "parentBlockHash",
+            default,
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
+        pub parent_block_hash: ::std::option::Option<::std::string::String>,
+        ///The number of the last block to fetch, inclusive (optional)
+        #[serde(
+            rename = "toBlock",
+            default,
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
+        pub to_block: ::std::option::Option<i64>,
     }
 
     ///Worker information response
@@ -650,7 +673,7 @@ pub mod types {
 ///
 ///API for querying and streaming blockchain data from the SQD network
 ///
-///Version: 0.9.1
+///Version: 0.10.0
 pub struct Client {
     pub(crate) baseurl: String,
     pub(crate) client: reqwest::Client,
@@ -691,7 +714,7 @@ impl Client {
 
 impl ClientInfo<()> for Client {
     fn api_version() -> &'static str {
-        "0.9.1"
+        "0.10.0"
     }
 
     fn baseurl(&self) -> &str {
@@ -753,9 +776,10 @@ impl Client {
         }
     }
 
-    ///Execute a SQL query on the network
+    ///Execute a data query via a specific worker (deprecated)
     ///
-    ///Executes a SQL query against a specific worker in the network
+    ///Sends a data query to a specific worker in the network. This endpoint is
+    /// deprecated.
     ///
     ///Sends a `POST` request to `/datasets/{dataset_id}/query/{worker_id}`
     ///
@@ -817,7 +841,7 @@ impl Client {
     pub async fn get_archival_head<'a>(
         &'a self,
         dataset: &'a str,
-    ) -> Result<ResponseValue<::serde_json::Value>, Error<()>> {
+    ) -> Result<ResponseValue<::std::option::Option<types::BlockHead>>, Error<()>> {
         let url = format!(
             "{}/datasets/{}/archival-head",
             self.baseurl,
@@ -865,7 +889,7 @@ impl Client {
     pub async fn run_archival_stream_restricted<'a>(
         &'a self,
         dataset: &'a str,
-        body: &'a ::serde_json::Value,
+        body: &'a types::StreamRequestBody,
     ) -> Result<ResponseValue<()>, Error<()>> {
         let url = format!(
             "{}/datasets/{}/archival-stream",
@@ -893,16 +917,20 @@ impl Client {
         let response = result?;
         match response.status().as_u16() {
             200u16 => Ok(ResponseValue::empty(response)),
+            204u16 => Ok(ResponseValue::empty(response)),
             400u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
             404u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            429u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            500u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            503u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
             _ => Err(Error::UnexpectedResponse(response)),
         }
     }
 
-    ///Stream archival data (debug mode without restrictions)
+    ///Stream archival data without request restrictions (debug)
     ///
-    ///Streams blockchain data from the archival layer without request
-    /// restrictions
+    ///Streams blockchain data from the archival layer using request parameters
+    /// as provided
     ///
     ///Sends a `POST` request to `/datasets/{dataset}/archival-stream/debug`
     ///
@@ -912,7 +940,7 @@ impl Client {
     pub async fn run_archival_stream<'a>(
         &'a self,
         dataset: &'a str,
-        body: &'a ::serde_json::Value,
+        body: &'a types::StreamRequestBody,
     ) -> Result<ResponseValue<()>, Error<()>> {
         let url = format!(
             "{}/datasets/{}/archival-stream/debug",
@@ -940,7 +968,49 @@ impl Client {
         let response = result?;
         match response.status().as_u16() {
             200u16 => Ok(ResponseValue::empty(response)),
+            204u16 => Ok(ResponseValue::empty(response)),
             400u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            404u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            429u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            500u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            503u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            _ => Err(Error::UnexpectedResponse(response)),
+        }
+    }
+
+    ///Get the height of a dataset via archival-stream (deprecated)
+    ///
+    ///Same as /datasets/{dataset}/height. Kept for backward compatibility.
+    ///
+    ///Sends a `GET` request to `/datasets/{dataset}/archival-stream/height`
+    ///
+    ///Arguments:
+    /// - `dataset`: Dataset name
+    pub async fn get_archival_stream_height<'a>(
+        &'a self,
+        dataset: &'a str,
+    ) -> Result<ResponseValue<ByteStream>, Error<()>> {
+        let url = format!(
+            "{}/datasets/{}/archival-stream/height",
+            self.baseurl,
+            encode_path(&dataset.to_string()),
+        );
+        let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
+        header_map.append(
+            ::reqwest::header::HeaderName::from_static("api-version"),
+            ::reqwest::header::HeaderValue::from_static(Self::api_version()),
+        );
+        #[allow(unused_mut)]
+        let mut request = self.client.get(url).headers(header_map).build()?;
+        let info = OperationInfo {
+            operation_id: "get_archival_stream_height",
+        };
+        self.pre(&mut request, &info).await?;
+        let result = self.exec(request, &info).await;
+        self.post(&result, &info).await?;
+        let response = result?;
+        match response.status().as_u16() {
+            200u16 => Ok(ResponseValue::stream(response)),
             404u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
             _ => Err(Error::UnexpectedResponse(response)),
         }
@@ -958,7 +1028,7 @@ impl Client {
     pub async fn get_finalized_head<'a>(
         &'a self,
         dataset: &'a str,
-    ) -> Result<ResponseValue<::serde_json::Value>, Error<()>> {
+    ) -> Result<ResponseValue<::std::option::Option<types::BlockHead>>, Error<()>> {
         let url = format!(
             "{}/datasets/{}/finalized-head",
             self.baseurl,
@@ -995,7 +1065,7 @@ impl Client {
 
     ///Stream finalized blockchain data
     ///
-    ///Streams blockchain data from the finalized data source
+    ///Streams only finalized blocks from archival and hotblocks sources
     ///
     ///Sends a `POST` request to `/datasets/{dataset}/finalized-stream`
     ///
@@ -1005,7 +1075,7 @@ impl Client {
     pub async fn run_finalized_stream<'a>(
         &'a self,
         dataset: &'a str,
-        body: &'a ::serde_json::Value,
+        body: &'a types::StreamRequestBody,
     ) -> Result<ResponseValue<()>, Error<()>> {
         let url = format!(
             "{}/datasets/{}/finalized-stream",
@@ -1033,7 +1103,49 @@ impl Client {
         let response = result?;
         match response.status().as_u16() {
             200u16 => Ok(ResponseValue::empty(response)),
+            204u16 => Ok(ResponseValue::empty(response)),
             400u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            404u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            429u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            500u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            503u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            _ => Err(Error::UnexpectedResponse(response)),
+        }
+    }
+
+    ///Get the height of a dataset via finalized-stream (deprecated)
+    ///
+    ///Same as /datasets/{dataset}/height. Kept for backward compatibility.
+    ///
+    ///Sends a `GET` request to `/datasets/{dataset}/finalized-stream/height`
+    ///
+    ///Arguments:
+    /// - `dataset`: Dataset name
+    pub async fn get_finalized_stream_height<'a>(
+        &'a self,
+        dataset: &'a str,
+    ) -> Result<ResponseValue<ByteStream>, Error<()>> {
+        let url = format!(
+            "{}/datasets/{}/finalized-stream/height",
+            self.baseurl,
+            encode_path(&dataset.to_string()),
+        );
+        let mut header_map = ::reqwest::header::HeaderMap::with_capacity(1usize);
+        header_map.append(
+            ::reqwest::header::HeaderName::from_static("api-version"),
+            ::reqwest::header::HeaderValue::from_static(Self::api_version()),
+        );
+        #[allow(unused_mut)]
+        let mut request = self.client.get(url).headers(header_map).build()?;
+        let info = OperationInfo {
+            operation_id: "get_finalized_stream_height",
+        };
+        self.pre(&mut request, &info).await?;
+        let result = self.exec(request, &info).await;
+        self.post(&result, &info).await?;
+        let response = result?;
+        match response.status().as_u16() {
+            200u16 => Ok(ResponseValue::stream(response)),
             404u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
             _ => Err(Error::UnexpectedResponse(response)),
         }
@@ -1054,7 +1166,7 @@ impl Client {
     pub async fn get_head<'a>(
         &'a self,
         dataset: &'a str,
-    ) -> Result<ResponseValue<::serde_json::Value>, Error<()>> {
+    ) -> Result<ResponseValue<::std::option::Option<types::BlockHead>>, Error<()>> {
         let url = format!(
             "{}/datasets/{}/head",
             self.baseurl,
@@ -1187,7 +1299,8 @@ impl Client {
 
     ///Stream real-time blockchain data
     ///
-    ///Streams blockchain data from the real-time data source
+    ///Streams blockchain data combining archival and real-time hotblocks
+    /// sources
     ///
     ///Sends a `POST` request to `/datasets/{dataset}/stream`
     ///
@@ -1197,7 +1310,7 @@ impl Client {
     pub async fn run_stream<'a>(
         &'a self,
         dataset: &'a str,
-        body: &'a ::serde_json::Value,
+        body: &'a types::StreamRequestBody,
     ) -> Result<ResponseValue<()>, Error<()>> {
         let url = format!(
             "{}/datasets/{}/stream",
@@ -1225,22 +1338,28 @@ impl Client {
         let response = result?;
         match response.status().as_u16() {
             200u16 => Ok(ResponseValue::empty(response)),
+            204u16 => Ok(ResponseValue::empty(response)),
             400u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
             404u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            409u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            429u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            500u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            503u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
             _ => Err(Error::UnexpectedResponse(response)),
         }
     }
 
-    ///Get block number by timestamp
+    ///Get the block number for a given timestamp
     ///
-    ///Finds the block number that occurred at or after the given timestamp
+    ///Returns the first block whose timestamp is greater than or equal to the
+    /// given timestamp
     ///
     ///Sends a `GET` request to
     /// `/datasets/{dataset}/timestamps/{timestamp}/block`
     ///
     ///Arguments:
     /// - `dataset`: Dataset name
-    /// - `timestamp`: Unix timestamp in seconds
+    /// - `timestamp`: Timestamp in seconds
     pub async fn get_blocknumber_by_timestamp<'a>(
         &'a self,
         dataset: &'a str,
@@ -1277,6 +1396,7 @@ impl Client {
         match response.status().as_u16() {
             200u16 => ResponseValue::from_response(response).await,
             404u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
+            500u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
             503u16 => Err(Error::ErrorResponse(ResponseValue::empty(response))),
             _ => Err(Error::UnexpectedResponse(response)),
         }
