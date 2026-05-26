@@ -32,8 +32,12 @@ use crate::{
     request_body = serde_json::Value,
     responses(
         (status = 200, description = "Archival data stream", content_type = "application/jsonl"),
-        (status = 400, description = "Invalid request parameters"),
+        (status = 204, description = "No new blocks available in the requested range"),
+        (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
+        (status = 429, description = "Rate limit exceeded"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "Service temporarily unavailable"),
     ),
     tag = "stream"
 )]
@@ -60,8 +64,12 @@ pub(crate) async fn run_archival_stream_restricted(
     request_body = serde_json::Value,
     responses(
         (status = 200, description = "Archival data stream", content_type = "application/jsonl"),
-        (status = 400, description = "Invalid request parameters"),
+        (status = 204, description = "No new blocks available in the requested range"),
+        (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
+        (status = 429, description = "Rate limit exceeded"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "Service temporarily unavailable"),
     ),
     tag = "stream"
 )]
@@ -114,8 +122,14 @@ pub(crate) async fn run_archival_stream(
     request_body = serde_json::Value,
     responses(
         (status = 200, description = "Real-time data stream", content_type = "application/jsonl"),
-        (status = 400, description = "Invalid request parameters"),
+        (status = 204, description = "No new blocks available in the requested range"),
+        (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
+        (status = 409, description = "Parent block hash mismatch", body = serde_json::Value,
+            example = json!({"previousBlocks": [{"number": 21780872, "hash": "0xf6a96a29423093e947960fcde3cf79730eadacd389fe2ed6cd1c97deb356a12e"}, {"number": 21780873, "hash": "0xcc44e9d4723600bb3078c5e0ab5df0cf7513df2e12e85f8548c5c469083b19bb"}]})),
+        (status = 429, description = "Rate limit exceeded"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "Service temporarily unavailable"),
     ),
     tag = "stream"
 )]
@@ -151,8 +165,12 @@ pub(crate) async fn run_stream(
     request_body = serde_json::Value,
     responses(
         (status = 200, description = "Finalized data stream", content_type = "application/jsonl"),
-        (status = 400, description = "Invalid request parameters"),
+        (status = 204, description = "No new blocks available in the requested range"),
+        (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
+        (status = 429, description = "Rate limit exceeded"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "Service temporarily unavailable"),
     ),
     tag = "stream"
 )]
