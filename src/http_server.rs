@@ -636,9 +636,9 @@ async fn get_worker(
         .into_response()
 }
 
-/// Execute a SQL query on the network
+/// Execute a data query via a specific worker (deprecated)
 ///
-/// Executes a SQL query against a specific worker in the network
+/// Sends a data query to a specific worker in the network. This endpoint is deprecated.
 #[utoipa::path(
     post,
     path = "/datasets/{dataset_id}/query/{worker_id}",
