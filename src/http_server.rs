@@ -122,11 +122,11 @@ pub async fn run_server(
         // Backward compatibility routes
         .route(
             "/datasets/:dataset/finalized-stream/height",
-            get(get_height).endpoint("/height"),
+            get(get_finalized_stream_height).endpoint("/height"),
         )
         .route(
             "/datasets/:dataset/archival-stream/height",
-            get(get_height).endpoint("/height"),
+            get(get_archival_stream_height).endpoint("/height"),
         )
         .route(
             "/datasets/:dataset_id/query/:worker_id",
@@ -575,7 +575,63 @@ async fn get_height(
     Path(dataset): Path<String>,
     dataset_id: DatasetId,
 ) -> impl IntoResponse {
-    match network.get_height(&dataset_id) {
+    height_response(&network, &dataset, &dataset_id)
+}
+
+/// Get the height of a dataset via finalized-stream (deprecated)
+///
+/// Same as /datasets/{dataset}/height. Kept for backward compatibility.
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/finalized-stream/height",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    responses(
+        (status = 200, description = "Height retrieved successfully", body = String),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "query",
+)]
+#[deprecated]
+async fn get_finalized_stream_height(
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Path(dataset): Path<String>,
+    dataset_id: DatasetId,
+) -> impl IntoResponse {
+    height_response(&network, &dataset, &dataset_id)
+}
+
+/// Get the height of a dataset via archival-stream (deprecated)
+///
+/// Same as /datasets/{dataset}/height. Kept for backward compatibility.
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/archival-stream/height",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    responses(
+        (status = 200, description = "Height retrieved successfully", body = String),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "query",
+)]
+#[deprecated]
+async fn get_archival_stream_height(
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Path(dataset): Path<String>,
+    dataset_id: DatasetId,
+) -> impl IntoResponse {
+    height_response(&network, &dataset, &dataset_id)
+}
+
+fn height_response(
+    network: &NetworkClient,
+    dataset: &str,
+    dataset_id: &DatasetId,
+) -> (StatusCode, String) {
+    match network.get_height(dataset_id) {
         Some(height) => (StatusCode::OK, height.to_string()),
         None => (
             StatusCode::NOT_FOUND,

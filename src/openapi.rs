@@ -92,6 +92,8 @@ pub struct DatasetStateResponse {
         crate::endpoints::stream::run_archival_stream,
         crate::endpoints::stream::run_finalized_stream,
         crate::endpoints::stream::run_stream,
+        crate::http_server::get_finalized_stream_height,
+        crate::http_server::get_archival_stream_height,
         crate::http_server::execute_query,
         crate::http_server::get_readiness,
         crate::http_server::get_metrics,
