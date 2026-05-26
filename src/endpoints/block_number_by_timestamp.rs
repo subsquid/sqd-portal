@@ -29,6 +29,23 @@ pub(crate) struct BlockNumberResponse {
     block_number: u64,
 }
 
+/// Get the block number for a given timestamp
+///
+/// Returns the first block whose timestamp is greater than or equal to the given timestamp
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/timestamps/{timestamp}/block",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+        ("timestamp" = u64, Path, description = "Timestamp in seconds"),
+    ),
+    responses(
+        (status = 200, description = "Block number resolved", body = crate::openapi::BlockNumberResponse),
+        (status = 404, description = "No block found for timestamp"),
+        (status = 503, description = "Upstream data source unavailable"),
+    ),
+    tag = "query"
+)]
 pub(crate) async fn get_blocknumber_by_timestamp(
     Path((_, timestamp)): Path<(DatasetId, u64)>,
     Extension(req): Extension<RequestId>,

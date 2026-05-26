@@ -20,6 +20,23 @@ use crate::{
     utils::conversion::{join_gzip_default, recompress_gzip},
 };
 
+/// Stream archival data with request restrictions applied
+///
+/// Streams blockchain data from the archival layer with rate limits and restrictions
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/archival-stream",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Archival data stream", content_type = "application/jsonl"),
+        (status = 400, description = "Invalid request parameters"),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "stream"
+)]
 pub(crate) async fn run_archival_stream_restricted(
     task_manager: Extension<Arc<TaskManager>>,
     network: Extension<Arc<NetworkClient>>,
@@ -31,6 +48,23 @@ pub(crate) async fn run_archival_stream_restricted(
     run_archival_stream(task_manager, network, config, dataset_id, request).await
 }
 
+/// Stream archival data without request restrictions (debug)
+///
+/// Streams blockchain data from the archival layer using request parameters as provided
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/archival-stream/debug",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Archival data stream", content_type = "application/jsonl"),
+        (status = 400, description = "Invalid request parameters"),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "stream"
+)]
 pub(crate) async fn run_archival_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(network): Extension<Arc<NetworkClient>>,
@@ -68,6 +102,23 @@ pub(crate) async fn run_archival_stream(
     }
 }
 
+/// Stream real-time blockchain data
+///
+/// Streams blockchain data combining archival and real-time hotblocks sources
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/stream",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Real-time data stream", content_type = "application/jsonl"),
+        (status = 400, description = "Invalid request parameters"),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "stream"
+)]
 pub(crate) async fn run_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
@@ -88,6 +139,23 @@ pub(crate) async fn run_stream(
     .await
 }
 
+/// Stream finalized blockchain data
+///
+/// Streams only finalized blocks from archival and hotblocks sources
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/finalized-stream",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Finalized data stream", content_type = "application/jsonl"),
+        (status = 400, description = "Invalid request parameters"),
+        (status = 404, description = "Dataset not found"),
+    ),
+    tag = "stream"
+)]
 pub(crate) async fn run_finalized_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
@@ -276,7 +344,7 @@ fn response_body(
     }
 }
 
-fn restrict_request(config: &Config, request: StreamRequest) -> StreamRequest {
+pub(crate) fn restrict_request(config: &Config, request: StreamRequest) -> StreamRequest {
     let max_chunks = match (request.max_chunks, config.max_chunks_per_stream) {
         (Some(requested), Some(limit)) => Some(requested.min(limit)),
         (Some(requested), None) => Some(requested),

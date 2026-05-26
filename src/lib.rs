@@ -1,6 +1,7 @@
 pub mod config;
 pub mod controller;
 pub mod datasets;
+pub mod endpoints;
 pub mod hotblocks;
 pub mod http_server;
 pub mod metrics;

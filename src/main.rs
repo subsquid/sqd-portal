@@ -13,21 +13,6 @@ use sqd_portal::network::NetworkClient;
 use sqd_portal::utils::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::utils::RwLock;
-
-mod config;
-mod controller;
-mod datasets;
-mod endpoints;
-mod hotblocks;
-mod http_server;
-mod metrics;
-mod network;
-#[cfg(feature = "sql")]
-mod sql;
-mod types;
-mod utils;
-
 #[derive(Parser)]
 #[command(version)]
 pub struct Cli {
@@ -125,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
 
     let config = Arc::new(args.config);
-    let hotblocks = Arc::new(hotblocks::build_client(&config).await?);
+    let hotblocks = Arc::new(sqd_portal::hotblocks::build_client(&config).await?);
     let network_client_builder =
         NetworkClient::builder(args.transport, config.clone(), datasets.clone()).await?;
 

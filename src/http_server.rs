@@ -12,11 +12,9 @@ use axum::{
 };
 use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
-use serde_json::{json, Value};
-use serde::Serialize;
+use serde_json::json;
 use sqd_contract_client::PeerId;
 
-use crate::network::NoWorker;
 use tokio::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
@@ -33,7 +31,7 @@ use crate::endpoints::{
         run_archival_stream, run_archival_stream_restricted, run_finalized_stream, run_stream,
     },
 };
-use crate::hotblocks::{HotblocksErr, StreamMode};
+use crate::hotblocks::HotblocksErr;
 use crate::openapi::ApiDoc;
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::types::Compression;
@@ -44,7 +42,7 @@ use crate::{
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
     network::{NetworkClient, NoWorker},
-    types::{ChunkId, DatasetId, GenericError, ParsedQuery, RequestError, StreamRequest},
+    types::{ChunkId, DatasetId, ParsedQuery, RequestError, StreamRequest},
     utils::logging,
 };
 
@@ -314,34 +312,6 @@ async fn get_head(
         .into_response()
 }
 
-/// Stream archival data with request restrictions applied
-///
-/// Streams blockchain data from the archival layer with rate limits and restrictions
-#[utoipa::path(
-    post,
-    path = "/datasets/{dataset}/archival-stream",
-    params(
-        ("dataset" = String, Path, description = "Dataset name"),
-    ),
-    request_body = serde_json::Value,
-    responses(
-        (status = 200, description = "Archival data stream", content_type = "application/jsonl"),
-        (status = 400, description = "Invalid request parameters"),
-        (status = 404, description = "Dataset not found"),
-    ),
-    tag = "stream"
-)]
-async fn run_archival_stream_restricted(
-    task_manager: Extension<Arc<TaskManager>>,
-    network: Extension<Arc<NetworkClient>>,
-    config: Extension<Arc<Config>>,
-    dataset_id: DatasetId,
-    raw_request: StreamRequest,
-) -> Response {
-    let request = restrict_request(&config, raw_request);
-    run_archival_stream(task_manager, network, config, dataset_id, request).await
-}
-
 /// Get the current status of the portal
 ///
 /// Responds with a JSON with human-readable information about the portal's state. The exact format may change.
@@ -503,7 +473,6 @@ async fn get_dataset_metadata(
     ),
     tag = "debug"
 )]
->>>>>>> efef0a6 (work in progress)
 async fn get_debug_block(
     Path((_dataset, block)): Path<(String, u64)>,
     dataset_id: DatasetId,
