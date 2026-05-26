@@ -192,7 +192,7 @@ pub async fn run_server(
         ("dataset" = String, Path, description = "Dataset name"),
     ),
     responses(
-        (status = 200, description = "Archival head block retrieved", body = Option<serde_json::Value>),
+        (status = 200, description = "Archival head block retrieved", body = Option<BlockHead>),
         (status = 404, description = "Dataset has no archival data source"),
     ),
     tag = "head"
@@ -232,7 +232,7 @@ async fn get_archival_head(
         ("dataset" = String, Path, description = "Dataset name"),
     ),
     responses(
-        (status = 200, description = "Finalized head block retrieved", body = Option<serde_json::Value>),
+        (status = 200, description = "Finalized head block retrieved", body = Option<BlockHead>),
         (status = 404, description = "Dataset has no data sources"),
     ),
     tag = "head"
@@ -280,7 +280,7 @@ async fn get_finalized_head(
         ("dataset" = String, Path, description = "Dataset name"),
     ),
     responses(
-        (status = 200, description = "Head block retrieved", body = Option<serde_json::Value>),
+        (status = 200, description = "Head block retrieved", body = Option<BlockHead>),
         (status = 404, description = "Dataset has no data sources"),
     ),
     tag = "head"
