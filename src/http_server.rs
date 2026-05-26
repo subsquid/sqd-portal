@@ -595,8 +595,10 @@ async fn get_height(
         ("start_block" = u64, Path, description = "Starting block number"),
     ),
     responses(
-        (status = 200, description = "Worker information retrieved", body = serde_json::Value),
+        (status = 200, description = "Worker URL retrieved", body = String),
         (status = 404, description = "Dataset not found"),
+        (status = 429, description = "Rate limit exceeded"),
+        (status = 503, description = "No available workers"),
     ),
     tag = "debug",
 )]
