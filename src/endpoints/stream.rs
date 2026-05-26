@@ -29,7 +29,7 @@ use crate::{
     params(
         ("dataset" = String, Path, description = "Dataset name"),
     ),
-    request_body = crate::openapi::StreamRequestBody,
+    request_body = StreamRequestBody,
     responses(
         (status = 200, description = "Archival data stream", content_type = "application/jsonl",
             headers(
@@ -66,7 +66,7 @@ pub(crate) async fn run_archival_stream_restricted(
     params(
         ("dataset" = String, Path, description = "Dataset name"),
     ),
-    request_body = crate::openapi::StreamRequestBody,
+    request_body = StreamRequestBody,
     responses(
         (status = 200, description = "Archival data stream", content_type = "application/jsonl",
             headers(
@@ -129,7 +129,7 @@ pub(crate) async fn run_archival_stream(
     params(
         ("dataset" = String, Path, description = "Dataset name"),
     ),
-    request_body = crate::openapi::StreamRequestBody,
+    request_body = StreamRequestBody,
     responses(
         (status = 200, description = "Real-time data stream", content_type = "application/jsonl",
             headers(
@@ -177,7 +177,7 @@ pub(crate) async fn run_stream(
     params(
         ("dataset" = String, Path, description = "Dataset name"),
     ),
-    request_body = crate::openapi::StreamRequestBody,
+    request_body = StreamRequestBody,
     responses(
         (status = 200, description = "Finalized data stream", content_type = "application/jsonl",
             headers(

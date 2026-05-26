@@ -15,6 +15,7 @@ use crate::{
     datasets::DatasetConfig,
     hotblocks::{HotblocksHandle, Status, StreamMode},
     network::NetworkClient,
+    openapi::BlockNumberResponse,
     types::{Compression, DatasetId, GenericError, ParsedQuery, StreamRequest},
     utils::{
         conversion::collect_to_string,
@@ -23,11 +24,6 @@ use crate::{
 };
 
 use super::stream::{DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_REALTIME_METRIC};
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct BlockNumberResponse {
-    block_number: u64,
-}
 
 /// Get the block number for a given timestamp
 ///
@@ -40,7 +36,7 @@ pub(crate) struct BlockNumberResponse {
         ("timestamp" = u64, Path, description = "Timestamp in seconds"),
     ),
     responses(
-        (status = 200, description = "Block number resolved", body = crate::openapi::BlockNumberResponse),
+        (status = 200, description = "Block number resolved", body = BlockNumberResponse),
         (status = 404, description = "No block found for timestamp", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
         (status = 503, description = "Upstream data source unavailable", body = ErrorResponse),
