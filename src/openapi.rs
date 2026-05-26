@@ -42,15 +42,19 @@ pub struct MetadataQueryParams {
     pub expand: Vec<String>,
 }
 
-/// Stream request body
+/// Data query request body for stream endpoints.
+/// Note: the full data query object accepts additional chain-specific filter fields
+/// beyond those documented here. See the data query specification for details.
 #[derive(Deserialize, Debug, ToSchema)]
+#[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct StreamRequestBody {
-    pub query: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_block: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_block: Option<u64>,
+    /// The number of the first block to fetch (required)
+    pub from_block: u64,
+    /// The number of the last block to fetch, inclusive (optional)
+    pub to_block: Option<u64>,
+    /// Expected hash of the parent of the first requested block (optional)
+    pub parent_block_hash: Option<String>,
 }
 
 /// Query execution request

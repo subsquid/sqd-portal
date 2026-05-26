@@ -29,7 +29,7 @@ use crate::{
     params(
         ("dataset" = String, Path, description = "Dataset name"),
     ),
-    request_body = serde_json::Value,
+    request_body = crate::openapi::StreamRequestBody,
     responses(
         (status = 200, description = "Archival data stream", content_type = "application/jsonl"),
         (status = 204, description = "No new blocks available in the requested range"),
@@ -61,7 +61,7 @@ pub(crate) async fn run_archival_stream_restricted(
     params(
         ("dataset" = String, Path, description = "Dataset name"),
     ),
-    request_body = serde_json::Value,
+    request_body = crate::openapi::StreamRequestBody,
     responses(
         (status = 200, description = "Archival data stream", content_type = "application/jsonl"),
         (status = 204, description = "No new blocks available in the requested range"),
@@ -119,7 +119,7 @@ pub(crate) async fn run_archival_stream(
     params(
         ("dataset" = String, Path, description = "Dataset name"),
     ),
-    request_body = serde_json::Value,
+    request_body = crate::openapi::StreamRequestBody,
     responses(
         (status = 200, description = "Real-time data stream", content_type = "application/jsonl"),
         (status = 204, description = "No new blocks available in the requested range"),
@@ -162,7 +162,7 @@ pub(crate) async fn run_stream(
     params(
         ("dataset" = String, Path, description = "Dataset name"),
     ),
-    request_body = serde_json::Value,
+    request_body = crate::openapi::StreamRequestBody,
     responses(
         (status = 200, description = "Finalized data stream", content_type = "application/jsonl"),
         (status = 204, description = "No new blocks available in the requested range"),
