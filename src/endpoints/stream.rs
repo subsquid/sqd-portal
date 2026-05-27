@@ -20,9 +20,9 @@ use crate::{
     utils::conversion::{join_gzip_default, recompress_gzip},
 };
 
-/// Stream archival data with request restrictions applied
+/// [INTERNAL] Archival stream
 ///
-/// Streams blockchain data from the archival layer with rate limits and restrictions
+/// Returns only archived blocks (no hotblocks). Server-side limits apply to the query.
 #[utoipa::path(
     post,
     path = "/datasets/{dataset}/archival-stream",
@@ -44,7 +44,7 @@ use crate::{
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),
-    tag = "stream"
+    tag = "Archival stream"
 )]
 pub(crate) async fn run_archival_stream_restricted(
     task_manager: Extension<Arc<TaskManager>>,
@@ -57,9 +57,9 @@ pub(crate) async fn run_archival_stream_restricted(
     run_archival_stream(task_manager, network, config, dataset_id, request).await
 }
 
-/// Stream archival data without request restrictions (debug)
+/// [INTERNAL] Archival stream (debug)
 ///
-/// Streams blockchain data from the archival layer using request parameters as provided
+/// Debug variant of /archival-stream without server-side query restrictions.
 #[utoipa::path(
     post,
     path = "/datasets/{dataset}/archival-stream/debug",
@@ -81,7 +81,7 @@ pub(crate) async fn run_archival_stream_restricted(
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),
-    tag = "stream"
+    tag = "Archival stream"
 )]
 pub(crate) async fn run_archival_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
@@ -120,9 +120,9 @@ pub(crate) async fn run_archival_stream(
     }
 }
 
-/// Stream real-time blockchain data
+/// Stream
 ///
-/// Streams blockchain data combining archival and real-time hotblocks sources
+/// Returns blocks matching the query. May include unfinalized blocks from the chain tip.
 #[utoipa::path(
     post,
     path = "/datasets/{dataset}/stream",
@@ -140,12 +140,20 @@ pub(crate) async fn run_archival_stream(
         (status = 204, description = "No new blocks available in the requested range"),
         (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
-        (status = 409, description = "Parent block hash mismatch. Response contains a previousBlocks array with {number, hash} pairs."),
+        (status = 409, description = "\
+Parent block hash mismatch — the `parentHash` of the first requested block does not match \
+`query.parentBlockHash`. This typically indicates a chain reorganization relative to the \
+client's state.\n\n\
+The response body is a JSON object with a single `previousBlocks` array of `{number, hash}` \
+pairs from the current canonical chain. The array may have arbitrary length but is \
+guaranteed to contain at least the parent of the first requested block. Clients should \
+find the last known shared ancestor and re-request from there; if no shared block is \
+found, request earlier blocks until one is."),
         (status = 429, description = "Rate limit exceeded"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),
-    tag = "stream"
+    tag = "Stream"
 )]
 pub(crate) async fn run_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
@@ -167,9 +175,10 @@ pub(crate) async fn run_stream(
     .await
 }
 
-/// Stream finalized blockchain data
+/// Finalized stream
 ///
-/// Streams only finalized blocks from archival and hotblocks sources
+/// Returns only finalized blocks matching the query. Same request format as /stream;
+/// no chain reorganizations (no 409 responses).
 #[utoipa::path(
     post,
     path = "/datasets/{dataset}/finalized-stream",
@@ -191,7 +200,7 @@ pub(crate) async fn run_stream(
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),
-    tag = "stream"
+    tag = "Stream"
 )]
 pub(crate) async fn run_finalized_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,

@@ -35,6 +35,11 @@ pub struct Cli {
 
     #[arg(long, env, hide(true))]
     pub log_span_durations: bool,
+
+    /// Show endpoints marked internal (tag prefixed with `_internal_`) in the OpenAPI docs.
+    /// By default, internal endpoints are stripped from /docs, /swagger-ui and /api-docs/openapi.json.
+    #[arg(long, env = "SHOW_INTERNAL_DOCS")]
+    pub show_internal_docs: bool,
 }
 
 #[cfg(not(target_env = "msvc"))]
@@ -166,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
             hotblocks,
             shutting_down,
             cancellation_token.clone(),
+            args.show_internal_docs,
         )),
         network_client.run(cancellation_token),
     )?;

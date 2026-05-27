@@ -25,9 +25,9 @@ use crate::{
 
 use super::stream::{DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_REALTIME_METRIC};
 
-/// Get the block number for a given timestamp
+/// Block at Timestamp
 ///
-/// Returns the first block whose timestamp is greater than or equal to the given timestamp
+/// Returns the first block whose timestamp is greater than or equal to the given value.
 #[utoipa::path(
     get,
     path = "/datasets/{dataset}/timestamps/{timestamp}/block",
@@ -41,7 +41,7 @@ use super::stream::{DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Upstream data source unavailable"),
     ),
-    tag = "query"
+    tag = "Datasets"
 )]
 pub(crate) async fn get_blocknumber_by_timestamp(
     Path((_, timestamp)): Path<(DatasetId, u64)>,

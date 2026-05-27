@@ -80,23 +80,29 @@ pub struct DatasetStateResponse {
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        crate::http_server::get_status,
+        // Datasets
         crate::http_server::get_datasets,
         crate::http_server::get_dataset_metadata,
         crate::http_server::get_dataset_state,
-        crate::http_server::get_archival_head,
-        crate::http_server::get_finalized_head,
-        crate::http_server::get_head,
         crate::endpoints::block_number_by_timestamp::get_blocknumber_by_timestamp,
+        // Stream — real-time pair, then finalized pair (POST stream before GET head).
+        // Deprecated endpoints appended at the end of the group.
+        crate::endpoints::stream::run_stream,
+        crate::http_server::get_head,
+        crate::endpoints::stream::run_finalized_stream,
+        crate::http_server::get_finalized_head,
+        crate::http_server::get_finalized_stream_height,
+        crate::http_server::execute_query,
+        // Archival stream (internal)
         crate::endpoints::stream::run_archival_stream_restricted,
         crate::endpoints::stream::run_archival_stream,
-        crate::endpoints::stream::run_finalized_stream,
-        crate::endpoints::stream::run_stream,
-        crate::http_server::get_finalized_stream_height,
+        crate::http_server::get_archival_head,
         crate::http_server::get_archival_stream_height,
-        crate::http_server::execute_query,
+        // Status (internal)
+        crate::http_server::get_status,
         crate::http_server::get_readiness,
         crate::http_server::get_metrics,
+        // Debug (internal)
         crate::http_server::get_debug_block,
         crate::http_server::get_all_workers,
     ),
@@ -127,12 +133,11 @@ pub struct DatasetStateResponse {
         (url = "http://localhost:8000", description = "Local development server"),
     ),
     tags(
-        (name = "status", description = "Portal and dataset status operations"),
-        (name = "datasets", description = "Dataset information and metadata"),
-        (name = "stream", description = "Data streaming operations"),
-        (name = "head", description = "Block head information"),
-        (name = "query", description = "Query operations"),
-        (name = "debug", description = "Debug operations"),
+        (name = "Status", description = "Portal and dataset status operations"),
+        (name = "Datasets", description = "Dataset information and metadata"),
+        (name = "Stream", description = "Stream blocks and query head — real-time and finalized"),
+        (name = "Archival stream", description = "Archival data only: stable historical blocks"),
+        (name = "Debug", description = "Debug operations"),
     ),
 )]
 pub struct ApiDoc;
