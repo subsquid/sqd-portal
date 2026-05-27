@@ -1,10 +1,10 @@
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::network::{CurrentEpoch, NetworkClientStatus, Status, Workers};
 use crate::types::api_types::AvailableDatasetApiResponse;
-
-#[allow(dead_code)]
 
 /// Status response for the portal
 #[derive(Serialize, Clone, Debug, ToSchema)]
