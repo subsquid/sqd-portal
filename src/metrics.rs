@@ -19,11 +19,11 @@ pub enum MutexLockMode {
     Write,
 }
 
-impl ToString for MutexLockMode {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for MutexLockMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MutexLockMode::Read => "read".to_owned(),
-            MutexLockMode::Write => "write".to_owned(),
+            MutexLockMode::Read => f.write_str("read"),
+            MutexLockMode::Write => f.write_str("write"),
         }
     }
 }

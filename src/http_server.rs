@@ -104,7 +104,7 @@ pub async fn run_server(
         )
         .route(
             "/datasets/:dataset",
-            get(get_dataset_metadata.clone()).endpoint("/dataset"),
+            get(get_dataset_metadata).endpoint("/dataset"),
         )
         .route(
             "/datasets/:dataset/metadata",
@@ -159,7 +159,7 @@ pub async fn run_server(
         .layer(cors)
         .layer(
             // This layer is added here to be applied before the request reaches trace layers
-            SetRequestIdLayer::x_request_id(MakeRequestUuid::default()),
+            SetRequestIdLayer::x_request_id(MakeRequestUuid),
         )
         .layer(Extension(task_manager))
         .layer(Extension(network_client))
@@ -502,13 +502,13 @@ where
             .map_err(IntoResponse::into_response)?;
         let (_, alias) = args
             .first()
-            .ok_or((StatusCode::NOT_FOUND, format!("not enough arguments")).into_response())?;
+            .ok_or((StatusCode::NOT_FOUND, "not enough arguments".to_string()).into_response())?;
         let Extension(network) = parts
             .extract::<Extension<Arc<NetworkClient>>>()
             .await
             .map_err(IntoResponse::into_response)?;
 
-        match network.dataset(&alias) {
+        match network.dataset(alias) {
             Some(config) => Ok(config.clone()),
             None => {
                 Err((StatusCode::NOT_FOUND, format!("Unknown dataset: {alias}")).into_response())

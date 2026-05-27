@@ -26,10 +26,10 @@ fn is_empty(f: &FieldRange) -> bool {
     extract_range_from_field(f) == &EMPTY
 }
 
-fn extract_range_from_field<'a>(f: &'a FieldRange) -> &'a Range<i128> {
+fn extract_range_from_field(f: &FieldRange) -> &Range<i128> {
     match f {
-        &FieldRange::BlockNumber(ref r) => r,
-        &FieldRange::Timestamp(ref r) => r,
+        FieldRange::BlockNumber(r) => r,
+        FieldRange::Timestamp(r) => r,
     }
 }
 
@@ -46,16 +46,17 @@ pub fn extract_blocks(
         tracing::debug!("Extracting from {}.{}: ", src.schema_name, src.table_name);
         let xtr = ExtractorExprTransformer {};
         let filter = src.filter.as_ref().unwrap_or(filter);
-        let _ = match xtr.transform_expr(filter, &src, tctx)? {
-            Extractor::Op(o, l, r) => match ranges_from_extractor(&o, &l, &r, &mut src.blocks)? {
-                Some(x) => src.blocks.push(x),
-                _ => (),
-            },
-            Extractor::List(f, os) => match ranges_from_list(&f, &os)? {
-                Some(x) => src.blocks.push(x),
-                _ => (),
-            },
-            Extractor::Empty => (),
+        match xtr.transform_expr(filter, src, tctx)? {
+            Extractor::Op(o, l, r) => {
+                if let Some(x) = ranges_from_extractor(&o, &l, &r, &mut src.blocks)? {
+                    src.blocks.push(x);
+                }
+            }
+            Extractor::List(f, os) => {
+                if let Some(x) = ranges_from_list(&f, &os)? {
+                    src.blocks.push(x);
+                }
+            }
             _ => (),
         };
         tracing::debug!("Ranges: {:?}", src.blocks);
@@ -81,8 +82,8 @@ pub enum Extractor {
 
 fn ranges_from_extractor(
     x: &Ext,
-    left: &Box<Extractor>,
-    right: &Box<Extractor>,
+    left: &Extractor,
+    right: &Extractor,
     ranges: &mut Vec<FieldRange>,
 ) -> RewriteTargetResult<Option<FieldRange>> {
     if COMPARE_OPS.contains(x) {
@@ -133,10 +134,10 @@ fn min_and_max(items: &[i128]) -> (i128, i128) {
 
 fn ranges_from_compare(
     x: &Ext,
-    left: &Box<Extractor>,
-    right: &Box<Extractor>,
+    left: &Extractor,
+    right: &Extractor,
 ) -> RewriteTargetResult<Option<FieldRange>> {
-    if **left == Extractor::Empty || **right == Extractor::Empty {
+    if *left == Extractor::Empty || *right == Extractor::Empty {
         return Ok(None);
     }
 
@@ -178,11 +179,11 @@ fn ranges_from_compare(
 
 fn ranges_from_logic(
     x: &Ext,
-    left: &Box<Extractor>,
-    right: &Box<Extractor>,
+    left: &Extractor,
+    right: &Extractor,
     ranges: &mut Vec<FieldRange>,
 ) -> RewriteTargetResult<Option<FieldRange>> {
-    if **left == Extractor::Empty || **right == Extractor::Empty {
+    if *left == Extractor::Empty || *right == Extractor::Empty {
         return Ok(None);
     }
 
@@ -192,13 +193,13 @@ fn ranges_from_logic(
     }
 
     // TODO: what about a plain boolean?
-    let l = match &**left {
+    let l = match left {
         Extractor::Op(o, l, r) => ranges_from_extractor(o, l, r, ranges),
         Extractor::List(f, os) => ranges_from_list(f, os),
         _ => Ok(None),
     }?;
 
-    let r = match &**right {
+    let r = match right {
         Extractor::Op(o, l, r) => ranges_from_extractor(o, l, r, ranges),
         Extractor::List(f, os) => ranges_from_list(f, os),
         _ => Ok(None),
@@ -214,11 +215,11 @@ fn ranges_from_logic(
 // TODO: handle field-field in compare
 fn normalize_compare_args(
     x: &Ext,
-    left: &Box<Extractor>,
-    right: &Box<Extractor>,
+    left: &Extractor,
+    right: &Extractor,
 ) -> RewriteTargetResult<(Ext, FieldType, i128)> {
-    let (op, t, i) = match (&**left, &**right) {
-        (Extractor::Field(t), Extractor::Literal(i)) => Ok((x.clone(), t, *i)),
+    let (op, t, i) = match (left, right) {
+        (Extractor::Field(t), Extractor::Literal(i)) => Ok((*x, t, *i)),
         (Extractor::Literal(i), Extractor::Field(t)) => match x {
             Ext::GT => Ok((Ext::LE, t, *i)),
             Ext::GE => Ok((Ext::LT, t, *i)),
@@ -242,22 +243,23 @@ fn ranges_from_and(
     right: Option<FieldRange>,
     ranges: &mut Vec<FieldRange>,
 ) -> RewriteTargetResult<Option<FieldRange>> {
-    if left.is_some() && right.is_some() {
-        range_intersect(left, right, ranges)
-    } else if left.is_some() {
-        if ranges.is_empty() {
-            Ok(left)
-        } else {
-            distribute_ranges(left.unwrap(), ranges)
+    match (left, right) {
+        (l @ Some(_), r @ Some(_)) => range_intersect(l, r, ranges),
+        (Some(l), None) => {
+            if ranges.is_empty() {
+                Ok(Some(l))
+            } else {
+                distribute_ranges(l, ranges)
+            }
         }
-    } else if right.is_some() {
-        if ranges.is_empty() {
-            Ok(right)
-        } else {
-            distribute_ranges(right.unwrap(), ranges)
+        (None, Some(r)) => {
+            if ranges.is_empty() {
+                Ok(Some(r))
+            } else {
+                distribute_ranges(r, ranges)
+            }
         }
-    } else {
-        Ok(None)
+        (None, None) => Ok(None),
     }
 }
 
@@ -512,7 +514,7 @@ impl ExprTransformer<Extractor, RewriteTargetErr> for ExtractorExprTransformer {
                         Ok(Extractor::Empty)
                     }
                 },
-                |m| Self::err_producer(m),
+                Self::err_producer,
             ),
             _ => rewrite_err("not a direct reference".to_string()),
         }
@@ -558,7 +560,7 @@ impl ExprTransformer<Extractor, RewriteTargetErr> for ExtractorExprTransformer {
         l: &expression::SingularOrList,
     ) -> Result<Extractor, RewriteTargetErr> {
         let field = if let Some(ref v) = l.value {
-            Some(self.transform_expr(&*v, source, tctx)?)
+            Some(self.transform_expr(v, source, tctx)?)
         } else {
             None
         };
