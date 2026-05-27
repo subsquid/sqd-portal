@@ -1,3 +1,5 @@
+use std::future::IntoFuture;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::http::Method;
@@ -16,6 +18,7 @@ use serde_json::json;
 use sqd_contract_client::PeerId;
 
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::request_id::{
@@ -59,6 +62,8 @@ pub async fn run_server(
     addr: SocketAddr,
     config: Arc<Config>,
     hotblocks: Arc<HotblocksHandle>,
+    shutting_down: Arc<AtomicBool>,
+    shutdown_signal: CancellationToken,
 ) -> anyhow::Result<()> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
@@ -159,6 +164,8 @@ pub async fn run_server(
         .route("/sql/query", post(sql_query).endpoint("/sql/query"))
         .route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
 
+    let drain_timeout = config.drain_timeout;
+
     let app = app
         .route_layer(axum::middleware::from_fn(logging::middleware))
         .layer(RequestDecompressionLayer::new())
@@ -171,12 +178,53 @@ pub async fn run_server(
         .layer(Extension(network_client))
         .layer(Extension(config))
         .layer(Extension(Arc::new(metrics_registry)))
-        .layer(Extension(hotblocks));
+        .layer(Extension(hotblocks))
+        .layer(Extension(shutting_down));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+
+    let cancel_for_serve = shutdown_signal.clone();
+    let serve = axum::serve(listener, app)
+        .with_graceful_shutdown(async move { cancel_for_serve.cancelled().await });
+
+    drive_serve_with_drain(serve.into_future(), shutdown_signal, drain_timeout).await?;
 
     tracing::info!("HTTP server stopped");
+    Ok(())
+}
+
+/// Races axum's graceful drain against a hard `drain_timeout` deadline.
+///
+/// See [`docs/GRACEFUL_SHUTDOWN.md`](../docs/GRACEFUL_SHUTDOWN.md) for the
+/// drain semantics — including what "force-close" actually does (and does
+/// not) to in-flight per-connection tasks.
+async fn drive_serve_with_drain<F>(
+    serve: F,
+    shutdown_signal: CancellationToken,
+    drain_timeout: std::time::Duration,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    let force_close = async {
+        shutdown_signal.cancelled().await;
+        tokio::time::sleep(drain_timeout).await;
+    };
+
+    tokio::select! {
+        res = serve => {
+            res?;
+            tracing::info!("HTTP server drained cleanly");
+        }
+        _ = force_close => {
+            tracing::warn!(
+                "Drain timeout {:?} exceeded; listener will close on serve drop. \
+                 In-flight connections are detached and will be aborted only on \
+                 process exit (runtime drop after main() returns).",
+                drain_timeout
+            );
+        }
+    }
     Ok(())
 }
 
@@ -546,11 +594,16 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
     ),
     tag = "status"
 )]
-async fn get_readiness(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
+async fn get_readiness(
+    Extension(client): Extension<Arc<NetworkClient>>,
+    Extension(shutting_down): Extension<Arc<AtomicBool>>,
+) -> impl IntoResponse {
+    if shutting_down.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Shutting down").into_response();
+    }
     if client.is_ready() {
         return (StatusCode::OK, "Ready").into_response();
     }
-
     (StatusCode::SERVICE_UNAVAILABLE, "Not ready").into_response()
 }
 
@@ -1029,5 +1082,122 @@ async fn sql_metadata(
             tracing::warn!("cannot fetch metadata: {:?}", e);
             e.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// End-to-end: real TCP listener + axum router + reqwest client. Verifies that
+    /// flipping the AtomicBool that `watch_shutdown_signal` flips on SIGTERM actually
+    /// changes the response observed by an HTTP client. The handler mirrors
+    /// `get_readiness` with `client.is_ready()` stubbed as `true`, since constructing
+    /// a real `NetworkClient` is heavy. The "Not ready" branch is pre-existing and
+    /// out of scope for this PR.
+    #[tokio::test]
+    async fn ready_endpoint_flips_to_503_when_shutdown_flag_set() {
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
+
+        let app = axum::Router::new()
+            .route(
+                "/ready",
+                axum::routing::get(|Extension(sd): Extension<Arc<AtomicBool>>| async move {
+                    if sd.load(Ordering::Relaxed) {
+                        (StatusCode::SERVICE_UNAVAILABLE, "Shutting down").into_response()
+                    } else {
+                        (StatusCode::OK, "Ready").into_response()
+                    }
+                }),
+            )
+            .layer(Extension(shutting_down.clone()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel_for_serve = cancel.clone();
+        let server = tokio::spawn(
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { cancel_for_serve.cancelled().await })
+                .into_future(),
+        );
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/ready");
+
+        let resp = client.get(&url).send().await.expect("GET /ready");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        // Equivalent to what `run_shutdown_sequence` does on SIGTERM.
+        shutting_down.store(true, Ordering::Relaxed);
+
+        let resp = client.get(&url).send().await.expect("GET /ready");
+        assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+        cancel.cancel();
+        server
+            .await
+            .expect("server join")
+            .expect("server drains cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_serve_returns_ok_when_serve_finishes_before_drain_timeout() {
+        let cancel = CancellationToken::new();
+        let drain_timeout = Duration::from_secs(10);
+
+        let serve = async {
+            // Simulates axum::serve resolving promptly after cancellation
+            // (the with_graceful_shutdown future fires, hyper drains and returns Ok).
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<(), std::io::Error>(())
+        };
+
+        let driver = tokio::spawn(drive_serve_with_drain(serve, cancel.clone(), drain_timeout));
+
+        tokio::time::advance(Duration::from_millis(10)).await;
+        cancel.cancel();
+
+        // Serve resolves before drain_timeout, so we get back quickly.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let res = driver.await.expect("join");
+        res.expect("clean drain returns Ok");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_serve_force_closes_when_serve_outlasts_drain_timeout() {
+        let cancel = CancellationToken::new();
+        let drain_timeout = Duration::from_millis(100);
+
+        let serve = std::future::pending::<std::io::Result<()>>();
+
+        let driver = tokio::spawn(drive_serve_with_drain(serve, cancel.clone(), drain_timeout));
+
+        // Trigger shutdown immediately; force_close arm starts its drain_timeout countdown.
+        cancel.cancel();
+
+        // Before drain_timeout the driver should still be pending.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert!(!driver.is_finished(), "should still be draining");
+
+        // After drain_timeout the force-close arm wins.
+        tokio::time::advance(Duration::from_millis(60)).await;
+        let res = driver.await.expect("join");
+        res.expect("force-close returns Ok");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_serve_propagates_serve_error() {
+        let cancel = CancellationToken::new();
+        let drain_timeout = Duration::from_secs(10);
+
+        let serve = async {
+            Err::<(), std::io::Error>(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
+        };
+
+        let res = drive_serve_with_drain(serve, cancel, drain_timeout).await;
+        let err = res.expect_err("error from serve propagates");
+        assert_eq!(err.to_string(), "boom");
     }
 }
