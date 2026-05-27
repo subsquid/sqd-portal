@@ -20,6 +20,32 @@ use crate::{
     utils::conversion::{join_gzip_default, recompress_gzip},
 };
 
+/// [INTERNAL] Archival stream
+///
+/// Returns only archived blocks (no hotblocks). Server-side limits apply to the query.
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/archival-stream",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = StreamRequestBody,
+    responses(
+        (status = 200, description = "Archival data stream", content_type = "application/jsonl",
+            headers(
+                ("X-Sqd-Finalized-Head-Number" = Option<u64>, description = "Finalized head block number"),
+                ("X-Sqd-Finalized-Head-Hash" = Option<String>, description = "Finalized head block hash"),
+                ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
+            )),
+        (status = 204, description = "No new blocks available in the requested range"),
+        (status = 400, description = "Invalid request parameters or query"),
+        (status = 404, description = "Dataset not found"),
+        (status = 429, description = "Rate limit exceeded"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "Service temporarily unavailable"),
+    ),
+    tag = "Archival stream"
+)]
 pub(crate) async fn run_archival_stream_restricted(
     task_manager: Extension<Arc<TaskManager>>,
     network: Extension<Arc<NetworkClient>>,
@@ -31,6 +57,32 @@ pub(crate) async fn run_archival_stream_restricted(
     run_archival_stream(task_manager, network, config, dataset_id, request).await
 }
 
+/// [INTERNAL] Archival stream (debug)
+///
+/// Debug variant of /archival-stream without server-side query restrictions.
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/archival-stream/debug",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = StreamRequestBody,
+    responses(
+        (status = 200, description = "Archival data stream", content_type = "application/jsonl",
+            headers(
+                ("X-Sqd-Finalized-Head-Number" = Option<u64>, description = "Finalized head block number"),
+                ("X-Sqd-Finalized-Head-Hash" = Option<String>, description = "Finalized head block hash"),
+                ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
+            )),
+        (status = 204, description = "No new blocks available in the requested range"),
+        (status = 400, description = "Invalid request parameters or query"),
+        (status = 404, description = "Dataset not found"),
+        (status = 429, description = "Rate limit exceeded"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "Service temporarily unavailable"),
+    ),
+    tag = "Archival stream"
+)]
 pub(crate) async fn run_archival_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(network): Extension<Arc<NetworkClient>>,
@@ -68,6 +120,41 @@ pub(crate) async fn run_archival_stream(
     }
 }
 
+/// Stream
+///
+/// Returns blocks matching the query. May include unfinalized blocks from the chain tip.
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/stream",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = StreamRequestBody,
+    responses(
+        (status = 200, description = "Real-time data stream", content_type = "application/jsonl",
+            headers(
+                ("X-Sqd-Finalized-Head-Number" = Option<u64>, description = "Finalized head block number"),
+                ("X-Sqd-Finalized-Head-Hash" = Option<String>, description = "Finalized head block hash"),
+                ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
+            )),
+        (status = 204, description = "No new blocks available in the requested range"),
+        (status = 400, description = "Invalid request parameters or query"),
+        (status = 404, description = "Dataset not found"),
+        (status = 409, description = "\
+Parent block hash mismatch — the `parentHash` of the first requested block does not match \
+`query.parentBlockHash`. This typically indicates a chain reorganization relative to the \
+client's state.\n\n\
+The response body is a JSON object with a single `previousBlocks` array of `{number, hash}` \
+pairs from the current canonical chain. The array may have arbitrary length but is \
+guaranteed to contain at least the parent of the first requested block. Clients should \
+find the last known shared ancestor and re-request from there; if no shared block is \
+found, request earlier blocks until one is."),
+        (status = 429, description = "Rate limit exceeded"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "Service temporarily unavailable"),
+    ),
+    tag = "Stream"
+)]
 pub(crate) async fn run_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
@@ -88,6 +175,33 @@ pub(crate) async fn run_stream(
     .await
 }
 
+/// Finalized stream
+///
+/// Returns only finalized blocks matching the query. Same request format as /stream;
+/// no chain reorganizations (no 409 responses).
+#[utoipa::path(
+    post,
+    path = "/datasets/{dataset}/finalized-stream",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    request_body = StreamRequestBody,
+    responses(
+        (status = 200, description = "Finalized data stream", content_type = "application/jsonl",
+            headers(
+                ("X-Sqd-Finalized-Head-Number" = Option<u64>, description = "Finalized head block number"),
+                ("X-Sqd-Finalized-Head-Hash" = Option<String>, description = "Finalized head block hash"),
+                ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
+            )),
+        (status = 204, description = "No new blocks available in the requested range"),
+        (status = 400, description = "Invalid request parameters or query"),
+        (status = 404, description = "Dataset not found"),
+        (status = 429, description = "Rate limit exceeded"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "Service temporarily unavailable"),
+    ),
+    tag = "Stream"
+)]
 pub(crate) async fn run_finalized_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
@@ -276,7 +390,7 @@ fn response_body(
     }
 }
 
-fn restrict_request(config: &Config, request: StreamRequest) -> StreamRequest {
+pub(crate) fn restrict_request(config: &Config, request: StreamRequest) -> StreamRequest {
     let max_chunks = match (request.max_chunks, config.max_chunks_per_stream) {
         (Some(requested), Some(limit)) => Some(requested.min(limit)),
         (Some(requested), None) => Some(requested),

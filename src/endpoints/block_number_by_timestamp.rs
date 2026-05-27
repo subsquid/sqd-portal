@@ -15,6 +15,7 @@ use crate::{
     datasets::DatasetConfig,
     hotblocks::{HotblocksHandle, Status, StreamMode},
     network::NetworkClient,
+    openapi::BlockNumberResponse,
     types::{Compression, DatasetId, GenericError, ParsedQuery, StreamRequest},
     utils::{
         conversion::collect_to_string,
@@ -24,11 +25,24 @@ use crate::{
 
 use super::stream::{DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_REALTIME_METRIC};
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct BlockNumberResponse {
-    block_number: u64,
-}
-
+/// Block at Timestamp
+///
+/// Returns the first block whose timestamp is greater than or equal to the given value.
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/timestamps/{timestamp}/block",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+        ("timestamp" = u64, Path, description = "Timestamp in seconds"),
+    ),
+    responses(
+        (status = 200, description = "Block number resolved", body = BlockNumberResponse),
+        (status = 404, description = "No block found for timestamp"),
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "Upstream data source unavailable"),
+    ),
+    tag = "Datasets"
+)]
 pub(crate) async fn get_blocknumber_by_timestamp(
     Path((_, timestamp)): Path<(DatasetId, u64)>,
     Extension(req): Extension<RequestId>,

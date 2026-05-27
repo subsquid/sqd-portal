@@ -24,6 +24,12 @@ pub struct StreamStats {
     pub throttled_for: Duration,
 }
 
+impl Default for StreamStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamStats {
     pub fn new() -> Self {
         let now = Instant::now();

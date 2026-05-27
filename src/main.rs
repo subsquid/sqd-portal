@@ -5,29 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use config::Config;
-use controller::task_manager::TaskManager;
-use datasets::Datasets;
-use http_server::run_server;
-use network::NetworkClient;
 use prometheus_client::registry::Registry;
 use sqd_network_transport::TransportArgs;
+use sqd_portal::config::Config;
+use sqd_portal::controller::task_manager::TaskManager;
+use sqd_portal::datasets::Datasets;
+use sqd_portal::http_server::run_server;
+use sqd_portal::network::NetworkClient;
+use sqd_portal::utils::RwLock;
 use tokio_util::sync::CancellationToken;
-
-use crate::utils::RwLock;
-
-mod config;
-mod controller;
-mod datasets;
-mod endpoints;
-mod hotblocks;
-mod http_server;
-mod metrics;
-mod network;
-#[cfg(feature = "sql")]
-mod sql;
-mod types;
-mod utils;
 
 #[derive(Parser)]
 #[command(version)]
@@ -49,6 +35,11 @@ pub struct Cli {
 
     #[arg(long, env, hide(true))]
     pub log_span_durations: bool,
+
+    /// Show endpoints marked internal (tag prefixed with `_internal_`) in the OpenAPI docs.
+    /// By default, internal endpoints are stripped from /docs, /swagger-ui and /api-docs/openapi.json.
+    #[arg(long, env = "SHOW_INTERNAL_DOCS")]
+    pub show_internal_docs: bool,
 }
 
 #[cfg(not(target_env = "msvc"))]
@@ -126,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
 
     let config = Arc::new(args.config);
-    let hotblocks = Arc::new(hotblocks::build_client(&config).await?);
+    let hotblocks = Arc::new(sqd_portal::hotblocks::build_client(&config).await?);
     let network_client_builder =
         NetworkClient::builder(args.transport, config.clone(), datasets.clone()).await?;
 
@@ -141,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
     let mut metrics_registry = Registry::with_labels(
         vec![(Cow::Borrowed("portal_id"), Cow::Owned(peer_id.to_string()))].into_iter(),
     );
-    metrics::register_metrics(metrics_registry.sub_registry_with_prefix("portal"));
+    sqd_portal::metrics::register_metrics(metrics_registry.sub_registry_with_prefix("portal"));
     sqd_network_transport::metrics::register_metrics(
         metrics_registry.sub_registry_with_prefix("transport"),
     );
@@ -180,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
             hotblocks,
             shutting_down,
             cancellation_token.clone(),
+            args.show_internal_docs,
         )),
         network_client.run(cancellation_token),
     )?;
