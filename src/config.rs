@@ -27,6 +27,17 @@ pub struct Config {
     )]
     pub transport_timeout: Duration,
 
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(
+        rename = "pre_drain_grace_period_sec",
+        default = "default_pre_drain_grace_period"
+    )]
+    pub pre_drain_grace_period: Duration,
+
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(rename = "drain_timeout_sec", default = "default_drain_timeout")]
+    pub drain_timeout: Duration,
+
     #[serde(default = "default_default_buffer_size")]
     pub default_buffer_size: usize,
 
@@ -167,6 +178,24 @@ fn default_transport_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
+// Graceful shutdown defaults. See docs/GRACEFUL_SHUTDOWN.md for the full
+// lifecycle and timing rationale.
+//
+// pre_drain_grace_period: window during which /ready returns 503 before we
+// start refusing connections — lets upstream load balancers stop routing new
+// traffic to this instance.
+// drain_timeout: hard cap on waiting for in-flight requests to complete.
+// Total shutdown budget = pre_drain_grace_period + drain_timeout. The
+// orchestrator's kill timeout must exceed it (plus a few seconds for
+// network-client wind-down and Sentry flush).
+fn default_pre_drain_grace_period() -> Duration {
+    Duration::from_secs(25)
+}
+
+fn default_drain_timeout() -> Duration {
+    Duration::from_secs(25)
+}
+
 fn default_default_buffer_size() -> usize {
     10
 }
@@ -217,4 +246,30 @@ where
 {
     let s = String::deserialize(deserializer)?;
     Ok(s.trim_end_matches('/').to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL_YAML: &str = r#"
+hostname: portal.example
+sqd_network:
+  datasets: https://example.invalid/datasets.yaml
+"#;
+
+    #[test]
+    fn shutdown_durations_default_when_omitted() {
+        let config: Config = serde_yaml::from_str(MINIMAL_YAML).expect("parse");
+        assert_eq!(config.pre_drain_grace_period, Duration::from_secs(25));
+        assert_eq!(config.drain_timeout, Duration::from_secs(25));
+    }
+
+    #[test]
+    fn shutdown_durations_can_be_overridden() {
+        let yaml = format!("{MINIMAL_YAML}pre_drain_grace_period_sec: 3\ndrain_timeout_sec: 7\n");
+        let config: Config = serde_yaml::from_str(&yaml).expect("parse");
+        assert_eq!(config.pre_drain_grace_period, Duration::from_secs(3));
+        assert_eq!(config.drain_timeout, Duration::from_secs(7));
+    }
 }
