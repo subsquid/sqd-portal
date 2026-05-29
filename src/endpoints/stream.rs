@@ -16,11 +16,12 @@ use crate::{
     hotblocks::{traceless_key, HeadMode, HotblocksHandle},
     http_server::{forward_hotblocks_response, forward_response},
     network::NetworkClient,
+    openapi::{ConflictResponse, StreamRequestBody},
     types::{Compression, DatasetId, RequestError, StreamRequest},
     utils::conversion::{join_gzip_default, recompress_gzip},
 };
 
-/// [INTERNAL] Archival stream
+/// Archival stream
 ///
 /// Returns only archived blocks (no hotblocks). Server-side limits apply to the query.
 #[utoipa::path(
@@ -44,7 +45,8 @@ use crate::{
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),
-    tag = "Archival stream"
+    tag = "Streaming",
+    extensions(("x-internal" = json!(true))),
 )]
 pub(crate) async fn run_archival_stream_restricted(
     task_manager: Extension<Arc<TaskManager>>,
@@ -57,7 +59,7 @@ pub(crate) async fn run_archival_stream_restricted(
     run_archival_stream(task_manager, network, config, dataset_id, request).await
 }
 
-/// [INTERNAL] Archival stream (debug)
+/// Debug Archival stream
 ///
 /// Debug variant of /archival-stream without server-side query restrictions.
 #[utoipa::path(
@@ -81,7 +83,8 @@ pub(crate) async fn run_archival_stream_restricted(
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),
-    tag = "Archival stream"
+    tag = "Streaming",
+    extensions(("x-internal" = json!(true))),
 )]
 pub(crate) async fn run_archival_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
@@ -142,18 +145,15 @@ pub(crate) async fn run_archival_stream(
         (status = 404, description = "Dataset not found"),
         (status = 409, description = "\
 Parent block hash mismatch — the `parentHash` of the first requested block does not match \
-`query.parentBlockHash`. This typically indicates a chain reorganization relative to the \
-client's state.\n\n\
-The response body is a JSON object with a single `previousBlocks` array of `{number, hash}` \
-pairs from the current canonical chain. The array may have arbitrary length but is \
-guaranteed to contain at least the parent of the first requested block. Clients should \
-find the last known shared ancestor and re-request from there; if no shared block is \
-found, request earlier blocks until one is."),
+`query.parentBlockHash`, typically a chain reorganization relative to the client's state. \
+The body (see schema below) lists recent canonical-chain blocks so the client can find a \
+shared ancestor and resume. See [How parentBlockHash works](#description/how-parentblockhash-works) \
+for the recovery procedure and a worked example.", body = ConflictResponse),
         (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),
-    tag = "Stream"
+    tag = "Streaming"
 )]
 pub(crate) async fn run_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
@@ -200,7 +200,7 @@ pub(crate) async fn run_stream(
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),
-    tag = "Stream"
+    tag = "Streaming"
 )]
 pub(crate) async fn run_finalized_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,

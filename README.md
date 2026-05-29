@@ -24,7 +24,7 @@ The server (axum) exposes per-dataset endpoints, including:
 - `GET /datasets/:dataset/timestamps/:timestamp/block`: resolve a timestamp to a block number.
 - `GET /status`, `GET /datasets`: Portal and dataset listing.
 - `GET /metrics` (Prometheus), `GET /ready` (readiness probe).
-- `/docs` (Scalar) and `/swagger-ui` with the OpenAPI spec at `/api-docs/openapi.json`.
+- `/docs` (Scalar), with the OpenAPI spec at `/api-docs/openapi.json`.
 
 A SQL query endpoint (`POST /sql/query`, `GET /sql/metadata`) is available when the crate is built with the `sql` feature.
 

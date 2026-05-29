@@ -36,8 +36,9 @@ pub struct Cli {
     #[arg(long, env, hide(true))]
     pub log_span_durations: bool,
 
-    /// Show endpoints marked internal (tag prefixed with `_internal_`) in the OpenAPI docs.
-    /// By default, internal endpoints are stripped from /docs, /swagger-ui and /api-docs/openapi.json.
+    /// Show endpoints marked internal (operations carrying the `x-internal: true`
+    /// OpenAPI extension) in the docs. By default such endpoints are stripped from
+    /// `/docs` and `/api-docs/openapi.json`.
     #[arg(long, env = "SHOW_INTERNAL_DOCS")]
     pub show_internal_docs: bool,
 }
@@ -184,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Awaits SIGTERM and runs the two-phase shutdown sequence.
 ///
-/// See [`docs/GRACEFUL_SHUTDOWN.md`](../docs/GRACEFUL_SHUTDOWN.md) for the
+/// See [`docs/decisions/graceful_shutdown.md`](../docs/decisions/graceful_shutdown.md) for the
 /// full lifecycle, timing rationale, and non-goals.
 async fn watch_shutdown_signal(
     mut sigterm: tokio::signal::unix::Signal,
