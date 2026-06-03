@@ -163,9 +163,14 @@ impl Config {
         let file = std::fs::File::open(config_path)?;
         let buf_reader = std::io::BufReader::new(file);
         let deser = serde_yaml::Deserializer::from_reader(buf_reader);
-        Ok(serde_yaml::with::singleton_map_recursive::deserialize(
-            deser,
-        )?)
+        let config: Self = serde_yaml::with::singleton_map_recursive::deserialize(deser)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        self.congestion.validate()?;
+        Ok(())
     }
 }
 
@@ -256,6 +261,43 @@ pub struct CongestionConfig {
     pub enabled: bool,
 }
 
+impl CongestionConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.min_window >= 1,
+            "congestion.min_window must be >= 1, got {}",
+            self.min_window
+        );
+        anyhow::ensure!(
+            self.min_window <= self.max_window,
+            "congestion.min_window ({}) must not exceed congestion.max_window ({})",
+            self.min_window,
+            self.max_window
+        );
+        anyhow::ensure!(
+            self.decrease_factor > 0.0 && self.decrease_factor < 1.0,
+            "congestion.decrease_factor must be in (0.0, 1.0), got {}",
+            self.decrease_factor
+        );
+        anyhow::ensure!(
+            self.headroom_threshold > 0.0 && self.headroom_threshold <= 1.0,
+            "congestion.headroom_threshold must be in (0.0, 1.0], got {}",
+            self.headroom_threshold
+        );
+        anyhow::ensure!(
+            self.read_timeout_sec >= 1,
+            "congestion.read_timeout_sec must be >= 1, got {}",
+            self.read_timeout_sec
+        );
+        anyhow::ensure!(
+            self.priority_stride >= 1,
+            "congestion.priority_stride must be >= 1, got {}",
+            self.priority_stride
+        );
+        Ok(())
+    }
+}
+
 impl Default for CongestionConfig {
     fn default() -> Self {
         Self {
@@ -302,5 +344,38 @@ sqd_network:
         let config: Config = serde_yaml::from_str(&yaml).expect("parse");
         assert_eq!(config.pre_drain_grace_period, Duration::from_secs(3));
         assert_eq!(config.drain_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn congestion_default_is_valid() {
+        assert!(CongestionConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn congestion_rejects_min_window_above_max_window() {
+        let config = CongestionConfig {
+            min_window: 600,
+            max_window: 500,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn congestion_rejects_decrease_factor_of_one() {
+        let config = CongestionConfig {
+            decrease_factor: 1.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn congestion_rejects_zero_min_window() {
+        let config = CongestionConfig {
+            min_window: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
     }
 }
