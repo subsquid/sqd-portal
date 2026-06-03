@@ -1,0 +1,16 @@
+[package]
+name = "portal-status"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone tool, intentionally kept out of the sqd-portal package so that
+# building the main binary does not require the generated `portal-client` crate.
+# `[workspace]` makes this its own workspace root, fully decoupled from the parent.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+sqd-portal-client = { path = "../../generated/portal-client" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

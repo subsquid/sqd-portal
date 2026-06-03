@@ -1,4 +1,4 @@
-.PHONY: openapi openapi-open client build-client
+.PHONY: openapi openapi-open client build-client portal-status
 
 openapi: openapi.html
 
@@ -17,3 +17,6 @@ client: openapi.json
 
 build-client: client
 	cargo build --manifest-path ./generated/portal-client/Cargo.toml
+
+portal-status:
+	cargo run --manifest-path ./tools/portal-status/Cargo.toml -- $(URL)

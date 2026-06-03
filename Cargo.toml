@@ -2,19 +2,6 @@
 name = "sqd-portal"
 version = "0.11.0-rc1"
 edition = "2021"
-autobins = false
-
-[[bin]]
-name = "sqd-portal"
-path = "src/main.rs"
-
-[[bin]]
-name = "gen_openapi"
-path = "src/bin/gen_openapi.rs"
-
-[[example]]
-name = "portal_status"
-path = "src/bin/portal_status.rs"
 
 [features]
 sql = ["dep:once_cell", "dep:substrait", "dep:sql_query_plan"]
@@ -72,7 +59,6 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 [dev-dependencies]
 proptest = "1.4.0"
 proptest_async = { version = "0.2.1", default-features = false, features = ["tokio"] }
-sqd-portal-client = { path = "./generated/portal-client" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "test-util"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
