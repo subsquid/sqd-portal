@@ -168,6 +168,17 @@ enum UpdateStatus {
     NotUpdated,
 }
 
+struct PendingPollSummary {
+    not_started: usize,
+    running: usize,
+    newly_finished: usize,
+}
+
+enum PendingSlotPoll {
+    Updated(RequestState),
+    NotUpdated,
+}
+
 impl UpdateStatus {
     fn updated(&self) -> bool {
         matches!(self, UpdateStatus::Updated)
@@ -260,138 +271,214 @@ impl StreamController {
 
     #[instrument(skip_all, level="debug", fields(chunk_index = slot.data_range.chunk_index))]
     fn poll_slot(&mut self, slot: &mut Slot, ctx: &mut Context<'_>) -> UpdateStatus {
-        let pending = match &mut slot.state {
-            RequestState::Pending(pending) => pending,
-            RequestState::NoWorkers => {
-                match self.start_querying_chunk(slot.data_range.clone(), ctx) {
-                    Ok(s) => {
-                        *slot = s;
-                        return UpdateStatus::Updated;
+        match &mut slot.state {
+            RequestState::Pending(pending) => {
+                match self.poll_pending_slot(&slot.data_range, pending, ctx) {
+                    PendingSlotPoll::Updated(state) => {
+                        slot.state = state;
+                        UpdateStatus::Updated
                     }
-                    Err((s, e)) => {
-                        *slot = s;
-                        self.last_error = Some(e.to_string());
-                        if matches!(slot.state, RequestState::NoWorkers) {
-                            return UpdateStatus::NotUpdated;
-                        } else {
-                            return UpdateStatus::Updated;
-                        }
-                    }
+                    PendingSlotPoll::NotUpdated => UpdateStatus::NotUpdated,
                 }
             }
+            _ => self.poll_deferred_slot(slot, ctx),
+        }
+    }
+
+    fn poll_deferred_slot(&mut self, slot: &mut Slot, ctx: &mut Context<'_>) -> UpdateStatus {
+        match &mut slot.state {
+            RequestState::NoWorkers => {}
             RequestState::Paused(state) => match state.timeout.as_mut().poll_unpin(ctx) {
                 Poll::Pending => return UpdateStatus::NotUpdated,
-                Poll::Ready(_) => match self.start_querying_chunk(slot.data_range.clone(), ctx) {
-                    Ok(s) => {
-                        *slot = s;
-                        return UpdateStatus::Updated;
-                    }
-                    Err((s, e)) => {
-                        *slot = s;
-                        self.last_error = Some(e.to_string());
-                        return UpdateStatus::Updated;
-                    }
-                },
+                Poll::Ready(_) => {}
             },
             _ => return UpdateStatus::NotUpdated,
+        }
+
+        match self.start_querying_chunk(slot.data_range.clone(), ctx) {
+            Ok(s) => {
+                *slot = s;
+                UpdateStatus::Updated
+            }
+            Err((s, e)) => {
+                *slot = s;
+                self.last_error = Some(e.to_string());
+                if matches!(slot.state, RequestState::NoWorkers) {
+                    UpdateStatus::NotUpdated
+                } else {
+                    UpdateStatus::Updated
+                }
+            }
+        }
+    }
+
+    fn poll_pending_slot(
+        &mut self,
+        data_range: &DataRange,
+        pending: &mut PendingRequests,
+        ctx: &mut Context<'_>,
+    ) -> PendingSlotPoll {
+        match self.poll_worker_requests(data_range, pending, ctx) {
+            Ok(summary) => self.advance_pending_slot(data_range, pending, summary, ctx),
+            Err(state) => PendingSlotPoll::Updated(state),
+        }
+    }
+
+    fn poll_worker_requests(
+        &mut self,
+        data_range: &DataRange,
+        pending: &mut PendingRequests,
+        ctx: &mut Context<'_>,
+    ) -> Result<PendingPollSummary, RequestState> {
+        let mut summary = PendingPollSummary {
+            not_started: 0,
+            running: 0,
+            newly_finished: 0,
         };
 
-        let mut num_not_started = 0;
-        let mut num_running = 0;
-        let mut num_new_finished = 0;
         for request in pending.requests.iter_mut() {
-            match request {
-                WorkerRequest::NotStarted(_) => num_not_started += 1,
-                WorkerRequest::Finished(_) => {}
-                WorkerRequest::Running(running) => {
-                    let Poll::Ready(response) = running.resp.poll_unpin(ctx) else {
-                        num_running += 1;
-                        continue;
-                    };
-                    num_new_finished += 1;
+            self.poll_worker_request(data_range, request, &mut summary, ctx)?;
+        }
 
-                    let response = response.expect("Worker query task shouldn't panic");
+        Ok(summary)
+    }
 
-                    // This is intentionally measured when the result has been polled, not when it's ready.
-                    // If the stream is consumed slower than generated, this duration may get significantly higher than the response time.
-                    // This way the extra "follow up" queries won't be sent, saving on the number of queries.
-                    let duration = running.start_time.elapsed();
-                    self.timeouts.observe(duration);
+    fn poll_worker_request(
+        &mut self,
+        data_range: &DataRange,
+        request: &mut WorkerRequest,
+        summary: &mut PendingPollSummary,
+        ctx: &mut Context<'_>,
+    ) -> Result<(), RequestState> {
+        match request {
+            WorkerRequest::NotStarted(_) => {
+                summary.not_started += 1;
+            }
+            WorkerRequest::Finished(_) => {}
+            WorkerRequest::Running(running) => {
+                let Poll::Ready(response) = running.resp.poll_unpin(ctx) else {
+                    summary.running += 1;
+                    return Ok(());
+                };
+                summary.newly_finished += 1;
 
-                    if retriable(&response) {
-                        tracing::debug!(
-                            "Got retriable error in {}ms from {}: {}",
+                // This is intentionally measured when the result has been polled, not when it's ready.
+                // If the stream is consumed slower than generated, this duration may get
+                // significantly higher than the response time.
+                // This way the extra "follow up" queries won't be sent, saving on the number of queries.
+                let duration = running.start_time.elapsed();
+                self.timeouts.observe(duration);
+
+                let response = match response {
+                    Ok(res) => res,
+                    Err(join_err) => {
+                        tracing::error!(
+                            "Worker query task failed in {}ms for {}: {}",
                             duration.as_millis(),
                             running.worker,
-                            response.as_ref().unwrap_err().to_string(),
+                            join_err,
                         );
-                        *request = WorkerRequest::Finished(FinishedWorkerRequest {
-                            result: response,
-                            worker: running.worker,
-                        });
-                    } else {
-                        // Work is over for this slot. All the remaining requests will be cancelled.
-                        slot.state = parse_response(
-                            response,
-                            &slot.data_range.range,
-                            running.worker,
-                            duration,
-                        );
-                        return UpdateStatus::Updated;
+                        return Err(RequestState::Done(Err(RequestError::InternalError(
+                            format!("worker query task failed: {join_err}"),
+                        ))));
                     }
+                };
+
+                if retriable(&response) {
+                    tracing::debug!(
+                        "Got retriable error in {}ms from {}: {}",
+                        duration.as_millis(),
+                        running.worker,
+                        response.as_ref().unwrap_err().to_string(),
+                    );
+                    *request = WorkerRequest::Finished(FinishedWorkerRequest {
+                        result: response,
+                        worker: running.worker,
+                    });
+                } else {
+                    // Work is over for this slot. All the remaining requests will be cancelled.
+                    return Err(parse_response(
+                        response,
+                        &data_range.range,
+                        running.worker,
+                        duration,
+                    ));
                 }
             }
         }
 
-        if num_running == 0 && num_not_started == 0 {
-            // All query attempts failed
-            let mut errors = Vec::with_capacity(pending.requests.len());
-            for request in pending.requests.drain(..) {
-                let WorkerRequest::Finished(f) = request else {
-                    unreachable!("all worker requests should be finished")
-                };
-                let error = RequestError::from_query_error(f.result.unwrap_err().clone(), f.worker)
-                    .to_string();
-                errors.push(error);
-            }
-            let message = format!("All query attempts failed: {}", errors.join("; "));
-            slot.state = RequestState::Done(Err(RequestError::InternalError(message)));
-            return UpdateStatus::Updated;
+        Ok(())
+    }
+
+    fn advance_pending_slot(
+        &mut self,
+        data_range: &DataRange,
+        pending: &mut PendingRequests,
+        summary: PendingPollSummary,
+        ctx: &mut Context<'_>,
+    ) -> PendingSlotPoll {
+        if summary.running == 0 && summary.not_started == 0 {
+            return PendingSlotPoll::Updated(Self::all_attempts_failed(pending));
         }
 
         let timed_out = pending.timeout.as_mut().poll(ctx).is_ready();
+        let should_retry = summary.newly_finished > 0 || timed_out || summary.running == 0;
 
-        let should_retry = num_new_finished > 0 || timed_out || num_running == 0;
-        if should_retry && num_not_started > 0 {
-            // Issue a retry
-            if timed_out {
-                tracing::trace!(
-                    "Request didn't complete in {}ms, sending one more query",
-                    pending.timeout_duration.as_millis()
-                );
-            }
-            for req in &mut pending.requests {
-                if let WorkerRequest::NotStarted(worker) = req {
-                    let is_speculative = num_running > 0;
-                    let lease = worker
-                        .lease
-                        .take()
-                        .expect("worker lease should only be used once");
-                    let request = self.send_query(&slot.data_range, lease, is_speculative);
-                    *req = WorkerRequest::Running(request);
-                    pending.set_timeout(self.timeouts.current_timeout(), ctx);
-                    break;
-                }
-            }
-            return UpdateStatus::NotUpdated;
+        if should_retry && summary.not_started > 0 {
+            self.start_next_attempt(data_range, pending, timed_out, summary.running, ctx);
+            return PendingSlotPoll::NotUpdated;
         }
 
         if should_retry {
             // The last query attempt timed out, wait for the rest to complete
-            assert!(num_running > 0);
+            assert!(summary.running > 0);
         }
 
-        UpdateStatus::NotUpdated
+        PendingSlotPoll::NotUpdated
+    }
+
+    fn all_attempts_failed(pending: &mut PendingRequests) -> RequestState {
+        let mut errors = Vec::with_capacity(pending.requests.len());
+        for request in pending.requests.drain(..) {
+            let WorkerRequest::Finished(f) = request else {
+                unreachable!("all worker requests should be finished")
+            };
+            let error =
+                RequestError::from_query_error(f.result.unwrap_err().clone(), f.worker).to_string();
+            errors.push(error);
+        }
+        let message = format!("All query attempts failed: {}", errors.join("; "));
+        RequestState::Done(Err(RequestError::InternalError(message)))
+    }
+
+    fn start_next_attempt(
+        &mut self,
+        data_range: &DataRange,
+        pending: &mut PendingRequests,
+        timed_out: bool,
+        running: usize,
+        ctx: &mut Context<'_>,
+    ) {
+        if timed_out {
+            tracing::trace!(
+                "Request didn't complete in {}ms, sending one more query",
+                pending.timeout_duration.as_millis()
+            );
+        }
+
+        for req in &mut pending.requests {
+            if let WorkerRequest::NotStarted(worker) = req {
+                let is_speculative = running > 0;
+                let lease = worker
+                    .lease
+                    .take()
+                    .expect("worker lease should only be used once");
+                let request = self.send_query(data_range, lease, is_speculative);
+                *req = WorkerRequest::Running(request);
+                pending.set_timeout(self.timeouts.current_timeout(), ctx);
+                break;
+            }
+        }
     }
 
     fn pop_response(
