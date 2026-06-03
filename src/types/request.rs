@@ -14,6 +14,7 @@ pub struct StreamRequest {
     pub retries: u8,
     pub compression: Compression,
     pub skip_parent_hash_validation: bool,
+    pub eager_continuations: bool,
 }
 
 #[derive(Debug, Clone)]

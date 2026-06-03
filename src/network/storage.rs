@@ -63,10 +63,6 @@ impl StorageClient {
         self.ignore_deprecated_workers = true;
     }
 
-    pub fn has_assignment(&self) -> bool {
-        self.assignment.read().is_some()
-    }
-
     pub fn num_workers(&self) -> usize {
         self.assignment
             .read()

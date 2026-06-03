@@ -1014,6 +1014,7 @@ where
             retries,
             compression,
             skip_parent_hash_validation: config.skip_parent_hash_validation,
+            eager_continuations: config.eager_continuations,
         })
     }
 }

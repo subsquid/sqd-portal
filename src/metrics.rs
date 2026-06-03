@@ -61,6 +61,8 @@ lazy_static::lazy_static! {
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 2.0, 30)));
     pub static ref STREAM_CHUNKS: Family<Labels, Histogram> =
         Family::new_with_constructor(|| Histogram::new(buckets(1., 20)));
+    pub static ref STREAM_MAX_CHUNK_PARTS: Family<Labels, Histogram> =
+        Family::new_with_constructor(|| Histogram::new(buckets(1., 20)));
     pub static ref STREAM_BYTES_PER_SECOND: Histogram = Histogram::new(exponential_buckets(100., 3.0, 20));
     pub static ref STREAM_BLOCKS_PER_SECOND: Family<Labels, Histogram> =
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 3.0, 20)));
@@ -137,10 +139,14 @@ pub fn report_stream_completed(
     let bytes = stats.response_bytes;
     let blocks = stats.response_blocks;
     let chunks = stats.chunks_downloaded;
+    let max_chunk_parts = stats.max_chunk_parts;
     STREAM_DURATIONS.get_or_create(&labels).observe(duration);
     STREAM_BYTES.get_or_create(&labels).observe(bytes as f64);
     STREAM_BLOCKS.get_or_create(&labels).observe(blocks as f64);
     STREAM_CHUNKS.get_or_create(&labels).observe(chunks as f64);
+    STREAM_MAX_CHUNK_PARTS
+        .get_or_create(&labels)
+        .observe(max_chunk_parts as f64);
     STREAM_BYTES_PER_SECOND.observe(bytes as f64 / duration);
     STREAM_BLOCKS_PER_SECOND
         .get_or_create(&labels)
@@ -269,6 +275,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "stream_chunks",
         "Numbers of chunks per stream",
         STREAM_CHUNKS.clone(),
+    );
+    registry.register(
+        "stream_max_chunk_parts",
+        "Maximum number of response parts queued for a single chunk in a completed stream",
+        STREAM_MAX_CHUNK_PARTS.clone(),
     );
     registry.register(
         "stream_bytes_per_second",
