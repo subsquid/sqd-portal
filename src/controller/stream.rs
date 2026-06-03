@@ -177,6 +177,8 @@ struct FinishedWorkerRequest {
     worker: PeerId,
 }
 
+type StartQueryingChunkError = (Box<Slot>, SendQueryError);
+
 impl Drop for RunningWorkerRequest {
     fn drop(&mut self) {
         self.resp.abort();
@@ -330,7 +332,7 @@ impl StreamController {
             Ok(slot) => slot,
             Err((slot, e)) => {
                 tracing::debug!("Couldn't schedule continuation request: {e:?}");
-                slot
+                *slot
             }
         };
         chunk_slot.active = Some(next_slot);
@@ -369,7 +371,7 @@ impl StreamController {
                 UpdateStatus::Updated
             }
             Err((s, e)) => {
-                *slot = s;
+                *slot = *s;
                 self.last_error = Some(e.to_string());
                 if matches!(slot.state, RequestState::NoWorkers) {
                     UpdateStatus::NotUpdated
@@ -562,26 +564,33 @@ impl StreamController {
             }
         };
 
-        let mut chunk_slot = match self.pop_buffered_response(chunk_slot) {
-            Ok(response) => return response,
-            Err(chunk_slot) => chunk_slot,
-        };
+        let mut chunk_slot = chunk_slot;
+        if let Some(response) = self.pop_buffered_response(&mut chunk_slot) {
+            if !chunk_slot.is_empty() {
+                self.buffer.push_front(chunk_slot);
+            }
+            return response;
+        }
 
         match chunk_slot.buffer_active_response(true) {
             BufferedActiveSlot::Nothing => {}
             BufferedActiveSlot::Completed => {
                 let response = self
-                    .pop_buffered_response(chunk_slot)
-                    .ok()
+                    .pop_buffered_response(&mut chunk_slot)
                     .expect("completed active slot should have produced a buffered response");
+                if !chunk_slot.is_empty() {
+                    self.buffer.push_front(chunk_slot);
+                }
                 return response;
             }
             BufferedActiveSlot::Partial(next_data_range) => {
                 self.schedule_continuation(&mut chunk_slot, next_data_range, ctx);
                 let response = self
-                    .pop_buffered_response(chunk_slot)
-                    .ok()
+                    .pop_buffered_response(&mut chunk_slot)
                     .expect("partial active slot should have produced a buffered response");
+                if !chunk_slot.is_empty() {
+                    self.buffer.push_front(chunk_slot);
+                }
                 return response;
             }
         }
@@ -622,15 +631,10 @@ impl StreamController {
 
     fn pop_buffered_response(
         &mut self,
-        mut chunk_slot: ChunkSlot,
-    ) -> Result<Poll<Option<Result<ResponseChunk, RequestError>>>, ChunkSlot> {
-        let Some(response) = chunk_slot.pending_responses.pop_front() else {
-            return Err(chunk_slot);
-        };
-        if !chunk_slot.is_empty() {
-            self.buffer.push_front(chunk_slot);
-        }
-        Ok(self.emit_buffered_response(response))
+        chunk_slot: &mut ChunkSlot,
+    ) -> Option<Poll<Option<Result<ResponseChunk, RequestError>>>> {
+        let response = chunk_slot.pending_responses.pop_front()?;
+        Some(self.emit_buffered_response(response))
     }
 
     fn emit_buffered_response(
@@ -701,7 +705,7 @@ impl StreamController {
                     if self.buffer.len() == 0 {
                         // Couldn't schedule a new request with no ongoing requests
                         // Return the error immediately
-                        let chunk_slot = ChunkSlot::new(slot);
+                        let chunk_slot = ChunkSlot::new(*slot);
                         self.stats.observe_chunk_parts(chunk_slot.num_parts());
                         self.buffer.push_back(chunk_slot);
                     }
@@ -736,7 +740,7 @@ impl StreamController {
         &mut self,
         range: DataRange,
         ctx: &mut Context<'_>,
-    ) -> Result<Slot, (Slot, SendQueryError)> {
+    ) -> Result<Slot, StartQueryingChunkError> {
         let block_range = self
             .request
             .query
@@ -762,7 +766,7 @@ impl StreamController {
                     data_range,
                     state: RequestState::NoWorkers,
                 };
-                Err((slot, err))
+                Err((Box::new(slot), err))
             }
             Err(err @ SendQueryError::Backoff(until)) => {
                 let mut slot = Slot {
@@ -770,7 +774,7 @@ impl StreamController {
                     state: RequestState::Paused(PausedState::new(until)),
                 };
                 self.poll_slot(&mut slot, ctx);
-                Err((slot, err))
+                Err((Box::new(slot), err))
             }
         }
     }
@@ -925,7 +929,7 @@ impl Slot {
         let read_range = BlockRange::new(*old.range.start(), *next_range.start() - 1);
         let next_data_range = DataRange {
             range: next_range,
-            chunk: old.chunk.clone(),
+            chunk: old.chunk,
             chunk_index: old.chunk_index,
         };
 
