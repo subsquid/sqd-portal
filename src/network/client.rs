@@ -26,7 +26,7 @@ use tracing::{debug_span, instrument, Instrument};
 use super::contracts_state::{ContractsState, Status};
 use super::priorities::NoWorker;
 use super::{ChunkNotFound, NetworkState, WorkerLease};
-use crate::controller::read_scheduler::{DownloadScheduler, Outcome, Priority};
+use crate::controller::download_scheduler::{DownloadScheduler, Outcome, Priority};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
 use crate::types::{BlockNumber, BlockRange, ChunkId, Compression, DataChunk};
