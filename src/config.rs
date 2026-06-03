@@ -252,7 +252,7 @@ pub struct CongestionConfig {
     pub min_shrink_interval_ms: u64,
     pub read_timeout_sec: u64,
     pub headroom_threshold: f64,
-    pub priority_stride: u64,
+    pub priority_stride: u32,
     pub enabled: bool,
 }
 

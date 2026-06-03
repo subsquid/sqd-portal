@@ -12,7 +12,7 @@ use crate::config::CongestionConfig;
 use crate::metrics;
 use crate::utils::Mutex;
 
-pub type Priority = u64;
+pub type Priority = u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -72,7 +72,7 @@ impl DownloadScheduler {
                     outcome: Outcome::Neutral,
                 };
             }
-            let priority_key = (priority.min(u32::MAX as u64) as u32, state.next_seq);
+            let priority_key = (priority, state.next_seq);
             state.next_seq += 1;
             let (tx, rx) = oneshot::channel();
             state.waiters.insert(priority_key, tx);

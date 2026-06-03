@@ -89,8 +89,8 @@ pub struct StreamController {
     stats: StreamStats,
     span: tracing::Span,
     last_error: Option<String>,
-    stream_index: u64,
-    priority_stride: u64,
+    stream_index: u32,
+    priority_stride: u32,
 }
 
 #[derive(Clone)]
@@ -190,8 +190,8 @@ impl StreamController {
     pub fn new(
         request: StreamRequest,
         network: Arc<NetworkClient>,
-        stream_index: u64,
-        priority_stride: u64,
+        stream_index: u32,
+        priority_stride: u32,
     ) -> Result<Self, RequestError> {
         let first_block = request.query.first_block();
 
@@ -708,7 +708,7 @@ impl StreamController {
         };
         let start_time = tokio::time::Instant::now();
 
-        let priority = self.stream_index * self.priority_stride + range.chunk_index as u64;
+        let priority = self.stream_index * self.priority_stride + range.chunk_index as u32;
 
         let worker = lease.worker();
         let fut = self

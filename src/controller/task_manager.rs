@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -21,9 +21,9 @@ pub struct TaskManager {
     network_client: Arc<NetworkClient>,
     running_tasks: AtomicUsize,
     max_tasks: usize,
-    next_stream_index: AtomicU64,
+    next_stream_index: AtomicU32,
     bandwidth_utilization_threshold: f64,
-    priority_stride: u64,
+    priority_stride: u32,
 }
 
 impl TaskManager {
@@ -31,13 +31,13 @@ impl TaskManager {
         network_client: Arc<NetworkClient>,
         max_parallel_streams: usize,
         bandwidth_utilization_threshold: f64,
-        priority_stride: u64,
+        priority_stride: u32,
     ) -> TaskManager {
         TaskManager {
             network_client,
             running_tasks: 0.into(),
             max_tasks: max_parallel_streams,
-            next_stream_index: AtomicU64::new(0),
+            next_stream_index: AtomicU32::new(0),
             bandwidth_utilization_threshold,
             priority_stride,
         }

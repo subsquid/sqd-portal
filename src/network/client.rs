@@ -447,7 +447,7 @@ impl NetworkClient {
         block_range: BlockRange,
         query: String,
         compression: Compression,
-        priority: Option<u64>,
+        priority: Option<u32>,
     ) -> QueryResult {
         let query_id = generate_query_id();
         let worker = lease.worker();
@@ -474,7 +474,7 @@ impl NetworkClient {
         &self,
         worker: PeerId,
         query: Query,
-        priority: Option<u64>,
+        priority: Option<u32>,
     ) -> QueryResult {
         let mut stream = self.send_to_transport(worker, query, priority).await?;
         let network_start = Instant::now();
@@ -534,7 +534,7 @@ impl NetworkClient {
         &self,
         worker: PeerId,
         query: Query,
-        priority: Option<u64>,
+        priority: Option<u32>,
     ) -> Result<ResponseStream, QueryError> {
         metrics::QUERIES_SENT
             .get_or_create(&vec![("worker".to_string(), worker.to_string())])
@@ -592,7 +592,7 @@ impl NetworkClient {
         worker: PeerId,
         stream: &mut ResponseStream,
         buf: &mut Vec<u8>,
-        priority: Option<u64>,
+        priority: Option<u32>,
     ) -> Result<Duration, QueryError> {
         let result = match (&self.read_scheduler, priority) {
             (Some(sched), Some(prio)) => {
