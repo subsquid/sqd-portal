@@ -208,7 +208,7 @@ impl WorkersPool {
     }
 
     fn default_priority() -> Priority {
-        (PriorityGroup::Best, 0, 0)
+        (PriorityGroup::Best, 0, i64::MIN)
     }
 }
 
