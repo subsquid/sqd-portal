@@ -217,23 +217,17 @@ impl StreamController {
 
     #[instrument(skip_all, level="debug", fields(chunk_index = slot.data_range.chunk_index))]
     fn poll_slot(&mut self, slot: &mut Slot, ctx: &mut Context<'_>) -> UpdateStatus {
-        if !matches!(slot.state, RequestState::Pending(_)) {
-            return self.poll_deferred_slot(slot, ctx);
-        }
-
-        let result = {
-            let RequestState::Pending(pending) = &mut slot.state else {
-                unreachable!("checked above")
-            };
-            self.poll_pending_slot(&slot.data_range, pending, ctx)
-        };
-
-        match result {
-            PendingSlotPoll::Updated(state) => {
-                slot.state = state;
-                UpdateStatus::Updated
+        match &mut slot.state {
+            RequestState::Pending(pending) => {
+                match self.poll_pending_slot(&slot.data_range, pending, ctx) {
+                    PendingSlotPoll::Updated(state) => {
+                        slot.state = state;
+                        UpdateStatus::Updated
+                    }
+                    PendingSlotPoll::NotUpdated => UpdateStatus::NotUpdated,
+                }
             }
-            PendingSlotPoll::NotUpdated => UpdateStatus::NotUpdated,
+            _ => self.poll_deferred_slot(slot, ctx),
         }
     }
 
