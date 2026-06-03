@@ -663,6 +663,10 @@ impl StreamController {
     }
 
     /// Leases `count` distinct workers for the given range, releasing all on any failure.
+    ///
+    /// Note that if enough distinct workers can't be found, some duplicates may be returned
+    /// leading to equal queries sent in parallel to the same worker. It's not a problem now,
+    /// but can be improved in the future.
     fn pre_lease_workers(
         &mut self,
         range: &DataRange,

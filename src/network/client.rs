@@ -574,6 +574,14 @@ impl NetworkClient {
         worker: PeerId,
         stream: &mut ResponseStream,
     ) -> Result<Vec<u8>, QueryError> {
+        // Intentionally not behind a download-scheduler permit.
+        // The constrained portal-side resource is the network bandwidth,
+        // so only `download_body` holds a permit.
+        // This lets arbitrarily many queries be in flight while the congestion
+        // window bounds only the parallel reads.
+        //
+        // It's not perfect because the yamux substream buffer will be filled until the
+        // backpressure propagates to the worker. But this is a reasonable tradeoff.
         let mut buf = Vec::with_capacity(1024 * 1024);
         wait_for_first_byte(stream, &mut buf, self.transport_timeout)
             .instrument(tracing::debug_span!("wait_first_byte"))

@@ -142,6 +142,9 @@ impl WorkersPool {
 
     pub fn unlease(&mut self, worker: PeerId) {
         self.modify(worker, |stats| {
+            // Normally, this should never underflow because unleasing the worker
+            // requires that it had been leased before. In case of a bug,
+            // an underflow should happen in the release mode.
             stats.running_queries -= 1;
         });
     }
