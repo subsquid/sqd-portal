@@ -7,5 +7,5 @@ mod storage;
 pub use client::{CurrentEpoch, NetworkClient, NetworkClientStatus, QueryResult, Workers};
 pub use contracts_state::Status;
 pub use priorities::{NoWorker, PrioritiesConfig, Priority};
-pub use state::NetworkState;
+pub use state::{NetworkState, WorkerLease};
 pub use storage::{ChunkNotFound, StorageClient};

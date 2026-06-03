@@ -35,21 +35,22 @@
 //!   │     │                                 chunk's    │      │
 //!   │     │                                 query)     │      │
 //!   └─────┴────────────────────────────────────────────┴──────┘
-//!                               ▲
-//!                               │
-//!                   Slot.state evolves through:
-//!                   ┌──────────┐ poll_slot   ┌──────────┐
-//!                   │ Pending  │────────────▶│  Done    │ ─ Ok(bytes) / Err
-//!                   │ (query   │             └──────────┘
-//!                   │  spawned)│             ┌──────────┐
-//!                   │          │────────────▶│ Partial  │ ─ has bytes for
-//!                   └──────────┘             │ (more to │   prefix; rest
-//!                        ▲                   │  fetch)  │   re-queried
-//!                        │                   └──────────┘
-//!                        │                         │
-//!                        └─────────────────────────┘
-//!                        continuation request fires
-//!                        on pop_response (next_range)
+//!                   ▲
+//!                   │
+//!            Slot.state evolves through:
+//!
+//!            ┌───────────┐
+//!            │ NoWorkers │──┐
+//!            └───────────┘  │     ┌─────────┐     ┌──────┐
+//!                           ├────▶│ Pending │────▶│ Done │ ─ Ok(bytes) / Err
+//!            ┌───────────┐  │     └─────────┘     └──────┘
+//!            │  Paused   │──┘          │
+//!            └───────────┘             ▼
+//!                ▲                ┌─────────┐
+//!                │                │ Partial │ ─ has bytes for
+//!                └────────────────│         │   prefix; rest
+//!                  continuation   └─────────┘   re-queried
+//!                  request fires
 //! ```
 
 #![allow(unstable_name_collisions)]
@@ -69,7 +70,7 @@ use tracing::{instrument, Instrument};
 
 use crate::{
     controller::timeouts::TimeoutManager,
-    network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult},
+    network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult, WorkerLease},
     types::{
         BlockRange, ChunkId, DataChunk, QueryError, RequestError, ResponseChunk, SendQueryError,
         StreamRequest,
@@ -88,8 +89,11 @@ pub struct StreamController {
     stats: StreamStats,
     span: tracing::Span,
     last_error: Option<String>,
+    stream_index: u32,
+    priority_stride: u32,
 }
 
+#[derive(Clone)]
 pub struct DataRange {
     pub range: BlockRange,
     pub chunk: DataChunk,
@@ -101,17 +105,29 @@ struct Slot {
     state: RequestState,
 }
 
-// The size of this structure never exceeds the maximum response size
 enum RequestState {
+    /// Couldn't find enough workers now.
+    /// Retry whenever the stream is polled, or give up if this is the first slot.
+    NoWorkers,
+    /// It's known how long to wait until the workers will become available.
+    /// If this is the first slot, it may be worth to wait.
+    Paused(PausedState),
+    /// Workers are allocated and queries to some of them are running. Waiting for the results.
     Pending(PendingRequests),
+    /// We've got a successful result from one of the workers but it didn't cover the whole chunk range.
+    /// A continuation request should be sent once we feed this result to the client.
     Partial(PartialResult),
+    /// Either a successful result has been received, or all the attempts have failed.
     Done(Result<ResponseChunk, RequestError>),
+}
+
+struct PausedState {
+    until: Instant,
+    timeout: Pin<Box<tokio::time::Sleep>>,
 }
 
 struct PendingRequests {
     requests: Vec<WorkerRequest>,
-    tries_left: u8,
-    last_error: Option<String>,
     timeout: Pin<Box<tokio::time::Sleep>>,
     timeout_duration: Duration,
 }
@@ -121,20 +137,62 @@ struct PartialResult {
     next_range: BlockRange,
 }
 
-struct WorkerRequest {
+enum WorkerRequest {
+    NotStarted(ReservedWorker),
+    Running(RunningWorkerRequest),
+    Finished(FinishedWorkerRequest),
+}
+
+struct ReservedWorker {
+    lease: Option<WorkerLease>,
+}
+
+struct RunningWorkerRequest {
     resp: tokio::task::JoinHandle<QueryResult>,
     start_time: tokio::time::Instant,
     worker: PeerId,
 }
 
-impl Drop for WorkerRequest {
+struct FinishedWorkerRequest {
+    result: QueryResult,
+    worker: PeerId,
+}
+
+impl Drop for RunningWorkerRequest {
     fn drop(&mut self) {
         self.resp.abort();
     }
 }
 
+enum UpdateStatus {
+    Updated,
+    NotUpdated,
+}
+
+struct PendingPollSummary {
+    not_started: usize,
+    running: usize,
+    newly_finished: usize,
+}
+
+enum PendingSlotPoll {
+    Updated(RequestState),
+    NotUpdated,
+}
+
+impl UpdateStatus {
+    fn updated(&self) -> bool {
+        matches!(self, UpdateStatus::Updated)
+    }
+}
+
 impl StreamController {
-    pub fn new(request: StreamRequest, network: Arc<NetworkClient>) -> Result<Self, RequestError> {
+    pub fn new(
+        request: StreamRequest,
+        network: Arc<NetworkClient>,
+        stream_index: u32,
+        priority_stride: u32,
+    ) -> Result<Self, RequestError> {
         let first_block = request.query.first_block();
 
         let first_chunk = match network.find_chunk(&request.dataset_id, first_block) {
@@ -166,6 +224,8 @@ impl StreamController {
             stats: StreamStats::new(),
             span: tracing::Span::current(),
             last_error: None,
+            stream_index,
+            priority_stride,
         })
     }
 
@@ -183,7 +243,7 @@ impl StreamController {
         let mut buffer = std::mem::take(&mut self.buffer);
         let mut updated = false;
         for slot in buffer.iter_mut() {
-            updated |= self.poll_slot(slot, ctx);
+            updated |= self.poll_slot(slot, ctx).updated();
         }
         self.buffer = buffer;
 
@@ -210,107 +270,216 @@ impl StreamController {
         result
     }
 
-    #[instrument(skip_all, level="trace", fields(chunk_index = slot.data_range.chunk_index))]
-    fn poll_slot(&mut self, slot: &mut Slot, ctx: &mut Context<'_>) -> bool {
-        let RequestState::Pending(pending) = &mut slot.state else {
-            return false;
+    #[instrument(skip_all, level="debug", fields(chunk_index = slot.data_range.chunk_index))]
+    fn poll_slot(&mut self, slot: &mut Slot, ctx: &mut Context<'_>) -> UpdateStatus {
+        match &mut slot.state {
+            RequestState::Pending(pending) => {
+                match self.poll_pending_slot(&slot.data_range, pending, ctx) {
+                    PendingSlotPoll::Updated(state) => {
+                        slot.state = state;
+                        UpdateStatus::Updated
+                    }
+                    PendingSlotPoll::NotUpdated => UpdateStatus::NotUpdated,
+                }
+            }
+            _ => self.poll_deferred_slot(slot, ctx),
+        }
+    }
+
+    fn poll_deferred_slot(&mut self, slot: &mut Slot, ctx: &mut Context<'_>) -> UpdateStatus {
+        match &mut slot.state {
+            RequestState::NoWorkers => {}
+            RequestState::Paused(state) => match state.timeout.as_mut().poll_unpin(ctx) {
+                Poll::Pending => return UpdateStatus::NotUpdated,
+                Poll::Ready(_) => {}
+            },
+            _ => return UpdateStatus::NotUpdated,
+        }
+
+        match self.start_querying_chunk(slot.data_range.clone(), ctx) {
+            Ok(s) => {
+                *slot = s;
+                UpdateStatus::Updated
+            }
+            Err((s, e)) => {
+                *slot = s;
+                self.last_error = Some(e.to_string());
+                if matches!(slot.state, RequestState::NoWorkers) {
+                    UpdateStatus::NotUpdated
+                } else {
+                    UpdateStatus::Updated
+                }
+            }
+        }
+    }
+
+    fn poll_pending_slot(
+        &mut self,
+        data_range: &DataRange,
+        pending: &mut PendingRequests,
+        ctx: &mut Context<'_>,
+    ) -> PendingSlotPoll {
+        match self.poll_worker_requests(data_range, pending, ctx) {
+            Ok(summary) => self.advance_pending_slot(data_range, pending, summary, ctx),
+            Err(state) => PendingSlotPoll::Updated(state),
+        }
+    }
+
+    fn poll_worker_requests(
+        &mut self,
+        data_range: &DataRange,
+        pending: &mut PendingRequests,
+        ctx: &mut Context<'_>,
+    ) -> Result<PendingPollSummary, RequestState> {
+        let mut summary = PendingPollSummary {
+            not_started: 0,
+            running: 0,
+            newly_finished: 0,
         };
 
-        let mut result = None;
-        let mut retry = false;
-        pending.requests.retain_mut(|request| {
-            let Poll::Ready(response) = request.resp.poll_unpin(ctx) else {
-                return true;
-            };
-            let response = response.unwrap();
-            // This is intentionally measured when the result has been polled, not when it's ready.
-            // If the stream is consumed slower than generated, this duration may get significantly higher than the response time.
-            // This way the extra "follow up" queries won't be sent, saving on the number of queries.
-            let duration = request.start_time.elapsed();
+        for request in pending.requests.iter_mut() {
+            self.poll_worker_request(data_range, request, &mut summary, ctx)?;
+        }
 
-            if better_result(result.as_ref().map(|(response, _, _)| response), &response) {
-                result = Some((response, duration, request.worker));
+        Ok(summary)
+    }
+
+    fn poll_worker_request(
+        &mut self,
+        data_range: &DataRange,
+        request: &mut WorkerRequest,
+        summary: &mut PendingPollSummary,
+        ctx: &mut Context<'_>,
+    ) -> Result<(), RequestState> {
+        match request {
+            WorkerRequest::NotStarted(_) => {
+                summary.not_started += 1;
             }
-            false
-        });
+            WorkerRequest::Finished(_) => {}
+            WorkerRequest::Running(running) => {
+                let Poll::Ready(response) = running.resp.poll_unpin(ctx) else {
+                    summary.running += 1;
+                    return Ok(());
+                };
+                summary.newly_finished += 1;
 
-        if let Some((response, duration, worker)) = result {
-            if retriable(&response) && pending.tries_left > 0 {
-                pending.last_error = Some(
-                    RequestError::from_query_error(response.clone().unwrap_err(), worker)
-                        .to_string(),
-                );
-                tracing::debug!("Retrying request: {:?}", response);
-                retry = true;
-            } else {
+                // This is intentionally measured when the result has been polled, not when it's ready.
+                // If the stream is consumed slower than generated, this duration may get
+                // significantly higher than the response time.
+                // This way the extra "follow up" queries won't be sent, saving on the number of queries.
+                let duration = running.start_time.elapsed();
                 self.timeouts.observe(duration);
-                slot.state = parse_response(response, &slot.data_range.range, worker);
-                tracing::debug!(
-                    "Got result ({}) in {}ms from {}",
-                    short_code(&slot.state),
-                    duration.as_millis(),
-                    worker
-                );
-                return true;
-            }
-        }
 
-        #[allow(clippy::collapsible_else_if)]
-        if pending.timeout.as_mut().poll(ctx).is_ready() {
-            if pending.tries_left > 0 {
-                retry = true;
-                if !pending.requests.is_empty() {
-                    tracing::debug!(
-                        "Request didn't complete in {}ms, sending one more query",
-                        pending.timeout_duration.as_millis()
-                    );
-                }
-            } else {
-                if pending.requests.is_empty() {
-                    slot.state = RequestState::Done(Err(RequestError::InternalError(
-                        "soft timeout exceeded".to_string(),
-                    )));
-                    return true;
-                } else {
-                    // wait for other requests to complete
-                }
-            }
-        }
-
-        if retry {
-            tracing::debug!("Handling retry, {} tries left", pending.tries_left);
-            assert!(pending.tries_left > 0);
-            pending.tries_left -= 1;
-            match self.send_query(&slot.data_range) {
-                Ok(worker_request) => {
-                    pending.set_timeout(self.timeouts.current_timeout());
-                    pending.requests.push(worker_request);
-                }
-                Err(SendQueryError::Backoff(until)) if pending.tries_left > 0 => {
-                    pending.set_deadline(until);
-                    tracing::debug!(
-                        "Pausing for {}ms before retrying request",
-                        pending.timeout_duration.as_millis()
-                    );
-                }
-                Err(e) if !pending.requests.is_empty() => {
-                    // wait for other requests to complete
-                    tracing::debug!("Couldn't schedule retry: {e:?}");
-                    if pending.last_error.is_none() {
-                        pending.last_error =
-                            Some(format!("couldn't retry query after soft timeout: {e}"));
+                let response = match response {
+                    Ok(res) => res,
+                    Err(join_err) => {
+                        tracing::error!(
+                            "Worker query task failed in {}ms for {}: {}",
+                            duration.as_millis(),
+                            running.worker,
+                            join_err,
+                        );
+                        return Err(RequestState::Done(Err(RequestError::InternalError(
+                            format!("worker query task failed: {join_err}"),
+                        ))));
                     }
-                    pending.set_timeout(self.timeouts.current_timeout());
-                }
-                Err(e) => {
-                    let last_error = pending.last_error.take().unwrap_or_else(|| e.to_string());
-                    slot.state = RequestState::Done(Err(RequestError::InternalError(last_error)));
-                    return true;
+                };
+
+                if retriable(&response) {
+                    tracing::debug!(
+                        "Got retriable error in {}ms from {}: {}",
+                        duration.as_millis(),
+                        running.worker,
+                        response.as_ref().unwrap_err().to_string(),
+                    );
+                    *request = WorkerRequest::Finished(FinishedWorkerRequest {
+                        result: response,
+                        worker: running.worker,
+                    });
+                } else {
+                    // Work is over for this slot. All the remaining requests will be cancelled.
+                    return Err(parse_response(
+                        response,
+                        &data_range.range,
+                        running.worker,
+                        duration,
+                    ));
                 }
             }
-            assert!(pending.timeout.poll_unpin(ctx).is_pending()); // pass the context to wake
         }
-        false
+
+        Ok(())
+    }
+
+    fn advance_pending_slot(
+        &mut self,
+        data_range: &DataRange,
+        pending: &mut PendingRequests,
+        summary: PendingPollSummary,
+        ctx: &mut Context<'_>,
+    ) -> PendingSlotPoll {
+        if summary.running == 0 && summary.not_started == 0 {
+            return PendingSlotPoll::Updated(Self::all_attempts_failed(pending));
+        }
+
+        let timed_out = pending.timeout.as_mut().poll(ctx).is_ready();
+        let should_retry = summary.newly_finished > 0 || timed_out || summary.running == 0;
+
+        if should_retry && summary.not_started > 0 {
+            self.start_next_attempt(data_range, pending, timed_out, summary.running, ctx);
+            return PendingSlotPoll::NotUpdated;
+        }
+
+        if should_retry {
+            // The last query attempt timed out, wait for the rest to complete
+            assert!(summary.running > 0);
+        }
+
+        PendingSlotPoll::NotUpdated
+    }
+
+    fn all_attempts_failed(pending: &mut PendingRequests) -> RequestState {
+        let mut errors = Vec::with_capacity(pending.requests.len());
+        for request in pending.requests.drain(..) {
+            let WorkerRequest::Finished(f) = request else {
+                unreachable!("all worker requests should be finished")
+            };
+            let error =
+                RequestError::from_query_error(f.result.unwrap_err().clone(), f.worker).to_string();
+            errors.push(error);
+        }
+        let message = format!("All query attempts failed: {}", errors.join("; "));
+        RequestState::Done(Err(RequestError::InternalError(message)))
+    }
+
+    fn start_next_attempt(
+        &mut self,
+        data_range: &DataRange,
+        pending: &mut PendingRequests,
+        timed_out: bool,
+        running: usize,
+        ctx: &mut Context<'_>,
+    ) {
+        if timed_out {
+            tracing::trace!(
+                "Request didn't complete in {}ms, sending one more query",
+                pending.timeout_duration.as_millis()
+            );
+        }
+
+        for req in &mut pending.requests {
+            if let WorkerRequest::NotStarted(worker) = req {
+                let is_speculative = running > 0;
+                let lease = worker
+                    .lease
+                    .take()
+                    .expect("worker lease should only be used once");
+                let request = self.send_query(data_range, lease, is_speculative);
+                *req = WorkerRequest::Running(request);
+                pending.set_timeout(self.timeouts.current_timeout(), ctx);
+                break;
+            }
+        }
     }
 
     fn pop_response(
@@ -323,20 +492,31 @@ impl StreamController {
         let chunk_index = slot.data_range.chunk_index;
         let (result, read_range) = match slot.state {
             RequestState::Done(result) => (Poll::Ready(Some(result)), slot.data_range.range),
-            RequestState::Pending(ref pending) => {
-                if pending.is_paused() {
-                    let duration = pending.time_left();
-                    if duration > MAX_IDLE_TIME {
-                        return Poll::Ready(Some(Err(RequestError::BusyFor(duration))));
-                    } else {
-                        self.stats.throttled(duration);
-                    }
+            RequestState::NoWorkers => {
+                // We don't know how long we'll have to wait, so give up immediately
+                return Poll::Ready(Some(Err(RequestError::Unavailable)));
+            }
+            RequestState::Paused(ref s) => {
+                // All workers are rate-limited, try to pause and continue streaming
+                let duration = s.until.duration_since(Instant::now());
+                if duration > MAX_IDLE_TIME {
+                    return Poll::Ready(Some(Err(RequestError::BusyFor(duration))));
+                } else {
+                    // TODO: fix calculation in case we're polling the same paused slot multiple times
+                    self.stats.throttled(duration);
                 }
                 let range = slot.data_range.range.clone();
                 self.buffer.push_front(slot);
                 (Poll::Pending, range)
             }
+            RequestState::Pending(_) => {
+                // The query is still running, keep waiting
+                let range = slot.data_range.range.clone();
+                self.buffer.push_front(slot);
+                (Poll::Pending, range)
+            }
             RequestState::Partial(PartialResult { data, next_range }) => {
+                // Return the partial result and schedule the continuation query
                 let read_range =
                     BlockRange::new(*slot.data_range.range.start(), *next_range.start() - 1);
                 let next_data_range = slot.data_range.with_range(next_range);
@@ -355,7 +535,7 @@ impl StreamController {
         if let Poll::Ready(Some(Ok(bytes))) = &result {
             self.stats
                 .sent_response_chunk(*read_range.end() - *read_range.start() + 1, bytes.len());
-            tracing::debug!(
+            tracing::trace!(
                 chunk_index,
                 "Writing response blocks {}-{} ({} bytes)",
                 *read_range.start(),
@@ -367,9 +547,12 @@ impl StreamController {
         result
     }
 
-    #[instrument(skip_all, level = "trace")]
     fn try_fill_slots(&mut self, ctx: &mut Context<'_>) {
-        if self.buffer.back().is_some_and(Slot::is_paused) {
+        if let Some(Slot {
+            state: RequestState::Paused(_),
+            ..
+        }) = self.buffer.back()
+        {
             // Either the amount of compute units is low or the network is overloaded.
             // Don't send new queries until the existing ones complete.
             return;
@@ -401,7 +584,9 @@ impl StreamController {
                     }
                 }
                 Err((slot, e)) => {
-                    tracing::debug!("Couldn't schedule request: {e:?}");
+                    if !matches!(e, SendQueryError::NoWorkers) {
+                        tracing::debug!("Couldn't schedule request: {e:?}");
+                    }
                     if self.buffer.len() == 0 {
                         // Couldn't schedule a new request with no ongoing requests
                         // Return the error immediately
@@ -444,54 +629,81 @@ impl StreamController {
             .query
             .intersect_with(&range.range)
             .expect("Chunk doesn't contain requested data");
-        let range = range.with_range(block_range);
-        let mut pending = match self.send_query(&range) {
-            Ok(request) => PendingRequests::new(
-                request,
-                self.timeouts.current_timeout(),
-                self.request.retries,
-            ),
-            Err(SendQueryError::Backoff(until)) => {
-                let request = PendingRequests::paused(until, self.request.retries);
-                tracing::debug!(
-                    "Pausing for {}ms before sending request",
-                    request.timeout_duration.as_millis()
-                );
-                request
+        let data_range = range.with_range(block_range);
+
+        let attempts = 1 + self.request.retries as usize;
+        match self.pre_lease_workers(&data_range, attempts) {
+            Ok(leases) => {
+                let mut slot = Slot {
+                    data_range,
+                    state: RequestState::Pending(PendingRequests::new(
+                        leases,
+                        self.timeouts.current_timeout(),
+                    )),
+                };
+                self.poll_slot(&mut slot, ctx);
+                Ok(slot)
             }
             Err(err @ SendQueryError::NoWorkers) => {
-                return Err((
-                    Slot {
-                        data_range: range,
-                        state: RequestState::Done(Err(RequestError::Unavailable)),
-                    },
-                    err,
-                ))
+                let slot = Slot {
+                    data_range,
+                    state: RequestState::NoWorkers,
+                };
+                Err((slot, err))
             }
-        };
-        assert!(pending.timeout.poll_unpin(ctx).is_pending());
-        Ok(Slot {
-            data_range: range,
-            state: RequestState::Pending(pending),
-        })
+            Err(err @ SendQueryError::Backoff(until)) => {
+                let mut slot = Slot {
+                    data_range,
+                    state: RequestState::Paused(PausedState::new(until)),
+                };
+                self.poll_slot(&mut slot, ctx);
+                Err((slot, err))
+            }
+        }
     }
 
-    fn send_query(&mut self, range: &DataRange) -> Result<WorkerRequest, SendQueryError> {
-        let worker =
+    /// Leases `count` distinct workers for the given range, releasing all on any failure.
+    ///
+    /// Note that if enough distinct workers can't be found, some duplicates may be returned
+    /// leading to equal queries sent in parallel to the same worker. It's not a problem now,
+    /// but can be improved in the future.
+    fn pre_lease_workers(
+        &mut self,
+        range: &DataRange,
+        count: usize,
+    ) -> Result<Vec<WorkerLease>, SendQueryError> {
+        let mut workers = Vec::with_capacity(count);
+        for _ in 0..count {
             match self
                 .network
-                .find_worker(&self.request.dataset_id, *range.range.start(), true)
+                .find_worker(&self.request.dataset_id, *range.range.start())
             {
-                Ok(worker) => worker,
-                Err(NoWorker::AllUnavailable) => return Err(SendQueryError::NoWorkers),
-                Err(NoWorker::Backoff(until)) => return Err(SendQueryError::Backoff(until)),
-            };
+                Ok(w) => workers.push(w),
+                Err(e) => {
+                    return Err(match e {
+                        NoWorker::AllUnavailable => SendQueryError::NoWorkers,
+                        NoWorker::Backoff(until) => SendQueryError::Backoff(until),
+                    });
+                }
+            }
+        }
+        Ok(workers)
+    }
+
+    /// Sends a query to an already-leased worker.
+    fn send_query(
+        &mut self,
+        range: &DataRange,
+        lease: WorkerLease,
+        is_speculative: bool,
+    ) -> RunningWorkerRequest {
         tracing::debug!(
-            "Sending query for chunk {} ({}-{}) to worker {}",
+            "Sending {}query for chunk {} ({}-{}) to worker {}",
+            if is_speculative { "another " } else { "" },
             range.chunk_index,
             range.range.start(),
             range.range.end(),
-            worker,
+            lease,
         );
         let query = if *range.range.start() == self.request.query.first_block() {
             self.request.query.to_string()
@@ -499,25 +711,30 @@ impl StreamController {
             self.request.query.without_parent_hash()
         };
         let start_time = tokio::time::Instant::now();
+
+        let priority = self.stream_index * self.priority_stride + range.chunk_index as u32;
+
+        let worker = lease.worker();
         let fut = self
             .network
             .clone()
             .query_worker(
-                worker,
+                lease,
                 self.request.request_id.to_string(),
                 ChunkId::new(self.request.dataset_id.clone(), range.chunk),
                 range.range.clone(),
                 query,
                 self.request.compression,
-                false,
+                Some(priority),
             )
             .in_current_span();
+
         self.stats.query_sent();
-        Ok(WorkerRequest {
+        RunningWorkerRequest {
             resp: tokio::spawn(fut),
             start_time,
             worker,
-        })
+        }
     }
 }
 
@@ -542,6 +759,8 @@ impl RequestState {
         match &self {
             RequestState::Pending(_) => '.',
             RequestState::Partial(_) => '+',
+            RequestState::NoWorkers => '?',
+            RequestState::Paused(_) => 'z',
             RequestState::Done(Ok(_)) => '#',
             RequestState::Done(Err(_)) => '!',
         }
@@ -560,69 +779,80 @@ impl DataRange {
 
 impl Slot {
     fn is_paused(&self) -> bool {
-        match &self.state {
-            RequestState::Pending(pending) => pending.is_paused(),
-            _ => false,
+        matches!(&self.state, RequestState::Paused(_))
+    }
+}
+
+impl PausedState {
+    fn new(until: Instant) -> Self {
+        Self {
+            until,
+            timeout: Box::pin(tokio::time::sleep_until(until)),
         }
     }
 }
 
 impl PendingRequests {
-    fn new(request: WorkerRequest, timeout: Duration, retries: u8) -> Self {
+    fn new(leases: impl IntoIterator<Item = WorkerLease>, timeout: Duration) -> Self {
         Self {
-            requests: vec![request],
-            tries_left: retries,
-            last_error: None,
+            requests: leases
+                .into_iter()
+                .map(|lease| {
+                    let peer_id = lease.worker();
+                    let result = WorkerRequest::NotStarted(ReservedWorker { lease: Some(lease) });
+                    tracing::trace!("Reserved worker {}", peer_id);
+                    result
+                })
+                .collect(),
             timeout: Box::pin(tokio::time::sleep(timeout)),
             timeout_duration: timeout,
         }
     }
 
-    fn paused(until: Instant, retries: u8) -> Self {
-        let timeout = until.duration_since(Instant::now());
-        Self {
-            requests: vec![],
-            tries_left: retries,
-            last_error: None,
-            timeout: Box::pin(tokio::time::sleep_until(until)),
-            timeout_duration: timeout,
-        }
-    }
-
-    // Paused state means that all workers are busy now and asked to backoff the next request
-    fn is_paused(&self) -> bool {
-        self.requests.is_empty()
-    }
-
-    fn time_left(&self) -> Duration {
-        self.timeout.deadline().duration_since(Instant::now())
-    }
-
-    fn set_timeout(&mut self, timeout: Duration) {
+    fn set_timeout(&mut self, timeout: Duration, ctx: &mut Context<'_>) {
         self.timeout = Box::pin(tokio::time::sleep(timeout));
         self.timeout_duration = timeout;
-    }
-
-    fn set_deadline(&mut self, deadline: Instant) {
-        self.timeout = Box::pin(tokio::time::sleep_until(deadline));
-        self.timeout_duration = deadline.duration_since(Instant::now());
+        assert!(self.timeout.poll_unpin(ctx).is_pending()); // pass the context to wake
     }
 }
 
-fn parse_response(response: QueryResult, range: &BlockRange, worker: PeerId) -> RequestState {
-    let result = match response {
-        Ok(result) => result,
-        Err(e) => return RequestState::Done(Err(RequestError::from_query_error(e, worker))),
+fn parse_response(
+    response: QueryResult,
+    range: &BlockRange,
+    worker: PeerId,
+    duration: Duration,
+) -> RequestState {
+    let s = match response {
+        Ok(success) => success,
+        Err(e) => {
+            let error = RequestError::from_query_error(e, worker);
+            tracing::debug!(
+                "Got error in {}ms from {}: {}",
+                duration.as_millis(),
+                worker,
+                error.to_string(),
+            );
+            return RequestState::Done(Err(error));
+        }
+    };
+    let result = s.ok;
+
+    let throughput = if s.transfer_time.is_zero() {
+        0.0
+    } else {
+        (s.response_size as f64 / (1024.0 * 1024.0)) / s.transfer_time.as_secs_f64()
     };
 
     let last_block = result.last_block;
-    if last_block == *range.end() {
+
+    let state = if last_block == *range.end() {
         RequestState::Done(Ok(result.data))
     } else if last_block < *range.start() {
         tracing::warn!(
-            "Got empty response for range {}-{}",
+            "Got empty response for range {}-{} from worker {}",
             range.start(),
-            range.end()
+            range.end(),
+            worker,
         );
         RequestState::Done(Err(RequestError::InternalError(format!(
             "the last returned block is {} which is below the first queried block {} from {}",
@@ -635,17 +865,20 @@ fn parse_response(response: QueryResult, range: &BlockRange, worker: PeerId) -> 
             data: result.data,
             next_range: BlockRange::new(last_block + 1, *range.end()),
         })
-    }
-}
-
-fn better_result(prev: Option<&QueryResult>, new: &QueryResult) -> bool {
-    let Some(prev) = prev else {
-        return true;
     };
-    if retriable(prev) {
-        return true;
-    }
-    new.is_ok()
+
+    tracing::debug!(
+        "Got result ({}) in {}ms from {}, {:.1} KB, ttfb={:.1?}, \
+            transfer={:.1?}, throughput={throughput:.2} MB/s",
+        short_code(&state),
+        duration.as_millis(),
+        worker,
+        s.response_size as f64 / 1024.0,
+        s.ttfb,
+        s.transfer_time
+    );
+
+    state
 }
 
 fn retriable(result: &QueryResult) -> bool {
@@ -664,6 +897,6 @@ fn short_code(result: &RequestState) -> &'static str {
         RequestState::Done(Ok(_)) => "ok",
         RequestState::Done(Err(e)) => e.short_code(),
         RequestState::Partial(_) => "partial",
-        RequestState::Pending(_) => "-",
+        RequestState::Pending(_) | RequestState::Paused(_) | RequestState::NoWorkers => "-",
     }
 }

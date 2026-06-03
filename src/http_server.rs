@@ -770,8 +770,8 @@ async fn get_worker(
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(config): Extension<Arc<Config>>,
 ) -> Response {
-    let worker_id = match client.find_worker(&dataset_id, start_block, false) {
-        Ok(worker_id) => worker_id,
+    let worker_id = match client.find_worker(&dataset_id, start_block) {
+        Ok(worker_id) => worker_id.worker(),
         Err(NoWorker::AllUnavailable) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -845,17 +845,25 @@ async fn execute_query(
     let range = query
         .intersect_with(&chunk.block_range())
         .expect("Found chunk should intersect with query");
+
+    let lease = match client.reserve_worker(worker_id) {
+        Some(lease) => lease,
+        None => {
+            return RequestError::BadRequest(format!("Worker {} does not exist", worker_id))
+                .into_response()
+        }
+    };
     let fut = client.query_worker(
-        worker_id,
+        lease,
         request_id,
         ChunkId::new(dataset_id, chunk),
         range,
         query.into_string(),
         Compression::Gzip,
-        true,
+        None,
     );
     let result = match fut.await {
-        Ok(result) => result,
+        Ok(success) => success.ok,
         Err(err) => return RequestError::from_query_error(err, worker_id).into_response(),
     };
     match json_lines_to_json(&result.data) {
@@ -886,7 +894,7 @@ where
             .map_err(IntoResponse::into_response)?;
         let (_, alias) = args
             .first()
-            .ok_or((StatusCode::NOT_FOUND, "not enough arguments".to_string()).into_response())?;
+            .ok_or((StatusCode::NOT_FOUND, "not enough arguments").into_response())?;
         let Extension(network) = parts
             .extract::<Extension<Arc<NetworkClient>>>()
             .await

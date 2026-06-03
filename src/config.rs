@@ -101,6 +101,9 @@ pub struct Config {
     #[serde(default = "default_query_size_limit")]
     pub query_size_limit: u64,
 
+    #[serde(default)]
+    pub congestion: CongestionConfig,
+
     #[serde(default = "default_sentry_dsn")]
     pub sentry_dsn: String,
 
@@ -160,9 +163,14 @@ impl Config {
         let file = std::fs::File::open(config_path)?;
         let buf_reader = std::io::BufReader::new(file);
         let deser = serde_yaml::Deserializer::from_reader(buf_reader);
-        Ok(serde_yaml::with::singleton_map_recursive::deserialize(
-            deser,
-        )?)
+        let config: Self = serde_yaml::with::singleton_map_recursive::deserialize(deser)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        self.congestion.validate()?;
+        Ok(())
     }
 }
 
@@ -205,7 +213,7 @@ fn default_max_buffer_size() -> usize {
 }
 
 fn default_default_retries() -> u8 {
-    7
+    1
 }
 
 fn default_default_timeout_quantile() -> f32 {
@@ -240,6 +248,71 @@ fn default_sentry_dsn() -> String {
     "https://b74e352d92a89dc36c3e6064284669af@o1149243.ingest.us.sentry.io/4510617125191680".into()
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CongestionConfig {
+    pub min_window: u32,
+    pub max_window: u32,
+    pub decrease_factor: f64,
+    pub min_shrink_interval_ms: u64,
+    pub read_timeout_sec: u64,
+    pub headroom_threshold: f64,
+    pub priority_stride: u32,
+    pub enabled: bool,
+}
+
+impl CongestionConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.min_window >= 1,
+            "congestion.min_window must be >= 1, got {}",
+            self.min_window
+        );
+        anyhow::ensure!(
+            self.min_window <= self.max_window,
+            "congestion.min_window ({}) must not exceed congestion.max_window ({})",
+            self.min_window,
+            self.max_window
+        );
+        anyhow::ensure!(
+            self.decrease_factor > 0.0 && self.decrease_factor < 1.0,
+            "congestion.decrease_factor must be in (0.0, 1.0), got {}",
+            self.decrease_factor
+        );
+        anyhow::ensure!(
+            self.headroom_threshold > 0.0 && self.headroom_threshold <= 1.0,
+            "congestion.headroom_threshold must be in (0.0, 1.0], got {}",
+            self.headroom_threshold
+        );
+        anyhow::ensure!(
+            self.read_timeout_sec >= 1,
+            "congestion.read_timeout_sec must be >= 1, got {}",
+            self.read_timeout_sec
+        );
+        anyhow::ensure!(
+            self.priority_stride >= 1,
+            "congestion.priority_stride must be >= 1, got {}",
+            self.priority_stride
+        );
+        Ok(())
+    }
+}
+
+impl Default for CongestionConfig {
+    fn default() -> Self {
+        Self {
+            min_window: 10,
+            max_window: 500,
+            decrease_factor: 0.75,
+            min_shrink_interval_ms: 2000,
+            read_timeout_sec: 1,
+            headroom_threshold: 0.95,
+            priority_stride: 100,
+            enabled: true,
+        }
+    }
+}
+
 fn parse_hostname<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -271,5 +344,38 @@ sqd_network:
         let config: Config = serde_yaml::from_str(&yaml).expect("parse");
         assert_eq!(config.pre_drain_grace_period, Duration::from_secs(3));
         assert_eq!(config.drain_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn congestion_default_is_valid() {
+        assert!(CongestionConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn congestion_rejects_min_window_above_max_window() {
+        let config = CongestionConfig {
+            min_window: 600,
+            max_window: 500,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn congestion_rejects_decrease_factor_of_one() {
+        let config = CongestionConfig {
+            decrease_factor: 1.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn congestion_rejects_zero_min_window() {
+        let config = CongestionConfig {
+            min_window: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
     }
 }

@@ -2,9 +2,10 @@ use std::time::SystemTime;
 use std::{sync::Arc, time::Duration};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use futures::StreamExt;
+use futures::{AsyncReadExt, StreamExt};
 use num_rational::Ratio;
 use num_traits::ToPrimitive;
+use prost::Message;
 use serde::Serialize;
 use sqd_primitives::BlockRef;
 use tokio::task::JoinError;
@@ -18,13 +19,14 @@ use sqd_contract_client::{Client as ContractClient, ClientError, Network, PeerId
 use sqd_messages::{query_error, query_result, Query, QueryFinished, QueryOk};
 use sqd_network_transport::{
     get_agent_info, AgentInfo, Keypair, P2PTransportBuilder, PortalConfig, PortalTransportHandle,
-    QueryFailure, TransportArgs,
+    QueryFailure, StreamClientTimeout, TransportArgs, QUERY_RESULT_MAX_SIZE,
 };
 use tracing::{debug_span, instrument, Instrument};
 
 use super::contracts_state::{ContractsState, Status};
 use super::priorities::NoWorker;
-use super::{ChunkNotFound, NetworkState};
+use super::{ChunkNotFound, NetworkState, WorkerLease};
+use crate::controller::download_scheduler::{DownloadScheduler, Outcome, Priority};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
 use crate::types::{BlockNumber, BlockRange, ChunkId, Compression, DataChunk};
@@ -35,8 +37,39 @@ use crate::{
     types::{generate_query_id, DatasetId, QueryError},
 };
 
-pub type QueryResult = Result<QueryOk, QueryError>;
+#[derive(Debug)]
+pub struct QuerySuccess {
+    pub ok: QueryOk,
+    pub ttfb: Duration,
+    pub transfer_time: Duration,
+    pub response_size: usize,
+}
 
+pub type QueryResult = Result<QuerySuccess, QueryError>;
+
+enum ReadError {
+    TooLarge,
+    Transport(String),
+}
+
+type ResponseStream = Box<dyn futures::AsyncRead + Unpin + Send>;
+
+struct QueryGuard {}
+
+impl QueryGuard {
+    fn new() -> Self {
+        metrics::QUERIES_RUNNING.inc();
+        Self {}
+    }
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        metrics::QUERIES_RUNNING.dec();
+    }
+}
+
+const CHUNK_SIZE: usize = 1024 * 1024;
 const LOGS_QUEUE_SIZE: usize = 10000;
 const MAX_LOGS_CHUNK_SIZE: usize = 100;
 const CONCURRENT_LOGS: usize = 5;
@@ -83,6 +116,8 @@ pub struct NetworkClient {
     logs_rx:
         UseOnce<sqd_network_transport::util::Receiver<Box<dyn FnOnce() -> QueryFinished + Send>>>,
     verify_responses: bool,
+    read_scheduler: Option<Arc<DownloadScheduler>>,
+    transport_timeout: Duration,
 }
 
 pub struct NetworkClientBuilder {
@@ -137,6 +172,14 @@ impl NetworkClientBuilder {
             network_state.ignore_deprecated_workers();
         }
 
+        let read_scheduler = if config.congestion.enabled {
+            let sched = Arc::new(DownloadScheduler::new(config.congestion.clone()));
+            metrics::CONGESTION_WINDOW.set(sched.window_size() as i64);
+            Some(sched)
+        } else {
+            None
+        };
+
         let this = Arc::new(NetworkClient {
             chain_update_interval: config.chain_update_interval,
             assignment_update_interval: config.assignments_update_interval,
@@ -150,6 +193,8 @@ impl NetworkClientBuilder {
             logs_tx,
             logs_rx,
             verify_responses: config.verify_worker_responses,
+            read_scheduler,
+            transport_timeout: config.transport_timeout,
         });
 
         tokio::spawn(async move {
@@ -373,13 +418,12 @@ impl NetworkClient {
         self.network_state.dataset_storage.head(dataset)
     }
 
-    pub fn find_worker(
-        &self,
-        dataset: &DatasetId,
-        block: u64,
-        lease: bool,
-    ) -> Result<PeerId, NoWorker> {
-        self.network_state.find_worker(dataset, block, lease)
+    pub fn find_worker(&self, dataset: &DatasetId, block: u64) -> Result<WorkerLease, NoWorker> {
+        self.network_state.find_worker(dataset, block)
+    }
+
+    pub fn reserve_worker(&self, worker: PeerId) -> Option<WorkerLease> {
+        self.network_state.reserve_worker(worker)
     }
 
     pub fn get_workers(&self, dataset: &DatasetId, block: u64) -> Vec<WorkerDebugInfo> {
@@ -397,38 +441,70 @@ impl NetworkClient {
     #[instrument(skip_all, level = "debug", fields(query_id))]
     pub async fn query_worker(
         self: Arc<Self>,
-        worker: PeerId,
+        lease: WorkerLease,
         request_id: String,
         chunk_id: ChunkId,
         block_range: BlockRange,
         query: String,
         compression: Compression,
-        lease: bool,
+        priority: Option<u32>,
     ) -> QueryResult {
         let query_id = generate_query_id();
+        let worker = lease.worker();
         tracing::Span::current().record("query_id", &query_id);
         tracing::trace!("Sending query {query_id} to {worker}");
 
-        if lease {
-            self.network_state.lease_worker(worker);
-        }
-        metrics::QUERIES_RUNNING.inc();
+        let _guard = QueryGuard::new();
+        let query = self
+            .prepare_query(
+                worker,
+                &query_id,
+                request_id,
+                chunk_id,
+                &block_range,
+                query,
+                compression,
+            )
+            .await;
+        let result = self.execute_query(worker, query, priority).await;
+        result
+    }
 
-        let this = self.clone();
-        let guard = scopeguard::guard(worker, |worker: PeerId| {
-            // The result is no longer needed. Either another query has got the result first,
-            // or the stream has been dropped. In either case, consider the query outrun.
-            this.network_state.report_query_outrun(worker);
-            metrics::QUERIES_RUNNING.dec();
-        });
+    async fn execute_query(
+        &self,
+        worker: PeerId,
+        query: Query,
+        priority: Option<u32>,
+    ) -> QueryResult {
+        let mut stream = self.send_to_transport(worker, query, priority).await?;
+        let network_start = Instant::now();
+        let mut buf = self.receive_first_byte(worker, &mut stream).await?;
+        let ttfb = network_start.elapsed();
+        let transfer_time = self
+            .download_body(worker, &mut stream, &mut buf, priority)
+            .await?;
+        let query_time = network_start.elapsed();
+        self.finalize_response(worker, buf, ttfb, transfer_time, query_time)
+            .await
+    }
 
+    async fn prepare_query(
+        &self,
+        worker: PeerId,
+        query_id: &str,
+        request_id: String,
+        chunk_id: ChunkId,
+        block_range: &BlockRange,
+        query: String,
+        compression: Compression,
+    ) -> Query {
         let compression = match compression {
             Compression::Gzip => sqd_messages::Compression::Gzip,
             Compression::Zstd => sqd_messages::Compression::Zstd,
         } as i32;
         let mut query = Query {
             dataset: chunk_id.dataset.to_url().to_owned(),
-            query_id: query_id.clone(),
+            query_id: query_id.to_owned(),
             request_id,
             query,
             block_range: Some(sqd_messages::Range {
@@ -440,7 +516,7 @@ impl NetworkClient {
             signature: Default::default(),
             compression,
         };
-        let query = tokio::task::spawn_blocking({
+        tokio::task::spawn_blocking({
             let keypair = self.keypair.clone();
             move || {
                 query
@@ -451,21 +527,113 @@ impl NetworkClient {
         })
         .instrument(tracing::debug_span!("sign_query"))
         .await
-        .unwrap();
+        .unwrap()
+    }
 
+    async fn send_to_transport(
+        &self,
+        worker: PeerId,
+        query: Query,
+        priority: Option<u32>,
+    ) -> Result<ResponseStream, QueryError> {
         metrics::QUERIES_SENT
             .get_or_create(&vec![("worker".to_string(), worker.to_string())])
             .inc();
 
-        let query_start_time = Instant::now();
-        let result = self
+        let send_permit = match (&self.read_scheduler, priority) {
+            (Some(sched), Some(prio)) => Some(sched.acquire(prio).await),
+            _ => None,
+        };
+        match self
             .transport_handle
-            .send_query(worker, query)
-            .instrument(tracing::debug_span!("running_query"))
-            .await;
-        scopeguard::ScopeGuard::into_inner(guard);
-        metrics::QUERIES_RUNNING.dec();
-        let query_time = query_start_time.elapsed();
+            .send_query_request(worker, query)
+            .instrument(tracing::debug_span!("send_query"))
+            .await
+        {
+            Ok(stream) => {
+                if let Some(mut permit) = send_permit {
+                    permit.outcome = Outcome::Success;
+                }
+                Ok(stream)
+            }
+            Err(failure) => {
+                if let Some(mut permit) = send_permit {
+                    if is_congestion_failure(&failure) {
+                        permit.outcome = Outcome::Congestion;
+                    }
+                } else if is_congestion_failure(&failure) {
+                    self.signal_congestion();
+                }
+                Err(self.convert_query_failure(worker, failure))
+            }
+        }
+    }
+
+    async fn receive_first_byte(
+        &self,
+        worker: PeerId,
+        stream: &mut ResponseStream,
+    ) -> Result<Vec<u8>, QueryError> {
+        // Intentionally not behind a download-scheduler permit.
+        // The constrained portal-side resource is the network bandwidth,
+        // so only `download_body` holds a permit.
+        // This lets arbitrarily many queries be in flight while the congestion
+        // window bounds only the parallel reads.
+        //
+        // It's not perfect because the yamux substream buffer will be filled until the
+        // backpressure propagates to the worker. But this is a reasonable tradeoff.
+        let mut buf = Vec::with_capacity(1024 * 1024);
+        wait_for_first_byte(stream, &mut buf, self.transport_timeout)
+            .instrument(tracing::debug_span!("wait_first_byte"))
+            .await
+            .map_err(|failure| {
+                if is_congestion_failure(&failure) {
+                    self.signal_congestion();
+                }
+                self.convert_query_failure(worker, failure)
+            })?;
+        Ok(buf)
+    }
+
+    async fn download_body(
+        &self,
+        worker: PeerId,
+        stream: &mut ResponseStream,
+        buf: &mut Vec<u8>,
+        priority: Option<u32>,
+    ) -> Result<Duration, QueryError> {
+        let result = match (&self.read_scheduler, priority) {
+            (Some(sched), Some(prio)) => {
+                read_response_with_permits(
+                    sched,
+                    prio,
+                    stream,
+                    buf,
+                    sched.read_timeout(),
+                    QUERY_RESULT_MAX_SIZE,
+                )
+                .instrument(tracing::debug_span!("read_response"))
+                .await
+            }
+            _ => {
+                read_response_simple(stream, buf, self.transport_timeout, QUERY_RESULT_MAX_SIZE)
+                    .instrument(tracing::debug_span!("read_response"))
+                    .await
+            }
+        };
+        result.map_err(|e| self.convert_read_error(worker, e))
+    }
+
+    async fn finalize_response(
+        &self,
+        worker: PeerId,
+        buf: Vec<u8>,
+        ttfb: Duration,
+        transfer_time: Duration,
+        query_time: Duration,
+    ) -> QueryResult {
+        let result = sqd_messages::QueryResult::decode(buf.as_slice())
+            .map_err(|e| QueryFailure::InvalidResponse(e.to_string()));
 
         if let Some(logs_tx) = &self.logs_tx {
             if let Ok(result) = result.as_ref() {
@@ -477,9 +645,60 @@ impl NetworkClient {
             }
         }
 
-        self.parse_query_result(worker, result)
+        let response_size = buf.len();
+        let throughput = if transfer_time.as_secs_f64() > 0.0 {
+            Some(response_size as f64 / transfer_time.as_secs_f64())
+        } else {
+            None
+        };
+        self.parse_query_result(worker, result, throughput)
             .await
             .inspect(|_| metrics::report_query_ok(query_time))
+            .map(|ok| QuerySuccess {
+                ok,
+                ttfb,
+                transfer_time,
+                response_size,
+            })
+    }
+
+    fn convert_query_failure(&self, peer_id: PeerId, failure: QueryFailure) -> QueryError {
+        match failure {
+            QueryFailure::InvalidRequest(e) => {
+                metrics::report_query_result(&peer_id, "invalid");
+                self.network_state.report_query_success(peer_id, None);
+                QueryError::Failure(format!("portal tried to send invalid request: {e}"))
+            }
+            QueryFailure::InvalidResponse(e) => {
+                metrics::report_query_result(&peer_id, "invalid");
+                self.network_state.report_query_error(peer_id);
+                QueryError::Retriable(format!("couldn't decode response: {e}"))
+            }
+            QueryFailure::Timeout(t) => {
+                metrics::report_query_result(&peer_id, "timeout");
+                self.network_state.report_query_failure(peer_id);
+                let msg = match t {
+                    StreamClientTimeout::Connect => "timed out connecting to the peer",
+                    StreamClientTimeout::Request => "timed out reading response",
+                };
+                QueryError::Retriable(msg.to_owned())
+            }
+            QueryFailure::TransportError(e) => {
+                metrics::report_query_result(&peer_id, "transport_error");
+                self.network_state.report_query_failure(peer_id);
+                QueryError::Retriable(format!("transport error: {e}"))
+            }
+        }
+    }
+
+    fn convert_read_error(&self, peer_id: PeerId, error: ReadError) -> QueryError {
+        metrics::report_query_result(&peer_id, "transport_error");
+        self.network_state.report_query_failure(peer_id);
+        let msg = match error {
+            ReadError::TooLarge => "response too large".to_owned(),
+            ReadError::Transport(e) => format!("transport error: {e}"),
+        };
+        QueryError::Retriable(msg)
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -487,7 +706,8 @@ impl NetworkClient {
         &self,
         peer_id: PeerId,
         result: Result<sqd_messages::QueryResult, QueryFailure>,
-    ) -> QueryResult {
+        throughput: Option<f64>,
+    ) -> Result<QueryOk, QueryError> {
         use query_error::Err;
 
         match result {
@@ -511,14 +731,14 @@ impl NetworkClient {
                 match result {
                     query_result::Result::Ok(ok) => {
                         metrics::report_query_result(&peer_id, "ok");
-                        self.network_state.report_query_success(peer_id);
+                        self.network_state.report_query_success(peer_id, throughput);
                         Ok(ok)
                     }
                     query_result::Result::Err(sqd_messages::QueryError { err: Some(err) }) => {
                         match err {
                             Err::BadRequest(s) => {
                                 metrics::report_query_result(&peer_id, "bad_request");
-                                self.network_state.report_query_success(peer_id);
+                                self.network_state.report_query_success(peer_id, None);
                                 Err(QueryError::BadRequest(format!(
                                     "couldn't parse request: {s}"
                                 )))
@@ -533,13 +753,13 @@ impl NetworkClient {
                                 if let Some(block_ref) = parse_base_block_mismatch(&s) {
                                     // That's input validation rather than bad query response
                                     metrics::report_query_result(&peer_id, "block_mismatch");
-                                    self.network_state.report_query_success(peer_id);
+                                    self.network_state.report_query_success(peer_id, None);
                                     Err(QueryError::BaseBlockMismatch(block_ref))
                                 } else if s == "Response too large" {
                                     // Caused by the query covering too much data; the client
                                     // should narrow it down rather than retry against another worker
                                     metrics::report_query_result(&peer_id, "response_too_large");
-                                    self.network_state.report_query_success(peer_id);
+                                    self.network_state.report_query_success(peer_id, None);
                                     Err(QueryError::BadRequest(
                                         "the response for this block exceeds the size limit; \
                                          try narrowing the query to request only the necessary data"
@@ -562,7 +782,7 @@ impl NetworkClient {
                             }
                             Err::TooManyRequests(()) => {
                                 metrics::report_query_result(&peer_id, "too_many_requests");
-                                self.network_state.report_query_success(peer_id);
+                                self.network_state.report_query_success(peer_id, None);
                                 if retry_after_ms.is_none() {
                                     self.network_state
                                         .hint_backoff(peer_id, Duration::from_millis(100));
@@ -583,38 +803,7 @@ impl NetworkClient {
                 self.network_state.report_query_error(peer_id);
                 Err(QueryError::Retriable("unknown error message".to_string()))
             }
-            Err(QueryFailure::InvalidRequest(e)) => {
-                metrics::report_query_result(&peer_id, "invalid");
-                self.network_state.report_query_failure(peer_id);
-                Err(QueryError::Failure(format!(
-                    "portal tried to send invalid request: {e}"
-                )))
-            }
-            Err(QueryFailure::InvalidResponse(e)) => {
-                metrics::report_query_result(&peer_id, "invalid");
-                self.network_state.report_query_error(peer_id);
-                Err(QueryError::Retriable(format!(
-                    "couldn't decode response: {e}"
-                )))
-            }
-            Err(QueryFailure::Timeout(t)) => {
-                metrics::report_query_result(&peer_id, "timeout");
-                self.network_state.report_query_failure(peer_id);
-                let msg = match t {
-                    sqd_network_transport::StreamClientTimeout::Connect => {
-                        "timed out connecting to the peer"
-                    }
-                    sqd_network_transport::StreamClientTimeout::Request => {
-                        "timed out reading response"
-                    }
-                };
-                Err(QueryError::Retriable(msg.to_owned()))
-            }
-            Err(QueryFailure::TransportError(e)) => {
-                metrics::report_query_result(&peer_id, "transport_error");
-                self.network_state.report_query_failure(peer_id);
-                Err(QueryError::Retriable(format!("transport error: {e}")))
-            }
+            Err(failure) => Err(self.convert_query_failure(peer_id, failure)),
         }
     }
 
@@ -674,8 +863,115 @@ impl NetworkClient {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.network_state.dataset_storage.has_assignment()
+        let num_workers = self.network_state.dataset_storage.num_workers();
+        let active_connections = self.transport_handle.active_connections() as usize;
+        num_workers > 0 && active_connections >= num_workers * 3 / 4
     }
+
+    fn signal_congestion(&self) {
+        if let Some(sched) = &self.read_scheduler {
+            sched.signal_congestion();
+        }
+    }
+
+    pub fn download_utilization(&self) -> Option<f64> {
+        self.read_scheduler.as_ref().map(|s| s.utilization())
+    }
+}
+
+fn is_congestion_failure(failure: &QueryFailure) -> bool {
+    matches!(
+        failure,
+        QueryFailure::Timeout(_) | QueryFailure::TransportError(_)
+    )
+}
+
+async fn wait_for_first_byte(
+    stream: &mut (impl futures::AsyncRead + Unpin),
+    buf: &mut Vec<u8>,
+    timeout: Duration,
+) -> Result<(), QueryFailure> {
+    let fut = async {
+        let mut byte = [0u8; 1];
+        let n = stream
+            .read(&mut byte)
+            .await
+            .map_err(|e| QueryFailure::TransportError(e.to_string()))?;
+        if n == 0 {
+            return Err(QueryFailure::InvalidResponse("Empty response".into()));
+        }
+        buf.push(byte[0]);
+        Ok(())
+    };
+    tokio::time::timeout(timeout, fut)
+        .await
+        .unwrap_or(Err(QueryFailure::Timeout(StreamClientTimeout::Request)))
+}
+
+/// Returns the cumulative time spent in actual reads (excludes permit wait time).
+async fn read_response_with_permits(
+    scheduler: &Arc<DownloadScheduler>,
+    priority: Priority,
+    stream: &mut (impl futures::AsyncRead + Unpin),
+    buf: &mut Vec<u8>,
+    read_timeout: Duration,
+    max_size: u64,
+) -> Result<Duration, ReadError> {
+    let mut chunk_buf = vec![0u8; CHUNK_SIZE];
+    let mut transfer_time = Duration::ZERO;
+    loop {
+        let mut permit = scheduler.acquire(priority).await;
+        let read_start = Instant::now();
+        match tokio::time::timeout(read_timeout, stream.read(&mut chunk_buf)).await {
+            Err(_) => {
+                // Timeout: worker stalled, abort download
+                permit.outcome = Outcome::Congestion;
+                return Err(ReadError::Transport("timed out reading response".into()));
+            }
+            Ok(Err(e)) => {
+                permit.outcome = Outcome::Congestion;
+                return Err(ReadError::Transport(e.to_string()));
+            }
+            Ok(Ok(0)) => {
+                // EOF: done reading
+                permit.outcome = Outcome::Success;
+                return Ok(transfer_time);
+            }
+            Ok(Ok(n)) => {
+                transfer_time += read_start.elapsed();
+                buf.extend_from_slice(&chunk_buf[..n]);
+                permit.outcome = Outcome::Success;
+                if buf.len() as u64 > max_size {
+                    return Err(ReadError::TooLarge);
+                }
+            }
+        }
+    }
+}
+
+async fn read_response_simple(
+    stream: &mut (impl futures::AsyncRead + Unpin),
+    buf: &mut Vec<u8>,
+    timeout: Duration,
+    max_size: u64,
+) -> Result<Duration, ReadError> {
+    let read_start = Instant::now();
+    let fut = async {
+        let remaining = max_size + 1 - buf.len() as u64;
+        stream
+            .take(remaining)
+            .read_to_end(buf)
+            .await
+            .map_err(|e| ReadError::Transport(e.to_string()))?;
+        if buf.len() as u64 > max_size {
+            return Err(ReadError::TooLarge);
+        }
+        Ok(())
+    };
+    tokio::time::timeout(timeout, fut)
+        .await
+        .unwrap_or_else(|_| Err(ReadError::Transport("timed out reading response".into())))?;
+    Ok(read_start.elapsed())
 }
 
 #[instrument(skip_all, level = "debug")]
