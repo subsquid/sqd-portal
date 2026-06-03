@@ -221,7 +221,6 @@ mod tests {
             min_window: 2,
             max_window: 100,
             decrease_factor: 0.75,
-            speculative_fraction: 0.1,
             min_shrink_interval_ms: 0,
             read_timeout_sec: 1,
             headroom_threshold: 0.95,
