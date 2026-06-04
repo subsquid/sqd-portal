@@ -2,6 +2,7 @@
 name = "sqd-portal"
 version = "0.11.0-rc1"
 edition = "2021"
+default-run = "sqd-portal"
 
 [features]
 sql = ["dep:once_cell", "dep:substrait", "dep:sql_query_plan"]
