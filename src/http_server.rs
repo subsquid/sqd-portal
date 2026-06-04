@@ -24,9 +24,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::request_id::{
     MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
-use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable as _};
-use utoipa_swagger_ui::SwaggerUi;
 
 use crate::datasets::DatasetConfig;
 use crate::endpoints::{
@@ -36,7 +34,7 @@ use crate::endpoints::{
     },
 };
 use crate::hotblocks::HotblocksErr;
-use crate::openapi::ApiDoc;
+use crate::openapi::{build_openapi_spec, serve_openapi_spec, BlockHead, StatusResponse};
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::types::Compression;
 use crate::utils::conversion::json_lines_to_json;
@@ -54,58 +52,6 @@ use crate::{
 use crate::sql;
 #[cfg(feature = "sql")]
 use axum::body;
-
-/// Endpoints whose doc-comment summary starts with this marker are considered internal.
-/// Mark a handler like:
-///
-/// ```ignore
-/// /// [INTERNAL] Get debug information for a specific block
-/// ```
-///
-/// They are stripped from the served OpenAPI spec unless `show_internal` is true.
-/// When shown, the marker is stripped from the summary for a clean UI.
-const INTERNAL_MARKER: &str = "[INTERNAL]";
-
-fn build_openapi_spec(show_internal: bool) -> utoipa::openapi::OpenApi {
-    let mut spec = ApiDoc::openapi();
-    spec.paths.paths.retain(|_, item| {
-        item.operations.retain(|_, op| {
-            let internal = op
-                .summary
-                .as_deref()
-                .is_some_and(|s| s.trim_start().starts_with(INTERNAL_MARKER));
-            if internal && !show_internal {
-                return false;
-            }
-            if internal {
-                if let Some(summary) = op.summary.as_mut() {
-                    *summary = summary
-                        .trim_start()
-                        .strip_prefix(INTERNAL_MARKER)
-                        .unwrap_or(summary)
-                        .trim_start()
-                        .to_string();
-                }
-            }
-            true
-        });
-        !item.operations.is_empty()
-    });
-
-    // Drop tag declarations that no surviving operation references — otherwise
-    // Scalar/Swagger render empty groups.
-    let used_tags: std::collections::HashSet<String> = spec
-        .paths
-        .paths
-        .values()
-        .flat_map(|item| item.operations.values())
-        .flat_map(|op| op.tags.iter().flatten().cloned())
-        .collect();
-    if let Some(tags) = spec.tags.as_mut() {
-        tags.retain(|t| used_tags.contains(&t.name));
-    }
-    spec
-}
 
 #[allow(deprecated)]
 pub async fn run_server(
@@ -211,8 +157,12 @@ pub async fn run_server(
         )
         .route("/metrics", get(get_metrics))
         .route("/ready", get(get_readiness))
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi_spec.clone()))
-        .merge(Scalar::with_url("/docs", openapi_spec));
+        .route("/api-docs/openapi.json", get(serve_openapi_spec))
+        .merge(
+            Scalar::with_url("/docs", openapi_spec.clone())
+                .custom_html(include_str!("../docs/openapi/scalar_template.html")),
+        )
+        .layer(Extension(Arc::new(openapi_spec)));
 
     // SQL Query Engine
     #[cfg(feature = "sql")]
@@ -251,7 +201,7 @@ pub async fn run_server(
 
 /// Races axum's graceful drain against a hard `drain_timeout` deadline.
 ///
-/// See [`docs/GRACEFUL_SHUTDOWN.md`](../docs/GRACEFUL_SHUTDOWN.md) for the
+/// See [`docs/decisions/graceful_shutdown.md`](../docs/decisions/graceful_shutdown.md) for the
 /// drain semantics — including what "force-close" actually does (and does
 /// not) to in-flight per-connection tasks.
 async fn drive_serve_with_drain<F>(
@@ -284,7 +234,7 @@ where
     Ok(())
 }
 
-/// [INTERNAL] Latest archival head
+/// Latest archival head
 ///
 /// Returns the block number and hash of the highest archived block (no hotblocks).
 #[utoipa::path(
@@ -297,7 +247,8 @@ where
         (status = 200, description = "Archival head block retrieved", body = Option<BlockHead>),
         (status = 404, description = "Dataset has no archival data source"),
     ),
-    tag = "Archival stream"
+    tag = "Streaming",
+    extensions(("x-internal" = json!(true))),
 )]
 async fn get_archival_head(
     Extension(network): Extension<Arc<NetworkClient>>,
@@ -337,7 +288,7 @@ async fn get_archival_head(
         (status = 200, description = "Finalized head block retrieved", body = Option<BlockHead>),
         (status = 404, description = "Dataset has no data sources"),
     ),
-    tag = "Stream"
+    tag = "Streaming"
 )]
 async fn get_finalized_head(
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
@@ -383,7 +334,7 @@ async fn get_finalized_head(
         (status = 200, description = "Head block retrieved", body = Option<BlockHead>),
         (status = 404, description = "Dataset has no data sources"),
     ),
-    tag = "Stream"
+    tag = "Streaming"
 )]
 async fn get_head(
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
@@ -412,7 +363,7 @@ async fn get_head(
         .into_response()
 }
 
-/// [INTERNAL] Portal Status
+/// Portal Status
 ///
 /// Returns a JSON document with human-readable information about the portal's state.
 /// The exact format may change without notice.
@@ -440,7 +391,8 @@ async fn get_head(
              "portal_version": "0.5.5"
          })),
     ),
-    tag = "Status"
+    tag = "Monitoring",
+    extensions(("x-internal" = json!(true))),
 )]
 async fn get_status(Extension(client): Extension<Arc<NetworkClient>>) -> impl IntoResponse {
     let response = crate::openapi::StatusResponse {
@@ -499,7 +451,7 @@ async fn get_datasets(
     axum::Json(res)
 }
 
-/// [INTERNAL] Dataset State
+/// Dataset State
 ///
 /// Returns the current state of the dataset.
 #[utoipa::path(
@@ -512,7 +464,8 @@ async fn get_datasets(
         (status = 200, description = "Dataset state retrieved successfully", body = serde_json::Value),
         (status = 404, description = "Dataset not found"),
     ),
-    tag = "Datasets"
+    tag = "Datasets",
+    extensions(("x-internal" = json!(true))),
 )]
 async fn get_dataset_state(
     dataset_id: DatasetId,
@@ -558,7 +511,7 @@ async fn get_dataset_metadata(
     axum::Json(resp.with_fields(&query.expand))
 }
 
-/// [INTERNAL] Block Debug Info
+/// Block Debug Info
 ///
 /// Returns worker information for the given dataset and block.
 #[utoipa::path(
@@ -572,7 +525,8 @@ async fn get_dataset_metadata(
         (status = 200, description = "Debug information retrieved", body = serde_json::Value),
         (status = 404, description = "Dataset or block not found"),
     ),
-    tag = "Debug"
+    tag = "Debug",
+    extensions(("x-internal" = json!(true))),
 )]
 async fn get_debug_block(
     Path((_dataset, block)): Path<(String, u64)>,
@@ -584,7 +538,7 @@ async fn get_debug_block(
     }))
 }
 
-/// [INTERNAL] Worker Inventory
+/// Worker Inventory
 ///
 /// Returns information about all workers currently visible to the portal.
 #[utoipa::path(
@@ -593,7 +547,8 @@ async fn get_debug_block(
     responses(
         (status = 200, description = "All worker information retrieved", body = serde_json::Value),
     ),
-    tag = "Debug"
+    tag = "Debug",
+    extensions(("x-internal" = json!(true))),
 )]
 async fn get_all_workers(
     Extension(client): Extension<Arc<NetworkClient>>,
@@ -603,7 +558,7 @@ async fn get_all_workers(
     }))
 }
 
-/// [INTERNAL] Prometheus Metrics
+/// Prometheus Metrics
 ///
 /// Returns portal metrics in OpenMetrics text format.
 #[utoipa::path(
@@ -612,7 +567,8 @@ async fn get_all_workers(
     responses(
         (status = 200, description = "Metrics in OpenMetrics format", content_type = "application/openmetrics-text"),
     ),
-    tag = "Status"
+    tag = "Monitoring",
+    extensions(("x-internal" = json!(true))),
 )]
 async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {
     lazy_static::lazy_static! {
@@ -634,7 +590,7 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
     (HEADERS.clone(), buffer)
 }
 
-/// [INTERNAL] Readiness Probe
+/// Readiness Probe
 ///
 /// Returns 200 once the portal is ready to serve requests; 503 otherwise (e.g. during shutdown).
 #[utoipa::path(
@@ -644,7 +600,8 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
         (status = 200, description = "Portal is ready"),
         (status = 503, description = "Portal is not ready"),
     ),
-    tag = "Status"
+    tag = "Monitoring",
+    extensions(("x-internal" = json!(true))),
 )]
 async fn get_readiness(
     Extension(client): Extension<Arc<NetworkClient>>,
@@ -659,7 +616,7 @@ async fn get_readiness(
     (StatusCode::SERVICE_UNAVAILABLE, "Not ready").into_response()
 }
 
-/// [INTERNAL] Dataset Height (deprecated)
+/// Dataset Height
 ///
 /// Returns the current height of the dataset. Kept for backward compatibility.
 #[utoipa::path(
@@ -672,7 +629,8 @@ async fn get_readiness(
         (status = 200, description = "Height retrieved successfully", body = String),
         (status = 404, description = "Dataset not found"),
     ),
-    tag = "Stream",
+    tag = "Streaming",
+    extensions(("x-internal" = json!(true))),
 )]
 #[deprecated]
 async fn get_height(
@@ -683,7 +641,7 @@ async fn get_height(
     height_response(&network, &dataset, &dataset_id)
 }
 
-/// [INTERNAL] Finalized Stream Height (deprecated)
+/// Finalized Stream Height
 ///
 /// Same as /datasets/{dataset}/height. Kept for backward compatibility.
 #[utoipa::path(
@@ -696,7 +654,8 @@ async fn get_height(
         (status = 200, description = "Height retrieved successfully", body = String),
         (status = 404, description = "Dataset not found"),
     ),
-    tag = "Stream",
+    tag = "Streaming",
+    extensions(("x-internal" = json!(true))),
 )]
 #[deprecated]
 async fn get_finalized_stream_height(
@@ -707,7 +666,7 @@ async fn get_finalized_stream_height(
     height_response(&network, &dataset, &dataset_id)
 }
 
-/// [INTERNAL] Archival Stream Height (deprecated)
+/// Archival Stream Height
 ///
 /// Same as /datasets/{dataset}/height. Kept for backward compatibility.
 #[utoipa::path(
@@ -720,7 +679,8 @@ async fn get_finalized_stream_height(
         (status = 200, description = "Height retrieved successfully", body = String),
         (status = 404, description = "Dataset not found"),
     ),
-    tag = "Archival stream",
+    tag = "Streaming",
+    extensions(("x-internal" = json!(true))),
 )]
 #[deprecated]
 async fn get_archival_stream_height(
@@ -745,7 +705,7 @@ fn height_response(
     }
 }
 
-/// [INTERNAL] Get worker information for a block range (deprecated)
+/// Worker Info
 ///
 /// Returns worker information for the given dataset and block range. This endpoint is deprecated.
 #[utoipa::path(
@@ -762,6 +722,7 @@ fn height_response(
         (status = 503, description = "No available workers"),
     ),
     tag = "Debug",
+    extensions(("x-internal" = json!(true))),
 )]
 #[deprecated]
 async fn get_worker(
@@ -800,7 +761,7 @@ async fn get_worker(
         .into_response()
 }
 
-/// [INTERNAL] Worker Query (deprecated)
+/// Worker Query
 ///
 /// Sends a data query to a specific worker in the network. Deprecated in favor of /stream.
 #[utoipa::path(
@@ -817,7 +778,8 @@ async fn get_worker(
         (status = 404, description = "Dataset or worker not found"),
         (status = 503, description = "Service unavailable"),
     ),
-    tag = "Stream",
+    tag = "Streaming",
+    extensions(("x-internal" = json!(true))),
 )]
 #[deprecated]
 async fn execute_query(
@@ -1150,54 +1112,6 @@ async fn sql_metadata(
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    #[test]
-    fn hide_internal_drops_marked_ops_and_empty_tags() {
-        let hidden = build_openapi_spec(false);
-        let summaries: Vec<&str> = hidden
-            .paths
-            .paths
-            .values()
-            .flat_map(|i| i.operations.values())
-            .filter_map(|o| o.summary.as_deref())
-            .collect();
-        assert!(
-            summaries.iter().all(|s| !s.contains(INTERNAL_MARKER)),
-            "no surviving op should carry the marker: {summaries:?}"
-        );
-
-        let tag_names: Vec<&str> = hidden
-            .tags
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|t| t.name.as_str())
-            .collect();
-        for empty_tag in ["Status", "Debug", "Archival stream"] {
-            assert!(
-                !tag_names.contains(&empty_tag),
-                "tag {empty_tag} should be pruned (all its operations are internal); got {tag_names:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn show_internal_keeps_all_and_strips_marker() {
-        let shown = build_openapi_spec(true);
-        let full = ApiDoc::openapi();
-        assert_eq!(shown.paths.paths.len(), full.paths.paths.len());
-        let summaries: Vec<&str> = shown
-            .paths
-            .paths
-            .values()
-            .flat_map(|i| i.operations.values())
-            .filter_map(|o| o.summary.as_deref())
-            .collect();
-        assert!(
-            summaries.iter().all(|s| !s.contains(INTERNAL_MARKER)),
-            "marker should be stripped from summaries when shown: {summaries:?}"
-        );
-    }
 
     /// End-to-end: real TCP listener + axum router + reqwest client. Verifies that
     /// flipping the AtomicBool that `watch_shutdown_signal` flips on SIGTERM actually
