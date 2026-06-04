@@ -79,7 +79,7 @@ fn setup_tracing(json: bool, log_span_durations: bool) {
         tracing_subscriber::fmt::layer()
             .with_target(false)
             .json()
-            .with_span_list(false)
+            .with_span_list(true)
             .flatten_event(true)
             .boxed()
     } else {
