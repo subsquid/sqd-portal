@@ -61,6 +61,11 @@ impl RequestError {
     }
 }
 
+/// Non-standard "Site is overloaded" status used to signal clients to back off.
+fn server_overloaded() -> StatusCode {
+    StatusCode::from_u16(529).expect("529 should be a valid status code")
+}
+
 impl axum::response::IntoResponse for RequestError {
     fn into_response(self) -> axum::response::Response {
         use axum::http::header;
@@ -80,13 +85,13 @@ impl axum::response::IntoResponse for RequestError {
             }
 
             s @ Self::BusyFor(duration) => axum::http::Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .status(server_overloaded())
                 .header(header::RETRY_AFTER, duration.as_secs() + 1)
                 .body(axum::body::Body::from(s.to_string()))
                 .unwrap(),
 
             s @ Self::RateLimitExceeded => axum::http::Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .status(server_overloaded())
                 .header(header::RETRY_AFTER, 1)
                 .body(axum::body::Body::from(s.to_string()))
                 .unwrap(),
