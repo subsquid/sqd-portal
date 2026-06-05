@@ -118,6 +118,7 @@ pub struct NetworkClient {
     verify_responses: bool,
     read_scheduler: Option<Arc<DownloadScheduler>>,
     transport_timeout: Duration,
+    default_worker_backoff: Duration,
 }
 
 pub struct NetworkClientBuilder {
@@ -195,6 +196,7 @@ impl NetworkClientBuilder {
             verify_responses: config.verify_worker_responses,
             read_scheduler,
             transport_timeout: config.transport_timeout,
+            default_worker_backoff: config.default_worker_backoff,
         });
 
         tokio::spawn(async move {
@@ -776,7 +778,7 @@ impl NetworkClient {
                                 self.network_state.report_query_error(peer_id);
                                 if retry_after_ms.is_none() {
                                     self.network_state
-                                        .hint_backoff(peer_id, Duration::from_millis(1000));
+                                        .hint_backoff(peer_id, self.default_worker_backoff);
                                 }
                                 Err(QueryError::Retriable("worker overloaded".to_owned()))
                             }
@@ -785,7 +787,7 @@ impl NetworkClient {
                                 self.network_state.report_query_success(peer_id, None);
                                 if retry_after_ms.is_none() {
                                     self.network_state
-                                        .hint_backoff(peer_id, Duration::from_millis(100));
+                                        .hint_backoff(peer_id, self.default_worker_backoff);
                                 }
                                 Err(QueryError::RateLimitExceeded)
                             }

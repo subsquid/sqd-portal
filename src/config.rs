@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use serde_with::serde_derive::Serialize;
-use serde_with::{serde_as, DurationSeconds};
+use serde_with::{serde_as, DurationMilliSeconds, DurationSeconds};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use url::Url;
@@ -48,6 +48,15 @@ pub struct Config {
 
     #[serde(default = "default_default_timeout_quantile")]
     pub default_timeout_quantile: f32,
+
+    /// Backoff applied to a worker that reports overload or rate limiting
+    /// without specifying an explicit `retry_after_ms`.
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
+    #[serde(
+        rename = "default_worker_backoff_ms",
+        default = "default_default_worker_backoff"
+    )]
+    pub default_worker_backoff: Duration,
 
     #[serde_as(as = "DurationSeconds")]
     #[serde(
@@ -225,6 +234,10 @@ fn default_default_retries() -> u8 {
 
 fn default_default_timeout_quantile() -> f32 {
     0.5
+}
+
+fn default_default_worker_backoff() -> Duration {
+    Duration::from_millis(1000)
 }
 
 fn default_chain_update_interval() -> Duration {
