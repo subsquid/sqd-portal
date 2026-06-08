@@ -10,7 +10,6 @@ use crate::types::DatasetRef;
 
 #[serde_as]
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(deserialize_with = "parse_hostname")]
     pub hostname: String,
@@ -142,7 +141,7 @@ pub enum ServeMode {
 pub type DatasetsConfig = BTreeMap<String, DatasetConfigModel>;
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct DatasetConfigModel {
     pub aliases: Vec<String>,
     pub sqd_network: Option<DatasetRef>,
@@ -166,7 +165,12 @@ impl Config {
         let file = std::fs::File::open(config_path)?;
         let buf_reader = std::io::BufReader::new(file);
         let deser = serde_yaml::Deserializer::from_reader(buf_reader);
-        let config: Self = serde_yaml::with::singleton_map_recursive::deserialize(deser)?;
+        let mut warn_unknown = |path: serde_ignored::Path| {
+            tracing::warn!("ignoring unknown config field: {path}");
+        };
+        let config: Self = serde_yaml::with::singleton_map_recursive::deserialize(
+            serde_ignored::Deserializer::new(deser, &mut warn_unknown),
+        )?;
         config.validate()?;
         Ok(config)
     }
@@ -333,6 +337,34 @@ hostname: portal.example
 sqd_network:
   datasets: https://example.invalid/datasets.yaml
 "#;
+
+    #[test]
+    fn unknown_fields_are_reported_not_rejected() {
+        let yaml = format!(
+            "{MINIMAL_YAML}unknown_top_level: 123\n\
+             congestion:\n  min_window: 5\n  bogus_nested: true\n"
+        );
+        let deser = serde_yaml::Deserializer::from_str(&yaml);
+        let mut ignored = Vec::new();
+        let config: Config = serde_yaml::with::singleton_map_recursive::deserialize(
+            serde_ignored::Deserializer::new(deser, &mut |path: serde_ignored::Path| {
+                ignored.push(path.to_string());
+            }),
+        )
+        .expect("parse");
+
+        // Known fields still deserialize correctly alongside the unknown ones.
+        assert_eq!(config.congestion.min_window, 5);
+        // Both the top-level and the nested unknown field are reported with paths.
+        assert!(
+            ignored.contains(&"unknown_top_level".to_string()),
+            "missing top-level unknown field, got {ignored:?}"
+        );
+        assert!(
+            ignored.contains(&"congestion.bogus_nested".to_string()),
+            "missing nested unknown field, got {ignored:?}"
+        );
+    }
 
     #[test]
     fn shutdown_durations_default_when_omitted() {
