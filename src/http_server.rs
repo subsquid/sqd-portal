@@ -1,5 +1,5 @@
 use std::future::IntoFuture;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::http::Method;
@@ -45,7 +45,7 @@ use crate::{
     config::Config,
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
-    network::{NetworkClient, NoWorker},
+    network::{NetworkClient, NoWorker, NotReady},
     types::{ChunkId, DatasetId, ParsedQuery, RequestError, StreamRequest},
     utils::logging,
 };
@@ -650,13 +650,53 @@ async fn get_readiness(
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(shutting_down): Extension<Arc<AtomicBool>>,
 ) -> impl IntoResponse {
-    if shutting_down.load(Ordering::Relaxed) {
-        return (StatusCode::SERVICE_UNAVAILABLE, "Shutting down").into_response();
+    // Stable discriminant per readiness *category*. `/ready` is polled
+    // continuously, so we log only when the category changes — entering a new
+    // state logs once (with live detail), while fluctuating connection counts
+    // within `InsufficientConnections` do not. Starts `READY` so a portal that
+    // never becomes ready still logs the reason on its first probe.
+    const READY: u8 = 0;
+    const SHUTTING_DOWN: u8 = 1;
+    const NO_WORKERS: u8 = 2;
+    const INSUFFICIENT_CONNECTIONS: u8 = 3;
+    static LAST_STATE: AtomicU8 = AtomicU8::new(READY);
+
+    let (state, code, body, reason): (u8, StatusCode, &str, Option<NotReady>) =
+        if shutting_down.load(Ordering::Relaxed) {
+            (
+                SHUTTING_DOWN,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Shutting down",
+                None,
+            )
+        } else {
+            match client.readiness() {
+                Ok(()) => (READY, StatusCode::OK, "Ready", None),
+                Err(reason) => {
+                    let state = match reason {
+                        NotReady::NoWorkers => NO_WORKERS,
+                        NotReady::InsufficientConnections { .. } => INSUFFICIENT_CONNECTIONS,
+                    };
+                    (
+                        state,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Not ready",
+                        Some(reason),
+                    )
+                }
+            }
+        };
+
+    if LAST_STATE.swap(state, Ordering::Relaxed) != state {
+        match (state, reason) {
+            (READY, _) => tracing::info!("readiness check now passing: portal is ready"),
+            (SHUTTING_DOWN, _) => tracing::info!("readiness check now failing: shutting down"),
+            (_, Some(reason)) => tracing::warn!("readiness check now failing: {reason}"),
+            (_, None) => {}
+        }
     }
-    if client.is_ready() {
-        return (StatusCode::OK, "Ready").into_response();
-    }
-    (StatusCode::SERVICE_UNAVAILABLE, "Not ready").into_response()
+
+    (code, body).into_response()
 }
 
 /// [INTERNAL] Dataset Height (deprecated)

@@ -212,6 +212,37 @@ impl NetworkClientBuilder {
     }
 }
 
+/// Why the portal is not ready to serve requests. The variant identifies the
+/// failure *category* (stable across fluctuating counts); `Display` renders the
+/// detailed, human-readable explanation used in logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotReady {
+    /// No workers are known for any dataset yet (still bootstrapping).
+    NoWorkers,
+    /// Fewer than the required fraction of worker connections are established.
+    InsufficientConnections {
+        active: usize,
+        required: usize,
+        workers: usize,
+    },
+}
+
+impl std::fmt::Display for NotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotReady::NoWorkers => write!(f, "no workers known for any dataset yet"),
+            NotReady::InsufficientConnections {
+                active,
+                required,
+                workers,
+            } => write!(
+                f,
+                "not enough active connections: {active} active < {required} required ({workers} workers known)"
+            ),
+        }
+    }
+}
+
 impl NetworkClient {
     pub async fn builder(
         args: TransportArgs,
@@ -865,9 +896,28 @@ impl NetworkClient {
     }
 
     pub fn is_ready(&self) -> bool {
-        let num_workers = self.network_state.dataset_storage.num_workers();
-        let active_connections = self.transport_handle.active_connections() as usize;
-        num_workers > 0 && active_connections >= num_workers * 3 / 4
+        self.readiness().is_ok()
+    }
+
+    /// Returns `Ok(())` if the portal is ready to serve requests, or `Err` with a
+    /// typed reason it is not (for diagnostics / logging). The reason's `Display`
+    /// renders a human-readable message, while the variant itself can be compared
+    /// to detect state changes without treating fluctuating counts as new states.
+    pub fn readiness(&self) -> Result<(), NotReady> {
+        let workers = self.network_state.dataset_storage.num_workers();
+        let active = self.transport_handle.active_connections() as usize;
+        let required = workers * 3 / 4;
+        if workers == 0 {
+            return Err(NotReady::NoWorkers);
+        }
+        if active < required {
+            return Err(NotReady::InsufficientConnections {
+                active,
+                required,
+                workers,
+            });
+        }
+        Ok(())
     }
 
     fn signal_congestion(&self) {
