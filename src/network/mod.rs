@@ -5,7 +5,8 @@ mod state;
 mod storage;
 
 pub use client::{
-    CurrentEpoch, NetworkClient, NetworkClientStatus, NotReady, QueryResult, Workers,
+    CurrentEpoch, NetworkClient, NetworkClientStatus, NotReady, QueryResult, QuerySuccess,
+    StreamingNetwork, Workers,
 };
 pub use contracts_state::Status;
 pub use priorities::{NoWorker, PrioritiesConfig, Priority};

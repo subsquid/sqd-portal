@@ -37,6 +37,66 @@ use crate::{
     types::{generate_query_id, DatasetId, QueryError},
 };
 
+/// The subset of [`NetworkClient`] that the stream controller depends on.
+///
+/// Abstracting it into a trait allows exercising the controller's chunk
+/// scheduling logic in tests with a mock network.
+pub trait StreamingNetwork: Send + Sync + 'static {
+    fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound>;
+
+    fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk>;
+
+    fn find_worker(&self, dataset: &DatasetId, block: u64) -> Result<WorkerLease, NoWorker>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_worker(
+        self: Arc<Self>,
+        lease: WorkerLease,
+        request_id: String,
+        chunk_id: ChunkId,
+        block_range: BlockRange,
+        query: String,
+        compression: Compression,
+        priority: Option<u32>,
+    ) -> futures::future::BoxFuture<'static, QueryResult>;
+}
+
+impl StreamingNetwork for NetworkClient {
+    fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound> {
+        NetworkClient::find_chunk(self, dataset, block)
+    }
+
+    fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
+        NetworkClient::next_chunk(self, dataset, chunk)
+    }
+
+    fn find_worker(&self, dataset: &DatasetId, block: u64) -> Result<WorkerLease, NoWorker> {
+        NetworkClient::find_worker(self, dataset, block)
+    }
+
+    fn query_worker(
+        self: Arc<Self>,
+        lease: WorkerLease,
+        request_id: String,
+        chunk_id: ChunkId,
+        block_range: BlockRange,
+        query: String,
+        compression: Compression,
+        priority: Option<u32>,
+    ) -> futures::future::BoxFuture<'static, QueryResult> {
+        Box::pin(NetworkClient::query_worker(
+            self,
+            lease,
+            request_id,
+            chunk_id,
+            block_range,
+            query,
+            compression,
+            priority,
+        ))
+    }
+}
+
 #[derive(Debug)]
 pub struct QuerySuccess {
     pub ok: QueryOk,
