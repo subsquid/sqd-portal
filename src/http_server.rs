@@ -1049,12 +1049,12 @@ where
             query,
             request_id: req_id,
             buffer_size,
+            max_stored_results_per_chunk: config.max_stored_results_per_chunk.max(1),
             max_chunks,
             timeout_quantile,
             retries,
             compression,
             skip_parent_hash_validation: config.skip_parent_hash_validation,
-            eager_continuations: config.eager_continuations,
         })
     }
 }

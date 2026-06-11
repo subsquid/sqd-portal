@@ -392,12 +392,12 @@ fn build_request(
         dataset_name: dname,
         request_id: req_id.to_string(),
         buffer_size: config.max_buffer_size,
+        max_stored_results_per_chunk: config.max_stored_results_per_chunk.max(1),
         max_chunks,
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
         compression: Compression::Gzip,
         skip_parent_hash_validation: false,
-        eager_continuations: config.eager_continuations,
     }
 }
 

@@ -399,6 +399,8 @@ pub(crate) fn restrict_request(config: &Config, request: StreamRequest) -> Strea
     };
     StreamRequest {
         buffer_size: request.buffer_size.min(config.max_buffer_size),
+        // This is an operator-controlled memory cap, not a client-tunable request option.
+        max_stored_results_per_chunk: config.max_stored_results_per_chunk.max(1),
         max_chunks,
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
