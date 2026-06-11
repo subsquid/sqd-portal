@@ -43,6 +43,8 @@ pub struct Config {
     #[serde(default = "default_max_buffer_size")]
     pub max_buffer_size: usize,
 
+    // Values above 1 enable eager partial continuations with bounded per-chunk buffering.
+    // A value of 1 effectively keeps continuation requests lazy.
     #[serde(default = "default_max_stored_results_per_chunk")]
     pub max_stored_results_per_chunk: usize,
 
