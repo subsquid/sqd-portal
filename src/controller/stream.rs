@@ -708,9 +708,17 @@ impl StreamController {
                         let chunk_slot = ChunkSlot::new(*slot);
                         self.stats.observe_chunk_parts(chunk_slot.num_parts());
                         self.buffer.push_back(chunk_slot);
+                        // The pushed slot now owns this chunk. If the stream survives
+                        // (`pop_response` keeps slots paused for less than MAX_IDLE_TIME
+                        // alive), the slot is retried in place by `poll_deferred_slot`.
+                        // Re-queueing the chunk into `next_chunk` as well would schedule
+                        // a second slot for the same chunk once the backoff expires,
+                        // duplicating the chunk's data in the response.
+                        self.next_chunk = self.get_next_chunk(&chunk);
+                    } else {
+                        self.next_chunk = Some(chunk);
                     }
                     self.last_error = Some(e.to_string());
-                    self.next_chunk = Some(chunk);
                     break;
                 }
             }
