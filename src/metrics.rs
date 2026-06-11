@@ -278,7 +278,7 @@ pub fn register_metrics(registry: &mut Registry) {
     );
     registry.register(
         "stream_max_chunk_parts",
-        "Maximum number of response parts queued for a single chunk in a completed stream",
+        "Maximum number of stored response parts for a single chunk in a completed stream",
         STREAM_MAX_CHUNK_PARTS.clone(),
     );
     registry.register(

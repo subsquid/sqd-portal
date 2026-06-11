@@ -43,6 +43,11 @@ pub struct Config {
     #[serde(default = "default_max_buffer_size")]
     pub max_buffer_size: usize,
 
+    // Values above 1 enable eager partial continuations with bounded per-chunk buffering.
+    // A value of 1 effectively keeps continuation requests lazy.
+    #[serde(default = "default_max_stored_results_per_chunk")]
+    pub max_stored_results_per_chunk: usize,
+
     #[serde(default = "default_default_retries")]
     pub default_retries: u8,
 
@@ -101,9 +106,6 @@ pub struct Config {
 
     #[serde(default)]
     pub use_gzjoin: bool,
-
-    #[serde(default = "default_true")]
-    pub eager_continuations: bool,
 
     #[serde(default)]
     pub ignore_deprecated_workers: bool,
@@ -226,6 +228,10 @@ fn default_default_buffer_size() -> usize {
 
 fn default_max_buffer_size() -> usize {
     1000
+}
+
+fn default_max_stored_results_per_chunk() -> usize {
+    2
 }
 
 fn default_default_retries() -> u8 {
@@ -384,6 +390,12 @@ sqd_network:
         let config: Config = serde_yaml::from_str(MINIMAL_YAML).expect("parse");
         assert_eq!(config.pre_drain_grace_period, Duration::from_secs(25));
         assert_eq!(config.drain_timeout, Duration::from_secs(25));
+    }
+
+    #[test]
+    fn max_stored_results_per_chunk_defaults_to_two() {
+        let config: Config = serde_yaml::from_str(MINIMAL_YAML).expect("parse");
+        assert_eq!(config.max_stored_results_per_chunk, 2);
     }
 
     #[test]
