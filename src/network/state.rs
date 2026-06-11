@@ -22,6 +22,18 @@ impl WorkerLease {
     pub fn worker(&self) -> PeerId {
         self.worker
     }
+
+    /// Creates a standalone lease backed by a fresh pool, for tests that
+    /// mock the network without a full [`NetworkState`].
+    #[cfg(test)]
+    pub(crate) fn for_tests(worker: PeerId) -> Self {
+        let pool = Arc::new(RwLock::new(
+            WorkersPool::new(PrioritiesConfig::default()),
+            "WorkerLease::for_tests pool",
+        ));
+        pool.write().lease(worker);
+        Self { pool, worker }
+    }
 }
 
 impl Drop for WorkerLease {

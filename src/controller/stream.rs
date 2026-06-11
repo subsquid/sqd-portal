@@ -71,7 +71,7 @@ use tracing::{instrument, Instrument};
 
 use crate::{
     controller::timeouts::TimeoutManager,
-    network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult, WorkerLease},
+    network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult, StreamingNetwork, WorkerLease},
     types::{
         BlockRange, ChunkId, DataChunk, QueryError, RequestError, ResponseChunk, SendQueryError,
         StreamRequest,
@@ -81,9 +81,9 @@ use crate::{
 
 const MAX_IDLE_TIME: Duration = Duration::from_millis(1000);
 
-pub struct StreamController {
+pub struct StreamController<N: StreamingNetwork = NetworkClient> {
     request: StreamRequest,
-    network: Arc<NetworkClient>,
+    network: Arc<N>,
     buffer: SlidingArray<ChunkSlot>,
     next_chunk: Option<DataChunk>,
     timeouts: TimeoutManager,
@@ -207,10 +207,10 @@ impl UpdateStatus {
     }
 }
 
-impl StreamController {
+impl<N: StreamingNetwork> StreamController<N> {
     pub fn new(
         request: StreamRequest,
-        network: Arc<NetworkClient>,
+        network: Arc<N>,
         stream_index: u32,
         priority_stride: u32,
     ) -> Result<Self, RequestError> {
@@ -708,9 +708,17 @@ impl StreamController {
                         let chunk_slot = ChunkSlot::new(*slot);
                         self.stats.observe_chunk_parts(chunk_slot.num_parts());
                         self.buffer.push_back(chunk_slot);
+                        // The pushed slot now owns this chunk. If the stream survives
+                        // (`pop_response` keeps slots paused for less than MAX_IDLE_TIME
+                        // alive), the slot is retried in place by `poll_deferred_slot`.
+                        // Re-queueing the chunk into `next_chunk` as well would schedule
+                        // a second slot for the same chunk once the backoff expires,
+                        // duplicating the chunk's data in the response.
+                        self.next_chunk = self.get_next_chunk(&chunk);
+                    } else {
+                        self.next_chunk = Some(chunk);
                     }
                     self.last_error = Some(e.to_string());
-                    self.next_chunk = Some(chunk);
                     break;
                 }
             }
@@ -851,7 +859,7 @@ impl StreamController {
     }
 }
 
-impl Drop for StreamController {
+impl<N: StreamingNetwork> Drop for StreamController<N> {
     fn drop(&mut self) {
         let _enter = self.span.enter();
         self.stats
@@ -859,7 +867,7 @@ impl Drop for StreamController {
     }
 }
 
-impl futures::Stream for StreamController {
+impl<N: StreamingNetwork> futures::Stream for StreamController<N> {
     type Item = Result<ResponseChunk, RequestError>;
 
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -1313,5 +1321,126 @@ mod tests {
         chunk_slot.active = None;
 
         assert_eq!(chunk_slot.debug_symbol(), '#');
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::{future::BoxFuture, StreamExt};
+
+    use crate::network::QuerySuccess;
+    use crate::types::{Compression, DatasetId, StreamRequest};
+
+    /// A single-chunk dataset whose workers are all in a backoff until
+    /// `backoff_until`; afterwards every query succeeds and returns the
+    /// queried range's full data.
+    struct MockNetwork {
+        chunk: DataChunk,
+        backoff_until: Instant,
+        queries_sent: AtomicUsize,
+    }
+
+    impl StreamingNetwork for MockNetwork {
+        fn find_chunk(
+            &self,
+            _dataset: &DatasetId,
+            _block: u64,
+        ) -> Result<DataChunk, ChunkNotFound> {
+            Ok(self.chunk.clone())
+        }
+
+        fn next_chunk(&self, _dataset: &DatasetId, _chunk: &DataChunk) -> Option<DataChunk> {
+            None
+        }
+
+        fn find_worker(&self, _dataset: &DatasetId, _block: u64) -> Result<WorkerLease, NoWorker> {
+            if Instant::now() < self.backoff_until {
+                return Err(NoWorker::Backoff(self.backoff_until));
+            }
+            Ok(WorkerLease::for_tests(PeerId::random()))
+        }
+
+        fn query_worker(
+            self: Arc<Self>,
+            _lease: WorkerLease,
+            _request_id: String,
+            _chunk_id: ChunkId,
+            block_range: BlockRange,
+            _query: String,
+            _compression: Compression,
+            _priority: Option<u32>,
+        ) -> BoxFuture<'static, QueryResult> {
+            self.queries_sent.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(QuerySuccess {
+                    ok: sqd_messages::QueryOk {
+                        data: format!("data-{}-{}", block_range.start(), block_range.end())
+                            .into_bytes(),
+                        last_block: *block_range.end(),
+                    },
+                    ttfb: Duration::from_millis(1),
+                    transfer_time: Duration::from_millis(1),
+                    response_size: 10,
+                })
+            })
+        }
+    }
+
+    fn stream_request() -> StreamRequest {
+        let query_json = r#"{
+            "type": "evm",
+            "fromBlock": 100,
+            "toBlock": 150,
+            "fields": {"block": {"number": true}},
+            "includeAllBlocks": true
+        }"#;
+        StreamRequest {
+            dataset_id: DatasetId::from_url("test-dataset"),
+            dataset_name: "test-dataset".to_owned(),
+            query: ParsedQuery::try_from(query_json.to_owned()).unwrap(),
+            request_id: "test-request".to_owned(),
+            buffer_size: 10,
+            max_chunks: None,
+            timeout_quantile: 0.5,
+            retries: 1,
+            compression: Compression::Gzip,
+            skip_parent_hash_validation: false,
+            eager_continuations: false,
+        }
+    }
+
+    /// Regression test for the duplicated-response incident: a request whose
+    /// first chunk hits a short worker backoff (all workers rate-limited)
+    /// must still serve the chunk's data exactly once.
+    ///
+    /// Before the fix, the failed scheduling attempt left the chunk owned
+    /// both by the error slot in the buffer (retried in place once the
+    /// backoff expired) and by `next_chunk` (scheduled a second time by
+    /// `try_fill_slots`), so the chunk's full data was queried and emitted
+    /// twice within one stream.
+    #[tokio::test(start_paused = true)]
+    async fn chunk_hitting_short_backoff_is_served_exactly_once() {
+        let network = Arc::new(MockNetwork {
+            chunk: test_chunk(),
+            backoff_until: Instant::now() + Duration::from_millis(100),
+            queries_sent: AtomicUsize::new(0),
+        });
+        let mut controller =
+            StreamController::new(stream_request(), network.clone(), 0, 1).unwrap();
+
+        let mut responses = Vec::new();
+        while let Some(item) = controller.next().await {
+            responses.push(item.expect("stream should not fail"));
+        }
+
+        assert_eq!(
+            responses,
+            vec![b"data-100-150".to_vec()],
+            "the chunk's data must be served exactly once",
+        );
+        assert_eq!(
+            network.queries_sent.load(Ordering::SeqCst),
+            1,
+            "the chunk must be queried exactly once",
+        );
     }
 }
