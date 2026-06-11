@@ -453,6 +453,7 @@ impl<N: StreamingNetwork> StreamController<N> {
                         ))));
                     }
                 };
+                let response = reject_out_of_range(response, &data_range.range, running.worker);
 
                 if retriable(&response) {
                     tracing::debug!(
@@ -1112,6 +1113,32 @@ fn build_query_for_range(query: &mut crate::types::ParsedQuery, range: &BlockRan
     }
 }
 
+/// A misbehaving worker may report (and include) data beyond the queried
+/// range. The data is an opaque compressed blob, so it can't be trimmed to
+/// the range without decompressing and re-encoding it; and a continuation
+/// range computed from such a `last_block` would be inverted. Reject the
+/// whole response as a retriable failure so another worker can serve the
+/// range instead.
+fn reject_out_of_range(response: QueryResult, range: &BlockRange, worker: PeerId) -> QueryResult {
+    match response {
+        Ok(success) if success.ok.last_block > *range.end() => {
+            tracing::warn!(
+                "Got response beyond the queried range {}-{} from worker {}: last block {}",
+                range.start(),
+                range.end(),
+                worker,
+                success.ok.last_block,
+            );
+            Err(QueryError::Retriable(format!(
+                "worker returned last block {} beyond the queried range end {}",
+                success.ok.last_block,
+                range.end(),
+            )))
+        }
+        response => response,
+    }
+}
+
 fn retriable(result: &QueryResult) -> bool {
     match result {
         Ok(_) => false,
@@ -1451,9 +1478,12 @@ mod tests {
     // ------------------------------------------------------------------
 
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicI64;
     use std::sync::Mutex as StdMutex;
 
     use proptest::prelude::*;
+
+    use crate::network::TestLeasePool;
 
     /// Scripted outcome of one `find_worker` call.
     #[derive(Debug, Clone)]
@@ -1474,17 +1504,65 @@ mod tests {
         /// Serve only this percentage of the queried range, forcing a
         /// continuation request for the remainder.
         Partial(u8),
+        /// Misbehave: report this many blocks beyond the queried range end.
+        Overshoot(u64),
         Retriable,
+        /// Never respond. Only used by the cancellation test; including it in
+        /// the random generator would (correctly) fail the liveness property,
+        /// because a slot whose every attempt hangs waits forever — in
+        /// production the transport read timeout, modeled here as `Retriable`,
+        /// breaks that wait.
+        Hang,
+    }
+
+    /// Decrements the live-query counter when the query future is dropped,
+    /// whether it completed or was aborted.
+    struct LiveQueryGuard(Arc<AtomicI64>);
+
+    impl LiveQueryGuard {
+        fn new(counter: &Arc<AtomicI64>) -> Self {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Self(counter.clone())
+        }
+    }
+
+    impl Drop for LiveQueryGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     /// A network where every `find_worker` / `query_worker` call consumes the
     /// next scripted event; exhausted scripts default to success.
     struct ScriptedNetwork {
         chunks: Vec<DataChunk>,
+        lease_pool: TestLeasePool,
         find_worker_script: StdMutex<VecDeque<FindWorkerEvent>>,
         query_script: StdMutex<VecDeque<QueryEvent>>,
-        /// Every block range a worker successfully answered for.
-        ok_ranges: StdMutex<Vec<(u64, u64)>>,
+        /// `(request_id, range)` of every in-range successful worker
+        /// execution (rejected overshoots don't count: their data is never
+        /// delivered, so re-executing their range is legal).
+        ok_ranges: StdMutex<Vec<(String, (u64, u64))>>,
+        /// Query futures currently alive (running or queued, not yet
+        /// completed nor aborted).
+        live_queries: Arc<AtomicI64>,
+    }
+
+    impl ScriptedNetwork {
+        fn new(
+            chunks: Vec<DataChunk>,
+            find_worker_script: Vec<FindWorkerEvent>,
+            query_script: Vec<QueryEvent>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                chunks,
+                lease_pool: TestLeasePool::new(),
+                find_worker_script: StdMutex::new(find_worker_script.into()),
+                query_script: StdMutex::new(query_script.into()),
+                ok_ranges: StdMutex::new(Vec::new()),
+                live_queries: Arc::new(AtomicI64::new(0)),
+            })
+        }
     }
 
     impl StreamingNetwork for ScriptedNetwork {
@@ -1514,7 +1592,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or(FindWorkerEvent::Lease);
             match event {
-                FindWorkerEvent::Lease => Ok(WorkerLease::for_tests(PeerId::random())),
+                FindWorkerEvent::Lease => Ok(self.lease_pool.lease(PeerId::random())),
                 FindWorkerEvent::ShortBackoff(ms) => Err(NoWorker::Backoff(
                     Instant::now() + Duration::from_millis(ms),
                 )),
@@ -1528,7 +1606,7 @@ mod tests {
         fn query_worker(
             self: Arc<Self>,
             _lease: WorkerLease,
-            _request_id: String,
+            request_id: String,
             _chunk_id: ChunkId,
             block_range: BlockRange,
             _query: String,
@@ -1541,17 +1619,29 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(QueryEvent::Full);
+            let guard = LiveQueryGuard::new(&self.live_queries);
             Box::pin(async move {
+                let _guard = guard;
                 let (start, end) = (*block_range.start(), *block_range.end());
                 let last = match event {
+                    QueryEvent::Hang => {
+                        futures::future::pending::<()>().await;
+                        unreachable!("pending future never resolves")
+                    }
                     QueryEvent::Retriable => {
                         return Err(QueryError::Retriable("scripted failure".to_owned()))
                     }
                     QueryEvent::Full => end,
+                    QueryEvent::Overshoot(extra) => end + extra,
                     QueryEvent::Partial(_) if start == end => end,
                     QueryEvent::Partial(pct) => start + (end - start) * (pct as u64) / 100,
                 };
-                self.ok_ranges.lock().unwrap().push((start, last));
+                if last <= end {
+                    self.ok_ranges
+                        .lock()
+                        .unwrap()
+                        .push((request_id, (start, last)));
+                }
                 Ok(QuerySuccess {
                     ok: sqd_messages::QueryOk {
                         data: format!("{start}:{last}").into_bytes(),
@@ -1565,16 +1655,23 @@ mod tests {
         }
     }
 
+    /// The block range requested by one of the concurrent streams.
+    #[derive(Debug, Clone)]
+    struct StreamSpec {
+        from: u64,
+        to: u64,
+    }
+
     #[derive(Debug, Clone)]
     struct Scenario {
         n_chunks: usize,
-        from: u64,
-        to: u64,
+        streams: Vec<StreamSpec>,
         find_worker_script: Vec<FindWorkerEvent>,
         query_script: Vec<QueryEvent>,
         buffer_size: usize,
         retries: u8,
         eager_continuations: bool,
+        max_chunks: Option<usize>,
     }
 
     impl Scenario {
@@ -1583,6 +1680,19 @@ mod tests {
 
         fn dataset_last_block(&self) -> u64 {
             Self::FIRST_BLOCK + (self.n_chunks as u64) * Self::CHUNK_SIZE - 1
+        }
+
+        /// The last block a cleanly completed stream is expected to serve:
+        /// the requested end, capped by the dataset end and by `max_chunks`.
+        fn expected_end(&self, spec: &StreamSpec) -> u64 {
+            let mut end = spec.to.min(self.dataset_last_block());
+            if let Some(limit) = self.max_chunks {
+                let first_chunk = (spec.from - Self::FIRST_BLOCK) / Self::CHUNK_SIZE;
+                let limit_end =
+                    Self::FIRST_BLOCK + (first_chunk + limit as u64) * Self::CHUNK_SIZE - 1;
+                end = end.min(limit_end);
+            }
+            end
         }
 
         fn build_chunks(&self) -> Vec<DataChunk> {
@@ -1596,7 +1706,7 @@ mod tests {
                 .collect()
         }
 
-        fn request(&self) -> StreamRequest {
+        fn request(&self, spec: &StreamSpec, stream_index: usize) -> StreamRequest {
             let query_json = format!(
                 r#"{{
                     "type": "evm",
@@ -1605,15 +1715,15 @@ mod tests {
                     "fields": {{"block": {{"number": true}}}},
                     "includeAllBlocks": true
                 }}"#,
-                self.from, self.to
+                spec.from, spec.to
             );
             StreamRequest {
                 dataset_id: DatasetId::from_url("test-dataset"),
                 dataset_name: "test-dataset".to_owned(),
                 query: ParsedQuery::try_from(query_json).unwrap(),
-                request_id: "test-request".to_owned(),
+                request_id: format!("stream-{stream_index}"),
                 buffer_size: self.buffer_size,
-                max_chunks: None,
+                max_chunks: self.max_chunks,
                 timeout_quantile: 0.5,
                 retries: self.retries,
                 compression: Compression::Gzip,
@@ -1631,8 +1741,9 @@ mod tests {
             1 => Just(FindWorkerEvent::Unavailable),
         ];
         let query_event = prop_oneof![
-            3 => Just(QueryEvent::Full),
+            4 => Just(QueryEvent::Full),
             2 => (10u8..=90).prop_map(QueryEvent::Partial),
+            1 => (1u64..=20).prop_map(QueryEvent::Overshoot),
             1 => Just(QueryEvent::Retriable),
         ];
         (1usize..=4)
@@ -1640,35 +1751,70 @@ mod tests {
                 let total_blocks = (n_chunks as u64) * Scenario::CHUNK_SIZE;
                 (
                     Just(n_chunks),
-                    0..total_blocks,
-                    0u64..300,
+                    prop::collection::vec((0..total_blocks, 0u64..300), 1..=3),
                     prop::collection::vec(find_worker_event.clone(), 0..6),
-                    prop::collection::vec(query_event.clone(), 0..8),
+                    prop::collection::vec(query_event.clone(), 0..10),
                     1usize..=10,
                     0u8..=2,
                     any::<bool>(),
+                    prop::option::of(1usize..=4),
                 )
             })
             .prop_map(
-                |(n_chunks, offset, span, fw, q, buffer_size, retries, eager)| Scenario {
+                |(n_chunks, streams, fw, q, buffer_size, retries, eager, max_chunks)| Scenario {
                     n_chunks,
-                    from: Scenario::FIRST_BLOCK + offset,
-                    to: Scenario::FIRST_BLOCK + offset + span,
+                    streams: streams
+                        .into_iter()
+                        .map(|(offset, span)| StreamSpec {
+                            from: Scenario::FIRST_BLOCK + offset,
+                            to: Scenario::FIRST_BLOCK + offset + span,
+                        })
+                        .collect(),
                     find_worker_script: fw,
                     query_script: q,
                     buffer_size,
                     retries,
                     eager_continuations: eager,
+                    max_chunks,
                 },
             )
     }
 
-    struct ScenarioOutcome {
+    struct StreamOutcome {
         /// (first_block, last_block) of every response chunk, in emission order.
         emissions: Vec<(u64, u64)>,
         error: Option<String>,
+    }
+
+    struct ScenarioOutcome {
+        streams: Vec<StreamOutcome>,
         timed_out: bool,
-        ok_ranges: Vec<(u64, u64)>,
+        ok_ranges: Vec<(String, (u64, u64))>,
+        leases_outstanding: usize,
+    }
+
+    async fn collect_stream<N: StreamingNetwork>(
+        request: StreamRequest,
+        network: Arc<N>,
+        stream_index: u32,
+    ) -> StreamOutcome {
+        let mut controller = StreamController::new(request, network, stream_index, 1).unwrap();
+        let mut emissions = Vec::new();
+        let mut error = None;
+        while let Some(item) = controller.next().await {
+            match item {
+                Ok(bytes) => {
+                    let text = String::from_utf8(bytes).unwrap();
+                    let (start, last) = text.split_once(':').unwrap();
+                    emissions.push((start.parse().unwrap(), last.parse().unwrap()));
+                }
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        StreamOutcome { emissions, error }
     }
 
     fn run_scenario(scenario: &Scenario) -> ScenarioOutcome {
@@ -1678,48 +1824,39 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let network = Arc::new(ScriptedNetwork {
-                chunks: scenario.build_chunks(),
-                find_worker_script: StdMutex::new(scenario.find_worker_script.clone().into()),
-                query_script: StdMutex::new(scenario.query_script.clone().into()),
-                ok_ranges: StdMutex::new(Vec::new()),
-            });
+            let network = ScriptedNetwork::new(
+                scenario.build_chunks(),
+                scenario.find_worker_script.clone(),
+                scenario.query_script.clone(),
+            );
 
-            let collect = async {
-                let mut controller =
-                    StreamController::new(scenario.request(), network.clone(), 0, 1).unwrap();
-                let mut emissions = Vec::new();
-                let mut error = None;
-                while let Some(item) = controller.next().await {
-                    match item {
-                        Ok(bytes) => {
-                            let text = String::from_utf8(bytes).unwrap();
-                            let (start, last) = text.split_once(':').unwrap();
-                            emissions.push((start.parse().unwrap(), last.parse().unwrap()));
-                        }
-                        Err(e) => {
-                            error = Some(e.to_string());
-                            break;
-                        }
-                    }
-                }
-                (emissions, error)
-            };
+            let collect_all =
+                futures::future::join_all(scenario.streams.iter().enumerate().map(|(i, spec)| {
+                    collect_stream(scenario.request(spec, i), network.clone(), i as u32)
+                }));
 
             // Virtual-time deadline: liveness. A stream stuck without timers
             // would otherwise hang the auto-advancing paused clock forever.
-            match tokio::time::timeout(Duration::from_secs(3600), collect).await {
-                Ok((emissions, error)) => ScenarioOutcome {
-                    emissions,
-                    error,
-                    timed_out: false,
-                    ok_ranges: network.ok_ranges.lock().unwrap().clone(),
-                },
+            match tokio::time::timeout(Duration::from_secs(3600), collect_all).await {
+                Ok(streams) => {
+                    // The controllers are dropped; give the runtime a few
+                    // turns to process the aborted query tasks so their
+                    // leases get returned.
+                    for _ in 0..8 {
+                        tokio::task::yield_now().await;
+                    }
+                    ScenarioOutcome {
+                        streams,
+                        timed_out: false,
+                        ok_ranges: network.ok_ranges.lock().unwrap().clone(),
+                        leases_outstanding: network.lease_pool.outstanding(),
+                    }
+                }
                 Err(_) => ScenarioOutcome {
-                    emissions: Vec::new(),
-                    error: None,
+                    streams: Vec::new(),
                     timed_out: true,
                     ok_ranges: network.ok_ranges.lock().unwrap().clone(),
+                    leases_outstanding: network.lease_pool.outstanding(),
                 },
             }
         })
@@ -1728,59 +1865,195 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
 
-        /// Whatever adversity the network throws at the controller, the
-        /// emitted stream must be a gapless, strictly increasing prefix of
-        /// the requested range, fully covering it on clean completion, and
-        /// no block range may be successfully executed by workers twice.
+        /// Whatever adversity the network throws at the controller(s) —
+        /// backoffs, unavailability, partial / out-of-range / failing worker
+        /// responses, chunk limits, several streams sharing the network —
+        /// every stream must emit a gapless, strictly increasing prefix of
+        /// its requested range, fully covering it on clean completion; no
+        /// block range may be executed twice for the same stream; and no
+        /// worker lease may leak.
         #[test]
         fn stream_invariants_hold_under_scheduling_adversity(scenario in scenario_strategy()) {
             let outcome = run_scenario(&scenario);
 
-            // Liveness: the stream always terminates (with data or an error).
-            prop_assert!(!outcome.timed_out, "stream did not terminate");
+            // Liveness: every stream terminates (with data or an error).
+            prop_assert!(!outcome.timed_out, "streams did not terminate");
 
-            // No duplicates, monotonically increasing, no gaps: each emission
-            // continues exactly where the previous one ended.
-            let mut expected_next = scenario.from;
-            for &(start, last) in &outcome.emissions {
-                prop_assert_eq!(
-                    start,
-                    expected_next,
-                    "emission must continue the stream exactly (emissions: {:?})",
-                    &outcome.emissions
-                );
-                prop_assert!(last >= start, "emission range must not be inverted");
-                expected_next = last + 1;
-            }
+            for (i, (spec, stream)) in scenario.streams.iter().zip(&outcome.streams).enumerate() {
+                // No duplicates, monotonically increasing, no gaps: each
+                // emission continues exactly where the previous one ended.
+                let mut expected_next = spec.from;
+                for &(start, last) in &stream.emissions {
+                    prop_assert_eq!(
+                        start,
+                        expected_next,
+                        "stream {} emission must continue the stream exactly (emissions: {:?})",
+                        i,
+                        &stream.emissions
+                    );
+                    prop_assert!(last >= start, "emission range must not be inverted");
+                    expected_next = last + 1;
+                }
 
-            // Completeness: a stream that ended without an error must have
-            // served the whole requested range (capped by the dataset end).
-            if outcome.error.is_none() {
-                let expected_end = scenario.to.min(scenario.dataset_last_block());
-                prop_assert_eq!(
-                    expected_next,
-                    expected_end + 1,
-                    "clean completion must cover the full range (emissions: {:?})",
-                    &outcome.emissions
-                );
+                // Completeness: a stream that ended without an error must
+                // have served the whole requested range (capped by the
+                // dataset end and the max_chunks limit).
+                if stream.error.is_none() {
+                    prop_assert_eq!(
+                        expected_next,
+                        scenario.expected_end(spec) + 1,
+                        "stream {} clean completion must cover the full range (emissions: {:?})",
+                        i,
+                        &stream.emissions
+                    );
+                }
             }
 
             // At-most-once execution: no block range is successfully served
-            // by workers more than once (retries of *failed* attempts are
-            // fine; re-executing delivered work is not).
+            // by workers more than once for the same stream (retries of
+            // *failed* attempts are fine; re-executing delivered work is not).
             let mut ok_count = HashMap::new();
-            for range in &outcome.ok_ranges {
-                *ok_count.entry(range).or_insert(0usize) += 1;
+            for executed in &outcome.ok_ranges {
+                *ok_count.entry(executed).or_insert(0usize) += 1;
             }
-            for (range, count) in ok_count {
+            for (executed, count) in ok_count {
                 prop_assert!(
                     count <= 1,
-                    "range {:?} was successfully executed {} times (all: {:?})",
-                    range,
+                    "{:?} was successfully executed {} times (all: {:?})",
+                    executed,
                     count,
                     &outcome.ok_ranges
                 );
             }
+
+            // No lease leaks: every worker slot taken is eventually returned.
+            prop_assert_eq!(
+                outcome.leases_outstanding,
+                0,
+                "worker leases leaked after all streams finished"
+            );
         }
+    }
+
+    /// An out-of-range worker response must be rejected and converted into a
+    /// retriable failure rather than trusted or treated as fatal.
+    #[test]
+    fn out_of_range_response_is_rejected_as_retriable() {
+        let success = |last_block| {
+            Ok(QuerySuccess {
+                ok: sqd_messages::QueryOk {
+                    data: b"data".to_vec(),
+                    last_block,
+                },
+                ttfb: Duration::from_millis(1),
+                transfer_time: Duration::from_millis(1),
+                response_size: 4,
+            })
+        };
+        let range = BlockRange::new(100, 150);
+
+        let rejected = reject_out_of_range(success(151), &range, PeerId::random());
+        assert!(
+            matches!(rejected, Err(QueryError::Retriable(_))),
+            "overshooting response must become a retriable error"
+        );
+        assert!(retriable(&rejected));
+
+        let in_range = reject_out_of_range(success(150), &range, PeerId::random());
+        assert!(in_range.is_ok(), "in-range response must pass through");
+    }
+
+    /// A single misbehaving worker must not fail the stream: its response is
+    /// skipped and the range is served by the next reserved worker.
+    #[tokio::test(start_paused = true)]
+    async fn overshooting_worker_response_is_skipped_and_retried() {
+        let scenario = Scenario {
+            n_chunks: 1,
+            streams: vec![StreamSpec { from: 100, to: 150 }],
+            find_worker_script: Vec::new(),
+            query_script: vec![QueryEvent::Overshoot(10)],
+            buffer_size: 10,
+            retries: 1,
+            eager_continuations: false,
+            max_chunks: None,
+        };
+        let network = ScriptedNetwork::new(
+            scenario.build_chunks(),
+            Vec::new(),
+            scenario.query_script.clone(),
+        );
+
+        let outcome = collect_stream(
+            scenario.request(&scenario.streams[0], 0),
+            network.clone(),
+            0,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.error, None,
+            "one bad worker must not fail the stream"
+        );
+        assert_eq!(
+            outcome.emissions,
+            vec![(100, 150)],
+            "the range must be served exactly once by the retry"
+        );
+    }
+
+    /// Dropping the stream (client disconnect) must abort the in-flight
+    /// worker queries and return their leases.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_stream_aborts_in_flight_queries() {
+        let scenario = Scenario {
+            n_chunks: 2,
+            streams: vec![StreamSpec { from: 100, to: 299 }],
+            find_worker_script: Vec::new(),
+            query_script: vec![QueryEvent::Hang; 8],
+            buffer_size: 4,
+            retries: 1,
+            eager_continuations: false,
+            max_chunks: None,
+        };
+        let network = ScriptedNetwork::new(
+            scenario.build_chunks(),
+            Vec::new(),
+            vec![QueryEvent::Hang; 8],
+        );
+        let mut controller = StreamController::new(
+            scenario.request(&scenario.streams[0], 0),
+            network.clone(),
+            0,
+            1,
+        )
+        .unwrap();
+
+        // One poll is enough to schedule the chunk queries; they all hang.
+        futures::future::poll_fn(|ctx| {
+            let _ = Pin::new(&mut controller).poll_next(ctx);
+            Poll::Ready(())
+        })
+        .await;
+        assert!(
+            network.live_queries.load(Ordering::SeqCst) > 0,
+            "queries should be in flight"
+        );
+
+        drop(controller);
+        // Aborts are processed by the runtime; give it a few turns.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            network.live_queries.load(Ordering::SeqCst),
+            0,
+            "dropping the stream must abort all in-flight worker queries"
+        );
+        assert_eq!(
+            network.lease_pool.outstanding(),
+            0,
+            "all worker leases must be returned"
+        );
     }
 }
