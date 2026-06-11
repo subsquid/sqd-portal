@@ -74,6 +74,8 @@ impl TaskManager {
         }
 
         let stream_index = self.next_stream_index.fetch_add(1, Ordering::Relaxed);
+        let dataset = request.dataset_id.clone();
+        let request_id = request.request_id.clone();
         let mut streamer = StreamController::new(
             request,
             self.network_client.clone(),
@@ -93,7 +95,16 @@ impl TaskManager {
                     None => break,
                     Some(Ok(chunk)) => yield chunk,
                     Some(Err(e)) => {
-                        tracing::warn!("Stream got interrupted: {:?}", e);
+                        // This warn is often the only signal of a systemic
+                        // degradation (all streams breaking at once), so it
+                        // must be attributable: which dataset, which request.
+                        tracing::warn!(
+                            dataset = %dataset,
+                            request_id,
+                            stream_index,
+                            error = ?e,
+                            "Stream got interrupted"
+                        );
                         // There is no way to pass the error to the client
                         break;
                     }
