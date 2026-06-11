@@ -1443,4 +1443,344 @@ mod tests {
             "the chunk must be queried exactly once",
         );
     }
+
+    // ------------------------------------------------------------------
+    // Property-based tests: random scheduling adversity (worker backoffs,
+    // partial responses, retriable failures) must never break the stream's
+    // core invariants.
+    // ------------------------------------------------------------------
+
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    use proptest::prelude::*;
+
+    /// Scripted outcome of one `find_worker` call.
+    #[derive(Debug, Clone)]
+    enum FindWorkerEvent {
+        Lease,
+        /// Expires while the stream is still allowed to wait (< MAX_IDLE_TIME).
+        ShortBackoff(u64),
+        /// Longer than MAX_IDLE_TIME: the stream gives up with `BusyFor`.
+        LongBackoff,
+        /// No workers at all: the stream gives up with `Unavailable`.
+        Unavailable,
+    }
+
+    /// Scripted outcome of one worker query.
+    #[derive(Debug, Clone)]
+    enum QueryEvent {
+        Full,
+        /// Serve only this percentage of the queried range, forcing a
+        /// continuation request for the remainder.
+        Partial(u8),
+        Retriable,
+    }
+
+    /// A network where every `find_worker` / `query_worker` call consumes the
+    /// next scripted event; exhausted scripts default to success.
+    struct ScriptedNetwork {
+        chunks: Vec<DataChunk>,
+        find_worker_script: StdMutex<VecDeque<FindWorkerEvent>>,
+        query_script: StdMutex<VecDeque<QueryEvent>>,
+        /// Every block range a worker successfully answered for.
+        ok_ranges: StdMutex<Vec<(u64, u64)>>,
+    }
+
+    impl StreamingNetwork for ScriptedNetwork {
+        fn find_chunk(&self, _dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound> {
+            if block < *self.chunks[0].block_range().start() {
+                return Err(ChunkNotFound::BeforeFirst {
+                    first_block: *self.chunks[0].block_range().start(),
+                });
+            }
+            self.chunks
+                .iter()
+                .find(|c| c.block_range().contains(&block))
+                .cloned()
+                .ok_or(ChunkNotFound::AfterLast)
+        }
+
+        fn next_chunk(&self, _dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
+            let pos = self.chunks.iter().position(|c| c == chunk)?;
+            self.chunks.get(pos + 1).cloned()
+        }
+
+        fn find_worker(&self, _dataset: &DatasetId, _block: u64) -> Result<WorkerLease, NoWorker> {
+            let event = self
+                .find_worker_script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(FindWorkerEvent::Lease);
+            match event {
+                FindWorkerEvent::Lease => Ok(WorkerLease::for_tests(PeerId::random())),
+                FindWorkerEvent::ShortBackoff(ms) => Err(NoWorker::Backoff(
+                    Instant::now() + Duration::from_millis(ms),
+                )),
+                FindWorkerEvent::LongBackoff => {
+                    Err(NoWorker::Backoff(Instant::now() + Duration::from_secs(60)))
+                }
+                FindWorkerEvent::Unavailable => Err(NoWorker::AllUnavailable),
+            }
+        }
+
+        fn query_worker(
+            self: Arc<Self>,
+            _lease: WorkerLease,
+            _request_id: String,
+            _chunk_id: ChunkId,
+            block_range: BlockRange,
+            _query: String,
+            _compression: Compression,
+            _priority: Option<u32>,
+        ) -> BoxFuture<'static, QueryResult> {
+            let event = self
+                .query_script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(QueryEvent::Full);
+            Box::pin(async move {
+                let (start, end) = (*block_range.start(), *block_range.end());
+                let last = match event {
+                    QueryEvent::Retriable => {
+                        return Err(QueryError::Retriable("scripted failure".to_owned()))
+                    }
+                    QueryEvent::Full => end,
+                    QueryEvent::Partial(_) if start == end => end,
+                    QueryEvent::Partial(pct) => start + (end - start) * (pct as u64) / 100,
+                };
+                self.ok_ranges.lock().unwrap().push((start, last));
+                Ok(QuerySuccess {
+                    ok: sqd_messages::QueryOk {
+                        data: format!("{start}:{last}").into_bytes(),
+                        last_block: last,
+                    },
+                    ttfb: Duration::from_millis(1),
+                    transfer_time: Duration::from_millis(1),
+                    response_size: 10,
+                })
+            })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct Scenario {
+        n_chunks: usize,
+        from: u64,
+        to: u64,
+        find_worker_script: Vec<FindWorkerEvent>,
+        query_script: Vec<QueryEvent>,
+        buffer_size: usize,
+        retries: u8,
+        eager_continuations: bool,
+    }
+
+    impl Scenario {
+        const CHUNK_SIZE: u64 = 100;
+        const FIRST_BLOCK: u64 = 100;
+
+        fn dataset_last_block(&self) -> u64 {
+            Self::FIRST_BLOCK + (self.n_chunks as u64) * Self::CHUNK_SIZE - 1
+        }
+
+        fn build_chunks(&self) -> Vec<DataChunk> {
+            (0..self.n_chunks)
+                .map(|i| {
+                    let first = Self::FIRST_BLOCK + (i as u64) * Self::CHUNK_SIZE;
+                    let last = first + Self::CHUNK_SIZE - 1;
+                    DataChunk::from_str(&format!("{first:010}/{first:010}-{last:010}-abcde"))
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        fn request(&self) -> StreamRequest {
+            let query_json = format!(
+                r#"{{
+                    "type": "evm",
+                    "fromBlock": {},
+                    "toBlock": {},
+                    "fields": {{"block": {{"number": true}}}},
+                    "includeAllBlocks": true
+                }}"#,
+                self.from, self.to
+            );
+            StreamRequest {
+                dataset_id: DatasetId::from_url("test-dataset"),
+                dataset_name: "test-dataset".to_owned(),
+                query: ParsedQuery::try_from(query_json).unwrap(),
+                request_id: "test-request".to_owned(),
+                buffer_size: self.buffer_size,
+                max_chunks: None,
+                timeout_quantile: 0.5,
+                retries: self.retries,
+                compression: Compression::Gzip,
+                skip_parent_hash_validation: false,
+                eager_continuations: self.eager_continuations,
+            }
+        }
+    }
+
+    fn scenario_strategy() -> impl Strategy<Value = Scenario> {
+        let find_worker_event = prop_oneof![
+            3 => Just(FindWorkerEvent::Lease),
+            3 => (10u64..=300).prop_map(FindWorkerEvent::ShortBackoff),
+            1 => Just(FindWorkerEvent::LongBackoff),
+            1 => Just(FindWorkerEvent::Unavailable),
+        ];
+        let query_event = prop_oneof![
+            3 => Just(QueryEvent::Full),
+            2 => (10u8..=90).prop_map(QueryEvent::Partial),
+            1 => Just(QueryEvent::Retriable),
+        ];
+        (1usize..=4)
+            .prop_flat_map(move |n_chunks| {
+                let total_blocks = (n_chunks as u64) * Scenario::CHUNK_SIZE;
+                (
+                    Just(n_chunks),
+                    0..total_blocks,
+                    0u64..300,
+                    prop::collection::vec(find_worker_event.clone(), 0..6),
+                    prop::collection::vec(query_event.clone(), 0..8),
+                    1usize..=10,
+                    0u8..=2,
+                    any::<bool>(),
+                )
+            })
+            .prop_map(
+                |(n_chunks, offset, span, fw, q, buffer_size, retries, eager)| Scenario {
+                    n_chunks,
+                    from: Scenario::FIRST_BLOCK + offset,
+                    to: Scenario::FIRST_BLOCK + offset + span,
+                    find_worker_script: fw,
+                    query_script: q,
+                    buffer_size,
+                    retries,
+                    eager_continuations: eager,
+                },
+            )
+    }
+
+    struct ScenarioOutcome {
+        /// (first_block, last_block) of every response chunk, in emission order.
+        emissions: Vec<(u64, u64)>,
+        error: Option<String>,
+        timed_out: bool,
+        ok_ranges: Vec<(u64, u64)>,
+    }
+
+    fn run_scenario(scenario: &Scenario) -> ScenarioOutcome {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let network = Arc::new(ScriptedNetwork {
+                chunks: scenario.build_chunks(),
+                find_worker_script: StdMutex::new(scenario.find_worker_script.clone().into()),
+                query_script: StdMutex::new(scenario.query_script.clone().into()),
+                ok_ranges: StdMutex::new(Vec::new()),
+            });
+
+            let collect = async {
+                let mut controller =
+                    StreamController::new(scenario.request(), network.clone(), 0, 1).unwrap();
+                let mut emissions = Vec::new();
+                let mut error = None;
+                while let Some(item) = controller.next().await {
+                    match item {
+                        Ok(bytes) => {
+                            let text = String::from_utf8(bytes).unwrap();
+                            let (start, last) = text.split_once(':').unwrap();
+                            emissions.push((start.parse().unwrap(), last.parse().unwrap()));
+                        }
+                        Err(e) => {
+                            error = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+                (emissions, error)
+            };
+
+            // Virtual-time deadline: liveness. A stream stuck without timers
+            // would otherwise hang the auto-advancing paused clock forever.
+            match tokio::time::timeout(Duration::from_secs(3600), collect).await {
+                Ok((emissions, error)) => ScenarioOutcome {
+                    emissions,
+                    error,
+                    timed_out: false,
+                    ok_ranges: network.ok_ranges.lock().unwrap().clone(),
+                },
+                Err(_) => ScenarioOutcome {
+                    emissions: Vec::new(),
+                    error: None,
+                    timed_out: true,
+                    ok_ranges: network.ok_ranges.lock().unwrap().clone(),
+                },
+            }
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+
+        /// Whatever adversity the network throws at the controller, the
+        /// emitted stream must be a gapless, strictly increasing prefix of
+        /// the requested range, fully covering it on clean completion, and
+        /// no block range may be successfully executed by workers twice.
+        #[test]
+        fn stream_invariants_hold_under_scheduling_adversity(scenario in scenario_strategy()) {
+            let outcome = run_scenario(&scenario);
+
+            // Liveness: the stream always terminates (with data or an error).
+            prop_assert!(!outcome.timed_out, "stream did not terminate");
+
+            // No duplicates, monotonically increasing, no gaps: each emission
+            // continues exactly where the previous one ended.
+            let mut expected_next = scenario.from;
+            for &(start, last) in &outcome.emissions {
+                prop_assert_eq!(
+                    start,
+                    expected_next,
+                    "emission must continue the stream exactly (emissions: {:?})",
+                    &outcome.emissions
+                );
+                prop_assert!(last >= start, "emission range must not be inverted");
+                expected_next = last + 1;
+            }
+
+            // Completeness: a stream that ended without an error must have
+            // served the whole requested range (capped by the dataset end).
+            if outcome.error.is_none() {
+                let expected_end = scenario.to.min(scenario.dataset_last_block());
+                prop_assert_eq!(
+                    expected_next,
+                    expected_end + 1,
+                    "clean completion must cover the full range (emissions: {:?})",
+                    &outcome.emissions
+                );
+            }
+
+            // At-most-once execution: no block range is successfully served
+            // by workers more than once (retries of *failed* attempts are
+            // fine; re-executing delivered work is not).
+            let mut ok_count = HashMap::new();
+            for range in &outcome.ok_ranges {
+                *ok_count.entry(range).or_insert(0usize) += 1;
+            }
+            for (range, count) in ok_count {
+                prop_assert!(
+                    count <= 1,
+                    "range {:?} was successfully executed {} times (all: {:?})",
+                    range,
+                    count,
+                    &outcome.ok_ranges
+                );
+            }
+        }
+    }
 }
