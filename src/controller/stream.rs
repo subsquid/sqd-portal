@@ -536,14 +536,10 @@ impl<N: StreamingNetwork> StreamController<N> {
                 self.buffer.push_front(chunk_slot);
                 return Poll::Pending;
             }
-            state @ RequestState::Partial(_) => {
+            RequestState::Partial(partial) => {
                 // Return the partial result and schedule the continuation query
-                let (response, next_data_range) = Slot {
-                    data_range: slot.data_range,
-                    state,
-                }
-                .into_partial_continuation()
-                .expect("slot state was checked to be partial");
+                let (response, next_data_range) =
+                    into_partial_continuation(slot.data_range, partial);
                 let BufferedResponse {
                     result,
                     read_range,
@@ -619,17 +615,13 @@ impl<N: StreamingNetwork> StreamController<N> {
                 });
                 true
             }
-            RequestState::Partial(PartialResult { data, next_range })
+            RequestState::Partial(partial)
                 if chunk_slot.has_capacity_for_eager_continuation(
                     self.request.max_stored_results_per_chunk,
                 ) =>
             {
-                let (response, next_data_range) = Slot {
-                    data_range: slot.data_range,
-                    state: RequestState::Partial(PartialResult { data, next_range }),
-                }
-                .into_partial_continuation()
-                .expect("slot state was checked to be partial");
+                let (response, next_data_range) =
+                    into_partial_continuation(slot.data_range, partial);
                 chunk_slot.buffered.push_back(response);
                 let next_slot = match self.start_querying_chunk(next_data_range, ctx) {
                     Ok(slot) => slot,
@@ -952,21 +944,21 @@ impl Slot {
     fn is_paused(&self) -> bool {
         matches!(&self.state, RequestState::Paused(_))
     }
+}
 
-    fn into_partial_continuation(self) -> Option<(BufferedResponse, DataRange)> {
-        let RequestState::Partial(PartialResult { data, next_range }) = self.state else {
-            return None;
-        };
-
-        let read_range = BlockRange::new(*self.data_range.range.start(), *next_range.start() - 1);
-        let next_data_range = self.data_range.with_range(next_range);
-        let response = BufferedResponse {
-            chunk_index: next_data_range.chunk_index,
-            read_range,
-            result: Ok(data),
-        };
-        Some((response, next_data_range))
-    }
+fn into_partial_continuation(
+    data_range: DataRange,
+    partial: PartialResult,
+) -> (BufferedResponse, DataRange) {
+    let PartialResult { data, next_range } = partial;
+    let read_range = BlockRange::new(*data_range.range.start(), *next_range.start() - 1);
+    let next_data_range = data_range.with_range(next_range);
+    let response = BufferedResponse {
+        chunk_index: next_data_range.chunk_index,
+        read_range,
+        result: Ok(data),
+    };
+    (response, next_data_range)
 }
 
 impl RequestState {
@@ -1118,13 +1110,10 @@ mod tests {
         }
     }
 
-    fn partial_slot(start: u64, end: u64, last_returned: u64, data: &[u8]) -> Slot {
-        Slot {
-            data_range: data_range(start, end),
-            state: RequestState::Partial(PartialResult {
-                data: data.to_vec(),
-                next_range: BlockRange::new(last_returned + 1, end),
-            }),
+    fn partial_result(end: u64, last_returned: u64, data: &[u8]) -> PartialResult {
+        PartialResult {
+            data: data.to_vec(),
+            next_range: BlockRange::new(last_returned + 1, end),
         }
     }
 
@@ -1138,9 +1127,10 @@ mod tests {
 
     #[test]
     fn partial_slot_is_split_into_done_part_and_continuation_range() {
-        let slot = partial_slot(100, 200, 120, b"first");
+        let data_range = data_range(100, 200);
+        let partial = partial_result(200, 120, b"first");
 
-        let (response, continuation) = slot.into_partial_continuation().unwrap();
+        let (response, continuation) = into_partial_continuation(data_range, partial);
 
         assert_eq!(response.read_range, BlockRange::new(100, 120));
         assert_eq!(response.chunk_index, 0);
@@ -1155,9 +1145,12 @@ mod tests {
 
     #[test]
     fn chunk_slot_keeps_completed_response_before_active_continuation() {
-        let mut chunk_slot = ChunkSlot::new(partial_slot(100, 200, 120, b"first"));
-        let slot = chunk_slot.active.take().unwrap();
-        let (response, continuation) = slot.into_partial_continuation().unwrap();
+        let (response, continuation) =
+            into_partial_continuation(data_range(100, 200), partial_result(200, 120, b"first"));
+        let mut chunk_slot = ChunkSlot {
+            active: None,
+            buffered: VecDeque::new(),
+        };
         chunk_slot.buffered.push_back(response);
         chunk_slot.active = Some(Slot {
             data_range: continuation,
@@ -1229,7 +1222,7 @@ mod tests {
     use futures::{future::BoxFuture, StreamExt};
 
     use crate::network::QuerySuccess;
-    use crate::types::{Compression, DatasetId, StreamRequest};
+    use crate::types::{Compression, DatasetId, ParsedQuery, StreamRequest};
 
     /// A single-chunk dataset whose workers are all in a backoff until
     /// `backoff_until`; afterwards every query succeeds and returns the
@@ -1246,7 +1239,7 @@ mod tests {
             _dataset: &DatasetId,
             _block: u64,
         ) -> Result<DataChunk, ChunkNotFound> {
-            Ok(self.chunk.clone())
+            Ok(self.chunk)
         }
 
         fn next_chunk(&self, _dataset: &DatasetId, _chunk: &DataChunk) -> Option<DataChunk> {
@@ -1300,6 +1293,7 @@ mod tests {
             query: ParsedQuery::try_from(query_json.to_owned()).unwrap(),
             request_id: "test-request".to_owned(),
             buffer_size: 10,
+            max_stored_results_per_chunk: 2,
             max_chunks: None,
             timeout_quantile: 0.5,
             retries: 1,
