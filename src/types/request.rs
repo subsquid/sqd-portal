@@ -9,12 +9,12 @@ pub struct StreamRequest {
     pub query: ParsedQuery,
     pub request_id: String,
     pub buffer_size: usize,
+    pub max_stored_results_per_chunk: usize,
     pub max_chunks: Option<usize>,
     pub timeout_quantile: f32,
     pub retries: u8,
     pub compression: Compression,
     pub skip_parent_hash_validation: bool,
-    pub eager_continuations: bool,
 }
 
 #[derive(Debug, Clone)]

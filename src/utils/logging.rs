@@ -19,7 +19,7 @@ pub struct StreamStats {
     pub chunks_downloaded: u64,
     pub response_blocks: u64,
     pub response_bytes: u64,
-    pub max_chunk_parts: u64,
+    pub max_chunk_parts: usize,
     pub start_time: Instant,
     pub last_log: Instant,
     pub throttled_for: Duration,
@@ -39,7 +39,7 @@ impl StreamStats {
             chunks_downloaded: 0,
             response_blocks: 0,
             response_bytes: 0,
-            max_chunk_parts: 1,
+            max_chunk_parts: 0,
             start_time: now,
             last_log: now,
             throttled_for: Duration::from_secs(0),
@@ -56,12 +56,12 @@ impl StreamStats {
         self.response_bytes += bytes as u64;
     }
 
-    pub fn observe_chunk_parts(&mut self, parts: usize) {
-        self.max_chunk_parts = self.max_chunk_parts.max(parts as u64);
-    }
-
     pub fn throttled(&mut self, duration: Duration) {
         self.throttled_for += duration;
+    }
+
+    pub fn observe_chunk_parts(&mut self, parts: usize) {
+        self.max_chunk_parts = self.max_chunk_parts.max(parts);
     }
 
     pub fn maybe_write_log(&mut self) {
