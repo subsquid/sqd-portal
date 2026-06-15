@@ -536,11 +536,19 @@ impl<N: StreamingNetwork> StreamController<N> {
                 self.buffer.push_front(chunk_slot);
                 return Poll::Pending;
             }
-            RequestState::Partial(PartialResult { data, next_range }) => {
+            state @ RequestState::Partial(_) => {
                 // Return the partial result and schedule the continuation query
-                let read_range =
-                    BlockRange::new(*slot.data_range.range.start(), *next_range.start() - 1);
-                let next_data_range = slot.data_range.with_range(next_range);
+                let (response, next_data_range) = Slot {
+                    data_range: slot.data_range,
+                    state,
+                }
+                .into_partial_continuation()
+                .expect("slot state was checked to be partial");
+                let BufferedResponse {
+                    result,
+                    read_range,
+                    chunk_index: _,
+                } = response;
                 let slot = match self.start_querying_chunk(next_data_range, ctx) {
                     Ok(slot) => slot,
                     Err(err) => {
@@ -549,7 +557,7 @@ impl<N: StreamingNetwork> StreamController<N> {
                         slot
                     }
                 };
-                (Poll::Ready(Some(Ok(data))), read_range, Some(slot))
+                (Poll::Ready(Some(result)), read_range, Some(slot))
             }
         };
 
@@ -616,14 +624,13 @@ impl<N: StreamingNetwork> StreamController<N> {
                     self.request.max_stored_results_per_chunk,
                 ) =>
             {
-                let read_range =
-                    BlockRange::new(*slot.data_range.range.start(), *next_range.start() - 1);
-                let next_data_range = slot.data_range.with_range(next_range);
-                chunk_slot.buffered.push_back(BufferedResponse {
-                    chunk_index: next_data_range.chunk_index,
-                    read_range,
-                    result: Ok(data),
-                });
+                let (response, next_data_range) = Slot {
+                    data_range: slot.data_range,
+                    state: RequestState::Partial(PartialResult { data, next_range }),
+                }
+                .into_partial_continuation()
+                .expect("slot state was checked to be partial");
+                chunk_slot.buffered.push_back(response);
                 let next_slot = match self.start_querying_chunk(next_data_range, ctx) {
                     Ok(slot) => slot,
                     Err(err) => {
@@ -945,6 +952,21 @@ impl Slot {
     fn is_paused(&self) -> bool {
         matches!(&self.state, RequestState::Paused(_))
     }
+
+    fn into_partial_continuation(self) -> Option<(BufferedResponse, DataRange)> {
+        let RequestState::Partial(PartialResult { data, next_range }) = self.state else {
+            return None;
+        };
+
+        let read_range = BlockRange::new(*self.data_range.range.start(), *next_range.start() - 1);
+        let next_data_range = self.data_range.with_range(next_range);
+        let response = BufferedResponse {
+            chunk_index: next_data_range.chunk_index,
+            read_range,
+            result: Ok(data),
+        };
+        Some((response, next_data_range))
+    }
 }
 
 impl RequestState {
@@ -1077,18 +1099,32 @@ mod tests {
 
     use super::*;
 
-    fn data_range() -> DataRange {
+    fn test_chunk() -> DataChunk {
+        DataChunk::from_str("0000000000/0000000100-0000000200-abcde").unwrap()
+    }
+
+    fn data_range(start: u64, end: u64) -> DataRange {
         DataRange {
-            range: 100..=199,
-            chunk: DataChunk::from_str("0000000000/0000000100-0000000199-0xabcde").unwrap(),
+            range: BlockRange::new(start, end),
+            chunk: test_chunk(),
             chunk_index: 0,
         }
     }
 
     fn slot(state: RequestState) -> Slot {
         Slot {
-            data_range: data_range(),
+            data_range: data_range(100, 199),
             state,
+        }
+    }
+
+    fn partial_slot(start: u64, end: u64, last_returned: u64, data: &[u8]) -> Slot {
+        Slot {
+            data_range: data_range(start, end),
+            state: RequestState::Partial(PartialResult {
+                data: data.to_vec(),
+                next_range: BlockRange::new(last_returned + 1, end),
+            }),
         }
     }
 
@@ -1098,6 +1134,49 @@ mod tests {
             read_range: 100..=149,
             result: Ok(vec![1, 2, 3]),
         }
+    }
+
+    #[test]
+    fn partial_slot_is_split_into_done_part_and_continuation_range() {
+        let slot = partial_slot(100, 200, 120, b"first");
+
+        let (response, continuation) = slot.into_partial_continuation().unwrap();
+
+        assert_eq!(response.read_range, BlockRange::new(100, 120));
+        assert_eq!(response.chunk_index, 0);
+        match response.result {
+            Ok(data) => assert_eq!(data, b"first"),
+            Err(_) => panic!("partial data should become an emit-ready response"),
+        }
+        assert_eq!(continuation.range, BlockRange::new(121, 200));
+        assert_eq!(continuation.chunk, test_chunk());
+        assert_eq!(continuation.chunk_index, 0);
+    }
+
+    #[test]
+    fn chunk_slot_keeps_completed_response_before_active_continuation() {
+        let mut chunk_slot = ChunkSlot::new(partial_slot(100, 200, 120, b"first"));
+        let slot = chunk_slot.active.take().unwrap();
+        let (response, continuation) = slot.into_partial_continuation().unwrap();
+        chunk_slot.buffered.push_back(response);
+        chunk_slot.active = Some(Slot {
+            data_range: continuation,
+            state: RequestState::NoWorkers,
+        });
+
+        assert_eq!(chunk_slot.buffered.len(), 1);
+        assert_eq!(
+            chunk_slot.buffered.front().unwrap().read_range,
+            BlockRange::new(100, 120)
+        );
+        assert_eq!(
+            chunk_slot.active.as_ref().unwrap().data_range.range,
+            BlockRange::new(121, 200)
+        );
+        assert!(matches!(
+            chunk_slot.active.as_ref().unwrap().state,
+            RequestState::NoWorkers
+        ));
     }
 
     #[test]
