@@ -1,69 +1,74 @@
 # SQD Portal
 
-## Overview
+SQD Portal is a Rust service that exposes blockchain data over a streaming HTTP API, backed by [SQD Network](https://docs.sqd.dev/en/network).
 
-A high-performance data gateway for the [SQD Network](https://docs.sqd.dev). Portals serve as bridges between data consumers and a decentralized network of workers, providing blockchain data access with a streaming HTTP API.
+## What it is
 
-## Data Sources
+A Portal sits between data consumers and SQD Network, a decentralized data lake served by worker, gateway, and scheduler nodes. It accepts dataset queries over HTTP, fans them out to network workers, validates responses, and returns the results as a continuous stream. SQD Portal is the data API layer of [SQD](https://sqd.dev/portal), the open data platform for Web3.
 
-### SQD Network
+## Data sources
 
-The SQD Network is powered by over 2,000 decentralized workers and delivers static blockchain data with a typical delay of up to a few hours from the chain head, enabling very high streaming speeds.
+Portal serves two kinds of data and merges them in a single stream:
 
-To access SQD Network you'll need to lock SQD tokens to your Portal's peer id in the smart contract (e.g., in the [Network App](https://network.subsquid.io/portal)). The more tokens are locked, the more bandwidth the portal will get.
+- **Historical data from SQD Network.** Static, finalized blockchain data served by the network's workers. Accessing the network requires locking SQD tokens to the Portal's peer id in the onchain contract (for example, via the [Network app](https://network.subsquid.io/portal)). Locked stake determines the Portal's share of network bandwidth.
+- **Real-time data from HotblocksDB.** Recent blocks near the chain head, streamed from a separate [HotblocksDB](https://github.com/subsquid/data/tree/master/crates/hotblocks) service.
 
-### Real-time data
+To serve only real-time data for an existing chain or a local devnet, see the [devnet EVM example](./examples/devnet-evm/README.md).
 
-Latest blocks are streamed from a separate service, [HotblocksDB](https://github.com/subsquid/data/tree/master/crates/hotblocks).
+## HTTP API
 
-Portal merges historical data from SQD Network with real-time data from HotblocksDB, allowing for both high throughput and low latency.
+The server (axum) exposes per-dataset endpoints, including:
 
-If you're only interested in real-time data of an existing blockchain or you want to index a small devnet, please refer to [this example](./examples/devnet-evm/README.md).
+- `POST /datasets/:dataset/stream` and `POST /datasets/:dataset/finalized-stream`: query and stream blocks.
+- `GET /datasets/:dataset/head`, `/finalized-head`, `/state`, `/metadata`: dataset status and metadata.
+- `GET /datasets/:dataset/timestamps/:timestamp/block`: resolve a timestamp to a block number.
+- `GET /status`, `GET /datasets`: Portal and dataset listing.
+- `GET /metrics` (Prometheus), `GET /ready` (readiness probe).
+- `/docs` (Scalar) and `/swagger-ui` with the OpenAPI spec at `/api-docs/openapi.json`.
 
-## Initial configuration
+A SQL query endpoint (`POST /sql/query`, `GET /sql/metadata`) is available when the crate is built with the `sql` feature.
 
-Symlink/rename the example env-file to `.env`:
+Query examples are in the [Portal docs](https://docs.sqd.dev/en/portal/evm/overview).
+
+## Configuration
+
+Copy or symlink an example env file to `.env`:
 
 ```bash
-# For mainnet
-ln -s mainnet.env .env
-```
-or
-```bash
-# For tethys testnet
-ln -s tethys.env .env
+ln -s mainnet.env .env   # mainnet
+ln -s tethys.env .env    # tethys testnet
 ```
 
-Generate a new key with
+Each env file sets `NETWORK`, `BOOT_NODES`, RPC endpoints, `HTTP_LISTEN_ADDR`, and `CONFIG` (the path to the YAML config, `mainnet.config.yml` or `tethys.config.yml`). The YAML config declares the SQD Network datasets source and any locally configured datasets. CLI flags map to environment variables; see `--help` for the full list.
+
+Generate a key for the Portal's peer id:
 
 ```bash
 docker run -u $(id -u):$(id -g) -v .:/cwd subsquid/keygen:latest /cwd/portal.key
 ```
 
-It will print your **peer id** to the console and save private key to the `portal.key` file.
-This peer id is what you need to register on chain.
+This prints the **peer id** and writes the private key to `portal.key`. The peer id is what you register onchain.
 
 ## Running with Docker
 
-Start the portal with
 ```bash
 KEY_PATH=portal.key docker compose up
 ```
-It will use `.env` and `mainnet.config.yml`/`tethys.config.yml` files for configuration.
 
-## Running from Source
+This reads `.env` and the configured `*.config.yml`.
 
-[Install Rust](https://rustup.rs/), then build and run with
+## Running from source
+
+[Install Rust](https://rustup.rs/) (the toolchain is pinned in `rust-toolchain.toml`), then:
 
 ```bash
 cargo run --release --key-path portal.key
 ```
 
-Then wait for it to download the assignment file (~300MB) and it's ready to go.
+On first start the Portal downloads the network assignment file (around 300 MB) before it begins serving.
 
-## Using
+## Querying
 
-Once the portal is running, you can query it like this:
 ```bash
 curl "localhost:8000/datasets/ethereum-mainnet/stream" --compressed -d '{
   "type": "evm",
@@ -79,4 +84,11 @@ curl "localhost:8000/datasets/ethereum-mainnet/stream" --compressed -d '{
 }'
 ```
 
-More query examples can be found in the [Docs](https://beta.docs.sqd.dev/en/portal/evm/overview).
+## Documentation
+
+- Portal: https://docs.sqd.dev/en/portal
+- SQD Network: https://docs.sqd.dev/en/network
+
+## License
+
+AGPL-3.0. See [LICENSE.md](./LICENSE.md).
