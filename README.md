@@ -2,7 +2,7 @@
 
 ## Overview
 
-A high-performance data gateway for the [SQD Network](https://docs.sqd.ai/subsquid-network/overview/). Portals serve as bridges between data consumers and a decentralized network of workers, providing blockchain data access with a streaming HTTP API.
+A high-performance data gateway for the [SQD Network](https://docs.sqd.dev). Portals serve as bridges between data consumers and a decentralized network of workers, providing blockchain data access with a streaming HTTP API.
 
 ## Data Sources
 
