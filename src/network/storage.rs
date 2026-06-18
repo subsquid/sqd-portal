@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
-use sqd_assignments::Assignment;
+use sqd_assignments::{Assignment, NetworkAssignment};
 use sqd_contract_client::{Network, PeerId};
 use sqd_primitives::BlockRef;
 use tracing::instrument;
@@ -83,24 +83,23 @@ impl StorageClient {
     async fn update_assignment(&self) -> anyhow::Result<()> {
         tracing::debug!("Checking for new assignment");
         let network_state = self.fetch_network_state().await?;
-        let assignment_id = network_state.assignment.id;
+        let visible_assignment = visible_assignment(&network_state);
+        let assignment_id = visible_assignment.id.clone();
+        let assignment_url = visible_assignment
+            .fb_url_v1
+            .clone()
+            .ok_or(anyhow!("Missing assignment URL"))?;
+        let effective_from = visible_assignment.effective_from;
         let latest_id = self.latest_assignment_id.read().clone();
         if latest_id.as_ref() == Some(&assignment_id) {
             tracing::debug!("Assignment has not been changed");
             return Ok(());
         }
 
-        let assignment = self
-            .fetch_assignment(
-                &network_state
-                    .assignment
-                    .fb_url_v1
-                    .ok_or(anyhow!("Missing fb_url"))?,
-            )
-            .await?;
+        let assignment = self.fetch_assignment(&assignment_url).await?;
 
         if latest_id.is_some() {
-            sleep_until(network_state.assignment.effective_from).await;
+            sleep_until(effective_from).await;
         }
 
         self.set_assignment(assignment, &assignment_id);
@@ -303,6 +302,77 @@ impl StorageClient {
                 .map(|(peer_id, ranges)| (peer_id, sqd_messages::RangeSet::from(ranges)))
                 .collect(),
         })
+    }
+}
+
+/// Selects the assignment portals should use for routing.
+///
+/// In the first NET-683 phase, `mvcc-chunks` portals prefer the dedicated
+/// portal assignment but temporarily fall back to the legacy assignment so
+/// rollouts can tolerate schedulers that have not started publishing
+/// `portal_assignment` yet.
+fn visible_assignment(network_state: &sqd_assignments::NetworkState) -> &NetworkAssignment {
+    #[cfg(feature = "mvcc-chunks")]
+    {
+        // First NET-683 step only splits portal discovery/publication.
+        // Until MVCC visibility logic lands, fall back to the legacy assignment.
+        match network_state.portal_assignment.as_ref() {
+            Some(assignment) => assignment,
+            None => {
+                tracing::warn!(
+                    "portal_assignment missing in network state; falling back to legacy assignment"
+                );
+                &network_state.assignment
+            }
+        }
+    }
+
+    #[cfg(not(feature = "mvcc-chunks"))]
+    {
+        &network_state.assignment
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(deprecated)]
+    fn assignment(id: &str) -> NetworkAssignment {
+        NetworkAssignment {
+            url: None,
+            fb_url: None,
+            fb_url_v1: Some(format!("https://example.test/{id}.fb.gz")),
+            id: id.to_string(),
+            effective_from: 123,
+        }
+    }
+
+    fn network_state() -> sqd_assignments::NetworkState {
+        sqd_assignments::NetworkState {
+            network: "testnet".to_string(),
+            assignment: assignment("legacy"),
+            #[cfg(feature = "mvcc-chunks")]
+            worker_assignment: None,
+            #[cfg(feature = "mvcc-chunks")]
+            portal_assignment: None,
+        }
+    }
+
+    #[test]
+    fn visible_assignment_uses_legacy_assignment() {
+        let state = network_state();
+
+        assert_eq!(visible_assignment(&state).id, "legacy");
+    }
+
+    #[cfg(feature = "mvcc-chunks")]
+    #[test]
+    fn visible_assignment_prefers_portal_assignment() {
+        let mut state = network_state();
+        state.portal_assignment = Some(assignment("portal"));
+
+        assert_eq!(visible_assignment(&state).id, "portal");
     }
 }
 

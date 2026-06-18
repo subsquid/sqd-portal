@@ -6,6 +6,7 @@ default-run = "sqd-portal"
 
 [features]
 sql = ["dep:once_cell", "dep:substrait", "dep:sql_query_plan"]
+mvcc-chunks = ["sqd-assignments/mvcc-chunks"]
 
 [dependencies]
 anyhow = "1"
