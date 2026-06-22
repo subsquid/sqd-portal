@@ -452,8 +452,10 @@ impl<N: StreamingNetwork> StreamController<N> {
             let WorkerRequest::Finished(f) = request else {
                 unreachable!("all worker requests should be finished")
             };
-            let error =
-                RequestError::from_query_error(f.result.unwrap_err().clone(), f.worker).to_string();
+            // Format from the QueryError directly so every attempt is labeled with its
+            // worker. Going through RequestError would drop the peer id for variants whose
+            // Display is a fixed string (e.g. RateLimitExceeded, BaseBlockMismatch).
+            let error = format!("worker {}: {}", f.worker, f.result.unwrap_err());
             errors.push(error);
         }
         let message = format!("All query attempts failed: {}", errors.join("; "));
