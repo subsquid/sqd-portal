@@ -932,8 +932,14 @@ impl ChunkSlot {
     }
 
     fn debug_symbol(&self) -> char {
-        if self.buffered.front().is_some() {
-            '*'
+        if !self.buffered.is_empty() && self.active.is_some() {
+            '+'
+        } else if let Some(response) = self.buffered.front() {
+            if response.result.is_ok() {
+                '#'
+            } else {
+                '!'
+            }
         } else if let Some(active) = &self.active {
             active.state.debug_symbol()
         } else {
