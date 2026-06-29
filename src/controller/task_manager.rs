@@ -60,12 +60,12 @@ impl TaskManager {
             }
         }
 
-        metrics::ACTIVE_STREAMS.set(running_tasks as i64 + 1);
+        metrics::ACTIVE_STREAMS.inc();
 
         let self_clone = self.clone();
         let guard = scopeguard::guard((), move |()| {
-            let prev = self_clone.running_tasks.fetch_sub(1, Ordering::Relaxed);
-            metrics::ACTIVE_STREAMS.set(prev as i64 - 1);
+            self_clone.running_tasks.fetch_sub(1, Ordering::Relaxed);
+            metrics::ACTIVE_STREAMS.dec();
             metrics::COMPLETED_STREAMS.inc();
         });
 
@@ -86,7 +86,7 @@ impl TaskManager {
             .await
             .expect("First chunk missing from the stream")?;
         Ok(stream! {
-            let _ = guard;
+            let _guard = guard;
             yield first_chunk;
             loop {
                 match streamer.next().instrument(tracing::debug_span!("stream_next")).await {
