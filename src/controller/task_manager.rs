@@ -86,7 +86,7 @@ impl TaskManager {
             .await
             .expect("First chunk missing from the stream")?;
         Ok(stream! {
-            let _ = guard;
+            let _guard = guard;
             yield first_chunk;
             loop {
                 match streamer.next().instrument(tracing::debug_span!("stream_next")).await {
