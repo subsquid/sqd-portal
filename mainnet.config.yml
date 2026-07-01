@@ -1,4 +1,5 @@
 hostname: http://0.0.0.0:8000
 sqd_network:
   datasets: https://cdn.subsquid.io/sqd-network/datasets.yml
+  metadata: https://cdn.subsquid.io/sqd-network/mainnet/metadata.yml
   serve: "all"
