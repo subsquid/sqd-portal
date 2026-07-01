@@ -44,7 +44,7 @@ use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
     controller::task_manager::TaskManager,
-    hotblocks::HotblocksHandle,
+    hotblocks::{traceless_key, HotblocksHandle},
     network::{NetworkClient, NoWorker, NotReady},
     types::{ChunkId, DatasetId, ParsedQuery, RequestError, StreamRequest},
     utils::logging,
@@ -344,7 +344,18 @@ async fn get_finalized_head(
     Extension(network): Extension<Arc<NetworkClient>>,
     dataset: DatasetConfig,
 ) -> Response {
-    if dataset.hotblocks.is_some() {
+    if let Some(hotblocks_cfg) = &dataset.hotblocks {
+        // Traced and traceless variants finalize independently, and a stream may use
+        // either. Report the minimum of their heads so we never advertise a head one
+        // variant can't yet serve.
+        if hotblocks_cfg.dataset_traceless.is_some() {
+            let traceless_name = traceless_key(&dataset.default_name);
+            let (traced, traceless) = tokio::join!(
+                hotblocks.get_finalized_head_opt(&dataset.default_name),
+                hotblocks.get_finalized_head_opt(&traceless_name),
+            );
+            return min_finalized_head_response(traced, traceless);
+        }
         return forward_hotblocks_response(
             &dataset.default_name,
             hotblocks
@@ -1137,6 +1148,28 @@ where
             )
                 .into_response()),
         }
+    }
+}
+
+/// Build a `/finalized-head` response with the lower of the traced and traceless heads,
+/// so it's streamable by whichever variant a later stream uses.
+///
+/// If either variant has no finalized block yet (`None`), the head is `None`: advertising
+/// `null` is safer than a head one variant can't serve. An error from either variant is
+/// surfaced as-is rather than degrading to the other's (possibly too-high) head.
+fn min_finalized_head_response(
+    traced: Result<Option<sqd_primitives::BlockRef>, HotblocksErr>,
+    traceless: Result<Option<sqd_primitives::BlockRef>, HotblocksErr>,
+) -> Response {
+    match (traced, traceless) {
+        (Ok(traced), Ok(traceless)) => {
+            let head = match (traced, traceless) {
+                (Some(a), Some(b)) => Some(if a.number <= b.number { a } else { b }),
+                _ => None,
+            };
+            axum::Json(head).into_response()
+        }
+        (Err(e), _) | (_, Err(e)) => forward_hotblocks_response(Err(e)),
     }
 }
 
