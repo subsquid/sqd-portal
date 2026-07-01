@@ -149,6 +149,22 @@ impl HotblocksHandle {
         Ok(result)
     }
 
+    /// Like [`Self::get_finalized_head`], but treats a `null` body (no finalized
+    /// block yet) as `Ok(None)` instead of a deserialization error.
+    pub async fn get_finalized_head_opt(
+        &self,
+        dataset: &str,
+    ) -> Result<Option<sqd_primitives::BlockRef>, HotblocksErr> {
+        let result = self
+            .request_finalized_head(dataset)
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(result)
+    }
+
     pub async fn request_status(&self, dataset: &str) -> Result<reqwest::Response, HotblocksErr> {
         let Some(url) = self.urls.get(dataset) else {
             return Err(HotblocksErr::UnknownDataset);
