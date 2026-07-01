@@ -1408,6 +1408,12 @@ mod tests {
         Partial(u8),
         /// Misbehave: report this many blocks beyond the queried range end.
         Overshoot(u64),
+        /// Serve the full range, but only after `ms` of (virtual) time. When
+        /// this exceeds the request timeout the controller fires a speculative
+        /// (hedged) query to another reserved worker while this one is still in
+        /// flight — the only way to drive the `is_speculative` path, since every
+        /// other event resolves instantly under the paused clock.
+        Slow(u64),
         Retriable,
         /// Never respond. Only used by the cancellation test; including it in
         /// the random generator would (correctly) fail the liveness property,
@@ -1536,6 +1542,10 @@ mod tests {
                         return Err(QueryError::Retriable("scripted failure".to_owned()))
                     }
                     QueryEvent::Full => end,
+                    QueryEvent::Slow(ms) => {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        end
+                    }
                     QueryEvent::Overshoot(extra) => end + extra,
                     QueryEvent::Partial(_) if start == end => end,
                     QueryEvent::Partial(pct) => start + (end - start) * (pct as u64) / 100,
@@ -1647,6 +1657,7 @@ mod tests {
         let query_event = prop_oneof![
             4 => Just(QueryEvent::Full),
             2 => (10u8..=90).prop_map(QueryEvent::Partial),
+            2 => (200u64..=2500).prop_map(QueryEvent::Slow),
             1 => (1u64..=20).prop_map(QueryEvent::Overshoot),
             1 => Just(QueryEvent::Retriable),
         ];
@@ -1772,12 +1783,12 @@ mod tests {
         #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
 
         /// Whatever adversity the network throws at the controller(s) —
-        /// backoffs, unavailability, partial / out-of-range / failing worker
-        /// responses, chunk limits, several streams sharing the network —
-        /// every stream must emit a gapless, strictly increasing prefix of
-        /// its requested range, fully covering it on clean completion; no
-        /// block range may be executed twice for the same stream; and no
-        /// worker lease may leak.
+        /// backoffs, unavailability, partial / out-of-range / slow / failing
+        /// worker responses, chunk limits, several streams sharing the network
+        /// — every stream must emit a gapless, strictly increasing prefix of
+        /// its requested range, fully covering it on clean completion;
+        /// redundant successful execution of a range (via hedging) stays
+        /// bounded by the reserved fan-out; and no worker lease may leak.
         #[test]
         fn stream_invariants_hold_under_scheduling_adversity(scenario in scenario_strategy()) {
             let outcome = run_scenario(&scenario);
@@ -1815,19 +1826,30 @@ mod tests {
                 }
             }
 
-            // At-most-once execution: no block range is successfully served
-            // by workers more than once for the same stream (retries of
-            // *failed* attempts are fine; re-executing delivered work is not).
+            // Bounded redundant execution. Hedging sends the *same* range to
+            // more than one healthy worker at once (a speculative query races
+            // an in-flight one — it is not a retry of a *failed* attempt), so a
+            // range legitimately can be executed successfully more than once.
+            // What must hold is that this redundancy stays bounded by the
+            // reserved fan-out (`retries + 1`) and never runs away: the stream
+            // reserves at most that many workers per range and enters the
+            // query-sending phase for a range at most once. Single *delivery*
+            // to the client is guaranteed separately by the no-duplicate /
+            // gapless emission invariant above — the losing hedged responses
+            // are discarded, never emitted.
+            let max_executions = scenario.retries as usize + 1;
             let mut ok_count = HashMap::new();
             for executed in &outcome.ok_ranges {
                 *ok_count.entry(executed).or_insert(0usize) += 1;
             }
             for (executed, count) in ok_count {
                 prop_assert!(
-                    count <= 1,
-                    "{:?} was successfully executed {} times (all: {:?})",
+                    count <= max_executions,
+                    "{:?} was successfully executed {} times, over the hedging \
+                     fan-out of {} (all: {:?})",
                     executed,
                     count,
+                    max_executions,
                     &outcome.ok_ranges
                 );
             }
@@ -1905,6 +1927,58 @@ mod tests {
             vec![(100, 150)],
             "the range must be served exactly once by the retry"
         );
+    }
+
+    /// Hedging (speculative queries) sends the *same* range to more than one
+    /// healthy worker at once, so a range can be executed successfully more
+    /// than once — that is by design, not a bug. What the stream must still
+    /// guarantee is that the client is *delivered* the range exactly once; the
+    /// losing hedged response is discarded, never emitted.
+    ///
+    /// Two workers are scripted to finish the same range at the same virtual
+    /// instant: the first (non-speculative) query lasts 1500ms, longer than
+    /// the 1000ms request timeout, so at t=1000 a speculative query is sent to
+    /// the second reserved worker; sleeping 500ms, it also completes at t=1500.
+    /// Both record an in-range success, so the range is executed twice.
+    #[test]
+    fn hedged_query_executes_twice_but_is_delivered_once() {
+        let scenario = Scenario {
+            n_chunks: 1,
+            streams: vec![StreamSpec { from: 100, to: 199 }],
+            find_worker_script: Vec::new(),
+            query_script: vec![QueryEvent::Slow(1500), QueryEvent::Slow(500)],
+            buffer_size: 1,
+            retries: 1,
+            max_stored_results_per_chunk: 1,
+            max_chunks: None,
+        };
+
+        let outcome = run_scenario(&scenario);
+
+        assert!(!outcome.timed_out, "stream must terminate");
+
+        // The range was genuinely executed by *both* healthy workers.
+        let executions = outcome
+            .ok_ranges
+            .iter()
+            .filter(|entry| entry.0 == "stream-0" && entry.1 == (100, 199))
+            .count();
+        assert_eq!(
+            executions, 2,
+            "hedging should have executed the range on both workers (all: {:?})",
+            outcome.ok_ranges
+        );
+
+        // Yet the client sees it exactly once, gapless and complete.
+        assert_eq!(outcome.streams[0].error, None, "hedging must not fail the stream");
+        assert_eq!(
+            outcome.streams[0].emissions,
+            vec![(100, 199)],
+            "the hedged range must be delivered exactly once"
+        );
+
+        // The aborted loser still returns its lease.
+        assert_eq!(outcome.leases_outstanding, 0, "worker leases leaked");
     }
 
     /// Dropping the stream (client disconnect) must abort the in-flight
