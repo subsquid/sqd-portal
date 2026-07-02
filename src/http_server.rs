@@ -16,6 +16,7 @@ use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
 use serde_json::json;
 use sqd_contract_client::PeerId;
+use sqd_primitives::BlockRef;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -324,9 +325,52 @@ async fn get_archival_head(
         .into_response()
 }
 
+// Prefer the real-time head; fall back to archival on any error.
+//
+// `realtime` is `Err` whenever hotblocks is unreachable *or* when it returns
+// HTTP 200 with a JSON `null` body (the case described in issue #83): the
+// `get_head` / `get_finalized_head` helpers call `.json::<BlockRef>()`, which
+// fails to deserialize `null` into a struct, producing a `reqwest` decode
+// error wrapped in `HotblocksErr::Request`. Both failure modes are intentionally
+// treated the same way — fall back to archival — mirroring the behaviour of the
+// `x-sqd-head-number` header in `stream_from_network` (see endpoints/stream.rs).
+fn coalesce_head(
+    realtime: Result<BlockRef, HotblocksErr>,
+    archival: Option<BlockRef>,
+) -> Option<BlockRef> {
+    realtime.ok().or(archival)
+}
+
+fn block_head_json_response(head: Option<BlockRef>) -> Response {
+    axum::Json(head.map(|h| {
+        json!({
+            "number": h.number,
+            "hash": h.hash,
+        })
+    }))
+    .into_response()
+}
+
+async fn hybrid_head_response(
+    hotblocks: &HotblocksHandle,
+    network: &NetworkClient,
+    dataset: &DatasetConfig,
+    finalized: bool,
+) -> Response {
+    let archival = dataset.network_id.as_ref().and_then(|id| network.head(id));
+    let realtime = if finalized {
+        hotblocks.get_finalized_head(&dataset.default_name).await
+    } else {
+        hotblocks.get_head(&dataset.default_name).await
+    };
+    block_head_json_response(coalesce_head(realtime, archival))
+}
+
 /// Latest finalized head
 ///
 /// Returns the block number and hash of the highest finalized block.
+/// For hybrid datasets, returns the real-time finalized head when available;
+/// otherwise falls back to the archival head. Matches `/finalized-stream` head behavior.
 #[utoipa::path(
     get,
     path = "/datasets/{dataset}/finalized-head",
@@ -356,6 +400,9 @@ async fn get_finalized_head(
             );
             return min_finalized_head_response(&dataset.default_name, traced, traceless);
         }
+        if dataset.network_id.is_some() {
+            return hybrid_head_response(&hotblocks, &network, &dataset, true).await;
+        }
         return forward_hotblocks_response(
             &dataset.default_name,
             hotblocks
@@ -364,15 +411,8 @@ async fn get_finalized_head(
         );
     }
 
-    // Fall back to network data source
     if let Some(dataset_id) = dataset.network_id {
-        let head = network.head(&dataset_id).map(|head| {
-            json!({
-                "number": head.number,
-                "hash": head.hash,
-            })
-        });
-        return axum::Json(head).into_response();
+        return block_head_json_response(network.head(&dataset_id));
     }
 
     (
@@ -385,6 +425,8 @@ async fn get_finalized_head(
 /// Latest head
 ///
 /// Returns the block number and hash of the highest block, including real-time data.
+/// For hybrid datasets, returns the real-time head when available; otherwise falls back
+/// to the archival head. Matches `/stream` head header behavior.
 #[utoipa::path(
     get,
     path = "/datasets/{dataset}/head",
@@ -403,21 +445,17 @@ async fn get_head(
     dataset: DatasetConfig,
 ) -> Response {
     if dataset.hotblocks.is_some() {
+        if dataset.network_id.is_some() {
+            return hybrid_head_response(&hotblocks, &network, &dataset, false).await;
+        }
         return forward_hotblocks_response(
             &dataset.default_name,
             hotblocks.request_head(&dataset.default_name).await,
         );
     }
 
-    // Fall back to network data source
     if let Some(dataset_id) = dataset.network_id {
-        let head = network.head(&dataset_id).map(|head| {
-            json!({
-                "number": head.number,
-                "hash": head.hash,
-            })
-        });
-        return axum::Json(head).into_response();
+        return block_head_json_response(network.head(&dataset_id));
     }
 
     (
@@ -1270,6 +1308,37 @@ async fn sql_metadata(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn block_ref(number: u64) -> BlockRef {
+        BlockRef {
+            number,
+            hash: format!("0x{number}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_head_prefers_realtime_over_archival() {
+        let realtime = block_ref(200);
+        let archival = block_ref(100);
+        assert_eq!(
+            coalesce_head(Ok(realtime.clone()), Some(archival)),
+            Some(realtime)
+        );
+    }
+
+    #[test]
+    fn coalesce_head_falls_back_to_archival_when_realtime_unavailable() {
+        let archival = block_ref(100);
+        assert_eq!(
+            coalesce_head(Err(HotblocksErr::UnknownDataset), Some(archival.clone())),
+            Some(archival)
+        );
+    }
+
+    #[test]
+    fn coalesce_head_returns_none_when_both_unavailable() {
+        assert_eq!(coalesce_head(Err(HotblocksErr::UnknownDataset), None), None);
+    }
 
     #[test]
     fn forward_response_strips_internal_headers() {
