@@ -3,17 +3,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::MethodRouter,
 };
-use std::collections::BTreeMap;
 use std::task::{Context, Poll};
 use tokio::time::{Duration, Instant};
 use tower::{Layer, Service};
 use tower_http::request_id::RequestId;
 use tracing::Instrument;
 
-use crate::{
-    metrics,
-    types::{QueryError, StreamRequest, WorkerFailureKind},
-};
+use crate::{metrics, types::StreamRequest};
 
 const LOG_INTERVAL: Duration = Duration::from_secs(5);
 const NO_DATA_SOURCE: &str = "none";
@@ -27,14 +23,6 @@ pub struct StreamStats {
     pub start_time: Instant,
     pub last_log: Instant,
     pub throttled_for: Duration,
-    worker_failures: WorkerFailureStats,
-}
-
-#[derive(Debug, Default)]
-struct WorkerFailureStats {
-    total: u64,
-    by_kind: BTreeMap<&'static str, u64>,
-    by_worker: BTreeMap<String, u64>,
 }
 
 impl Default for StreamStats {
@@ -55,7 +43,6 @@ impl StreamStats {
             start_time: now,
             last_log: now,
             throttled_for: Duration::from_secs(0),
-            worker_failures: WorkerFailureStats::default(),
         }
     }
 
@@ -77,26 +64,14 @@ impl StreamStats {
         self.throttled_for += duration;
     }
 
-    pub fn worker_query_failed(&mut self, worker: impl ToString, error: &QueryError) {
-        if let QueryError::WorkerFailure { kind, .. } = error {
-            self.worker_failures.record(worker.to_string(), *kind);
-        }
-    }
-
     pub fn maybe_write_log(&mut self) {
         if self.last_log.elapsed() >= LOG_INTERVAL {
-            let (top_failure_worker, top_failure_worker_failures) =
-                self.worker_failures.top_worker();
             tracing::info!(
                 queries_sent = self.queries_sent,
                 chunks_downloaded = self.chunks_downloaded,
                 max_chunk_parts = self.max_chunk_parts,
                 blocks_streamed = self.response_blocks,
                 bytes_streamed = self.response_bytes,
-                worker_failures = self.worker_failures.total,
-                worker_failure_counts = %self.worker_failures.counts_summary(),
-                top_failure_worker = %top_failure_worker,
-                top_failure_worker_failures,
                 "Streaming..."
             );
             self.last_log = Instant::now();
@@ -109,7 +84,6 @@ impl StreamStats {
         //     query = request.query.to_string(),
         //     "Query processed"
         // );
-        let (top_failure_worker, top_failure_worker_failures) = self.worker_failures.top_worker();
         tracing::info!(
             dataset = %request.dataset_id,
             // The summary is written on Drop, outside the `http_request` span —
@@ -124,51 +98,10 @@ impl StreamStats {
             bytes_streamed = self.response_bytes,
             total_time = ?self.start_time.elapsed(),
             throttled_for = ?self.throttled_for,
-            worker_failures = self.worker_failures.total,
-            worker_failure_counts = %self.worker_failures.counts_summary(),
-            top_failure_worker = %top_failure_worker,
-            top_failure_worker_failures,
             error = error.unwrap_or_else(|| "-".to_string()),
             "Stream finished"
         );
         metrics::report_stream_completed(self, &request.dataset_id, Some(&request.dataset_name));
-    }
-}
-
-impl WorkerFailureStats {
-    fn record(&mut self, worker: String, kind: WorkerFailureKind) {
-        self.total += 1;
-        *self.by_kind.entry(kind.as_str()).or_default() += 1;
-        *self.by_worker.entry(worker).or_default() += 1;
-    }
-
-    fn counts_summary(&self) -> String {
-        if self.total == 0 {
-            return "-".to_string();
-        }
-        let mut counts = self.by_kind.iter().collect::<Vec<_>>();
-        counts.sort_by(|(left_kind, left_count), (right_kind, right_count)| {
-            right_count
-                .cmp(left_count)
-                .then_with(|| left_kind.cmp(right_kind))
-        });
-        counts
-            .iter()
-            .map(|(kind, count)| format!("{kind}={count}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    fn top_worker(&self) -> (String, u64) {
-        self.by_worker
-            .iter()
-            .max_by(|(left_worker, left_count), (right_worker, right_count)| {
-                left_count
-                    .cmp(right_count)
-                    .then_with(|| right_worker.cmp(left_worker))
-            })
-            .map(|(worker, count)| (worker.clone(), *count))
-            .unwrap_or_else(|| ("-".to_string(), 0))
     }
 }
 
@@ -249,57 +182,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{data_source_metric_label, StreamStats};
+    use super::data_source_metric_label;
     use crate::endpoints::stream::{DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_REALTIME_METRIC};
-    use crate::types::{QueryError, WorkerFailureKind};
-
-    #[test]
-    fn worker_failure_stats_aggregate_by_kind_and_top_worker() {
-        let mut stats = StreamStats::new();
-
-        stats.worker_query_failed(
-            "worker-a",
-            &QueryError::WorkerFailure {
-                kind: WorkerFailureKind::Timeout,
-                message: "timed out reading response".to_string(),
-            },
-        );
-        stats.worker_query_failed(
-            "worker-b",
-            &QueryError::WorkerFailure {
-                kind: WorkerFailureKind::TransportError,
-                message: "transport error: closed".to_string(),
-            },
-        );
-        stats.worker_query_failed(
-            "worker-a",
-            &QueryError::WorkerFailure {
-                kind: WorkerFailureKind::Timeout,
-                message: "timed out connecting to the peer".to_string(),
-            },
-        );
-        stats.worker_query_failed(
-            "worker-a",
-            &QueryError::Retriable("not counted".to_string()),
-        );
-        stats.worker_query_failed(
-            "worker-c",
-            &QueryError::WorkerFailure {
-                kind: WorkerFailureKind::InvalidResponse,
-                message: "couldn't decode response".to_string(),
-            },
-        );
-
-        assert_eq!(stats.worker_failures.total, 4);
-        assert_eq!(
-            stats.worker_failures.counts_summary(),
-            "timeout=2 invalid_response=1 transport_error=1"
-        );
-        assert_eq!(
-            stats.worker_failures.top_worker(),
-            ("worker-a".to_string(), 2)
-        );
-    }
 
     #[test]
     fn data_source_metric_label_keeps_network() {

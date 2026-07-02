@@ -454,10 +454,6 @@ impl StreamController {
                     }
                 };
 
-                if let Err(error) = &response {
-                    self.stats.worker_query_failed(running.worker, error);
-                }
-
                 if retriable(&response) {
                     tracing::debug!(
                         "Got retriable error in {}ms from {}: {}",
@@ -1113,7 +1109,6 @@ fn retriable(result: &QueryResult) -> bool {
         Ok(_) => false,
         Err(QueryError::BadRequest(_)) => false,
         Err(QueryError::Retriable(_)) => true,
-        Err(QueryError::WorkerFailure { .. }) => true,
         Err(QueryError::Failure(_)) => false,
         Err(QueryError::RateLimitExceeded) => true,
         Err(QueryError::BaseBlockMismatch(_)) => false,
@@ -1258,16 +1253,6 @@ mod tests {
 
         assert!(first_query.contains("parentBlockHash"));
         assert!(!continuation_query.contains("parentBlockHash"));
-    }
-
-    #[test]
-    fn worker_failures_remain_retriable() {
-        let result = Err(QueryError::WorkerFailure {
-            kind: crate::types::WorkerFailureKind::Timeout,
-            message: "timed out reading response".to_string(),
-        });
-
-        assert!(retriable(&result));
     }
 
     #[test]
