@@ -5,6 +5,25 @@ use serde::Serialize;
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WorkerFailureKind {
+    InvalidResponse,
+    Timeout,
+    TransportError,
+    ReadError,
+}
+
+impl WorkerFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidResponse => "invalid_response",
+            Self::Timeout => "timeout",
+            Self::TransportError => "transport_error",
+            Self::ReadError => "read_error",
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum RequestError {
     #[error("{0}")]
@@ -31,6 +50,11 @@ pub enum QueryError {
     BadRequest(String),
     #[error("{0}")]
     Retriable(String),
+    #[error("{message}")]
+    WorkerFailure {
+        kind: WorkerFailureKind,
+        message: String,
+    },
     #[error("{0}")]
     Failure(String),
     #[error("rate limit exceeded")]
@@ -54,6 +78,9 @@ impl RequestError {
             QueryError::Retriable(s) => {
                 RequestError::InternalError(format!("received an error from worker {worker}: {s}"))
             }
+            QueryError::WorkerFailure { message, .. } => RequestError::InternalError(format!(
+                "received an error from worker {worker}: {message}"
+            )),
             QueryError::Failure(s) => RequestError::Failure(format!("worker {worker} failed: {s}")),
             QueryError::RateLimitExceeded => RequestError::RateLimitExceeded,
             QueryError::BaseBlockMismatch(block_ref) => RequestError::BaseBlockMismatch(block_ref),

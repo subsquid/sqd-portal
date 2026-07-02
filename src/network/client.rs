@@ -34,7 +34,7 @@ use crate::utils::{RwLock, UseOnce};
 use crate::{
     config::Config,
     metrics,
-    types::{generate_query_id, DatasetId, QueryError},
+    types::{generate_query_id, DatasetId, QueryError, WorkerFailureKind},
 };
 
 #[derive(Debug)]
@@ -719,26 +719,22 @@ impl NetworkClient {
             })
     }
 
-    // Worker-query failures used to be metrics-only: the most common cause of
-    // elevated 5xx (worker timeouts / transport errors) left no trace in logs.
-    // Emit one warn per failure so log readers can localize the failing peer
-    // and failure kind; events inherit the `query_worker` span fields
-    // (dataset/chunk/request_id). Known risk: volume scales with the failure
-    // rate, so a large incident produces a noticeable stream of warns — if
-    // that proves too noisy, rate-limit here rather than dropping the events.
+    // Keep per-attempt failures structured so the stream summary can report
+    // totals by kind and top failing worker without emitting a warn per retry.
     fn convert_query_failure(&self, peer_id: PeerId, failure: QueryFailure) -> QueryError {
         match failure {
             QueryFailure::InvalidRequest(e) => {
                 metrics::report_query_result(&peer_id, "invalid");
                 self.network_state.report_query_success(peer_id, None);
-                tracing::warn!(peer_id = %peer_id, kind = "invalid_request", error = %e, "worker query failed");
                 QueryError::Failure(format!("portal tried to send invalid request: {e}"))
             }
             QueryFailure::InvalidResponse(e) => {
                 metrics::report_query_result(&peer_id, "invalid");
                 self.network_state.report_query_error(peer_id);
-                tracing::warn!(peer_id = %peer_id, kind = "invalid_response", error = %e, "worker query failed");
-                QueryError::Retriable(format!("couldn't decode response: {e}"))
+                QueryError::WorkerFailure {
+                    kind: WorkerFailureKind::InvalidResponse,
+                    message: format!("couldn't decode response: {e}"),
+                }
             }
             QueryFailure::Timeout(t) => {
                 metrics::report_query_result(&peer_id, "timeout");
@@ -747,14 +743,18 @@ impl NetworkClient {
                     StreamClientTimeout::Connect => "timed out connecting to the peer",
                     StreamClientTimeout::Request => "timed out reading response",
                 };
-                tracing::warn!(peer_id = %peer_id, kind = "timeout", phase = msg, "worker query failed");
-                QueryError::Retriable(msg.to_owned())
+                QueryError::WorkerFailure {
+                    kind: WorkerFailureKind::Timeout,
+                    message: msg.to_owned(),
+                }
             }
             QueryFailure::TransportError(e) => {
                 metrics::report_query_result(&peer_id, "transport_error");
                 self.network_state.report_query_failure(peer_id);
-                tracing::warn!(peer_id = %peer_id, kind = "transport_error", error = %e, "worker query failed");
-                QueryError::Retriable(format!("transport error: {e}"))
+                QueryError::WorkerFailure {
+                    kind: WorkerFailureKind::TransportError,
+                    message: format!("transport error: {e}"),
+                }
             }
         }
     }
@@ -766,8 +766,10 @@ impl NetworkClient {
             ReadError::TooLarge => "response too large".to_owned(),
             ReadError::Transport(e) => format!("transport error: {e}"),
         };
-        tracing::warn!(peer_id = %peer_id, kind = "read_error", error = %msg, "worker query failed");
-        QueryError::Retriable(msg)
+        QueryError::WorkerFailure {
+            kind: WorkerFailureKind::ReadError,
+            message: msg,
+        }
     }
 
     #[instrument(skip_all, level = "debug")]
