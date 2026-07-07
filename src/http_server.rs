@@ -968,7 +968,9 @@ where
             .expect("RequestId should be set by the SetRequestIdLayer")
             .header_value()
             .to_str()
-            .expect("RequestId should be a valid string")
+            // A client-supplied `x-request-id` is preserved verbatim and can contain
+            // non-visible-ASCII bytes; fall back rather than panic on the request task.
+            .unwrap_or_default()
             .to_owned();
 
         let Query(params) = req

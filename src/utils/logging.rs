@@ -113,7 +113,10 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         .expect("RequestId should be set by SetRequestIdLayer")
         .header_value()
         .to_str()
-        .expect("Request ID should be a valid string");
+        // The request id may be a client-supplied `x-request-id` header, which is
+        // preserved verbatim and can contain non-visible-ASCII bytes. Fall back to
+        // an empty id rather than panicking the request task on such input.
+        .unwrap_or_default();
 
     let span = tracing::span!(tracing::Level::INFO, "http_request", request_id);
 
@@ -201,6 +204,39 @@ mod tests {
     #[test]
     fn data_source_metric_label_preserves_unrecognized_values() {
         assert_eq!(data_source_metric_label("custom"), "custom");
+    }
+
+    // Regression test: a client-supplied `x-request-id` header is preserved verbatim
+    // by SetRequestIdLayer and may contain non-visible-ASCII bytes (obs-text, 0x80-0xFF),
+    // which are valid in an HTTP header value but make `HeaderValue::to_str()` fail.
+    // The logging middleware must not panic on such input (previously a per-connection DoS).
+    #[tokio::test]
+    async fn middleware_does_not_panic_on_non_ascii_request_id() {
+        use axum::{
+            body::Body,
+            http::{header::HeaderValue, Request, StatusCode},
+            middleware::from_fn,
+            routing::get,
+            Router,
+        };
+        use tower::ServiceExt;
+        use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
+
+        // Mirror the real layering: the logging middleware runs inside SetRequestIdLayer,
+        // so the RequestId extension is populated (here, from the client header) before it.
+        let app = Router::new()
+            .route("/status", get(|| async { "ok" }))
+            .route_layer(from_fn(super::middleware))
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+
+        let req = Request::builder()
+            .uri("/status")
+            .header("x-request-id", HeaderValue::from_bytes(&[0x80]).unwrap())
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.expect("router should respond");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
 
