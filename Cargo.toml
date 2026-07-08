@@ -58,6 +58,8 @@ tracing-futures = { version = "0.2.5", features = ["tokio", "futures-03"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
+reqwest-retry = "0.7"
+reqwest-middleware = "0.4"
 
 [dev-dependencies]
 proptest = "1.4.0"
