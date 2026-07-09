@@ -1,0 +1,951 @@
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use super::{
+    config::{CommercialConfig, PublicFallbackConfig},
+    types::{
+        Defaults, KeySnapshot, KeyStatus, OnExceed, PublicDefaults, PublicLimits, PublicQuota,
+        SnapshotRecord,
+    },
+};
+use crate::metrics;
+
+const SNAPSHOT_PATH_SEGMENTS: [&str; 4] = ["internal", "portal", "v1", "snapshots"];
+const RESOLVE_PATH_SEGMENTS: [&str; 4] = ["internal", "portal", "v1", "authorize"];
+const DEFAULT_PAGE_LIMIT: u16 = 1000;
+
+pub struct SnapshotStore {
+    inner: Arc<SnapshotStoreInner>,
+}
+
+struct SnapshotStoreInner {
+    records: ArcSwap<HashMap<String, Arc<KeySnapshot>>>,
+    defaults: ArcSwap<Defaults>,
+    cursor: AtomicU64,
+    ready: AtomicBool,
+    loaded_from_cache: AtomicBool,
+    cache_path: PathBuf,
+    sync_interval: Duration,
+    negative_cache_ttl: Duration,
+    negative_cache: DashMap<String, Instant>,
+    resolve_limiter: Mutex<ResolveLimiter>,
+    client: reqwest::Client,
+    control_plane_url: url::Url,
+    service_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoreView {
+    pub records: Arc<HashMap<String, Arc<KeySnapshot>>>,
+    pub defaults: Arc<Defaults>,
+    pub cursor: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotPage {
+    records: Vec<SnapshotRecord>,
+    next_cursor: u64,
+    #[serde(default)]
+    reset: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolveRequest<'a> {
+    key_id: &'a str,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DiskCache {
+    cursor: u64,
+    records: Vec<SnapshotRecord>,
+    defaults: Defaults,
+    saved_at: u64,
+}
+
+struct ResolveLimiter {
+    rate_per_sec: f64,
+    capacity: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl SnapshotStore {
+    pub fn spawn(
+        config: &CommercialConfig,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<(Arc<Self>, JoinHandle<()>)> {
+        let service_token = std::env::var(&config.service_token_env).unwrap_or_default();
+        let store = Arc::new(Self {
+            inner: Arc::new(SnapshotStoreInner {
+                records: ArcSwap::from_pointee(HashMap::new()),
+                defaults: ArcSwap::from_pointee(defaults_from_fallback(&config.public_fallback)),
+                cursor: AtomicU64::new(0),
+                ready: AtomicBool::new(false),
+                loaded_from_cache: AtomicBool::new(false),
+                cache_path: config.snapshot_cache_path.clone(),
+                sync_interval: Duration::from_secs(config.sync_interval_secs.max(1)),
+                negative_cache_ttl: Duration::from_secs(config.negative_cache_secs.max(1)),
+                negative_cache: DashMap::new(),
+                resolve_limiter: Mutex::new(ResolveLimiter::new(config.resolve_rate_per_sec)),
+                client: reqwest::Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .build()?,
+                control_plane_url: config.control_plane_url.clone(),
+                service_token,
+            }),
+        });
+        store.load_disk_cache();
+
+        let task_store = store.clone();
+        let task = tokio::spawn(async move {
+            task_store.run_sync_loop(cancel).await;
+        });
+        Ok((store, task))
+    }
+
+    pub fn inactive(fallback: &PublicFallbackConfig) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(SnapshotStoreInner {
+                records: ArcSwap::from_pointee(HashMap::new()),
+                defaults: ArcSwap::from_pointee(defaults_from_fallback(fallback)),
+                cursor: AtomicU64::new(0),
+                ready: AtomicBool::new(true),
+                loaded_from_cache: AtomicBool::new(false),
+                cache_path: PathBuf::new(),
+                sync_interval: Duration::from_secs(10),
+                negative_cache_ttl: Duration::from_secs(15),
+                negative_cache: DashMap::new(),
+                resolve_limiter: Mutex::new(ResolveLimiter::new(0)),
+                client: reqwest::Client::new(),
+                control_plane_url: "http://127.0.0.1/"
+                    .parse()
+                    .expect("static URL should parse"),
+                service_token: String::new(),
+            }),
+        })
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.inner.ready.load(Ordering::Relaxed)
+    }
+
+    pub fn loaded_from_cache(&self) -> bool {
+        self.inner.loaded_from_cache.load(Ordering::Relaxed)
+    }
+
+    pub fn view(&self) -> StoreView {
+        StoreView {
+            records: self.inner.records.load_full(),
+            defaults: self.inner.defaults.load_full(),
+            cursor: self.inner.cursor.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn get(&self, key_id: &str) -> Option<Arc<KeySnapshot>> {
+        self.inner.records.load().get(key_id).cloned()
+    }
+
+    pub async fn get_or_resolve(&self, key_id: &str) -> Option<Arc<KeySnapshot>> {
+        if let Some(record) = self.get(key_id) {
+            return Some(record);
+        }
+        self.resolve(key_id).await.ok().flatten()
+    }
+
+    async fn run_sync_loop(self: Arc<Self>, cancel: CancellationToken) {
+        loop {
+            if !self.is_ready() {
+                if let Err(err) = self.bootstrap().await {
+                    tracing::warn!(error = %err, "commercial snapshot bootstrap failed");
+                }
+            } else if let Err(err) = self.sync_once().await {
+                tracing::warn!(error = %err, "commercial snapshot sync failed");
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(self.inner.sync_interval) => {}
+            }
+        }
+    }
+
+    async fn bootstrap(&self) -> anyhow::Result<()> {
+        let mut cursor = 0;
+        let mut all = Vec::new();
+        loop {
+            let page = self.fetch_page(cursor).await?;
+            cursor = page.next_cursor;
+            let len = page.records.len();
+            all.extend(page.records);
+            if len < usize::from(DEFAULT_PAGE_LIMIT) {
+                break;
+            }
+        }
+        self.replace_records(all, cursor).await?;
+        self.inner.ready.store(true, Ordering::Release);
+        tracing::info!(cursor, "commercial snapshot bootstrap applied");
+        Ok(())
+    }
+
+    async fn sync_once(&self) -> anyhow::Result<()> {
+        let cursor = self.inner.cursor.load(Ordering::Relaxed);
+        let page = self.fetch_page(cursor).await?;
+        if page.reset {
+            tracing::info!(cursor, "commercial snapshot cursor reset requested");
+            self.bootstrap().await?;
+            return Ok(());
+        }
+        if page.records.is_empty() {
+            return Ok(());
+        }
+        let count = page.records.len();
+        self.apply_records(page.records, page.next_cursor).await?;
+        tracing::info!(
+            count,
+            cursor = page.next_cursor,
+            "commercial snapshot delta applied"
+        );
+        Ok(())
+    }
+
+    async fn fetch_page(&self, cursor: u64) -> anyhow::Result<SnapshotPage> {
+        let mut url = commercial_url(&self.inner.control_plane_url, &SNAPSHOT_PATH_SEGMENTS)?;
+        url.query_pairs_mut()
+            .append_pair("cursor", &cursor.to_string())
+            .append_pair("limit", &DEFAULT_PAGE_LIMIT.to_string());
+        let response = self
+            .inner
+            .client
+            .get(url)
+            .bearer_auth(&self.inner.service_token)
+            .send()
+            .await?;
+        let status = response.status();
+        anyhow::ensure!(
+            status.is_success(),
+            "snapshot feed returned status {status}"
+        );
+        Ok(response.json().await?)
+    }
+
+    async fn resolve(&self, key_id: &str) -> anyhow::Result<Option<Arc<KeySnapshot>>> {
+        if self.negative_cached(key_id) {
+            return Ok(None);
+        }
+        if !self.take_resolve_token() {
+            tracing::info!(
+                key_id,
+                "commercial snapshot resolve fail-closed: rate limited"
+            );
+            return Ok(None);
+        }
+
+        let url = commercial_url(&self.inner.control_plane_url, &RESOLVE_PATH_SEGMENTS)?;
+        let response = self
+            .inner
+            .client
+            .post(url)
+            .bearer_auth(&self.inner.service_token)
+            .json(&ResolveRequest { key_id })
+            .send()
+            .await?;
+        match response.status() {
+            StatusCode::OK => {
+                let record: KeySnapshot = response.json().await?;
+                let record = self.upsert_key(record).await?;
+                Ok(Some(record))
+            }
+            StatusCode::NOT_FOUND => {
+                self.inner.negative_cache.insert(
+                    key_id.to_string(),
+                    Instant::now() + self.inner.negative_cache_ttl,
+                );
+                Ok(None)
+            }
+            status => anyhow::bail!("resolve returned status {status}"),
+        }
+    }
+
+    async fn replace_records(
+        &self,
+        records: Vec<SnapshotRecord>,
+        cursor: u64,
+    ) -> anyhow::Result<()> {
+        let mut map = HashMap::new();
+        let mut defaults = None;
+        for record in records {
+            match record {
+                SnapshotRecord::Defaults(record) => defaults = Some(Defaults::from(record)),
+                SnapshotRecord::Key(record) => {
+                    map.insert(record.key_id.clone(), Arc::new(record));
+                }
+            }
+        }
+        if let Some(defaults) = defaults {
+            self.inner.defaults.store(Arc::new(defaults));
+        }
+        self.inner.records.store(Arc::new(map));
+        self.inner.cursor.store(cursor, Ordering::Release);
+        self.persist_disk_cache().await?;
+        Ok(())
+    }
+
+    async fn apply_records(&self, records: Vec<SnapshotRecord>, cursor: u64) -> anyhow::Result<()> {
+        let mut map = (**self.inner.records.load()).clone();
+        for record in records {
+            match record {
+                SnapshotRecord::Defaults(record) => {
+                    self.inner.defaults.store(Arc::new(Defaults::from(record)));
+                }
+                SnapshotRecord::Key(record) => {
+                    if record.status != KeyStatus::Active {
+                        tracing::info!(key_id = record.key_id, "commercial key became non-active");
+                    }
+                    map.insert(record.key_id.clone(), Arc::new(record));
+                }
+            }
+        }
+        self.inner.records.store(Arc::new(map));
+        self.inner.cursor.store(cursor, Ordering::Release);
+        self.persist_disk_cache().await?;
+        Ok(())
+    }
+
+    async fn upsert_key(&self, record: KeySnapshot) -> anyhow::Result<Arc<KeySnapshot>> {
+        let record = Arc::new(record);
+        let mut map = (**self.inner.records.load()).clone();
+        map.insert(record.key_id.clone(), record.clone());
+        let cursor = self.inner.cursor.load(Ordering::Relaxed).max(record.seq);
+        self.inner.records.store(Arc::new(map));
+        self.inner.cursor.store(cursor, Ordering::Release);
+        self.persist_disk_cache().await?;
+        Ok(record)
+    }
+
+    fn load_disk_cache(&self) {
+        let path = &self.inner.cache_path;
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let cache = match serde_json::from_slice::<DiskCache>(&bytes) {
+            Ok(cache) => cache,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "failed to load commercial snapshot cache");
+                return;
+            }
+        };
+        let mut map = HashMap::new();
+        for record in cache.records {
+            if let SnapshotRecord::Key(record) = record {
+                map.insert(record.key_id.clone(), Arc::new(record));
+            }
+        }
+        self.inner.records.store(Arc::new(map));
+        self.inner.defaults.store(Arc::new(cache.defaults));
+        self.inner.cursor.store(cache.cursor, Ordering::Release);
+        self.inner.ready.store(true, Ordering::Release);
+        self.inner.loaded_from_cache.store(true, Ordering::Release);
+        let age = now_secs().saturating_sub(cache.saved_at);
+        metrics::set_commercial_snapshot_age(age as i64);
+        tracing::warn!(path = %path.display(), age_seconds = age, "loaded commercial snapshot disk cache");
+    }
+
+    async fn persist_disk_cache(&self) -> anyhow::Result<()> {
+        let path = &self.inner.cache_path;
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let records = self
+            .inner
+            .records
+            .load()
+            .values()
+            .map(|record| SnapshotRecord::Key((**record).clone()))
+            .collect();
+        let cache = DiskCache {
+            cursor: self.inner.cursor.load(Ordering::Relaxed),
+            records,
+            defaults: (**self.inner.defaults.load()).clone(),
+            saved_at: now_secs(),
+        };
+        let bytes = serde_json::to_vec(&cache)?;
+        let tmp = tmp_path(path);
+        tokio::fs::write(&tmp, bytes).await?;
+        tokio::fs::rename(&tmp, path).await?;
+        metrics::set_commercial_snapshot_age(0);
+        Ok(())
+    }
+
+    fn negative_cached(&self, key_id: &str) -> bool {
+        let Some(entry) = self.inner.negative_cache.get(key_id) else {
+            return false;
+        };
+        if *entry.value() > Instant::now() {
+            return true;
+        }
+        drop(entry);
+        self.inner.negative_cache.remove(key_id);
+        false
+    }
+
+    fn take_resolve_token(&self) -> bool {
+        self.inner.resolve_limiter.lock().unwrap().take()
+    }
+}
+
+impl ResolveLimiter {
+    fn new(rate_per_sec: u64) -> Self {
+        let capacity = rate_per_sec as f64;
+        Self {
+            rate_per_sec: capacity,
+            capacity,
+            tokens: capacity,
+            last: Instant::now(),
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        if self.rate_per_sec <= 0.0 {
+            return false;
+        }
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.rate_per_sec).min(self.capacity);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn defaults_from_fallback(config: &PublicFallbackConfig) -> Defaults {
+    Defaults {
+        public: PublicDefaults {
+            limits: PublicLimits {
+                throughput_bytes_per_sec: Some(config.throughput_bytes_per_sec),
+                burst_bytes: Some(config.burst_bytes),
+                max_response_bytes: Some(config.max_response_bytes),
+                concurrency: Some(config.concurrency as u64),
+            },
+            quota: PublicQuota {
+                volume_bytes: config.volume_bytes,
+                window_secs: config.window_secs,
+                on_exceed: OnExceed::Reject,
+            },
+        },
+        messages: HashMap::new(),
+        seq: 0,
+    }
+}
+
+fn commercial_url(base: &url::Url, segments: &[&str]) -> anyhow::Result<url::Url> {
+    let mut url = base.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    let mut path = url
+        .path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("control plane URL cannot be a base"))?;
+    path.pop_if_empty();
+    path.extend(segments);
+    drop(path);
+    Ok(url)
+}
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+pub mod test_support {
+    use std::{
+        collections::VecDeque,
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+    };
+
+    use axum::{
+        extract::{Query, State},
+        http::{HeaderMap, StatusCode},
+        routing::{get, post},
+        Json, Router,
+    };
+    use serde::{Deserialize, Serialize};
+    use tokio::task::JoinHandle;
+
+    use super::*;
+    use crate::commercial::{
+        DefaultsRecord, Entitlements, Quota, SnapshotLimits, StreamUsageEvent,
+    };
+
+    pub const SERVICE_TOKEN: &str = "test-service-token";
+    pub const KEY_ID: &str = "AbCdEfGhIjKlMnOp";
+    pub const SECRET_SHA256: &str =
+        "73337f479fe170d73e53e247f3052e4243cc9c2a0ffa621853d9385c619efb77";
+
+    #[derive(Clone)]
+    pub struct MockControlPlane {
+        addr: SocketAddr,
+        state: Arc<MockState>,
+        _task: Arc<JoinHandle<()>>,
+    }
+
+    #[derive(Default)]
+    struct MockState {
+        pages: Mutex<VecDeque<MockPage>>,
+        resolves: Mutex<HashMap<String, Option<KeySnapshot>>>,
+        resolve_calls: Mutex<Vec<String>>,
+        usage_batches: Mutex<Vec<Vec<StreamUsageEvent>>>,
+    }
+
+    #[derive(Clone)]
+    struct MockPage {
+        min_cursor: u64,
+        page: SnapshotPage,
+    }
+
+    #[derive(Deserialize)]
+    struct CursorQuery {
+        cursor: u64,
+        #[allow(dead_code)]
+        limit: Option<u16>,
+    }
+
+    #[derive(Deserialize)]
+    struct ResolveBody {
+        key_id: String,
+    }
+
+    impl MockControlPlane {
+        pub async fn spawn() -> Self {
+            let state = Arc::new(MockState::default());
+            let app = Router::new()
+                .route("/internal/portal/v1/snapshots", get(snapshots))
+                .route("/internal/portal/v1/authorize", post(resolve))
+                .route("/internal/portal/v1/usage", post(usage))
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self {
+                addr,
+                state,
+                _task: Arc::new(task),
+            }
+        }
+
+        pub fn url(&self) -> url::Url {
+            format!("http://{}", self.addr).parse().unwrap()
+        }
+
+        pub fn push_page(&self, min_cursor: u64, page: SnapshotPage) {
+            self.state
+                .pages
+                .lock()
+                .unwrap()
+                .push_back(MockPage { min_cursor, page });
+        }
+
+        pub fn resolve_with(&self, key_id: &str, record: Option<KeySnapshot>) {
+            self.state
+                .resolves
+                .lock()
+                .unwrap()
+                .insert(key_id.to_string(), record);
+        }
+
+        pub fn resolve_calls(&self) -> Vec<String> {
+            self.state.resolve_calls.lock().unwrap().clone()
+        }
+
+        pub fn usage_batches(&self) -> Vec<Vec<StreamUsageEvent>> {
+            self.state.usage_batches.lock().unwrap().clone()
+        }
+    }
+
+    pub fn active_snapshot(seq: u64) -> KeySnapshot {
+        KeySnapshot {
+            key_id: KEY_ID.to_string(),
+            secret_sha256: Some(SECRET_SHA256.to_string()),
+            account_id: Some("account".to_string()),
+            status: KeyStatus::Active,
+            expires_at: None,
+            limits: Some(SnapshotLimits {
+                throughput_bytes_per_sec: Some(1_000_000),
+                burst_bytes: Some(2_000_000),
+                max_response_bytes: Some(3_000_000),
+                concurrency: Some(4),
+                max_chunks: None,
+            }),
+            entitlements: Some(Entitlements {
+                chains: vec!["ethereum-mainnet".to_string()],
+                traces: vec![],
+            }),
+            quota: Some(Quota {
+                remaining_bytes: 10_000,
+                period_end: Some(4_102_444_800),
+                version: seq,
+                on_exceed: OnExceed::Reject,
+            }),
+            seq,
+        }
+    }
+
+    pub fn defaults_record(seq: u64) -> DefaultsRecord {
+        DefaultsRecord {
+            key_id: "__defaults__".to_string(),
+            public: PublicDefaults {
+                limits: PublicLimits {
+                    throughput_bytes_per_sec: Some(100),
+                    burst_bytes: Some(200),
+                    max_response_bytes: Some(300),
+                    concurrency: Some(2),
+                },
+                quota: PublicQuota {
+                    volume_bytes: 400,
+                    window_secs: 60,
+                    on_exceed: OnExceed::Reject,
+                },
+            },
+            messages: HashMap::from([("invalid_key".to_string(), "invalid".to_string())]),
+            seq,
+        }
+    }
+
+    pub fn page(records: Vec<SnapshotRecord>, next_cursor: u64, reset: bool) -> SnapshotPage {
+        SnapshotPage {
+            records,
+            next_cursor,
+            reset,
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct UsageBody {
+        events: Vec<StreamUsageEvent>,
+    }
+
+    #[derive(Serialize)]
+    struct UsageResponse {
+        accepted: usize,
+        duplicates: usize,
+    }
+
+    fn authorized(headers: &HeaderMap) -> bool {
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some(&format!("Bearer {SERVICE_TOKEN}"))
+    }
+
+    async fn snapshots(
+        State(state): State<Arc<MockState>>,
+        headers: HeaderMap,
+        Query(query): Query<CursorQuery>,
+    ) -> Result<Json<SnapshotPage>, StatusCode> {
+        if !authorized(&headers) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let mut pages = state.pages.lock().unwrap();
+        let index = pages
+            .iter()
+            .position(|page| query.cursor >= page.min_cursor)
+            .unwrap_or(0);
+        let page = pages
+            .remove(index)
+            .map(|page| page.page)
+            .unwrap_or(SnapshotPage {
+                records: vec![],
+                next_cursor: query.cursor,
+                reset: false,
+            });
+        Ok(Json(page))
+    }
+
+    async fn resolve(
+        State(state): State<Arc<MockState>>,
+        headers: HeaderMap,
+        Json(request): Json<ResolveBody>,
+    ) -> Result<Json<KeySnapshot>, StatusCode> {
+        if !authorized(&headers) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        state
+            .resolve_calls
+            .lock()
+            .unwrap()
+            .push(request.key_id.to_string());
+        let record = state.resolves.lock().unwrap().get(&request.key_id).cloned();
+        match record {
+            Some(Some(record)) => Ok(Json(record)),
+            _ => Err(StatusCode::NOT_FOUND),
+        }
+    }
+
+    async fn usage(
+        State(state): State<Arc<MockState>>,
+        headers: HeaderMap,
+        Json(body): Json<UsageBody>,
+    ) -> Result<Json<UsageResponse>, StatusCode> {
+        if !authorized(&headers) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let accepted = body.events.len();
+        state.usage_batches.lock().unwrap().push(body.events);
+        Ok(Json(UsageResponse {
+            accepted,
+            duplicates: 0,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{test_support::*, *};
+
+    fn config(
+        mock: &MockControlPlane,
+        cache_path: PathBuf,
+        resolve_rate_per_sec: u64,
+    ) -> CommercialConfig {
+        CommercialConfig {
+            control_plane_url: mock.url(),
+            service_token_env: "PORTAL_STORE_TEST_TOKEN".to_string(),
+            sync_interval_secs: 1,
+            flush_interval_secs: 5,
+            flush_max_events: 500,
+            usage_buffer_max_events: 1000,
+            snapshot_cache_path: cache_path,
+            resolve_rate_per_sec,
+            negative_cache_secs: 60,
+            pod_count: 1,
+            public_fallback: PublicFallbackConfig {
+                throughput_bytes_per_sec: 1,
+                burst_bytes: 1,
+                max_response_bytes: 1,
+                volume_bytes: 1,
+                window_secs: 1,
+                concurrency: 1,
+            },
+        }
+    }
+
+    fn cache_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("sqd-portal-{name}-{}.json", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn bootstrap_pages_and_persists_cache() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let mut first_page = vec![SnapshotRecord::Defaults(defaults_record(1))];
+        for i in 0..999 {
+            let mut record = active_snapshot(1);
+            record.key_id = format!("dummy-{i}");
+            first_page.push(SnapshotRecord::Key(record));
+        }
+        mock.push_page(0, page(first_page, 1, false));
+        mock.push_page(
+            1,
+            page(vec![SnapshotRecord::Key(active_snapshot(2))], 2, false),
+        );
+        let path = cache_path("bootstrap");
+        let (store, task) =
+            SnapshotStore::spawn(&config(&mock, path.clone(), 10), CancellationToken::new())
+                .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(store.get(KEY_ID).is_some());
+        assert!(path.exists());
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn disk_cache_round_trip_is_ready_without_control_plane() {
+        let path = cache_path("round-trip");
+        let cache = DiskCache {
+            cursor: 2,
+            records: vec![SnapshotRecord::Key(active_snapshot(2))],
+            defaults: Defaults::from(defaults_record(1)),
+            saved_at: now_secs(),
+        };
+        tokio::fs::write(&path, serde_json::to_vec(&cache).unwrap())
+            .await
+            .unwrap();
+
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let (store, task) =
+            SnapshotStore::spawn(&config(&mock, path.clone(), 10), CancellationToken::new())
+                .unwrap();
+
+        assert!(store.is_ready());
+        assert!(store.loaded_from_cache());
+        assert!(store.get(KEY_ID).is_some());
+
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn delta_upserts_and_tombstones() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        mock.push_page(
+            0,
+            page(vec![SnapshotRecord::Key(active_snapshot(1))], 1, false),
+        );
+        let mut revoked = active_snapshot(2);
+        revoked.status = KeyStatus::Revoked;
+        mock.push_page(
+            1,
+            page(vec![SnapshotRecord::Key(revoked.clone())], 2, false),
+        );
+        let path = cache_path("delta");
+        let (store, task) =
+            SnapshotStore::spawn(&config(&mock, path.clone(), 10), CancellationToken::new())
+                .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.view().cursor < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(store.get(KEY_ID).unwrap().status, KeyStatus::Revoked);
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn reset_rebootstraps_without_clearing_serving_store_first() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        mock.push_page(
+            0,
+            page(vec![SnapshotRecord::Key(active_snapshot(1))], 1, false),
+        );
+        mock.push_page(1, page(vec![], 1, true));
+        let mut next = active_snapshot(3);
+        next.account_id = Some("next".to_string());
+        mock.push_page(0, page(vec![SnapshotRecord::Key(next.clone())], 3, false));
+        let path = cache_path("reset");
+        let (store, task) =
+            SnapshotStore::spawn(&config(&mock, path.clone(), 10), CancellationToken::new())
+                .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.get(KEY_ID).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.view().cursor < 3 {
+                assert!(store.get(KEY_ID).is_some());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.get(KEY_ID).unwrap().account_id.as_deref(),
+            Some("next")
+        );
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_budget_exhaustion_fails_closed_and_negative_cache_suppresses_repeats() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let path = cache_path("resolve");
+        let config = config(&mock, path.clone(), 1);
+        let (store, task) = SnapshotStore::spawn(&config, CancellationToken::new()).unwrap();
+        store.inner.ready.store(true, Ordering::Release);
+
+        mock.resolve_with("missing", None);
+        assert!(store.get_or_resolve("missing").await.is_none());
+        assert!(store.get_or_resolve("missing").await.is_none());
+        assert_eq!(mock.resolve_calls(), vec!["missing".to_string()]);
+
+        assert!(store.get_or_resolve("rate-limited").await.is_none());
+        assert_eq!(mock.resolve_calls(), vec!["missing".to_string()]);
+
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_hit_inserts_record() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let mut resolved = active_snapshot(42);
+        resolved.key_id = "fresh-key".to_string();
+        mock.resolve_with("fresh-key", Some(resolved.clone()));
+        let path = cache_path("resolve-hit");
+        let (store, task) =
+            SnapshotStore::spawn(&config(&mock, path.clone(), 10), CancellationToken::new())
+                .unwrap();
+        store.inner.ready.store(true, Ordering::Release);
+
+        let record = store.get_or_resolve("fresh-key").await.unwrap();
+
+        assert_eq!(record.key_id, "fresh-key");
+        assert_eq!(store.get("fresh-key").unwrap().seq, 42);
+        assert_eq!(mock.resolve_calls(), vec!["fresh-key".to_string()]);
+
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}

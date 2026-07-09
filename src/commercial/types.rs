@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -143,4 +143,114 @@ pub struct StreamUsageEvent {
     pub status: UsageStatus,
     pub pod: String,
     pub quota_version: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStatus {
+    Active,
+    Suspended,
+    Revoked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SnapshotLimits {
+    pub throughput_bytes_per_sec: Option<u64>,
+    pub burst_bytes: Option<u64>,
+    pub max_response_bytes: Option<u64>,
+    pub concurrency: Option<u64>,
+    #[serde(default)]
+    pub max_chunks: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Entitlements {
+    #[serde(default)]
+    pub chains: Vec<String>,
+    #[serde(default)]
+    pub traces: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quota {
+    pub remaining_bytes: i64,
+    pub period_end: Option<u64>,
+    pub version: u64,
+    pub on_exceed: OnExceed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeySnapshot {
+    pub key_id: String,
+    #[serde(default)]
+    pub secret_sha256: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub status: KeyStatus,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    #[serde(default)]
+    pub limits: Option<SnapshotLimits>,
+    #[serde(default)]
+    pub entitlements: Option<Entitlements>,
+    #[serde(default)]
+    pub quota: Option<Quota>,
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicLimits {
+    pub throughput_bytes_per_sec: Option<u64>,
+    pub burst_bytes: Option<u64>,
+    pub max_response_bytes: Option<u64>,
+    pub concurrency: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicQuota {
+    pub volume_bytes: u64,
+    pub window_secs: u64,
+    pub on_exceed: OnExceed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicDefaults {
+    pub limits: PublicLimits,
+    pub quota: PublicQuota,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Defaults {
+    #[serde(rename = "public_tier")]
+    pub public: PublicDefaults,
+    #[serde(default)]
+    pub messages: HashMap<String, String>,
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultsRecord {
+    pub key_id: String,
+    #[serde(rename = "public_tier")]
+    pub public: PublicDefaults,
+    #[serde(default)]
+    pub messages: HashMap<String, String>,
+    pub seq: u64,
+}
+
+impl From<DefaultsRecord> for Defaults {
+    fn from(record: DefaultsRecord) -> Self {
+        Self {
+            public: record.public,
+            messages: record.messages,
+            seq: record.seq,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SnapshotRecord {
+    Defaults(DefaultsRecord),
+    Key(KeySnapshot),
 }

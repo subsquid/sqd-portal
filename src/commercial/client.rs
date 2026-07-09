@@ -1,6 +1,12 @@
 use async_trait::async_trait;
 
-use super::types::{Authorization, AuthorizeRequest, Granted, GrantedLimits, OnExceed, Principal};
+use super::{
+    store::SnapshotStore,
+    types::{
+        Authorization, AuthorizeRequest, Credential, Granted, GrantedLimits, OnExceed, Principal,
+        Rejected,
+    },
+};
 
 #[async_trait]
 pub trait ControlPlaneClient: Send + Sync {
@@ -26,6 +32,34 @@ pub fn oss_grant() -> Granted {
         limits: GrantedLimits::default(),
         on_exceed: OnExceed::Reject,
         quota_version: 0,
+    }
+}
+
+pub struct LocalControlPlane {
+    store: std::sync::Arc<SnapshotStore>,
+}
+
+impl LocalControlPlane {
+    pub fn new(store: std::sync::Arc<SnapshotStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl ControlPlaneClient for LocalControlPlane {
+    async fn authorize(&self, req: AuthorizeRequest) -> Authorization {
+        if let Credential::Key { key_id, .. } = &req.credential {
+            if self.store.get_or_resolve(key_id).await.is_none() {
+                return Authorization::Rejected(Rejected {
+                    reason: "invalid_key".to_string(),
+                    http_status: 401,
+                    message: "Invalid API key".to_string(),
+                    retry_after_secs: None,
+                });
+            }
+        }
+
+        Authorization::Granted(oss_grant())
     }
 }
 

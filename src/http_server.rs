@@ -44,7 +44,7 @@ use crate::utils::logging::MethodRouterExt;
 use crate::{
     commercial::{
         extractor as commercial_extractor, CommercialGrant, CommercialRuntime, Endpoint,
-        MeterHandle, UsageReporter,
+        MeterHandle, SnapshotStore, UsageReporter,
     },
     config::Config,
     controller::task_manager::TaskManager,
@@ -273,7 +273,7 @@ pub async fn run_server(
 
     let drain_timeout = config.drain_timeout;
 
-    let app = app
+    let mut app = app
         .route_layer(axum::middleware::from_fn(logging::middleware))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
@@ -289,6 +289,9 @@ pub async fn run_server(
         .layer(Extension(commercial.control_plane))
         .layer(Extension(commercial.usage_reporter))
         .layer(Extension(shutting_down));
+    if let Some(snapshot_store) = commercial.snapshot_store {
+        app = app.layer(Extension(snapshot_store));
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
@@ -702,6 +705,7 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
 async fn get_readiness(
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(shutting_down): Extension<Arc<AtomicBool>>,
+    snapshot_store: Option<Extension<Arc<SnapshotStore>>>,
 ) -> impl IntoResponse {
     // Stable discriminant per readiness *category*. `/ready` is polled
     // continuously, so we log only when the category changes — entering a new
@@ -712,6 +716,7 @@ async fn get_readiness(
     const SHUTTING_DOWN: u8 = 1;
     const NO_WORKERS: u8 = 2;
     const INSUFFICIENT_CONNECTIONS: u8 = 3;
+    const SNAPSHOTS_NOT_READY: u8 = 4;
     static LAST_STATE: AtomicU8 = AtomicU8::new(READY);
 
     let (state, code, body, reason): (u8, StatusCode, &str, Option<NotReady>) =
@@ -720,6 +725,16 @@ async fn get_readiness(
                 SHUTTING_DOWN,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Shutting down",
+                None,
+            )
+        } else if snapshot_store
+            .as_ref()
+            .is_some_and(|store| !store.is_ready())
+        {
+            (
+                SNAPSHOTS_NOT_READY,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Commercial snapshots not ready",
                 None,
             )
         } else {
@@ -744,6 +759,9 @@ async fn get_readiness(
         match (state, reason) {
             (READY, _) => tracing::info!("readiness check now passing: portal is ready"),
             (SHUTTING_DOWN, _) => tracing::info!("readiness check now failing: shutting down"),
+            (SNAPSHOTS_NOT_READY, _) => {
+                tracing::warn!("readiness check now failing: commercial snapshots not ready");
+            }
             (_, Some(reason)) => tracing::warn!("readiness check now failing: {reason}"),
             (_, None) => {}
         }
