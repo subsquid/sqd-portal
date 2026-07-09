@@ -228,12 +228,15 @@ fn query_api_key(query: Option<&str>) -> Option<String> {
 }
 
 fn ip_bucket_from_headers(headers: &HeaderMap, client_ip_header: &str) -> String {
-    let Some(ip) = headers
-        .get(client_ip_header)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.rsplit(',').find_map(|part| parse_ip(part.trim())))
-    else {
+    let Some(value) = headers.get(client_ip_header) else {
         return "local".to_string();
+    };
+    let Ok(value) = value.to_str() else {
+        return "invalid".to_string();
+    };
+    let rightmost = value.rsplit(',').next().unwrap_or_default().trim();
+    let Some(ip) = parse_ip(rightmost) else {
+        return "invalid".to_string();
     };
 
     match ip {
@@ -397,6 +400,19 @@ mod tests {
             credential_from_request(&headers, None, "x-client-ip").unwrap(),
             Credential::None {
                 ip_bucket: "198.51.100.7/32".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn keyless_requests_do_not_scan_left_past_invalid_rightmost_forwarded_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9, not-an-ip".parse().unwrap());
+
+        assert_eq!(
+            credential_from_request(&headers, None, "x-forwarded-for").unwrap(),
+            Credential::None {
+                ip_bucket: "invalid".to_string(),
             }
         );
     }

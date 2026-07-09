@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use serde::Deserialize;
 use url::Url;
@@ -17,6 +17,10 @@ pub struct CommercialConfig {
     pub pod_count: usize,
     #[serde(default = "default_client_ip_header")]
     pub client_ip_header: String,
+    #[serde(default = "default_throttle_residual_secs")]
+    pub throttle_residual_secs: u64,
+    #[serde(default = "default_sweep_horizon_window_multiplier")]
+    pub sweep_horizon_window_multiplier: u64,
     pub public_fallback: PublicFallbackConfig,
 }
 
@@ -51,11 +55,36 @@ impl CommercialConfig {
             !self.client_ip_header.trim().is_empty(),
             "commercial.client_ip_header must not be empty"
         );
+        anyhow::ensure!(
+            self.throttle_residual_secs > 0,
+            "commercial.throttle_residual_secs must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.sweep_horizon_window_multiplier > 0,
+            "commercial.sweep_horizon_window_multiplier must be greater than zero"
+        );
 
         Ok(())
+    }
+
+    pub fn sweep_horizon(&self) -> Duration {
+        Duration::from_secs(
+            self.public_fallback
+                .window_secs
+                .max(1)
+                .saturating_mul(self.sweep_horizon_window_multiplier),
+        )
     }
 }
 
 fn default_client_ip_header() -> String {
     "x-forwarded-for".to_string()
+}
+
+pub fn default_throttle_residual_secs() -> u64 {
+    60
+}
+
+fn default_sweep_horizon_window_multiplier() -> u64 {
+    2
 }

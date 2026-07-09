@@ -1,6 +1,7 @@
 use subtle::ConstantTimeEq;
 
 use super::{
+    config::default_throttle_residual_secs,
     types::{
         Authorization, AuthorizeRequest, Credential, Defaults, Granted, GrantedLimits, KeySnapshot,
         KeyStatus, OnExceed, Principal, Rejected, SnapshotLimits,
@@ -24,6 +25,11 @@ pub struct EvaluationState {
     pub concurrency_available: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EvaluationPolicy {
+    pub throttle_residual_secs: u64,
+}
+
 impl Default for EvaluationState {
     fn default() -> Self {
         Self {
@@ -34,11 +40,30 @@ impl Default for EvaluationState {
     }
 }
 
+impl Default for EvaluationPolicy {
+    fn default() -> Self {
+        Self {
+            throttle_residual_secs: default_throttle_residual_secs(),
+        }
+    }
+}
+
 pub async fn evaluate_with_store(
     store: &SnapshotStore,
     tally: Option<&TallyStore>,
     concurrency: Option<&ConcurrencyLimiter>,
     req: AuthorizeRequest,
+) -> Authorization {
+    evaluate_with_store_and_policy(store, tally, concurrency, req, EvaluationPolicy::default())
+        .await
+}
+
+pub async fn evaluate_with_store_and_policy(
+    store: &SnapshotStore,
+    tally: Option<&TallyStore>,
+    concurrency: Option<&ConcurrencyLimiter>,
+    req: AuthorizeRequest,
+    policy: EvaluationPolicy,
 ) -> Authorization {
     let view = store.view();
     match &req.credential {
@@ -74,7 +99,7 @@ pub async fn evaluate_with_store(
             let (permit, concurrency_available) =
                 acquire_key_permit(snapshot.as_deref(), concurrency);
             state.concurrency_available = concurrency_available;
-            match evaluate(&req, snapshot.as_deref(), &view.defaults, state) {
+            match evaluate_with_policy(&req, snapshot.as_deref(), &view.defaults, state, policy) {
                 Authorization::Granted(mut granted) => {
                     granted.concurrency_permit = permit;
                     Authorization::Granted(granted)
@@ -84,6 +109,7 @@ pub async fn evaluate_with_store(
         }
         Credential::None { ip_bucket } => evaluate_anonymous_with_state(
             &view.defaults,
+            policy,
             tally,
             concurrency,
             ip_bucket,
@@ -99,11 +125,29 @@ pub fn evaluate(
     defaults: &Defaults,
     state: EvaluationState,
 ) -> Authorization {
+    evaluate_with_policy(req, snapshot, defaults, state, EvaluationPolicy::default())
+}
+
+pub fn evaluate_with_policy(
+    req: &AuthorizeRequest,
+    snapshot: Option<&KeySnapshot>,
+    defaults: &Defaults,
+    state: EvaluationState,
+    policy: EvaluationPolicy,
+) -> Authorization {
     match &req.credential {
         Credential::Key {
             key_id,
             secret_sha256,
-        } => evaluate_key(req, snapshot, defaults, state, key_id, secret_sha256),
+        } => evaluate_key(
+            req,
+            snapshot,
+            defaults,
+            state,
+            policy,
+            key_id,
+            secret_sha256,
+        ),
         Credential::None { .. } => evaluate_anonymous(defaults),
         Credential::Internal { .. } => Authorization::Granted(super::client::oss_grant()),
     }
@@ -114,6 +158,7 @@ fn evaluate_key(
     snapshot: Option<&KeySnapshot>,
     defaults: &Defaults,
     state: EvaluationState,
+    policy: EvaluationPolicy,
     key_id: &str,
     secret_sha256: &str,
 ) -> Authorization {
@@ -148,7 +193,9 @@ fn evaluate_key(
                 GrantedLimits {
                     throughput_bytes_per_sec: Some(floor_bytes_per_sec),
                     burst_bytes: Some(floor_bytes_per_sec),
-                    max_response_bytes: Some(floor_bytes_per_sec.saturating_mul(60)),
+                    max_response_bytes: Some(
+                        floor_bytes_per_sec.saturating_mul(policy.throttle_residual_secs),
+                    ),
                     max_chunks: snapshot
                         .limits
                         .as_ref()
@@ -259,6 +306,7 @@ fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
 
 fn evaluate_anonymous_with_state(
     defaults: &Defaults,
+    policy: EvaluationPolicy,
     tally: Option<&TallyStore>,
     concurrency: Option<&ConcurrencyLimiter>,
     ip_bucket: &str,
@@ -297,7 +345,9 @@ fn evaluate_anonymous_with_state(
                 GrantedLimits {
                     throughput_bytes_per_sec: Some(floor_bytes_per_sec),
                     burst_bytes: Some(floor_bytes_per_sec),
-                    max_response_bytes: Some(floor_bytes_per_sec.saturating_mul(60)),
+                    max_response_bytes: Some(
+                        floor_bytes_per_sec.saturating_mul(policy.throttle_residual_secs),
+                    ),
                     max_chunks: None,
                 },
                 Some(defaults.public.quota.volume_bytes as i64),
@@ -515,6 +565,8 @@ mod tests {
             negative_cache_secs: 60,
             pod_count: 1,
             client_ip_header: "x-forwarded-for".to_string(),
+            throttle_residual_secs: 60,
+            sweep_horizon_window_multiplier: 2,
             public_fallback: PublicFallbackConfig {
                 throughput_bytes_per_sec: 1,
                 burst_bytes: 1,
@@ -707,6 +759,31 @@ mod tests {
     }
 
     #[test]
+    fn throttle_residual_uses_policy_seconds() {
+        let mut quota_state = state();
+        quota_state.tally_bytes = 10_000;
+        let mut throttled = active_snapshot(1);
+        throttled.quota.as_mut().unwrap().on_exceed = OnExceed::Throttle {
+            floor_bytes_per_sec: 7,
+        };
+
+        match evaluate_with_policy(
+            &request(SECRET_SHA256),
+            Some(&throttled),
+            &defaults(),
+            quota_state,
+            EvaluationPolicy {
+                throttle_residual_secs: 10,
+            },
+        ) {
+            Authorization::Granted(grant) => {
+                assert_eq!(grant.limits.max_response_bytes, Some(70));
+            }
+            Authorization::Rejected(_) => panic!("expected throttle grant"),
+        }
+    }
+
+    #[test]
     fn grant_caps_max_response_by_effective_remaining_and_anonymous_uses_defaults() {
         let mut quota_state = state();
         quota_state.tally_bytes = 9_500;
@@ -752,7 +829,14 @@ mod tests {
         let tally = TallyStore::default();
         tally.debit("anon:local", 120, defaults.public.quota.volume_bytes);
 
-        match evaluate_anonymous_with_state(&defaults, Some(&tally), None, "local", 120) {
+        match evaluate_anonymous_with_state(
+            &defaults,
+            EvaluationPolicy::default(),
+            Some(&tally),
+            None,
+            "local",
+            120,
+        ) {
             Authorization::Rejected(rejected) => {
                 assert_eq!(rejected.reason, "anon_limited");
                 assert_eq!(rejected.http_status, 429);
@@ -760,7 +844,14 @@ mod tests {
             Authorization::Granted(_) => panic!("expected anon limit rejection"),
         }
 
-        match evaluate_anonymous_with_state(&defaults, Some(&tally), None, "other", 120) {
+        match evaluate_anonymous_with_state(
+            &defaults,
+            EvaluationPolicy::default(),
+            Some(&tally),
+            None,
+            "other",
+            120,
+        ) {
             Authorization::Granted(grant) => {
                 assert_eq!(grant.principal.account_id, "anonymous");
                 assert_eq!(grant.tally_account_id.as_deref(), Some("anon:other"));
@@ -780,7 +871,14 @@ mod tests {
         let tally = TallyStore::default();
         tally.debit("anon:local", 120, defaults.public.quota.volume_bytes);
 
-        match evaluate_anonymous_with_state(&defaults, Some(&tally), None, "local", 120) {
+        match evaluate_anonymous_with_state(
+            &defaults,
+            EvaluationPolicy::default(),
+            Some(&tally),
+            None,
+            "local",
+            120,
+        ) {
             Authorization::Granted(grant) => {
                 assert_eq!(grant.principal.account_id, "anonymous");
                 assert_eq!(grant.limits.throughput_bytes_per_sec, Some(7));
@@ -796,13 +894,27 @@ mod tests {
         let limiter = ConcurrencyLimiter::new(1);
         let mut held = Vec::new();
         for _ in 0..3 {
-            match evaluate_anonymous_with_state(&defaults, None, Some(&limiter), "local", 120) {
+            match evaluate_anonymous_with_state(
+                &defaults,
+                EvaluationPolicy::default(),
+                None,
+                Some(&limiter),
+                "local",
+                120,
+            ) {
                 Authorization::Granted(grant) => held.push(grant),
                 Authorization::Rejected(_) => panic!("expected permit"),
             }
         }
 
-        match evaluate_anonymous_with_state(&defaults, None, Some(&limiter), "local", 120) {
+        match evaluate_anonymous_with_state(
+            &defaults,
+            EvaluationPolicy::default(),
+            None,
+            Some(&limiter),
+            "local",
+            120,
+        ) {
             Authorization::Rejected(rejected) => {
                 assert_eq!(rejected.reason, "concurrency_limit");
                 assert_eq!(rejected.http_status, 429);

@@ -902,6 +902,8 @@ mod tests {
             negative_cache_secs: 60,
             pod_count: 1,
             client_ip_header: "x-forwarded-for".to_string(),
+            throttle_residual_secs: 60,
+            sweep_horizon_window_multiplier: 2,
             public_fallback: PublicFallbackConfig {
                 throughput_bytes_per_sec: 1,
                 burst_bytes: 1,

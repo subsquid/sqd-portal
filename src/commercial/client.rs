@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::metrics;
 
 use super::{
-    evaluate,
+    evaluate::{self, EvaluationPolicy},
     store::SnapshotStore,
     types::{Authorization, AuthorizeRequest, Granted, GrantedLimits, OnExceed, Principal},
     ConcurrencyLimiter, TallyStore,
@@ -43,6 +43,7 @@ pub struct LocalControlPlane {
     store: std::sync::Arc<SnapshotStore>,
     tally: std::sync::Arc<TallyStore>,
     concurrency: std::sync::Arc<ConcurrencyLimiter>,
+    policy: EvaluationPolicy,
 }
 
 impl LocalControlPlane {
@@ -50,11 +51,13 @@ impl LocalControlPlane {
         store: std::sync::Arc<SnapshotStore>,
         tally: std::sync::Arc<TallyStore>,
         concurrency: std::sync::Arc<ConcurrencyLimiter>,
+        policy: EvaluationPolicy,
     ) -> Self {
         Self {
             store,
             tally,
             concurrency,
+            policy,
         }
     }
 }
@@ -62,11 +65,12 @@ impl LocalControlPlane {
 #[async_trait]
 impl ControlPlaneClient for LocalControlPlane {
     async fn authorize(&self, req: AuthorizeRequest) -> Authorization {
-        let result = evaluate::evaluate_with_store(
+        let result = evaluate::evaluate_with_store_and_policy(
             &self.store,
             Some(&self.tally),
             Some(&self.concurrency),
             req,
+            self.policy,
         )
         .await;
         match &result {

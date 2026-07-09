@@ -35,9 +35,6 @@ impl ConcurrencyLimiter {
 
     pub fn try_acquire(&self, account_id: &str, global_limit: u64) -> Option<ConcurrencyPermit> {
         let permits = per_pod_permits(global_limit, self.pod_count);
-        if permits == 0 {
-            return None;
-        }
         let semaphore = self.semaphore(account_id, permits);
         semaphore
             .try_acquire_owned()

@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub use client::{ControlPlaneClient, LocalControlPlane, NoopControlPlane};
 pub use concurrency::ConcurrencyLimiter;
 pub use config::CommercialConfig;
+use evaluate::EvaluationPolicy;
 pub use extractor::CommercialGrant;
 pub use meter::MeterHandle;
 pub use registry::ActiveStreamRegistry;
@@ -70,7 +71,7 @@ pub fn build(config: Option<&CommercialConfig>, cancel: CancellationToken) -> Co
                 concurrency.clone(),
                 store.clone(),
                 Duration::from_secs(config.sync_interval_secs.max(1)),
-                Duration::from_secs(config.public_fallback.window_secs.max(1).saturating_mul(2)),
+                config.sweep_horizon(),
                 cancel.clone(),
             );
             BuildParts {
@@ -78,6 +79,9 @@ pub fn build(config: Option<&CommercialConfig>, cancel: CancellationToken) -> Co
                     store.clone(),
                     tally.clone(),
                     concurrency,
+                    EvaluationPolicy {
+                        throttle_residual_secs: config.throttle_residual_secs,
+                    },
                 )),
                 usage_reporter: reporter,
                 snapshot_store: Some(store),

@@ -428,6 +428,9 @@ sqd_network:
         );
         assert_eq!(commercial.pod_count, 4);
         assert_eq!(commercial.public_fallback.concurrency, 2);
+        assert_eq!(commercial.throttle_residual_secs, 60);
+        assert_eq!(commercial.sweep_horizon_window_multiplier, 2);
+        assert_eq!(commercial.sweep_horizon(), Duration::from_secs(172800));
         std::env::remove_var("PORTAL_CP_TOKEN_FOR_PARSE_TEST");
     }
 
