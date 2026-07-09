@@ -84,6 +84,127 @@ fn commercial_route_layer(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CommercialRouteDef {
+    method: CommercialRouteMethod,
+    path: &'static str,
+    endpoint_path: &'static str,
+    endpoint: Endpoint,
+    handler: CommercialRouteHandler,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommercialRouteMethod {
+    Get,
+    Post,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CommercialRouteHandler {
+    ArchivalStreamRestricted,
+    ArchivalStreamDebug,
+    FinalizedStream,
+    Stream,
+    TimestampBlock,
+    LegacyQuery,
+    #[cfg(feature = "sql")]
+    SqlQuery,
+}
+
+const COMMERCIAL_ROUTES: &[CommercialRouteDef] = &[
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/datasets/:dataset/archival-stream",
+        endpoint_path: "/archival-stream",
+        endpoint: Endpoint::ArchivalStream,
+        handler: CommercialRouteHandler::ArchivalStreamRestricted,
+    },
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/datasets/:dataset/archival-stream/debug",
+        endpoint_path: "/archival-stream/debug",
+        endpoint: Endpoint::ArchivalStream,
+        handler: CommercialRouteHandler::ArchivalStreamDebug,
+    },
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/datasets/:dataset/finalized-stream",
+        endpoint_path: "/finalized-stream",
+        endpoint: Endpoint::FinalizedStream,
+        handler: CommercialRouteHandler::FinalizedStream,
+    },
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/datasets/:dataset/stream",
+        endpoint_path: "/stream",
+        endpoint: Endpoint::Stream,
+        handler: CommercialRouteHandler::Stream,
+    },
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Get,
+        path: "/datasets/:dataset/timestamps/:timestamp/block",
+        endpoint_path: "/timestamps/block",
+        endpoint: Endpoint::TsLookup,
+        handler: CommercialRouteHandler::TimestampBlock,
+    },
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/datasets/:dataset_id/query/:worker_id",
+        endpoint_path: "/query",
+        endpoint: Endpoint::LegacyQuery,
+        handler: CommercialRouteHandler::LegacyQuery,
+    },
+    #[cfg(feature = "sql")]
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/sql/query",
+        endpoint_path: "/sql/query",
+        endpoint: Endpoint::SqlQuery,
+        handler: CommercialRouteHandler::SqlQuery,
+    },
+];
+
+fn register_commercial_routes<F>(
+    mut router: Router,
+    commercial_enabled: bool,
+    mut route_for: F,
+) -> Router
+where
+    F: FnMut(CommercialRouteDef) -> MethodRouter,
+{
+    for def in COMMERCIAL_ROUTES {
+        router = router.route(
+            def.path,
+            commercial_route_layer(route_for(*def), commercial_enabled, def.endpoint)
+                .endpoint(def.endpoint_path),
+        );
+    }
+    router
+}
+
+#[allow(deprecated)]
+fn production_commercial_route(def: CommercialRouteDef) -> MethodRouter {
+    match (def.method, def.handler) {
+        (CommercialRouteMethod::Post, CommercialRouteHandler::ArchivalStreamRestricted) => {
+            post(run_archival_stream_restricted)
+        }
+        (CommercialRouteMethod::Post, CommercialRouteHandler::ArchivalStreamDebug) => {
+            post(run_archival_stream)
+        }
+        (CommercialRouteMethod::Post, CommercialRouteHandler::FinalizedStream) => {
+            post(run_finalized_stream)
+        }
+        (CommercialRouteMethod::Post, CommercialRouteHandler::Stream) => post(run_stream),
+        (CommercialRouteMethod::Get, CommercialRouteHandler::TimestampBlock) => {
+            get(get_blocknumber_by_timestamp)
+        }
+        (CommercialRouteMethod::Post, CommercialRouteHandler::LegacyQuery) => post(execute_query),
+        #[cfg(feature = "sql")]
+        (CommercialRouteMethod::Post, CommercialRouteHandler::SqlQuery) => post(sql_query),
+        _ => unreachable!("commercial route method and handler are inconsistent"),
+    }
+}
+
 fn build_openapi_spec(show_internal: bool) -> utoipa::openapi::OpenApi {
     let mut spec = ApiDoc::openapi();
     spec.paths.paths.retain(|_, item| {
@@ -155,40 +276,8 @@ pub async fn run_server(
         )
         // Portal status
         .route("/status", get(get_status).endpoint("/status"))
-        .route("/datasets", get(get_datasets).endpoint("/datasets"))
-        // Streaming data
-        .route(
-            "/datasets/:dataset/archival-stream",
-            commercial_route_layer(
-                post(run_archival_stream_restricted),
-                commercial_enabled,
-                Endpoint::ArchivalStream,
-            )
-            .endpoint("/archival-stream"),
-        )
-        .route(
-            "/datasets/:dataset/archival-stream/debug",
-            commercial_route_layer(
-                post(run_archival_stream),
-                commercial_enabled,
-                Endpoint::ArchivalStream,
-            )
-            .endpoint("/archival-stream/debug"),
-        )
-        .route(
-            "/datasets/:dataset/finalized-stream",
-            commercial_route_layer(
-                post(run_finalized_stream),
-                commercial_enabled,
-                Endpoint::FinalizedStream,
-            )
-            .endpoint("/finalized-stream"),
-        )
-        .route(
-            "/datasets/:dataset/stream",
-            commercial_route_layer(post(run_stream), commercial_enabled, Endpoint::Stream)
-                .endpoint("/stream"),
-        )
+        .route("/datasets", get(get_datasets).endpoint("/datasets"));
+    let app = register_commercial_routes(app, commercial_enabled, production_commercial_route)
         // Getting head
         .route(
             "/datasets/:dataset/archival-head",
@@ -212,15 +301,6 @@ pub async fn run_server(
             "/datasets/:dataset/metadata",
             get(get_dataset_metadata).endpoint("/metadata"),
         )
-        .route(
-            "/datasets/:dataset/timestamps/:timestamp/block",
-            commercial_route_layer(
-                get(get_blocknumber_by_timestamp),
-                commercial_enabled,
-                Endpoint::TsLookup,
-            )
-            .endpoint("/timestamps/block"),
-        )
         // Backward compatibility routes
         .route(
             "/datasets/:dataset/finalized-stream/height",
@@ -229,15 +309,6 @@ pub async fn run_server(
         .route(
             "/datasets/:dataset/archival-stream/height",
             get(get_archival_stream_height).endpoint("/height"),
-        )
-        .route(
-            "/datasets/:dataset_id/query/:worker_id",
-            commercial_route_layer(
-                post(execute_query),
-                commercial_enabled,
-                Endpoint::LegacyQuery,
-            )
-            .endpoint("/query"),
         )
         .route(
             "/datasets/:dataset/height",
@@ -263,13 +334,7 @@ pub async fn run_server(
 
     // SQL Query Engine
     #[cfg(feature = "sql")]
-    let app = app
-        .route(
-            "/sql/query",
-            commercial_route_layer(post(sql_query), commercial_enabled, Endpoint::SqlQuery)
-                .endpoint("/sql/query"),
-        )
-        .route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
+    let app = app.route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
 
     let drain_timeout = config.drain_timeout;
 
@@ -1504,6 +1569,38 @@ mod tests {
             .unwrap()
     }
 
+    fn test_commercial_route(def: CommercialRouteDef) -> MethodRouter {
+        let route = match def.method {
+            CommercialRouteMethod::Get => get(metered_test_handler),
+            CommercialRouteMethod::Post => post(metered_test_handler),
+        };
+        route.layer(Extension(def.endpoint))
+    }
+
+    fn http_method(method: CommercialRouteMethod) -> Method {
+        match method {
+            CommercialRouteMethod::Get => Method::GET,
+            CommercialRouteMethod::Post => Method::POST,
+        }
+    }
+
+    fn sample_path(def: CommercialRouteDef) -> &'static str {
+        match def.path {
+            "/datasets/:dataset/archival-stream" => "/datasets/ethereum-mainnet/archival-stream",
+            "/datasets/:dataset/archival-stream/debug" => {
+                "/datasets/ethereum-mainnet/archival-stream/debug"
+            }
+            "/datasets/:dataset/finalized-stream" => "/datasets/ethereum-mainnet/finalized-stream",
+            "/datasets/:dataset/stream" => "/datasets/ethereum-mainnet/stream",
+            "/datasets/:dataset/timestamps/:timestamp/block" => {
+                "/datasets/ethereum-mainnet/timestamps/1/block"
+            }
+            "/datasets/:dataset_id/query/:worker_id" => "/datasets/ethereum-mainnet/query/worker",
+            "/sql/query" => "/sql/query",
+            path => unreachable!("missing commercial route test sample for {path}"),
+        }
+    }
+
     #[tokio::test]
     async fn commercial_disabled_skips_extractor_and_meter_on_metered_route() {
         let reporter = Arc::new(RecordingReporter::default());
@@ -1644,77 +1741,91 @@ mod tests {
     #[tokio::test]
     async fn commercial_enabled_meters_all_metered_route_identities() {
         let query = r#"{"type":"evm","fromBlock":1,"fields":{"block":{"number":true}}}"#;
-        let cases = [
+        let expected = vec![
             (
-                Method::POST,
-                "/datasets/ethereum-mainnet/archival-stream",
+                CommercialRouteMethod::Post,
+                "/datasets/:dataset/archival-stream",
                 Endpoint::ArchivalStream,
-                Some(query),
             ),
             (
-                Method::POST,
-                "/datasets/ethereum-mainnet/archival-stream/debug",
+                CommercialRouteMethod::Post,
+                "/datasets/:dataset/archival-stream/debug",
                 Endpoint::ArchivalStream,
-                Some(query),
             ),
             (
-                Method::POST,
-                "/datasets/ethereum-mainnet/finalized-stream",
+                CommercialRouteMethod::Post,
+                "/datasets/:dataset/finalized-stream",
                 Endpoint::FinalizedStream,
-                Some(query),
             ),
             (
-                Method::POST,
-                "/datasets/ethereum-mainnet/stream",
+                CommercialRouteMethod::Post,
+                "/datasets/:dataset/stream",
                 Endpoint::Stream,
-                Some(query),
             ),
             (
-                Method::GET,
-                "/datasets/ethereum-mainnet/timestamps/1/block",
+                CommercialRouteMethod::Get,
+                "/datasets/:dataset/timestamps/:timestamp/block",
                 Endpoint::TsLookup,
-                None,
             ),
             (
-                Method::POST,
-                "/datasets/ethereum-mainnet/query/worker",
+                CommercialRouteMethod::Post,
+                "/datasets/:dataset_id/query/:worker_id",
                 Endpoint::LegacyQuery,
-                Some(query),
             ),
-            (Method::POST, "/sql/query", Endpoint::SqlQuery, None),
+            #[cfg(feature = "sql")]
+            (
+                CommercialRouteMethod::Post,
+                "/sql/query",
+                Endpoint::SqlQuery,
+            ),
         ];
+        let actual = COMMERCIAL_ROUTES
+            .iter()
+            .map(|def| (def.method, def.path, def.endpoint))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
 
-        for (method, path, endpoint, body) in cases {
-            let reporter = Arc::new(RecordingReporter::default());
-            let route = match method {
-                Method::GET => get(metered_test_handler),
-                Method::POST => post(metered_test_handler),
-                _ => unreachable!("test only covers GET/POST"),
+        let reporter = Arc::new(RecordingReporter::default());
+        let app = register_commercial_routes(axum::Router::new(), true, test_commercial_route)
+            .layer(Extension(reporter.clone() as Arc<dyn UsageReporter>))
+            .layer(Extension(
+                Arc::new(GrantingControlPlane) as Arc<dyn ControlPlaneClient>
+            ));
+
+        for def in COMMERCIAL_ROUTES {
+            let body = if matches!(
+                def.endpoint,
+                Endpoint::Stream
+                    | Endpoint::FinalizedStream
+                    | Endpoint::ArchivalStream
+                    | Endpoint::LegacyQuery
+            ) {
+                Some(query)
+            } else {
+                None
             };
-            let app = axum::Router::new()
-                .route(path, commercial_route_layer(route, true, endpoint))
-                .layer(Extension(endpoint))
-                .layer(Extension(reporter.clone() as Arc<dyn UsageReporter>))
-                .layer(Extension(
-                    Arc::new(GrantingControlPlane) as Arc<dyn ControlPlaneClient>
-                ));
-
             let response = app
+                .clone()
                 .oneshot(
                     Request::builder()
-                        .method(method)
-                        .uri(format!("{path}?api_key=sqd_data_key_secret"))
+                        .method(http_method(def.method))
+                        .uri(format!("{}?api_key=sqd_data_key_secret", sample_path(*def)))
                         .body(body.map_or_else(Body::empty, Body::from))
                         .unwrap(),
                 )
                 .await
                 .unwrap();
 
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-            assert_eq!(response.headers()["x-meter-created"], "true", "{path}");
+            assert_eq!(response.status(), StatusCode::OK, "{}", def.path);
+            assert_eq!(
+                response.headers()["x-meter-created"],
+                "true",
+                "{}",
+                def.path
+            );
             let event = reporter.events.lock().unwrap().pop().expect("usage event");
-            assert_eq!(event.endpoint, endpoint, "{path}");
-            assert_eq!(event.logical_bytes, 12, "{path}");
+            assert_eq!(event.endpoint, def.endpoint, "{}", def.path);
+            assert_eq!(event.logical_bytes, 12, "{}", def.path);
         }
     }
 
