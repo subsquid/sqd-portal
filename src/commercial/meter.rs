@@ -3,7 +3,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     task::{Context, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -74,7 +74,7 @@ impl MeterHandle {
                 status: AtomicU8::new(status_code(UsageStatus::ClientDisconnect)),
                 flushed: AtomicBool::new(false),
                 reporter,
-                pod: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
+                pod: pod_hostname().to_string(),
                 quota_version,
             }),
         }
@@ -382,6 +382,13 @@ fn uuid_v7() -> String {
         now.subsec_nanos(),
     ))
     .to_string()
+}
+
+fn pod_hostname() -> &'static str {
+    static HOSTNAME: OnceLock<String> = OnceLock::new();
+    HOSTNAME
+        .get_or_init(|| std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()))
+        .as_str()
 }
 
 fn seconds_since_epoch(time: SystemTime) -> f64 {

@@ -568,8 +568,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "tokio 1.48.0",
- "zstd 0.13.3",
- "zstd-safe 7.2.4",
 ]
 
 [[package]]

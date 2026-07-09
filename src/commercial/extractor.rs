@@ -27,32 +27,39 @@ pub async fn middleware(mut req: Request, next: Next, endpoint: Endpoint) -> Res
         Credential::Key { key_id, .. } => key_id.clone(),
         _ => "-".to_string(),
     };
-    let client = req
+    let granted = match req
         .extensions()
         .get::<Arc<dyn ControlPlaneClient>>()
-        .expect("ControlPlaneClient extension should be installed")
-        .clone();
-    let authorization = client
-        .authorize(AuthorizeRequest {
-            credential,
-            dataset,
-            endpoint,
-            query: QueryDescriptor {
-                requires_traces: false,
-                requires_statediffs: false,
-                first_block: None,
-                chain_kind: None,
-            },
-        })
-        .await;
-    let granted = match authorization {
-        Authorization::Granted(granted) => granted,
-        Authorization::Rejected(rejected) => {
-            tracing::warn!(
-                reason = rejected.reason,
-                status = rejected.http_status,
-                "commercial authorization rejected during attribution-only phase"
-            );
+        .cloned()
+    {
+        Some(client) => {
+            let authorization = client
+                .authorize(AuthorizeRequest {
+                    credential,
+                    dataset,
+                    endpoint,
+                    query: QueryDescriptor {
+                        requires_traces: false,
+                        requires_statediffs: false,
+                        first_block: None,
+                        chain_kind: None,
+                    },
+                })
+                .await;
+            match authorization {
+                Authorization::Granted(granted) => granted,
+                Authorization::Rejected(rejected) => {
+                    tracing::warn!(
+                        reason = rejected.reason,
+                        status = rejected.http_status,
+                        "commercial authorization rejected during attribution-only phase"
+                    );
+                    oss_grant()
+                }
+            }
+        }
+        None => {
+            tracing::warn!("commercial control-plane client extension missing; falling back to OSS attribution");
             oss_grant()
         }
     };
@@ -130,7 +137,12 @@ fn dataset_from_path(path: &str, endpoint: &Endpoint) -> String {
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::Body, http::Request as HttpRequest, middleware::from_fn, routing::get};
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request as HttpRequest,
+        middleware::from_fn,
+        routing::get,
+    };
     use tower::ServiceExt;
 
     use super::*;
@@ -220,5 +232,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn middleware_falls_back_to_oss_when_client_extension_is_missing() {
+        let app = axum::Router::new()
+            .route(
+                "/datasets/ethereum-mainnet/stream",
+                get(
+                    |axum::Extension(principal): axum::Extension<Principal>| async move {
+                        principal.account_id
+                    },
+                ),
+            )
+            .route_layer(from_fn(|req, next| middleware(req, next, Endpoint::Stream)));
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/datasets/ethereum-mainnet/stream?api_key={TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"oss");
     }
 }

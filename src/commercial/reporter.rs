@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -13,6 +13,7 @@ use super::{config::CommercialConfig, types::StreamUsageEvent};
 use crate::metrics;
 
 const MAX_RETRY_ATTEMPTS: usize = 5;
+const USAGE_PATH_SEGMENTS: [&str; 4] = ["internal", "portal", "v1", "usage"];
 
 pub trait UsageReporter: Send + Sync {
     fn report(&self, event: StreamUsageEvent);
@@ -178,12 +179,7 @@ impl BufferedUsageReporter {
     }
 
     async fn send_once(&self, batch: &[StreamUsageEvent]) -> Result<(), SendBatchError> {
-        let url = self
-            .inner
-            .options
-            .control_plane_url
-            .join("/internal/portal/v1/usage")
-            .map_err(|err| SendBatchError::Retry(err.to_string()))?;
+        let url = usage_url(&self.inner.options.control_plane_url)?;
         let response = self
             .inner
             .client
@@ -206,11 +202,11 @@ impl BufferedUsageReporter {
     }
 
     fn queue_len(&self) -> usize {
-        self.inner.queue.lock().unwrap().len()
+        self.lock_queue().len()
     }
 
     fn pop_batch(&self) -> Option<Vec<StreamUsageEvent>> {
-        let mut queue = self.inner.queue.lock().unwrap();
+        let mut queue = self.lock_queue();
         if queue.is_empty() {
             return None;
         }
@@ -220,7 +216,7 @@ impl BufferedUsageReporter {
     }
 
     fn push_front_batch(&self, mut batch: Vec<StreamUsageEvent>) {
-        let mut queue = self.inner.queue.lock().unwrap();
+        let mut queue = self.lock_queue();
         while let Some(event) = batch.pop() {
             queue.push_front(event);
         }
@@ -229,11 +225,23 @@ impl BufferedUsageReporter {
             metrics::report_commercial_usage_dropped();
         }
     }
+
+    fn lock_queue(&self) -> MutexGuard<'_, VecDeque<StreamUsageEvent>> {
+        match self.inner.queue.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "commercial usage reporter queue lock poisoned; recovering buffered events"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
 }
 
 impl UsageReporter for BufferedUsageReporter {
     fn report(&self, event: StreamUsageEvent) {
-        let mut queue = self.inner.queue.lock().unwrap();
+        let mut queue = self.lock_queue();
         if queue.len() >= self.inner.options.capacity {
             queue.pop_front();
             metrics::report_commercial_usage_dropped();
@@ -242,6 +250,19 @@ impl UsageReporter for BufferedUsageReporter {
         drop(queue);
         self.inner.notify.notify_one();
     }
+}
+
+fn usage_url(base: &url::Url) -> Result<url::Url, SendBatchError> {
+    let mut url = base.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|_| SendBatchError::Retry("control plane URL cannot be a base".to_string()))?;
+    segments.pop_if_empty();
+    segments.extend(USAGE_PATH_SEGMENTS);
+    drop(segments);
+    Ok(url)
 }
 
 #[derive(Debug)]
@@ -345,6 +366,16 @@ mod tests {
             flush_max_events,
             capacity,
         })
+    }
+
+    #[test]
+    fn usage_url_appends_to_existing_base_path() {
+        let url = usage_url(&"https://control.example.com/base/api/".parse().unwrap()).unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://control.example.com/base/api/internal/portal/v1/usage"
+        );
     }
 
     #[tokio::test]
