@@ -61,7 +61,7 @@ struct MeterInner {
     tally: Option<Arc<TallyStore>>,
     kill: Arc<AtomicBool>,
     floor_bytes_per_sec: Arc<AtomicU64>,
-    bucket: Option<AsyncMutex<TokenBucket>>,
+    bucket: AsyncMutex<Option<TokenBucket>>,
     _registration: Option<StreamRegistration>,
     _concurrency_permit: Option<ConcurrencyPermit>,
 }
@@ -145,7 +145,7 @@ impl MeterHandle {
         let tally_account_id = tally_account_id.unwrap_or_else(|| principal.account_id.clone());
         let kill = Arc::new(AtomicBool::new(false));
         let floor_bytes_per_sec = Arc::new(AtomicU64::new(0));
-        let bucket = bucket_from_limits(&limits);
+        let bucket = AsyncMutex::new(bucket_from_limits(&limits));
         let registration = registry.as_ref().map(|registry| {
             registry.register(
                 event_id.clone(),
@@ -326,16 +326,18 @@ impl MeterInner {
     }
 
     async fn pace(&self, bytes: u64) {
-        let Some(bucket) = &self.bucket else {
-            return;
-        };
         let mut warned = false;
         loop {
             let Some((rate, burst)) = self.current_rate_and_burst() else {
                 return;
             };
             let wait = {
-                let mut bucket = bucket.lock().await;
+                let mut bucket = self.bucket.lock().await;
+                let bucket = bucket.get_or_insert_with(|| TokenBucket {
+                    available: burst,
+                    burst,
+                    last: TokioInstant::now(),
+                });
                 bucket.refill(rate, burst);
                 if bucket.available > 0.0 {
                     bucket.available -= bytes as f64;
@@ -624,17 +626,17 @@ fn gzip_len(bytes: &[u8]) -> anyhow::Result<u64> {
     Ok(decoded.len() as u64)
 }
 
-fn bucket_from_limits(limits: &GrantedLimits) -> Option<AsyncMutex<TokenBucket>> {
+fn bucket_from_limits(limits: &GrantedLimits) -> Option<TokenBucket> {
     let rate = limits.throughput_bytes_per_sec?;
     if rate == 0 {
         return None;
     }
     let burst = limits.burst_bytes.unwrap_or(rate).max(1);
-    Some(AsyncMutex::new(TokenBucket {
+    Some(TokenBucket {
         available: burst as f64,
         burst: burst as f64,
         last: TokioInstant::now(),
-    }))
+    })
 }
 
 impl TokenBucket {
@@ -1173,6 +1175,33 @@ mod tests {
                 burst_bytes: Some(100),
                 ..GrantedLimits::default()
             },
+            OnExceed::Throttle {
+                floor_bytes_per_sec: 1,
+            },
+            Some(1),
+        );
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"xx")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"y")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"z")),
+        ];
+        let start = tokio::time::Instant::now();
+
+        let output = tap_plain_stream(stream::iter(chunks), meter);
+        let emitted: Vec<_> = output.collect().await;
+
+        assert_eq!(emitted.len(), 3);
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn throttle_floor_installs_bucket_for_unlimited_grant() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, _, _) = enforced_meter(
+            reporter.clone(),
+            GrantedLimits::default(),
             OnExceed::Throttle {
                 floor_bytes_per_sec: 1,
             },
