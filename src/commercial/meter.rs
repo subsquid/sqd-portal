@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read},
+    io::{self, Read, Write},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
@@ -183,17 +183,46 @@ where
     S: Stream<Item = Vec<u8>> + Send + 'static,
 {
     stream! {
+        let mut zstd_decoder = match compression {
+            Compression::Gzip => None,
+            Compression::Zstd => match zstd::stream::write::Decoder::new(ZstdLogicalByteCounter {
+                meter: meter.clone(),
+            }) {
+                Ok(decoder) => Some(decoder),
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to initialize zstd usage decoder");
+                    meter.mark_error();
+                    None
+                }
+            },
+        };
         futures::pin_mut!(input);
         while let Some(frame) = input.next().await {
             meter.add_chunk();
-            match logical_len(&frame, compression) {
-                Ok(len) => meter.add_logical_bytes(len),
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to decode portal usage frame for logical byte count");
-                    meter.mark_error();
+            match compression {
+                Compression::Gzip => match gzip_len(&frame) {
+                    Ok(len) => meter.add_logical_bytes(len),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to decode portal usage gzip frame for logical byte count");
+                        meter.mark_error();
+                    }
+                },
+                Compression::Zstd => {
+                    if let Some(decoder) = &mut zstd_decoder {
+                        if let Err(err) = decoder.write_all(&frame) {
+                            tracing::warn!(error = %err, "failed to decode portal usage zstd stream for logical byte count");
+                            meter.mark_error();
+                        }
+                    }
                 }
             }
             yield frame;
+        }
+        if let Some(mut decoder) = zstd_decoder {
+            if let Err(err) = decoder.flush() {
+                tracing::warn!(error = %err, "failed to finish zstd stream usage decoder");
+                meter.mark_error();
+            }
         }
     }
 }
@@ -321,10 +350,18 @@ impl AsyncWrite for LogicalByteCounter {
     }
 }
 
-fn logical_len(bytes: &[u8], compression: Compression) -> anyhow::Result<u64> {
-    match compression {
-        Compression::Gzip => gzip_len(bytes),
-        Compression::Zstd => Ok(zstd::stream::decode_all(bytes)?.len() as u64),
+struct ZstdLogicalByteCounter {
+    meter: MeterHandle,
+}
+
+impl Write for ZstdLogicalByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.meter.add_logical_bytes(buf.len() as u64);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -477,6 +514,25 @@ mod tests {
         assert_eq!(event.logical_bytes, data.len() as u64);
         assert_eq!(event.wire_bytes, wire);
         assert_eq!(event.chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn zstd_tap_counts_split_frame_across_chunks() {
+        let data = b"{\"split\":true,\"frame\":\"zstd\"}\n";
+        let frame = zstd::stream::encode_all(&data[..], 0).unwrap();
+        let split = frame.len() / 2;
+        let wire = frame.len() as u64;
+
+        let event = drive_metered_frames(
+            vec![frame[..split].to_vec(), frame[split..].to_vec()],
+            Compression::Zstd,
+        )
+        .await;
+
+        assert_eq!(event.logical_bytes, data.len() as u64);
+        assert_eq!(event.wire_bytes, wire);
+        assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::Completed);
     }
 
     #[test]
