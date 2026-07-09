@@ -1,9 +1,11 @@
 use std::time::Duration;
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use serde::Serialize;
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
+
+use crate::commercial::Rejected;
 
 #[derive(thiserror::Error, Debug)]
 pub enum RequestError {
@@ -23,6 +25,20 @@ pub enum RequestError {
     BusyFor(Duration),
     #[error("Base block mismatch")]
     BaseBlockMismatch(sqd_primitives::BlockRef),
+    #[error("{0}")]
+    Unauthorized(String),
+    #[error("{message}")]
+    PaymentRequired {
+        message: String,
+        retry_after: Option<u64>,
+    },
+    #[error("{0}")]
+    Forbidden(String),
+    #[error("{message}")]
+    TooManyRequests {
+        message: String,
+        retry_after: Option<u64>,
+    },
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -108,6 +124,38 @@ impl axum::response::IntoResponse for RequestError {
                 });
                 return (StatusCode::CONFLICT, axum::Json(body)).into_response();
             }
+
+            Self::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message).into_response(),
+
+            Self::PaymentRequired {
+                message,
+                retry_after,
+            } => {
+                let mut response = (StatusCode::PAYMENT_REQUIRED, message).into_response();
+                if let Some(retry_after) = retry_after {
+                    response.headers_mut().insert(
+                        header::RETRY_AFTER,
+                        HeaderValue::from_str(&retry_after.to_string()).unwrap(),
+                    );
+                }
+                response
+            }
+
+            Self::Forbidden(message) => (StatusCode::FORBIDDEN, message).into_response(),
+
+            Self::TooManyRequests {
+                message,
+                retry_after,
+            } => {
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, message).into_response();
+                if let Some(retry_after) = retry_after {
+                    response.headers_mut().insert(
+                        header::RETRY_AFTER,
+                        HeaderValue::from_str(&retry_after.to_string()).unwrap(),
+                    );
+                }
+                response
+            }
         };
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -126,6 +174,28 @@ impl RequestError {
             Self::Failure(_) => "failure",
             Self::Unavailable | Self::BusyFor(_) | Self::RateLimitExceeded => "overloaded",
             Self::BaseBlockMismatch(_) => "base_block_mismatch",
+            Self::Unauthorized(_) => "unauthorized",
+            Self::PaymentRequired { .. } => "payment_required",
+            Self::Forbidden(_) => "forbidden",
+            Self::TooManyRequests { .. } => "too_many_requests",
+        }
+    }
+}
+
+impl From<Rejected> for RequestError {
+    fn from(rejected: Rejected) -> Self {
+        match rejected.http_status {
+            401 => Self::Unauthorized(rejected.message),
+            402 => Self::PaymentRequired {
+                message: rejected.message,
+                retry_after: rejected.retry_after_secs,
+            },
+            403 => Self::Forbidden(rejected.message),
+            429 => Self::TooManyRequests {
+                message: rejected.message,
+                retry_after: rejected.retry_after_secs,
+            },
+            _ => Self::Forbidden(rejected.message),
         }
     }
 }

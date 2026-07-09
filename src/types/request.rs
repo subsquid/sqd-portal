@@ -58,6 +58,32 @@ impl ParsedQuery {
         }
     }
 
+    pub fn requires_traces(&self) -> bool {
+        match &self.parsed {
+            Query::Eth(q) => q.requires_traces(),
+            _ => false,
+        }
+    }
+
+    pub fn requires_statediffs(&self) -> bool {
+        match &self.parsed {
+            Query::Eth(q) => q.requires_statediffs(),
+            _ => false,
+        }
+    }
+
+    pub fn chain_kind(&self) -> &'static str {
+        match &self.parsed {
+            Query::Eth(_) => "evm",
+            Query::Solana(_) => "solana",
+            Query::Substrate(_) => "substrate",
+            Query::Bitcoin(_) => "bitcoin",
+            Query::Fuel(_) => "fuel",
+            Query::HyperliquidFills(_) | Query::HyperliquidReplicaCmds(_) => "hyperliquid",
+            Query::Tron(_) => "tron",
+        }
+    }
+
     pub fn intersect_with(&self, range: &BlockRange) -> Option<BlockRange> {
         let begin = std::cmp::max(*range.start(), self.first_block());
         let end = if let Some(last_block) = self.last_block() {

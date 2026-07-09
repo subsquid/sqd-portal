@@ -1,11 +1,9 @@
 use async_trait::async_trait;
 
 use super::{
+    evaluate,
     store::SnapshotStore,
-    types::{
-        Authorization, AuthorizeRequest, Credential, Granted, GrantedLimits, OnExceed, Principal,
-        Rejected,
-    },
+    types::{Authorization, AuthorizeRequest, Granted, GrantedLimits, OnExceed, Principal},
 };
 
 #[async_trait]
@@ -48,18 +46,7 @@ impl LocalControlPlane {
 #[async_trait]
 impl ControlPlaneClient for LocalControlPlane {
     async fn authorize(&self, req: AuthorizeRequest) -> Authorization {
-        if let Credential::Key { key_id, .. } = &req.credential {
-            if self.store.get_or_resolve(key_id).await.is_none() {
-                return Authorization::Rejected(Rejected {
-                    reason: "invalid_key".to_string(),
-                    http_status: 401,
-                    message: "Invalid API key".to_string(),
-                    retry_after_secs: None,
-                });
-            }
-        }
-
-        Authorization::Granted(oss_grant())
+        evaluate::evaluate_with_store(&self.store, req).await
     }
 }
 

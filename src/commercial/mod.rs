@@ -13,6 +13,7 @@ pub use types::*;
 
 mod client;
 mod config;
+pub mod evaluate;
 pub mod extractor;
 pub mod meter;
 mod reporter;
