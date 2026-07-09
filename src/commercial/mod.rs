@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use client::{ControlPlaneClient, LocalControlPlane, NoopControlPlane};
 pub use concurrency::ConcurrencyLimiter;
-pub use config::CommercialConfig;
+pub use config::{CommercialConfig, PublicFallbackConfig};
 use evaluate::EvaluationPolicy;
 pub use extractor::CommercialGrant;
 pub use meter::MeterHandle;

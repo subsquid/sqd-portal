@@ -216,6 +216,11 @@ impl SnapshotStore {
             .insert(key_id.to_string(), Instant::now() + ttl);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_ready_for_test(&self, ready: bool) {
+        self.inner.ready.store(ready, Ordering::Release);
+    }
+
     async fn run_sync_loop(self: Arc<Self>, cancel: CancellationToken) {
         loop {
             let _ = self.run_sync_tick().await;
@@ -674,7 +679,9 @@ pub mod test_support {
     struct MockState {
         pages: Mutex<VecDeque<MockPage>>,
         resolves: Mutex<HashMap<String, Option<KeySnapshot>>>,
+        resolve_statuses: Mutex<HashMap<String, StatusCode>>,
         resolve_calls: Mutex<Vec<String>>,
+        resolve_bodies: Mutex<Vec<serde_json::Value>>,
         usage_batches: Mutex<Vec<Vec<StreamUsageEvent>>>,
     }
 
@@ -689,11 +696,6 @@ pub mod test_support {
         cursor: u64,
         #[allow(dead_code)]
         limit: Option<u16>,
-    }
-
-    #[derive(Deserialize)]
-    struct ResolveBody {
-        key_id: String,
     }
 
     impl MockControlPlane {
@@ -736,8 +738,20 @@ pub mod test_support {
                 .insert(key_id.to_string(), record);
         }
 
+        pub fn resolve_status(&self, key_id: &str, status: StatusCode) {
+            self.state
+                .resolve_statuses
+                .lock()
+                .unwrap()
+                .insert(key_id.to_string(), status);
+        }
+
         pub fn resolve_calls(&self) -> Vec<String> {
             self.state.resolve_calls.lock().unwrap().clone()
+        }
+
+        pub fn resolve_bodies(&self) -> Vec<serde_json::Value> {
+            self.state.resolve_bodies.lock().unwrap().clone()
         }
 
         pub fn usage_batches(&self) -> Vec<Vec<StreamUsageEvent>> {
@@ -847,17 +861,22 @@ pub mod test_support {
     async fn resolve(
         State(state): State<Arc<MockState>>,
         headers: HeaderMap,
-        Json(request): Json<ResolveBody>,
+        Json(body): Json<serde_json::Value>,
     ) -> Result<Json<KeySnapshot>, StatusCode> {
         if !authorized(&headers) {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        state
-            .resolve_calls
-            .lock()
-            .unwrap()
-            .push(request.key_id.to_string());
-        let record = state.resolves.lock().unwrap().get(&request.key_id).cloned();
+        state.resolve_bodies.lock().unwrap().push(body.clone());
+        let key_id = body
+            .get("key_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        state.resolve_calls.lock().unwrap().push(key_id.clone());
+        if let Some(status) = state.resolve_statuses.lock().unwrap().get(&key_id) {
+            return Err(*status);
+        }
+        let record = state.resolves.lock().unwrap().get(&key_id).cloned();
         match record {
             Some(Some(record)) => Ok(Json(record)),
             _ => Err(StatusCode::NOT_FOUND),
@@ -884,6 +903,24 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::{test_support::*, *};
+    use bytes::Bytes;
+    use futures::{stream, StreamExt};
+
+    use crate::commercial::{
+        meter::tap_plain_stream, Endpoint, Granted, GrantedLimits, MeterHandle, Principal,
+        StreamUsageEvent, UsageReporter, UsageStatus,
+    };
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: Mutex<Vec<StreamUsageEvent>>,
+    }
+
+    impl UsageReporter for RecordingReporter {
+        fn report(&self, event: StreamUsageEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     fn config(
         mock: &MockControlPlane,
@@ -1118,6 +1155,50 @@ mod tests {
         let _ = tokio::fs::remove_file(path).await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn suspension_kill_cuts_stream_within_one_interval_and_chunk() {
+        let tally = Arc::new(TallyStore::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = MeterHandle::new_enforced(
+            Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: Some(KEY_ID.to_string()),
+                },
+                tally_account_id: None,
+                limits: GrantedLimits::default(),
+                on_exceed: OnExceed::Reject,
+                quota_version: 1,
+                quota_remaining_bytes: Some(1_000),
+                concurrency_permit: None,
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter.clone(),
+            tally,
+            registry.clone(),
+        );
+        let start = tokio::time::Instant::now();
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(registry.kill_key(KEY_ID), 1);
+
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"first")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"second")),
+        ];
+        let emitted: Vec<_> = tap_plain_stream(stream::iter(chunks), meter)
+            .collect()
+            .await;
+
+        assert_eq!(emitted.len(), 1);
+        assert!(start.elapsed() <= Duration::from_secs(1));
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.status, UsageStatus::CutSuspended);
+    }
+
     #[tokio::test]
     async fn reset_rebootstraps_without_clearing_serving_store_first() {
         std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
@@ -1182,6 +1263,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_server_error_and_network_error_fail_closed() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        mock.resolve_status("server-error", StatusCode::INTERNAL_SERVER_ERROR);
+        let path = cache_path("resolve-5xx");
+        let (store, task) =
+            SnapshotStore::spawn(&config(&mock, path.clone(), 10), CancellationToken::new())
+                .unwrap();
+        store.inner.ready.store(true, Ordering::Release);
+
+        assert!(store.get_or_resolve("server-error").await.is_none());
+        assert_eq!(mock.resolve_calls(), vec!["server-error".to_string()]);
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let network_path = cache_path("resolve-network-error");
+        let mut config = config(&mock, network_path.clone(), 10);
+        config.control_plane_url = format!("http://{addr}").parse().unwrap();
+        let (store, task) = SnapshotStore::spawn(&config, CancellationToken::new()).unwrap();
+        store.inner.ready.store(true, Ordering::Release);
+
+        assert!(store.get_or_resolve("network-error").await.is_none());
+
+        task.abort();
+        let _ = tokio::fs::remove_file(network_path).await;
+    }
+
+    #[tokio::test]
     async fn resolve_hit_inserts_record() {
         std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
         let mock = MockControlPlane::spawn().await;
@@ -1199,6 +1311,14 @@ mod tests {
         assert_eq!(record.key_id, "fresh-key");
         assert_eq!(store.get("fresh-key").unwrap().seq, 42);
         assert_eq!(mock.resolve_calls(), vec!["fresh-key".to_string()]);
+        assert_eq!(
+            mock.resolve_bodies(),
+            vec![serde_json::json!({ "key_id": "fresh-key" })]
+        );
+        let body = mock.resolve_bodies().pop().unwrap();
+        assert!(body.get("secret").is_none());
+        assert!(body.get("secret_sha256").is_none());
+        assert!(body.get("hash").is_none());
 
         task.abort();
         let _ = tokio::fs::remove_file(path).await;

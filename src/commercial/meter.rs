@@ -1172,6 +1172,36 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn null_or_zero_throughput_has_no_bucket_and_no_stall() {
+        for limits in [
+            GrantedLimits {
+                throughput_bytes_per_sec: None,
+                burst_bytes: Some(1),
+                ..GrantedLimits::default()
+            },
+            GrantedLimits {
+                throughput_bytes_per_sec: Some(0),
+                burst_bytes: Some(0),
+                ..GrantedLimits::default()
+            },
+        ] {
+            let reporter = Arc::new(RecordingReporter::default());
+            let (meter, _, _) = enforced_meter(reporter, limits, OnExceed::Reject, Some(100));
+            let chunks = vec![
+                Ok::<_, std::io::Error>(Bytes::from_static(b"a")),
+                Ok::<_, std::io::Error>(Bytes::from_static(b"b")),
+            ];
+            let start = tokio::time::Instant::now();
+
+            let output = tap_plain_stream(stream::iter(chunks), meter);
+            let emitted: Vec<_> = output.collect().await;
+
+            assert_eq!(emitted.len(), 2);
+            assert_eq!(start.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn oversized_chunk_creates_debt_without_deadlocking() {
         let reporter = Arc::new(RecordingReporter::default());
         let (meter, _, _) = enforced_meter(

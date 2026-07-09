@@ -863,6 +863,43 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_quota_rolls_over_on_fixed_window_boundary() {
+        let defaults = defaults();
+        let tally = TallyStore::default();
+        tally.debit("anon:local", 120, defaults.public.quota.volume_bytes);
+
+        match evaluate_anonymous_with_state(
+            &defaults,
+            EvaluationPolicy::default(),
+            Some(&tally),
+            None,
+            "local",
+            179,
+        ) {
+            Authorization::Rejected(rejected) => {
+                assert_eq!(rejected.reason, "anon_limited");
+                assert_eq!(rejected.retry_after_secs, Some(1));
+            }
+            Authorization::Granted(_) => panic!("expected current window to reject"),
+        }
+
+        match evaluate_anonymous_with_state(
+            &defaults,
+            EvaluationPolicy::default(),
+            Some(&tally),
+            None,
+            "local",
+            180,
+        ) {
+            Authorization::Granted(grant) => {
+                assert_eq!(grant.tally_account_id.as_deref(), Some("anon:local"));
+                assert_eq!(grant.quota_version, 180);
+            }
+            Authorization::Rejected(_) => panic!("expected next window to pass"),
+        }
+    }
+
+    #[test]
     fn anonymous_throttle_grants_floor_when_window_exhausted() {
         let mut defaults = defaults();
         defaults.public.quota.on_exceed = OnExceed::Throttle {

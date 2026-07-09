@@ -1355,10 +1355,16 @@ async fn sql_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::async_trait;
     use std::sync::Mutex;
     use std::time::Duration;
 
     use tower::ServiceExt;
+
+    use crate::commercial::{
+        Authorization, ControlPlaneClient, Credential, Granted, GrantedLimits, OnExceed, Principal,
+        PublicFallbackConfig,
+    };
 
     #[test]
     fn hide_internal_drops_marked_ops_and_empty_tags() {
@@ -1472,14 +1478,18 @@ mod tests {
     }
 
     async fn metered_test_handler(
+        endpoint: Option<Extension<Endpoint>>,
         grant: Option<Extension<CommercialGrant>>,
         reporter: Option<Extension<Arc<dyn UsageReporter>>>,
     ) -> Response {
         const BODY: &[u8] = b"{\"ok\":true}\n";
+        let endpoint = endpoint
+            .map(|endpoint| endpoint.0)
+            .unwrap_or(Endpoint::Stream);
         let meter = meter_from_extensions(
             grant,
             reporter,
-            Endpoint::Stream,
+            endpoint,
             "ethereum-mainnet".to_string(),
             "request".to_string(),
         );
@@ -1524,6 +1534,188 @@ mod tests {
             reporter.events.lock().unwrap().is_empty(),
             "no meter means no usage event or commercial metric side effect"
         );
+    }
+
+    async fn ready_test_handler(
+        Extension(shutting_down): Extension<Arc<AtomicBool>>,
+        snapshot_store: Option<Extension<Arc<SnapshotStore>>>,
+    ) -> Response {
+        if shutting_down.load(Ordering::Relaxed) {
+            return (StatusCode::SERVICE_UNAVAILABLE, "Shutting down").into_response();
+        }
+        if snapshot_store
+            .as_ref()
+            .is_some_and(|store| !store.is_ready())
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Commercial snapshots not ready",
+            )
+                .into_response();
+        }
+
+        (StatusCode::OK, "Ready").into_response()
+    }
+
+    fn public_fallback_for_ready_test() -> PublicFallbackConfig {
+        PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_endpoint_covers_commercial_store_and_oss_branches() {
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let store = SnapshotStore::inactive(&public_fallback_for_ready_test());
+        store.set_ready_for_test(false);
+        let app = axum::Router::new()
+            .route("/ready", get(ready_test_handler))
+            .layer(Extension(shutting_down.clone()))
+            .layer(Extension(store.clone()));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        store.set_ready_for_test(true);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let oss_app = axum::Router::new()
+            .route("/ready", get(ready_test_handler))
+            .layer(Extension(shutting_down));
+        let response = oss_app
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    struct GrantingControlPlane;
+
+    #[async_trait]
+    impl ControlPlaneClient for GrantingControlPlane {
+        async fn authorize(&self, req: crate::commercial::AuthorizeRequest) -> Authorization {
+            let api_key_id = match req.credential {
+                Credential::Key { key_id, .. } => Some(key_id),
+                Credential::None { .. } | Credential::Internal { .. } => None,
+            };
+            Authorization::Granted(Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id,
+                },
+                tally_account_id: None,
+                limits: GrantedLimits::default(),
+                on_exceed: OnExceed::Reject,
+                quota_version: 1,
+                quota_remaining_bytes: Some(1_000_000),
+                concurrency_permit: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn commercial_enabled_meters_all_metered_route_identities() {
+        let query = r#"{"type":"evm","fromBlock":1,"fields":{"block":{"number":true}}}"#;
+        let cases = [
+            (
+                Method::POST,
+                "/datasets/ethereum-mainnet/archival-stream",
+                Endpoint::ArchivalStream,
+                Some(query),
+            ),
+            (
+                Method::POST,
+                "/datasets/ethereum-mainnet/archival-stream/debug",
+                Endpoint::ArchivalStream,
+                Some(query),
+            ),
+            (
+                Method::POST,
+                "/datasets/ethereum-mainnet/finalized-stream",
+                Endpoint::FinalizedStream,
+                Some(query),
+            ),
+            (
+                Method::POST,
+                "/datasets/ethereum-mainnet/stream",
+                Endpoint::Stream,
+                Some(query),
+            ),
+            (
+                Method::GET,
+                "/datasets/ethereum-mainnet/timestamps/1/block",
+                Endpoint::TsLookup,
+                None,
+            ),
+            (
+                Method::POST,
+                "/datasets/ethereum-mainnet/query/worker",
+                Endpoint::LegacyQuery,
+                Some(query),
+            ),
+            (Method::POST, "/sql/query", Endpoint::SqlQuery, None),
+        ];
+
+        for (method, path, endpoint, body) in cases {
+            let reporter = Arc::new(RecordingReporter::default());
+            let route = match method {
+                Method::GET => get(metered_test_handler),
+                Method::POST => post(metered_test_handler),
+                _ => unreachable!("test only covers GET/POST"),
+            };
+            let app = axum::Router::new()
+                .route(path, commercial_route_layer(route, true, endpoint))
+                .layer(Extension(endpoint))
+                .layer(Extension(reporter.clone() as Arc<dyn UsageReporter>))
+                .layer(Extension(
+                    Arc::new(GrantingControlPlane) as Arc<dyn ControlPlaneClient>
+                ));
+
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("{path}?api_key=sqd_data_key_secret"))
+                        .body(body.map_or_else(Body::empty, Body::from))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.headers()["x-meter-created"], "true", "{path}");
+            let event = reporter.events.lock().unwrap().pop().expect("usage event");
+            assert_eq!(event.endpoint, endpoint, "{path}");
+            assert_eq!(event.logical_bytes, 12, "{path}");
+        }
     }
 
     #[tokio::test]
