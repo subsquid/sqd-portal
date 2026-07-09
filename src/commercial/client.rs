@@ -4,6 +4,7 @@ use super::{
     evaluate,
     store::SnapshotStore,
     types::{Authorization, AuthorizeRequest, Granted, GrantedLimits, OnExceed, Principal},
+    TallyStore,
 };
 
 #[async_trait]
@@ -30,23 +31,25 @@ pub fn oss_grant() -> Granted {
         limits: GrantedLimits::default(),
         on_exceed: OnExceed::Reject,
         quota_version: 0,
+        quota_remaining_bytes: None,
     }
 }
 
 pub struct LocalControlPlane {
     store: std::sync::Arc<SnapshotStore>,
+    tally: std::sync::Arc<TallyStore>,
 }
 
 impl LocalControlPlane {
-    pub fn new(store: std::sync::Arc<SnapshotStore>) -> Self {
-        Self { store }
+    pub fn new(store: std::sync::Arc<SnapshotStore>, tally: std::sync::Arc<TallyStore>) -> Self {
+        Self { store, tally }
     }
 }
 
 #[async_trait]
 impl ControlPlaneClient for LocalControlPlane {
     async fn authorize(&self, req: AuthorizeRequest) -> Authorization {
-        evaluate::evaluate_with_store(&self.store, req).await
+        evaluate::evaluate_with_store(&self.store, Some(&self.tally), req).await
     }
 }
 

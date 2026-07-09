@@ -14,7 +14,7 @@ use crate::{
         meter::{
             tap_gzip_stream, tap_input_chunks, tap_input_frames, tap_plain_stream, tap_wire_stream,
         },
-        CommercialGrant, DataSource, Endpoint, MeterHandle, UsageReporter,
+        CommercialGrant, DataSource, Endpoint, GrantedLimits, MeterHandle, UsageReporter,
     },
     config::Config,
     controller::task_manager::TaskManager,
@@ -65,6 +65,8 @@ pub(crate) async fn run_archival_stream_restricted(
     raw_request: StreamRequest,
 ) -> Response {
     let request = restrict_request(&config, raw_request);
+    let request =
+        restrict_request_to_grant(request, grant.as_ref().map(|grant| &grant.0.granted.limits));
     let meter = meter_from_extensions(
         grant,
         reporter,
@@ -110,6 +112,8 @@ pub(crate) async fn run_archival_stream(
     dataset_id: DatasetId,
     request: StreamRequest,
 ) -> Response {
+    let request =
+        restrict_request_to_grant(request, grant.as_ref().map(|grant| &grant.0.granted.limits));
     let meter = meter_from_extensions(
         grant,
         reporter,
@@ -298,6 +302,8 @@ async fn run_stream_internal(
     reporter: Option<Extension<Arc<dyn UsageReporter>>>,
 ) -> Response {
     let request = restrict_request(&config, request);
+    let request =
+        restrict_request_to_grant(request, grant.as_ref().map(|grant| &grant.0.granted.limits));
     let endpoint = match mode {
         StreamMode::RealTime => Endpoint::Stream,
         StreamMode::Finalized => Endpoint::FinalizedStream,
@@ -558,14 +564,25 @@ fn meter_from_extensions(
 ) -> Option<MeterHandle> {
     let grant = grant?;
     let reporter = reporter?;
-    Some(MeterHandle::new(
-        grant.0 .0.principal.clone(),
-        request_id,
-        endpoint,
-        dataset,
-        reporter.0,
-        grant.0 .0.quota_version,
-    ))
+    match (grant.0.tally.clone(), grant.0.registry.clone()) {
+        (Some(tally), Some(registry)) => Some(MeterHandle::new_enforced(
+            grant.0.granted.clone(),
+            request_id,
+            endpoint,
+            dataset,
+            reporter.0,
+            tally,
+            registry,
+        )),
+        _ => Some(MeterHandle::new(
+            grant.0.granted.principal.clone(),
+            request_id,
+            endpoint,
+            dataset,
+            reporter.0,
+            grant.0.granted.quota_version,
+        )),
+    }
 }
 
 fn discard_meter(meter: &Option<MeterHandle>) {
@@ -588,6 +605,26 @@ pub(crate) fn restrict_request(config: &Config, request: StreamRequest) -> Strea
         max_chunks,
         timeout_quantile: config.default_timeout_quantile,
         retries: config.default_retries,
+        ..request
+    }
+}
+
+fn restrict_request_to_grant(
+    request: StreamRequest,
+    limits: Option<&GrantedLimits>,
+) -> StreamRequest {
+    let grant_max_chunks = limits
+        .and_then(|limits| limits.max_chunks)
+        .and_then(|max_chunks| usize::try_from(max_chunks).ok());
+    let Some(grant_max_chunks) = grant_max_chunks else {
+        return request;
+    };
+    let max_chunks = match request.max_chunks {
+        Some(requested) => Some(requested.min(grant_max_chunks)),
+        None => Some(grant_max_chunks),
+    };
+    StreamRequest {
+        max_chunks,
         ..request
     }
 }
@@ -665,7 +702,10 @@ mod tests {
     use futures::stream;
 
     use super::*;
-    use crate::commercial::{Principal, StreamUsageEvent, UsageReporter, UsageStatus};
+    use crate::{
+        commercial::{Principal, StreamUsageEvent, UsageReporter, UsageStatus},
+        types::ParsedQuery,
+    };
 
     #[derive(Default)]
     struct RecordingReporter {
@@ -716,6 +756,46 @@ mod tests {
     fn split_frame(frame: Vec<u8>) -> Vec<Vec<u8>> {
         let split = frame.len() / 2;
         vec![frame[..split].to_vec(), frame[split..].to_vec()]
+    }
+
+    fn stream_request(max_chunks: Option<usize>) -> StreamRequest {
+        StreamRequest {
+            dataset_id: DatasetId::from_url("test-dataset"),
+            dataset_name: "test-dataset".to_string(),
+            query: ParsedQuery::try_from(
+                r#"{"type":"evm","fromBlock":1,"fields":{"block":{"number":true}}}"#.to_string(),
+            )
+            .unwrap(),
+            request_id: "request".to_string(),
+            buffer_size: 10,
+            max_stored_results_per_chunk: 2,
+            max_chunks,
+            timeout_quantile: 0.5,
+            retries: 1,
+            compression: Compression::Gzip,
+            skip_parent_hash_validation: false,
+        }
+    }
+
+    #[test]
+    fn grant_caps_max_chunks_after_operator_restriction() {
+        let capped = restrict_request_to_grant(
+            stream_request(Some(10)),
+            Some(&GrantedLimits {
+                max_chunks: Some(3),
+                ..GrantedLimits::default()
+            }),
+        );
+        assert_eq!(capped.max_chunks, Some(3));
+
+        let capped = restrict_request_to_grant(
+            stream_request(None),
+            Some(&GrantedLimits {
+                max_chunks: Some(4),
+                ..GrantedLimits::default()
+            }),
+        );
+        assert_eq!(capped.max_chunks, Some(4));
     }
 
     #[test]

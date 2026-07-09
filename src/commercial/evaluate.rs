@@ -5,7 +5,7 @@ use super::{
         Authorization, AuthorizeRequest, Credential, Defaults, Granted, GrantedLimits, KeySnapshot,
         KeyStatus, OnExceed, Principal, Rejected, SnapshotLimits,
     },
-    SnapshotStore,
+    SnapshotStore, TallyStore,
 };
 
 const INVALID_KEY: &str = "invalid_key";
@@ -34,7 +34,11 @@ impl Default for EvaluationState {
     }
 }
 
-pub async fn evaluate_with_store(store: &SnapshotStore, req: AuthorizeRequest) -> Authorization {
+pub async fn evaluate_with_store(
+    store: &SnapshotStore,
+    tally: Option<&TallyStore>,
+    req: AuthorizeRequest,
+) -> Authorization {
     let view = store.view();
     match &req.credential {
         Credential::Key { key_id, .. } => {
@@ -43,12 +47,15 @@ pub async fn evaluate_with_store(store: &SnapshotStore, req: AuthorizeRequest) -
             } else {
                 store.get_or_resolve(key_id).await
             };
-            evaluate(
-                &req,
-                snapshot.as_deref(),
-                &view.defaults,
-                EvaluationState::default(),
-            )
+            let mut state = EvaluationState::default();
+            if let (Some(tally), Some(snapshot)) = (tally, snapshot.as_deref()) {
+                if let (Some(account_id), Some(quota)) =
+                    (snapshot.account_id.as_deref(), snapshot.quota.as_ref())
+                {
+                    state.tally_bytes = tally.bytes_for(account_id, quota.version);
+                }
+            }
+            evaluate(&req, snapshot.as_deref(), &view.defaults, state)
         }
         Credential::None { .. } => evaluate(&req, None, &view.defaults, EvaluationState::default()),
         Credential::Internal { .. } => Authorization::Granted(super::client::oss_grant()),
@@ -181,6 +188,7 @@ fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
         },
         on_exceed: defaults.public.quota.on_exceed.clone(),
         quota_version: defaults.seq,
+        quota_remaining_bytes: None,
     })
 }
 
@@ -214,6 +222,7 @@ fn grant(
             .as_ref()
             .map(|quota| quota.version)
             .unwrap_or(0),
+        quota_remaining_bytes: snapshot.quota.as_ref().map(|quota| quota.remaining_bytes),
     }
 }
 

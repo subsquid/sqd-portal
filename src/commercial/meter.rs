@@ -18,7 +18,11 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use uuid::{NoContext, Timestamp, Uuid};
 
 use crate::{
-    commercial::{DataSource, Endpoint, Principal, StreamUsageEvent, UsageReporter, UsageStatus},
+    commercial::{
+        registry::StreamRegistration, ActiveStreamRegistry, DataSource, Endpoint, Granted,
+        GrantedLimits, OnExceed, Principal, StreamUsageEvent, TallyStore, UsageReporter,
+        UsageStatus,
+    },
     metrics,
     types::Compression,
 };
@@ -46,6 +50,13 @@ struct MeterInner {
     reporter: Arc<dyn UsageReporter>,
     pod: String,
     quota_version: u64,
+    limits: GrantedLimits,
+    on_exceed: OnExceed,
+    quota_remaining_bytes: Option<i64>,
+    tally: Option<Arc<TallyStore>>,
+    kill: Arc<AtomicBool>,
+    floor_bytes_per_sec: Arc<AtomicU64>,
+    _registration: Option<StreamRegistration>,
 }
 
 impl MeterHandle {
@@ -57,10 +68,74 @@ impl MeterHandle {
         reporter: Arc<dyn UsageReporter>,
         quota_version: u64,
     ) -> Self {
+        Self::from_parts(
+            principal,
+            GrantedLimits::default(),
+            OnExceed::Reject,
+            quota_version,
+            None,
+            request_id,
+            endpoint,
+            dataset,
+            reporter,
+            None,
+            None,
+        )
+    }
+
+    pub fn new_enforced(
+        granted: Granted,
+        request_id: String,
+        endpoint: Endpoint,
+        dataset: String,
+        reporter: Arc<dyn UsageReporter>,
+        tally: Arc<TallyStore>,
+        registry: Arc<ActiveStreamRegistry>,
+    ) -> Self {
+        Self::from_parts(
+            granted.principal,
+            granted.limits,
+            granted.on_exceed,
+            granted.quota_version,
+            granted.quota_remaining_bytes,
+            request_id,
+            endpoint,
+            dataset,
+            reporter,
+            Some(tally),
+            Some(registry),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        principal: Principal,
+        limits: GrantedLimits,
+        on_exceed: OnExceed,
+        quota_version: u64,
+        quota_remaining_bytes: Option<i64>,
+        request_id: String,
+        endpoint: Endpoint,
+        dataset: String,
+        reporter: Arc<dyn UsageReporter>,
+        tally: Option<Arc<TallyStore>>,
+        registry: Option<Arc<ActiveStreamRegistry>>,
+    ) -> Self {
+        let event_id = uuid_v7();
+        let kill = Arc::new(AtomicBool::new(false));
+        let floor_bytes_per_sec = Arc::new(AtomicU64::new(0));
+        let registration = registry.as_ref().map(|registry| {
+            registry.register(
+                event_id.clone(),
+                principal.api_key_id.clone(),
+                kill.clone(),
+                floor_bytes_per_sec.clone(),
+            )
+        });
         Self {
             inner: Arc::new(MeterInner {
                 principal,
-                event_id: uuid_v7(),
+                event_id,
                 request_id,
                 endpoint,
                 dataset,
@@ -76,6 +151,13 @@ impl MeterHandle {
                 reporter,
                 pod: pod_hostname().to_string(),
                 quota_version,
+                limits,
+                on_exceed,
+                quota_remaining_bytes,
+                tally,
+                kill,
+                floor_bytes_per_sec,
+                _registration: registration,
             }),
         }
     }
@@ -88,6 +170,13 @@ impl MeterHandle {
 
     pub fn add_logical_bytes(&self, bytes: u64) {
         self.inner.logical.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(tally) = &self.inner.tally {
+            tally.debit(
+                &self.inner.principal.account_id,
+                self.inner.quota_version,
+                bytes,
+            );
+        }
     }
 
     pub fn add_wire_bytes(&self, bytes: u64) {
@@ -103,9 +192,7 @@ impl MeterHandle {
     }
 
     pub fn mark_error(&self) {
-        self.inner
-            .status
-            .store(status_code(UsageStatus::Error), Ordering::Relaxed);
+        self.inner.set_status(UsageStatus::Error);
     }
 
     pub fn complete(&self) {
@@ -122,9 +209,14 @@ impl MeterHandle {
         self.inner.flushed.store(true, Ordering::Release);
     }
 
+    pub fn should_stop_after_chunk(&self) -> bool {
+        self.inner.should_stop_after_chunk()
+    }
+
     pub fn record_plain_bytes_and_complete(&self, bytes: u64) {
         self.add_logical_bytes(bytes);
         self.add_wire_bytes(bytes);
+        self.should_stop_after_chunk();
         self.complete();
     }
 
@@ -138,6 +230,56 @@ impl MeterHandle {
 }
 
 impl MeterInner {
+    fn should_stop_after_chunk(&self) -> bool {
+        if self.kill.load(Ordering::Acquire) {
+            self.set_status(UsageStatus::CutSuspended);
+            return true;
+        }
+
+        let logical = self.logical.load(Ordering::Acquire);
+        if self
+            .limits
+            .max_response_bytes
+            .is_some_and(|max| logical > max)
+        {
+            self.set_status(UsageStatus::CutMaxBytes);
+            return true;
+        }
+
+        let Some(tally) = &self.tally else {
+            return false;
+        };
+        let Some(snapshot_remaining) = self.quota_remaining_bytes else {
+            return false;
+        };
+        if tally.effective_remaining(
+            &self.principal.account_id,
+            self.quota_version,
+            snapshot_remaining,
+        ) > 0
+        {
+            return false;
+        }
+
+        match self.on_exceed {
+            OnExceed::Reject => {
+                self.set_status(UsageStatus::CutQuota);
+                true
+            }
+            OnExceed::Throttle {
+                floor_bytes_per_sec,
+            } => {
+                self.floor_bytes_per_sec
+                    .store(floor_bytes_per_sec, Ordering::Release);
+                false
+            }
+        }
+    }
+
+    fn set_status(&self, status: UsageStatus) {
+        self.status.store(status_code(status), Ordering::Relaxed);
+    }
+
     fn flush_once(&self) {
         if self.flushed.swap(true, Ordering::AcqRel) {
             return;
@@ -216,7 +358,11 @@ where
                     }
                 }
             }
+            let stop = meter.should_stop_after_chunk();
             yield frame;
+            if stop {
+                break;
+            }
         }
         if let Some(mut decoder) = zstd_decoder {
             if let Err(err) = decoder.flush() {
@@ -253,7 +399,11 @@ where
             } else {
                 meter.mark_error();
             }
+            let stop = meter.should_stop_after_chunk();
             yield item;
+            if stop {
+                break;
+            }
         }
         meter.complete();
     }
@@ -271,7 +421,11 @@ where
             } else {
                 meter.mark_error();
             }
+            let stop = meter.should_stop_after_chunk();
             yield item;
+            if stop {
+                break;
+            }
         }
         meter.complete();
     }
@@ -318,7 +472,11 @@ where
                 }
                 Err(_) => meter.mark_error(),
             }
+            let stop = meter.should_stop_after_chunk();
             yield item;
+            if stop {
+                break;
+            }
         }
         if let Err(err) = decoder.shutdown().await {
             tracing::warn!(error = %err, "failed to finish gzip stream usage decoder");
@@ -483,6 +641,39 @@ mod tests {
         )
     }
 
+    fn enforced_meter(
+        reporter: Arc<RecordingReporter>,
+        limits: GrantedLimits,
+        on_exceed: OnExceed,
+        quota_remaining_bytes: Option<i64>,
+    ) -> (MeterHandle, Arc<TallyStore>, Arc<ActiveStreamRegistry>) {
+        let tally = Arc::new(TallyStore::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let granted = Granted {
+            principal: Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some("key".to_string()),
+            },
+            limits,
+            on_exceed,
+            quota_version: 7,
+            quota_remaining_bytes,
+        };
+        (
+            MeterHandle::new_enforced(
+                granted,
+                "request".to_string(),
+                Endpoint::Stream,
+                "ethereum-mainnet".to_string(),
+                reporter,
+                tally.clone(),
+                registry.clone(),
+            ),
+            tally,
+            registry,
+        )
+    }
+
     async fn drive_metered_frames(
         frames: Vec<Vec<u8>>,
         compression: Compression,
@@ -624,5 +815,82 @@ mod tests {
         let event = reporter.events.lock().unwrap().pop().unwrap();
         assert_eq!(event.wire_bytes, 5);
         assert_eq!(event.status, UsageStatus::ClientDisconnect);
+    }
+
+    #[tokio::test]
+    async fn enforced_plain_stream_cuts_after_max_response_chunk() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, tally, _) = enforced_meter(
+            reporter.clone(),
+            GrantedLimits {
+                max_response_bytes: Some(5),
+                ..GrantedLimits::default()
+            },
+            OnExceed::Reject,
+            Some(100),
+        );
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"12345")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"6")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"never")),
+        ];
+
+        let output = tap_plain_stream(stream::iter(chunks), meter);
+        let emitted: Vec<_> = output.collect().await;
+
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(tally.bytes_for("account", 7), 6);
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, 6);
+        assert_eq!(event.status, UsageStatus::CutMaxBytes);
+    }
+
+    #[tokio::test]
+    async fn enforced_plain_stream_cuts_when_quota_remaining_crosses_zero() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, tally, _) = enforced_meter(
+            reporter.clone(),
+            GrantedLimits::default(),
+            OnExceed::Reject,
+            Some(5),
+        );
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"123")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"456")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"never")),
+        ];
+
+        let output = tap_plain_stream(stream::iter(chunks), meter);
+        let emitted: Vec<_> = output.collect().await;
+
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(tally.effective_remaining("account", 7, 5), -1);
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, 6);
+        assert_eq!(event.status, UsageStatus::CutQuota);
+    }
+
+    #[tokio::test]
+    async fn enforced_plain_stream_cuts_when_registry_kills_key() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, _, registry) = enforced_meter(
+            reporter.clone(),
+            GrantedLimits::default(),
+            OnExceed::Reject,
+            Some(100),
+        );
+        assert_eq!(registry.kill_key("key"), 1);
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"first")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"never")),
+        ];
+
+        let output = tap_plain_stream(stream::iter(chunks), meter);
+        let emitted: Vec<_> = output.collect().await;
+
+        assert_eq!(emitted.len(), 1);
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.status, UsageStatus::CutSuspended);
+        assert_eq!(registry.len(), 0);
     }
 }

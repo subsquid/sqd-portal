@@ -21,6 +21,7 @@ use super::{
         Defaults, KeySnapshot, KeyStatus, OnExceed, PublicDefaults, PublicLimits, PublicQuota,
         SnapshotRecord,
     },
+    ActiveStreamRegistry, TallyStore,
 };
 use crate::metrics;
 
@@ -46,6 +47,13 @@ struct SnapshotStoreInner {
     client: reqwest::Client,
     control_plane_url: url::Url,
     service_token: String,
+    hooks: SnapshotHooks,
+}
+
+#[derive(Clone, Default)]
+pub struct SnapshotHooks {
+    pub tally: Option<Arc<TallyStore>>,
+    pub registry: Option<Arc<ActiveStreamRegistry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +96,14 @@ impl SnapshotStore {
         config: &CommercialConfig,
         cancel: CancellationToken,
     ) -> anyhow::Result<(Arc<Self>, JoinHandle<()>)> {
+        Self::spawn_with_hooks(config, cancel, SnapshotHooks::default())
+    }
+
+    pub fn spawn_with_hooks(
+        config: &CommercialConfig,
+        cancel: CancellationToken,
+        hooks: SnapshotHooks,
+    ) -> anyhow::Result<(Arc<Self>, JoinHandle<()>)> {
         let service_token = std::env::var(&config.service_token_env).unwrap_or_default();
         let store = Arc::new(Self {
             inner: Arc::new(SnapshotStoreInner {
@@ -106,6 +122,7 @@ impl SnapshotStore {
                     .build()?,
                 control_plane_url: config.control_plane_url.clone(),
                 service_token,
+                hooks,
             }),
         });
         store.load_disk_cache();
@@ -135,6 +152,7 @@ impl SnapshotStore {
                     .parse()
                     .expect("static URL should parse"),
                 service_token: String::new(),
+                hooks: SnapshotHooks::default(),
             }),
         })
     }
@@ -291,6 +309,7 @@ impl SnapshotStore {
             match record {
                 SnapshotRecord::Defaults(record) => defaults = Some(Defaults::from(record)),
                 SnapshotRecord::Key(record) => {
+                    self.apply_snapshot_hooks(&record);
                     map.insert(record.key_id.clone(), Arc::new(record));
                 }
             }
@@ -312,6 +331,7 @@ impl SnapshotStore {
                     self.inner.defaults.store(Arc::new(Defaults::from(record)));
                 }
                 SnapshotRecord::Key(record) => {
+                    self.apply_snapshot_hooks(&record);
                     if record.status != KeyStatus::Active {
                         tracing::info!(key_id = record.key_id, "commercial key became non-active");
                     }
@@ -326,6 +346,7 @@ impl SnapshotStore {
     }
 
     async fn upsert_key(&self, record: KeySnapshot) -> anyhow::Result<Arc<KeySnapshot>> {
+        self.apply_snapshot_hooks(&record);
         let record = Arc::new(record);
         let mut map = (**self.inner.records.load()).clone();
         map.insert(record.key_id.clone(), record.clone());
@@ -413,6 +434,28 @@ impl SnapshotStore {
 
     fn take_resolve_token(&self) -> bool {
         self.inner.resolve_limiter.lock().unwrap().take()
+    }
+
+    fn apply_snapshot_hooks(&self, record: &KeySnapshot) {
+        if let (Some(tally), Some(account_id), Some(quota)) = (
+            &self.inner.hooks.tally,
+            record.account_id.as_deref(),
+            record.quota.as_ref(),
+        ) {
+            tally.rebase_account(account_id, quota.version);
+        }
+        if record.status != KeyStatus::Active {
+            if let Some(registry) = &self.inner.hooks.registry {
+                let killed = registry.kill_key(&record.key_id);
+                if killed > 0 {
+                    tracing::info!(
+                        key_id = record.key_id,
+                        killed,
+                        "commercial key kill flag applied to active streams"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -859,6 +902,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(store.get(KEY_ID).unwrap().status, KeyStatus::Revoked);
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn sync_hooks_rebase_tally_and_kill_non_active_streams() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        mock.push_page(
+            0,
+            page(vec![SnapshotRecord::Key(active_snapshot(1))], 1, false),
+        );
+        let mut suspended = active_snapshot(2);
+        suspended.status = KeyStatus::Suspended;
+        mock.push_page(1, page(vec![SnapshotRecord::Key(suspended)], 2, false));
+        let tally = Arc::new(TallyStore::default());
+        tally.debit("account", 1, 100);
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let kill = Arc::new(AtomicBool::new(false));
+        let _registration = registry.register(
+            "event".to_string(),
+            Some(KEY_ID.to_string()),
+            kill.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let path = cache_path("hooks");
+        let (store, task) = SnapshotStore::spawn_with_hooks(
+            &config(&mock, path.clone(), 10),
+            CancellationToken::new(),
+            SnapshotHooks {
+                tally: Some(tally.clone()),
+                registry: Some(registry),
+            },
+        )
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.view().cursor < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(tally.version_for("account"), Some(2));
+        assert_eq!(tally.bytes_for("account", 2), 0);
+        assert!(kill.load(Ordering::Acquire));
+
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
     }

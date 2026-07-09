@@ -91,6 +91,7 @@ pub struct Granted {
     pub limits: GrantedLimits,
     pub on_exceed: OnExceed,
     pub quota_version: u64,
+    pub quota_remaining_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

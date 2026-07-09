@@ -462,14 +462,25 @@ fn meter_from_extensions(
 ) -> Option<MeterHandle> {
     let grant = grant?;
     let reporter = reporter?;
-    Some(MeterHandle::new(
-        grant.0 .0.principal.clone(),
-        request_id,
-        Endpoint::TsLookup,
-        dataset,
-        reporter.0,
-        grant.0 .0.quota_version,
-    ))
+    match (grant.0.tally.clone(), grant.0.registry.clone()) {
+        (Some(tally), Some(registry)) => Some(MeterHandle::new_enforced(
+            grant.0.granted.clone(),
+            request_id,
+            Endpoint::TsLookup,
+            dataset,
+            reporter.0,
+            tally,
+            registry,
+        )),
+        _ => Some(MeterHandle::new(
+            grant.0.granted.principal.clone(),
+            request_id,
+            Endpoint::TsLookup,
+            dataset,
+            reporter.0,
+            grant.0.granted.quota_version,
+        )),
+    }
 }
 
 fn finish_meter_error(meter: &Option<MeterHandle>) {

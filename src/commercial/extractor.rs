@@ -12,8 +12,8 @@ use tracing::field;
 use url::form_urlencoded;
 
 use super::{
-    client::oss_grant, Authorization, AuthorizeRequest, ControlPlaneClient, Credential, Endpoint,
-    Granted, QueryDescriptor, Rejected,
+    client::oss_grant, ActiveStreamRegistry, Authorization, AuthorizeRequest, ControlPlaneClient,
+    Credential, Endpoint, Granted, QueryDescriptor, Rejected, TallyStore,
 };
 use crate::{
     config::Config,
@@ -23,7 +23,11 @@ use crate::{
 const API_KEY_PREFIX: &str = "sqd_data_";
 
 #[derive(Clone, Debug)]
-pub struct CommercialGrant(pub Granted);
+pub struct CommercialGrant {
+    pub granted: Granted,
+    pub tally: Option<Arc<TallyStore>>,
+    pub registry: Option<Arc<ActiveStreamRegistry>>,
+}
 
 pub async fn middleware(mut req: Request, next: Next, endpoint: Endpoint) -> Response {
     let credential = match credential_from_request(req.headers(), req.uri().query()) {
@@ -77,7 +81,13 @@ pub async fn middleware(mut req: Request, next: Next, endpoint: Endpoint) -> Res
     tracing::Span::current().record("key_id", field::display(&key_id));
     tracing::Span::current().record("account_id", field::display(&granted.principal.account_id));
     req.extensions_mut().insert(granted.principal.clone());
-    req.extensions_mut().insert(CommercialGrant(granted));
+    let tally = req.extensions().get::<Arc<TallyStore>>().cloned();
+    let registry = req.extensions().get::<Arc<ActiveStreamRegistry>>().cloned();
+    req.extensions_mut().insert(CommercialGrant {
+        granted,
+        tally,
+        registry,
+    });
 
     next.run(req).await
 }
