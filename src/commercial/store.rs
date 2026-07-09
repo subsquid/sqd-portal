@@ -191,6 +191,31 @@ impl SnapshotStore {
         self.resolve(key_id).await.ok().flatten()
     }
 
+    pub(crate) fn sweep_negative_cache(&self) -> usize {
+        let now = Instant::now();
+        let mut removed = 0;
+        self.inner.negative_cache.retain(|_, expires_at| {
+            let expired = *expires_at <= now;
+            if expired {
+                removed += 1;
+            }
+            !expired
+        });
+        removed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn negative_cache_len(&self) -> usize {
+        self.inner.negative_cache.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_negative_cache_for_test(&self, key_id: &str, ttl: Duration) {
+        self.inner
+            .negative_cache
+            .insert(key_id.to_string(), Instant::now() + ttl);
+    }
+
     async fn run_sync_loop(self: Arc<Self>, cancel: CancellationToken) {
         loop {
             let _ = self.run_sync_tick().await;

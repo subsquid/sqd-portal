@@ -267,9 +267,6 @@ fn evaluate_anonymous_with_state(
     let account_key = format!("anon:{ip_bucket}");
     let window_secs = defaults.public.quota.window_secs.max(1);
     let window_start = now_secs - (now_secs % window_secs);
-    if let Some(tally) = tally {
-        tally.sweep_anonymous(now_secs, window_secs.saturating_mul(2));
-    }
 
     let permit = match (defaults.public.limits.concurrency, concurrency) {
         (Some(limit), Some(limiter)) => limiter.try_acquire(&account_key, limit),

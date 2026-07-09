@@ -82,7 +82,7 @@ impl TallyStore {
             .iter()
             .filter(|entry| {
                 entry.key().starts_with("anon:")
-                    && entry.value().last_seen.load(Ordering::Acquire) < cutoff
+                    && entry.value().last_seen.load(Ordering::Acquire) <= cutoff
             })
             .map(|entry| entry.key().clone())
             .collect();
