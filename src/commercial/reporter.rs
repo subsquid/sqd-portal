@@ -125,6 +125,7 @@ impl BufferedUsageReporter {
             match self.send_once(&batch).await {
                 Ok(()) => return,
                 Err(SendBatchError::Drop(status)) => {
+                    metrics::report_commercial_usage_dropped();
                     tracing::error!(
                         status = status.as_u16(),
                         count = batch.len(),
