@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use axum::{
     body::{to_bytes, Body},
@@ -30,10 +30,21 @@ pub struct CommercialGrant {
 }
 
 pub async fn middleware(mut req: Request, next: Next, endpoint: Endpoint) -> Response {
-    let credential = match credential_from_request(req.headers(), req.uri().query()) {
-        Ok(credential) => credential,
-        Err(rejected) => return RequestError::from(rejected).into_response(),
-    };
+    let client_ip_header = req
+        .extensions()
+        .get::<Arc<Config>>()
+        .and_then(|config| {
+            config
+                .commercial
+                .as_ref()
+                .map(|commercial| commercial.client_ip_header.as_str())
+        })
+        .unwrap_or("x-forwarded-for");
+    let credential =
+        match credential_from_request(req.headers(), req.uri().query(), client_ip_header) {
+            Ok(credential) => credential,
+            Err(rejected) => return RequestError::from(rejected).into_response(),
+        };
     let dataset = dataset_from_path(req.uri().path(), &endpoint);
     let query = match query_descriptor_from_request(req, endpoint).await {
         Ok((next_req, query)) => {
@@ -105,6 +116,7 @@ pub fn parse_api_key_token(token: &str) -> Option<(String, String)> {
 fn credential_from_request(
     headers: &HeaderMap,
     query: Option<&str>,
+    client_ip_header: &str,
 ) -> Result<Credential, Rejected> {
     if let Some(value) = bearer_token(headers).or_else(|| query_api_key(query)) {
         if let Some((key_id, secret_sha256)) = parse_api_key_token(&value) {
@@ -121,7 +133,7 @@ fn credential_from_request(
     }
 
     Ok(Credential::None {
-        ip_bucket: "unknown".to_string(),
+        ip_bucket: ip_bucket_from_headers(headers, client_ip_header),
     })
 }
 
@@ -211,6 +223,31 @@ fn query_api_key(query: Option<&str>) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
+fn ip_bucket_from_headers(headers: &HeaderMap, client_ip_header: &str) -> String {
+    let Some(ip) = headers
+        .get(client_ip_header)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').find_map(|part| parse_ip(part.trim())))
+    else {
+        return "local".to_string();
+    };
+
+    match ip {
+        IpAddr::V4(ip) => format!("{ip}/32"),
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            format!(
+                "{:x}:{:x}:{:x}:{:x}::/64",
+                segments[0], segments[1], segments[2], segments[3]
+            )
+        }
+    }
+}
+
+fn parse_ip(value: &str) -> Option<IpAddr> {
+    value.parse().ok()
+}
+
 fn secret_sha256(secret: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
@@ -283,7 +320,7 @@ mod tests {
         );
 
         assert_eq!(
-            credential_from_request(&headers, None).unwrap(),
+            credential_from_request(&headers, None, "x-forwarded-for").unwrap(),
             Credential::Key {
                 key_id: "AbCdEfGhIjKlMnOp".to_string(),
                 secret_sha256: "73337f479fe170d73e53e247f3052e4243cc9c2a0ffa621853d9385c619efb77"
@@ -297,7 +334,12 @@ mod tests {
         let headers = HeaderMap::new();
 
         assert!(matches!(
-            credential_from_request(&headers, Some(&format!("api_key={TOKEN}"))).unwrap(),
+            credential_from_request(
+                &headers,
+                Some(&format!("api_key={TOKEN}")),
+                "x-forwarded-for"
+            )
+            .unwrap(),
             Credential::Key { .. }
         ));
     }
@@ -310,20 +352,58 @@ mod tests {
             "Bearer sqd_data_key_".parse().unwrap(),
         );
 
-        let rejected = credential_from_request(&headers, None).unwrap_err();
+        let rejected = credential_from_request(&headers, None, "x-forwarded-for").unwrap_err();
         assert_eq!(rejected.reason, "invalid_key");
         assert_eq!(rejected.http_status, 401);
     }
 
     #[test]
     fn credential_debug_redacts_secret_hash() {
-        let credential =
-            credential_from_request(&HeaderMap::new(), Some(&format!("api_key={TOKEN}"))).unwrap();
+        let credential = credential_from_request(
+            &HeaderMap::new(),
+            Some(&format!("api_key={TOKEN}")),
+            "x-forwarded-for",
+        )
+        .unwrap();
         let rendered = format!("{credential:?}");
 
         assert!(!rendered.contains("0123456789abcdefghijklmnopqrstuv"));
         assert!(
             !rendered.contains("73337f479fe170d73e53e247f3052e4243cc9c2a0ffa621853d9385c619efb77")
+        );
+    }
+
+    #[test]
+    fn keyless_requests_bucket_by_rightmost_forwarded_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.9, 2001:db8:abcd:12:3456::1".parse().unwrap(),
+        );
+
+        assert_eq!(
+            credential_from_request(&headers, None, "x-forwarded-for").unwrap(),
+            Credential::None {
+                ip_bucket: "2001:db8:abcd:12::/64".to_string(),
+            }
+        );
+
+        headers.insert("x-client-ip", "198.51.100.7".parse().unwrap());
+        assert_eq!(
+            credential_from_request(&headers, None, "x-client-ip").unwrap(),
+            Credential::None {
+                ip_bucket: "198.51.100.7/32".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn keyless_requests_without_forwarded_header_use_local_bucket() {
+        assert_eq!(
+            credential_from_request(&HeaderMap::new(), None, "x-forwarded-for").unwrap(),
+            Credential::None {
+                ip_bucket: "local".to_string(),
+            }
         );
     }
 

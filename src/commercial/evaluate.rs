@@ -82,7 +82,13 @@ pub async fn evaluate_with_store(
                 rejected => rejected,
             }
         }
-        Credential::None { .. } => evaluate(&req, None, &view.defaults, EvaluationState::default()),
+        Credential::None { ip_bucket } => evaluate_anonymous_with_state(
+            &view.defaults,
+            tally,
+            concurrency,
+            ip_bucket,
+            EvaluationState::default().now_secs,
+        ),
         Credential::Internal { .. } => Authorization::Granted(super::client::oss_grant()),
     }
 }
@@ -205,6 +211,7 @@ fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
             account_id: "anonymous".to_string(),
             api_key_id: None,
         },
+        tally_account_id: None,
         limits: GrantedLimits {
             max_response_bytes: defaults.public.limits.max_response_bytes,
             throughput_bytes_per_sec: defaults.public.limits.throughput_bytes_per_sec,
@@ -216,6 +223,100 @@ fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
         quota_remaining_bytes: None,
         concurrency_permit: None,
     })
+}
+
+fn evaluate_anonymous_with_state(
+    defaults: &Defaults,
+    tally: Option<&TallyStore>,
+    concurrency: Option<&ConcurrencyLimiter>,
+    ip_bucket: &str,
+    now_secs: u64,
+) -> Authorization {
+    let account_key = format!("anon:{ip_bucket}");
+    let window_secs = defaults.public.quota.window_secs.max(1);
+    let window_start = now_secs - (now_secs % window_secs);
+    if let Some(tally) = tally {
+        tally.sweep_anonymous(now_secs, window_secs.saturating_mul(2));
+    }
+
+    let permit = match (defaults.public.limits.concurrency, concurrency) {
+        (Some(limit), Some(limiter)) => limiter.try_acquire(&account_key, limit),
+        _ => None,
+    };
+    if concurrency.is_some() && defaults.public.limits.concurrency.is_some() && permit.is_none() {
+        return reject(defaults, CONCURRENCY_LIMIT, 429, Some(1));
+    }
+
+    let served = tally
+        .map(|tally| tally.bytes_for(&account_key, window_start))
+        .unwrap_or(0);
+    let effective = defaults.public.quota.volume_bytes as i64 - served as i64;
+    if effective <= 0 {
+        return match defaults.public.quota.on_exceed.clone() {
+            OnExceed::Reject => reject(
+                defaults,
+                ANON_LIMITED,
+                429,
+                Some(window_start + window_secs - now_secs),
+            ),
+            OnExceed::Throttle {
+                floor_bytes_per_sec,
+            } => Authorization::Granted(anonymous_grant(
+                defaults,
+                account_key,
+                window_start,
+                GrantedLimits {
+                    throughput_bytes_per_sec: Some(floor_bytes_per_sec),
+                    burst_bytes: Some(floor_bytes_per_sec),
+                    max_response_bytes: Some(floor_bytes_per_sec.saturating_mul(60)),
+                    max_chunks: None,
+                },
+                Some(defaults.public.quota.volume_bytes as i64),
+                permit,
+            )),
+        };
+    }
+
+    let mut limits = GrantedLimits {
+        max_response_bytes: defaults.public.limits.max_response_bytes,
+        throughput_bytes_per_sec: defaults.public.limits.throughput_bytes_per_sec,
+        burst_bytes: defaults.public.limits.burst_bytes,
+        max_chunks: None,
+    };
+    if let Ok(effective) = u64::try_from(effective) {
+        limits.max_response_bytes = min_optional(limits.max_response_bytes, Some(effective));
+    }
+
+    Authorization::Granted(anonymous_grant(
+        defaults,
+        account_key,
+        window_start,
+        limits,
+        Some(defaults.public.quota.volume_bytes as i64),
+        permit,
+    ))
+}
+
+fn anonymous_grant(
+    defaults: &Defaults,
+    account_key: String,
+    quota_version: u64,
+    limits: GrantedLimits,
+    quota_remaining_bytes: Option<i64>,
+    concurrency_permit: Option<super::concurrency::ConcurrencyPermit>,
+) -> Granted {
+    Granted {
+        principal: Principal {
+            account_id: "anonymous".to_string(),
+            api_key_id: None,
+        },
+        tally_account_id: Some(account_key),
+        limits,
+        on_exceed: defaults.public.quota.on_exceed.clone(),
+        quota_version,
+        quota_remaining_bytes,
+        concurrency_permit,
+    }
 }
 
 fn granted_limits(limits: Option<&SnapshotLimits>) -> GrantedLimits {
@@ -241,6 +342,7 @@ fn grant(
             account_id: snapshot.account_id.clone().unwrap_or_default(),
             api_key_id: Some(key_id.to_string()),
         },
+        tally_account_id: None,
         limits,
         on_exceed,
         quota_version: snapshot
@@ -319,7 +421,7 @@ mod tests {
     use super::*;
     use crate::commercial::{
         store::test_support::{active_snapshot, defaults_record, KEY_ID, SECRET_SHA256},
-        Credential, Endpoint, QueryDescriptor,
+        ConcurrencyLimiter, Credential, Endpoint, QueryDescriptor, TallyStore,
     };
 
     const WRONG_SHA256: &str = "aac742262c66b43621baf5b5439b30aa0de646e131c665f1d2118372cdb9b0ed";
@@ -563,6 +665,71 @@ mod tests {
                 assert_eq!(grant.limits.max_response_bytes, Some(300));
             }
             Authorization::Rejected(_) => panic!("expected anonymous grant"),
+        }
+    }
+
+    #[test]
+    fn anonymous_quota_is_per_bucket_and_keeps_public_principal() {
+        let defaults = defaults();
+        let tally = TallyStore::default();
+        tally.debit("anon:local", 120, defaults.public.quota.volume_bytes);
+
+        match evaluate_anonymous_with_state(&defaults, Some(&tally), None, "local", 120) {
+            Authorization::Rejected(rejected) => {
+                assert_eq!(rejected.reason, "anon_limited");
+                assert_eq!(rejected.http_status, 429);
+            }
+            Authorization::Granted(_) => panic!("expected anon limit rejection"),
+        }
+
+        match evaluate_anonymous_with_state(&defaults, Some(&tally), None, "other", 120) {
+            Authorization::Granted(grant) => {
+                assert_eq!(grant.principal.account_id, "anonymous");
+                assert_eq!(grant.tally_account_id.as_deref(), Some("anon:other"));
+                assert_eq!(grant.quota_version, 120);
+                assert_eq!(grant.limits.max_response_bytes, Some(300));
+            }
+            Authorization::Rejected(_) => panic!("expected distinct IP bucket to pass"),
+        }
+    }
+
+    #[test]
+    fn anonymous_throttle_grants_floor_when_window_exhausted() {
+        let mut defaults = defaults();
+        defaults.public.quota.on_exceed = OnExceed::Throttle {
+            floor_bytes_per_sec: 7,
+        };
+        let tally = TallyStore::default();
+        tally.debit("anon:local", 120, defaults.public.quota.volume_bytes);
+
+        match evaluate_anonymous_with_state(&defaults, Some(&tally), None, "local", 120) {
+            Authorization::Granted(grant) => {
+                assert_eq!(grant.principal.account_id, "anonymous");
+                assert_eq!(grant.limits.throughput_bytes_per_sec, Some(7));
+                assert_eq!(grant.limits.max_response_bytes, Some(420));
+            }
+            Authorization::Rejected(_) => panic!("expected throttled anon grant"),
+        }
+    }
+
+    #[test]
+    fn anonymous_concurrency_exhaustion_rejects() {
+        let defaults = defaults();
+        let limiter = ConcurrencyLimiter::new(1);
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            match evaluate_anonymous_with_state(&defaults, None, Some(&limiter), "local", 120) {
+                Authorization::Granted(grant) => held.push(grant),
+                Authorization::Rejected(_) => panic!("expected permit"),
+            }
+        }
+
+        match evaluate_anonymous_with_state(&defaults, None, Some(&limiter), "local", 120) {
+            Authorization::Rejected(rejected) => {
+                assert_eq!(rejected.reason, "concurrency_limit");
+                assert_eq!(rejected.http_status, 429);
+            }
+            Authorization::Granted(_) => panic!("expected concurrency rejection"),
         }
     }
 }

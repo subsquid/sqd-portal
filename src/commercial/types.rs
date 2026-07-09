@@ -90,6 +90,8 @@ pub enum OnExceed {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Granted {
     pub principal: Principal,
+    #[serde(default)]
+    pub tally_account_id: Option<String>,
     pub limits: GrantedLimits,
     pub on_exceed: OnExceed,
     pub quota_version: u64,

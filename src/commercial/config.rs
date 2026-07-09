@@ -15,6 +15,8 @@ pub struct CommercialConfig {
     pub resolve_rate_per_sec: u64,
     pub negative_cache_secs: u64,
     pub pod_count: usize,
+    #[serde(default = "default_client_ip_header")]
+    pub client_ip_header: String,
     pub public_fallback: PublicFallbackConfig,
 }
 
@@ -45,7 +47,15 @@ impl CommercialConfig {
             self.pod_count >= 1,
             "commercial.pod_count must be greater than zero"
         );
+        anyhow::ensure!(
+            !self.client_ip_header.trim().is_empty(),
+            "commercial.client_ip_header must not be empty"
+        );
 
         Ok(())
     }
+}
+
+fn default_client_ip_header() -> String {
+    "x-forwarded-for".to_string()
 }

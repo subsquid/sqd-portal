@@ -798,6 +798,7 @@ mod tests {
             resolve_rate_per_sec,
             negative_cache_secs: 60,
             pod_count: 1,
+            client_ip_header: "x-forwarded-for".to_string(),
             public_fallback: PublicFallbackConfig {
                 throughput_bytes_per_sec: 1,
                 burst_bytes: 1,

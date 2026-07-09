@@ -36,6 +36,7 @@ pub struct MeterHandle {
 
 struct MeterInner {
     principal: Principal,
+    tally_account_id: String,
     event_id: String,
     request_id: String,
     endpoint: Endpoint,
@@ -80,6 +81,7 @@ impl MeterHandle {
     ) -> Self {
         Self::from_parts(
             principal,
+            None,
             GrantedLimits::default(),
             OnExceed::Reject,
             quota_version,
@@ -104,6 +106,7 @@ impl MeterHandle {
     ) -> Self {
         Self::from_parts(
             granted.principal,
+            granted.tally_account_id,
             granted.limits,
             granted.on_exceed,
             granted.quota_version,
@@ -120,6 +123,7 @@ impl MeterHandle {
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
         principal: Principal,
+        tally_account_id: Option<String>,
         limits: GrantedLimits,
         on_exceed: OnExceed,
         quota_version: u64,
@@ -132,6 +136,7 @@ impl MeterHandle {
         registry: Option<Arc<ActiveStreamRegistry>>,
     ) -> Self {
         let event_id = uuid_v7();
+        let tally_account_id = tally_account_id.unwrap_or_else(|| principal.account_id.clone());
         let kill = Arc::new(AtomicBool::new(false));
         let floor_bytes_per_sec = Arc::new(AtomicU64::new(0));
         let bucket = bucket_from_limits(&limits);
@@ -146,6 +151,7 @@ impl MeterHandle {
         Self {
             inner: Arc::new(MeterInner {
                 principal,
+                tally_account_id,
                 event_id,
                 request_id,
                 endpoint,
@@ -188,7 +194,7 @@ impl MeterHandle {
             .fetch_add(bytes, Ordering::Relaxed);
         if let Some(tally) = &self.inner.tally {
             tally.debit(
-                &self.inner.principal.account_id,
+                &self.inner.tally_account_id,
                 self.inner.quota_version,
                 bytes,
             );
@@ -276,7 +282,7 @@ impl MeterInner {
             return false;
         };
         if tally.effective_remaining(
-            &self.principal.account_id,
+            &self.tally_account_id,
             self.quota_version,
             snapshot_remaining,
         ) > 0
@@ -747,6 +753,7 @@ mod tests {
                 account_id: "account".to_string(),
                 api_key_id: Some("key".to_string()),
             },
+            tally_account_id: None,
             limits,
             on_exceed,
             quota_version: 7,
