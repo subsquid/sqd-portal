@@ -276,6 +276,10 @@ impl MeterInner {
         }
 
         let logical = self.logical.load(Ordering::Acquire);
+        // Admission folds effective remaining quota into max_response_bytes. With
+        // multiple concurrent streams, quota exhaustion can therefore surface as
+        // CutMaxBytes here instead of CutQuota; that attribution trade-off is
+        // accepted because enforcement still stops on a complete chunk boundary.
         if self
             .limits
             .max_response_bytes

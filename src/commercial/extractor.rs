@@ -206,6 +206,8 @@ fn invalid_key() -> Rejected {
     Rejected {
         reason: "invalid_key".to_string(),
         http_status: 401,
+        // Malformed keys are rejected before store lookup, so no defaults
+        // record is available to supply the control-plane message.
         message: "Invalid API key".to_string(),
         retry_after_secs: None,
     }

@@ -66,6 +66,9 @@ impl TallyStore {
 
     pub fn sweep_anonymous(&self, now_secs: u64, idle_secs: u64) -> usize {
         let cutoff = now_secs.saturating_sub(idle_secs);
+        // A live meter caches its Tally handle, so a stream whose chunk gap
+        // exceeds the sweep horizon can be orphaned from this map. Debits touch
+        // last_seen, making that practically negligible for active streams.
         let keys: Vec<String> = self
             .entries
             .iter()
