@@ -208,11 +208,14 @@ impl BufferedUsageReporter {
     fn pop_batch(&self) -> Option<Vec<StreamUsageEvent>> {
         let mut queue = self.lock_queue();
         if queue.is_empty() {
+            metrics::set_commercial_usage_buffer_len(0);
             return None;
         }
 
         let count = queue.len().min(self.inner.options.flush_max_events);
-        Some(queue.drain(..count).collect())
+        let batch = queue.drain(..count).collect();
+        metrics::set_commercial_usage_buffer_len(queue.len() as i64);
+        Some(batch)
     }
 
     fn push_front_batch(&self, mut batch: Vec<StreamUsageEvent>) {
@@ -224,6 +227,7 @@ impl BufferedUsageReporter {
             queue.pop_back();
             metrics::report_commercial_usage_dropped();
         }
+        metrics::set_commercial_usage_buffer_len(queue.len() as i64);
     }
 
     fn lock_queue(&self) -> MutexGuard<'_, VecDeque<StreamUsageEvent>> {
@@ -245,8 +249,10 @@ impl UsageReporter for BufferedUsageReporter {
         if queue.len() >= self.inner.options.capacity {
             queue.pop_front();
             metrics::report_commercial_usage_dropped();
+            tracing::warn!("commercial usage buffer full; dropping oldest event");
         }
         queue.push_back(event);
+        metrics::set_commercial_usage_buffer_len(queue.len() as i64);
         drop(queue);
         self.inner.notify.notify_one();
     }

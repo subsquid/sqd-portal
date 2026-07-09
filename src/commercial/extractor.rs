@@ -17,6 +17,7 @@ use super::{
 };
 use crate::{
     config::Config,
+    metrics,
     types::{ParsedQuery, RequestError},
 };
 
@@ -43,7 +44,10 @@ pub async fn middleware(mut req: Request, next: Next, endpoint: Endpoint) -> Res
     let credential =
         match credential_from_request(req.headers(), req.uri().query(), client_ip_header) {
             Ok(credential) => credential,
-            Err(rejected) => return RequestError::from(rejected).into_response(),
+            Err(rejected) => {
+                metrics::report_commercial_authorize("rejected", &rejected.reason);
+                return RequestError::from(rejected).into_response();
+            }
         };
     let dataset = dataset_from_path(req.uri().path(), &endpoint);
     let query = match query_descriptor_from_request(req, endpoint).await {

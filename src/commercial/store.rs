@@ -262,6 +262,7 @@ impl SnapshotStore {
 
     async fn resolve(&self, key_id: &str) -> anyhow::Result<Option<Arc<KeySnapshot>>> {
         if self.negative_cached(key_id) {
+            metrics::report_commercial_resolve("negative_cache");
             return Ok(None);
         }
         if !self.take_resolve_token() {
@@ -269,6 +270,7 @@ impl SnapshotStore {
                 key_id,
                 "commercial snapshot resolve fail-closed: rate limited"
             );
+            metrics::report_commercial_resolve("rate_limited");
             return Ok(None);
         }
 
@@ -285,6 +287,7 @@ impl SnapshotStore {
             StatusCode::OK => {
                 let record: KeySnapshot = response.json().await?;
                 let record = self.upsert_key(record).await?;
+                metrics::report_commercial_resolve("hit");
                 Ok(Some(record))
             }
             StatusCode::NOT_FOUND => {
@@ -292,9 +295,13 @@ impl SnapshotStore {
                     key_id.to_string(),
                     Instant::now() + self.inner.negative_cache_ttl,
                 );
+                metrics::report_commercial_resolve("not_found");
                 Ok(None)
             }
-            status => anyhow::bail!("resolve returned status {status}"),
+            status => {
+                metrics::report_commercial_resolve("error");
+                anyhow::bail!("resolve returned status {status}")
+            }
         }
     }
 
@@ -318,8 +325,10 @@ impl SnapshotStore {
             self.inner.defaults.store(Arc::new(defaults));
         }
         self.inner.records.store(Arc::new(map));
+        metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.inner.cursor.store(cursor, Ordering::Release);
         self.persist_disk_cache().await?;
+        metrics::set_commercial_sync_staleness(0);
         Ok(())
     }
 
@@ -340,8 +349,10 @@ impl SnapshotStore {
             }
         }
         self.inner.records.store(Arc::new(map));
+        metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.inner.cursor.store(cursor, Ordering::Release);
         self.persist_disk_cache().await?;
+        metrics::set_commercial_sync_staleness(0);
         Ok(())
     }
 
@@ -352,8 +363,10 @@ impl SnapshotStore {
         map.insert(record.key_id.clone(), record.clone());
         let cursor = self.inner.cursor.load(Ordering::Relaxed).max(record.seq);
         self.inner.records.store(Arc::new(map));
+        metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.inner.cursor.store(cursor, Ordering::Release);
         self.persist_disk_cache().await?;
+        metrics::set_commercial_sync_staleness(0);
         Ok(record)
     }
 
@@ -385,6 +398,8 @@ impl SnapshotStore {
         self.inner.loaded_from_cache.store(true, Ordering::Release);
         let age = now_secs().saturating_sub(cache.saved_at);
         metrics::set_commercial_snapshot_age(age as i64);
+        metrics::set_commercial_sync_staleness(age as i64);
+        metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         tracing::warn!(path = %path.display(), age_seconds = age, "loaded commercial snapshot disk cache");
     }
 
@@ -417,6 +432,7 @@ impl SnapshotStore {
         tokio::fs::write(&tmp, bytes).await?;
         tokio::fs::rename(&tmp, path).await?;
         metrics::set_commercial_snapshot_age(0);
+        metrics::set_commercial_sync_staleness(0);
         Ok(())
     }
 

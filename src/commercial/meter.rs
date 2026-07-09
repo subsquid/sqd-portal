@@ -306,7 +306,16 @@ impl MeterInner {
     }
 
     fn set_status(&self, status: UsageStatus) {
-        self.status.store(status_code(status), Ordering::Relaxed);
+        let code = status_code(status.clone());
+        let old = self.status.swap(code, Ordering::Relaxed);
+        if old != code
+            && matches!(
+                status,
+                UsageStatus::CutQuota | UsageStatus::CutMaxBytes | UsageStatus::CutSuspended
+            )
+        {
+            metrics::report_commercial_cutoff(&status);
+        }
     }
 
     async fn pace(&self, bytes: u64) {
@@ -327,6 +336,7 @@ impl MeterInner {
                 }
                 Duration::from_secs_f64(((-bucket.available) + 1.0) / rate)
             };
+            metrics::observe_commercial_throttle_stall(wait);
             if wait > Duration::from_secs(30) && !warned {
                 tracing::warn!(
                     stall_seconds = wait.as_secs_f64(),

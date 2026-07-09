@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 
+use crate::metrics;
+
 use super::{
     evaluate,
     store::SnapshotStore,
@@ -60,8 +62,20 @@ impl LocalControlPlane {
 #[async_trait]
 impl ControlPlaneClient for LocalControlPlane {
     async fn authorize(&self, req: AuthorizeRequest) -> Authorization {
-        evaluate::evaluate_with_store(&self.store, Some(&self.tally), Some(&self.concurrency), req)
-            .await
+        let result = evaluate::evaluate_with_store(
+            &self.store,
+            Some(&self.tally),
+            Some(&self.concurrency),
+            req,
+        )
+        .await;
+        match &result {
+            Authorization::Granted(_) => metrics::report_commercial_authorize("granted", "ok"),
+            Authorization::Rejected(rejected) => {
+                metrics::report_commercial_authorize("rejected", &rejected.reason)
+            }
+        }
+        result
     }
 }
 

@@ -13,7 +13,7 @@ use reqwest::StatusCode;
 use sqd_contract_client::PeerId;
 
 use crate::{
-    commercial::{DataSource, Endpoint},
+    commercial::{DataSource, Endpoint, UsageStatus},
     types::DatasetId,
     utils::logging::StreamStats,
 };
@@ -75,6 +75,14 @@ lazy_static::lazy_static! {
     pub static ref STREAM_THROTTLED_RATIO: Histogram = Histogram::new(iter::empty());
     pub static ref COMMERCIAL_USAGE_DROPPED: Counter = Default::default();
     pub static ref COMMERCIAL_SNAPSHOT_AGE_SECONDS: Gauge = Default::default();
+    pub static ref COMMERCIAL_SYNC_STALENESS_SECONDS: Gauge = Default::default();
+    pub static ref COMMERCIAL_SNAPSHOT_RECORDS: Gauge = Default::default();
+    pub static ref COMMERCIAL_AUTHORIZE: Family<Labels, Counter> = Default::default();
+    pub static ref COMMERCIAL_RESOLVE: Family<Labels, Counter> = Default::default();
+    pub static ref COMMERCIAL_USAGE_BUFFER_LEN: Gauge = Default::default();
+    pub static ref COMMERCIAL_CUTOFFS: Family<Labels, Counter> = Default::default();
+    pub static ref COMMERCIAL_THROTTLE_STALL_SECONDS: Histogram =
+        Histogram::new(exponential_buckets(0.01, 2.0, 20));
 
     pub static ref CONGESTION_WINDOW: Gauge = Default::default();
     pub static ref CONGESTION_IN_FLIGHT: Gauge = Default::default();
@@ -187,6 +195,46 @@ pub fn set_commercial_snapshot_age(seconds: i64) {
     COMMERCIAL_SNAPSHOT_AGE_SECONDS.set(seconds);
 }
 
+pub fn set_commercial_sync_staleness(seconds: i64) {
+    COMMERCIAL_SYNC_STALENESS_SECONDS.set(seconds);
+}
+
+pub fn set_commercial_snapshot_records(records: i64) {
+    COMMERCIAL_SNAPSHOT_RECORDS.set(records);
+}
+
+pub fn report_commercial_authorize(outcome: &str, reason: &str) {
+    COMMERCIAL_AUTHORIZE
+        .get_or_create(&vec![
+            ("outcome".to_owned(), outcome.to_owned()),
+            ("reason".to_owned(), reason.to_owned()),
+        ])
+        .inc();
+}
+
+pub fn report_commercial_resolve(result: &str) {
+    COMMERCIAL_RESOLVE
+        .get_or_create(&vec![("result".to_owned(), result.to_owned())])
+        .inc();
+}
+
+pub fn set_commercial_usage_buffer_len(len: i64) {
+    COMMERCIAL_USAGE_BUFFER_LEN.set(len);
+}
+
+pub fn report_commercial_cutoff(status: &UsageStatus) {
+    COMMERCIAL_CUTOFFS
+        .get_or_create(&vec![(
+            "status".to_owned(),
+            usage_status_label(status).to_owned(),
+        )])
+        .inc();
+}
+
+pub fn observe_commercial_throttle_stall(duration: std::time::Duration) {
+    COMMERCIAL_THROTTLE_STALL_SECONDS.observe(duration.as_secs_f64());
+}
+
 fn endpoint_label(endpoint: &Endpoint) -> &'static str {
     match endpoint {
         Endpoint::Stream => "stream",
@@ -202,6 +250,17 @@ fn data_source_label(data_source: &DataSource) -> &'static str {
     match data_source {
         DataSource::Network => "network",
         DataSource::RealTime => "real_time",
+    }
+}
+
+fn usage_status_label(status: &UsageStatus) -> &'static str {
+    match status {
+        UsageStatus::Completed => "completed",
+        UsageStatus::ClientDisconnect => "client_disconnect",
+        UsageStatus::CutQuota => "cut_quota",
+        UsageStatus::CutMaxBytes => "cut_max_bytes",
+        UsageStatus::CutSuspended => "cut_suspended",
+        UsageStatus::Error => "error",
     }
 }
 
@@ -366,6 +425,41 @@ pub fn register_metrics(registry: &mut Registry) {
         "commercial_snapshot_age_seconds",
         "Age of the commercial snapshot disk cache currently loaded by the portal",
         COMMERCIAL_SNAPSHOT_AGE_SECONDS.clone(),
+    );
+    registry.register(
+        "commercial_sync_staleness_seconds",
+        "Seconds since the latest successful commercial snapshot sync",
+        COMMERCIAL_SYNC_STALENESS_SECONDS.clone(),
+    );
+    registry.register(
+        "commercial_snapshot_records",
+        "Number of key records in the commercial snapshot store",
+        COMMERCIAL_SNAPSHOT_RECORDS.clone(),
+    );
+    registry.register(
+        "commercial_authorize_total",
+        "Commercial authorization outcomes by reason",
+        COMMERCIAL_AUTHORIZE.clone(),
+    );
+    registry.register(
+        "commercial_resolve_total",
+        "Commercial on-miss resolve outcomes",
+        COMMERCIAL_RESOLVE.clone(),
+    );
+    registry.register(
+        "commercial_usage_buffer_len",
+        "Commercial usage reporter buffered event count",
+        COMMERCIAL_USAGE_BUFFER_LEN.clone(),
+    );
+    registry.register(
+        "commercial_cutoffs_total",
+        "Commercial stream cutoff count by terminal status",
+        COMMERCIAL_CUTOFFS.clone(),
+    );
+    registry.register(
+        "commercial_throttle_stall_seconds",
+        "Commercial throttle stalls before response chunks",
+        COMMERCIAL_THROTTLE_STALL_SECONDS.clone(),
     );
 
     registry.register(
