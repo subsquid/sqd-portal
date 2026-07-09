@@ -504,16 +504,29 @@ fn build_request(
 mod tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
+    use axum::{routing::get, Router};
     use flate2::{write::GzEncoder, Compression};
     use sqd_primitives::BlockRef;
     use std::io::Write;
 
+    use crate::commercial::{Principal, StreamUsageEvent, UsageStatus};
     use crate::hotblocks::StatusData;
 
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: Mutex<Vec<StreamUsageEvent>>,
+    }
+
+    impl UsageReporter for RecordingReporter {
+        fn report(&self, event: StreamUsageEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     #[tokio::test]
     async fn get_blocknumber_by_timestamp_uses_archive_path_first() {
@@ -694,10 +707,72 @@ mod tests {
         assert!(decode_hotblocks_stream_body(true, b"not gzip").is_err());
     }
 
+    #[tokio::test]
+    async fn collect_hotblocks_stream_counts_ts_lookup_usage() {
+        let body = b"{\"header\":{\"number\":100,\"timestamp\":1700000000}}\n";
+        let encoded = gzip(body);
+        let response = response_with_body(encoded.clone(), true).await;
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = MeterHandle::new(
+            Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some("key".to_string()),
+            },
+            "request".to_string(),
+            Endpoint::TsLookup,
+            "ethereum-mainnet".to_string(),
+            reporter.clone(),
+            7,
+        );
+
+        let decoded = collect_hotblocks_stream(response, Some(meter))
+            .await
+            .unwrap();
+
+        assert_eq!(decoded, String::from_utf8(body.to_vec()).unwrap());
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.endpoint, Endpoint::TsLookup);
+        assert_eq!(event.data_source, DataSource::RealTime);
+        assert_eq!(event.logical_bytes, body.len() as u64);
+        assert_eq!(event.wire_bytes, encoded.len() as u64);
+        assert_eq!(event.chunks, 1);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    async fn response_with_body(body: Vec<u8>, is_gzip: bool) -> reqwest::Response {
+        let app = Router::new().route(
+            "/body",
+            get(move || {
+                let body = body.clone();
+                async move {
+                    let mut builder = Response::builder().status(StatusCode::OK);
+                    if is_gzip {
+                        builder = builder.header(header::CONTENT_ENCODING, "gzip");
+                    }
+                    builder.body(axum::body::Body::from(body)).unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        reqwest::Client::builder()
+            .no_gzip()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/body"))
+            .send()
+            .await
+            .unwrap()
     }
 
     fn fake_status() -> Status {

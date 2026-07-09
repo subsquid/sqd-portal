@@ -655,10 +655,17 @@ const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static(DATA_SOURCE_R
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    use axum::body::to_bytes;
+    use flate2::{write::GzEncoder, Compression as GzipCompression};
+    use futures::stream;
 
     use super::*;
-    use crate::commercial::{Principal, StreamUsageEvent, UsageReporter};
+    use crate::commercial::{Principal, StreamUsageEvent, UsageReporter, UsageStatus};
 
     #[derive(Default)]
     struct RecordingReporter {
@@ -669,6 +676,46 @@ mod tests {
         fn report(&self, event: StreamUsageEvent) {
             self.events.lock().unwrap().push(event);
         }
+    }
+
+    fn meter(reporter: Arc<RecordingReporter>) -> MeterHandle {
+        MeterHandle::new(
+            Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some("key".to_string()),
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter,
+            0,
+        )
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), GzipCompression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    async fn collect_response_body(
+        frames: Vec<Vec<u8>>,
+        compression: Compression,
+        use_gzjoin: bool,
+        meter: Option<MeterHandle>,
+    ) -> Vec<u8> {
+        to_bytes(
+            response_body(stream::iter(frames), compression, use_gzjoin, meter),
+            usize::MAX,
+        )
+        .await
+        .unwrap()
+        .to_vec()
+    }
+
+    fn split_frame(frame: Vec<u8>) -> Vec<Vec<u8>> {
+        let split = frame.len() / 2;
+        vec![frame[..split].to_vec(), frame[split..].to_vec()]
     }
 
     #[test]
@@ -724,5 +771,71 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(reporter.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_body_gzjoin_taps_chunks_without_changing_wire_output() {
+        let plain = b"{\"gzjoin\":true}\n";
+        let frames = split_frame(gzip(plain));
+        let expected = collect_response_body(frames.clone(), Compression::Gzip, true, None).await;
+        let reporter = Arc::new(RecordingReporter::default());
+        let metered = collect_response_body(
+            frames,
+            Compression::Gzip,
+            true,
+            Some(meter(reporter.clone())),
+        )
+        .await;
+
+        assert_eq!(metered, expected);
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, plain.len() as u64);
+        assert_eq!(event.wire_bytes, expected.len() as u64);
+        assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn response_body_recompress_taps_chunks_without_changing_wire_output() {
+        let plain = b"{\"recompress\":true}\n";
+        let frames = split_frame(gzip(plain));
+        let expected = collect_response_body(frames.clone(), Compression::Gzip, false, None).await;
+        let reporter = Arc::new(RecordingReporter::default());
+        let metered = collect_response_body(
+            frames,
+            Compression::Gzip,
+            false,
+            Some(meter(reporter.clone())),
+        )
+        .await;
+
+        assert_eq!(metered, expected);
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, plain.len() as u64);
+        assert_eq!(event.wire_bytes, expected.len() as u64);
+        assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn response_body_zstd_taps_frames_without_changing_wire_output() {
+        let plain = b"{\"zstd\":true}\n";
+        let frames = split_frame(zstd::stream::encode_all(&plain[..], 0).unwrap());
+        let expected = collect_response_body(frames.clone(), Compression::Zstd, false, None).await;
+        let reporter = Arc::new(RecordingReporter::default());
+        let metered = collect_response_body(
+            frames,
+            Compression::Zstd,
+            false,
+            Some(meter(reporter.clone())),
+        )
+        .await;
+
+        assert_eq!(metered, expected);
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, plain.len() as u64);
+        assert_eq!(event.wire_bytes, expected.len() as u64);
+        assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::Completed);
     }
 }

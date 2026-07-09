@@ -290,7 +290,10 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::commercial::types::{DataSource, Endpoint, UsageStatus};
+    use crate::{
+        commercial::types::{DataSource, Endpoint, UsageStatus},
+        metrics,
+    };
 
     fn event(id: &str) -> StreamUsageEvent {
         StreamUsageEvent {
@@ -453,6 +456,22 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].event_id, "retry-me");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn client_error_drops_batch_and_records_metric() {
+        let (url, mut rx) = mock_server(vec![StatusCode::BAD_REQUEST]).await;
+        let reporter = reporter(url, Duration::from_secs(60), 1, 10);
+        let before = metrics::COMMERCIAL_USAGE_DROPPED.get();
+
+        reporter.report(event("bad-request"));
+        reporter
+            .flush_one_batch_with_retry(&CancellationToken::new())
+            .await;
+
+        assert!(reporter.pop_batch().is_none());
+        assert!(rx.try_recv().is_err());
+        assert!(metrics::COMMERCIAL_USAGE_DROPPED.get() > before);
     }
 
     #[tokio::test]

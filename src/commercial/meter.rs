@@ -465,13 +465,17 @@ mod tests {
     }
 
     fn meter(reporter: Arc<RecordingReporter>) -> MeterHandle {
+        meter_for(reporter, Endpoint::Stream)
+    }
+
+    fn meter_for(reporter: Arc<RecordingReporter>, endpoint: Endpoint) -> MeterHandle {
         MeterHandle::new(
             Principal {
                 account_id: "account".to_string(),
                 api_key_id: Some("key".to_string()),
             },
             "request".to_string(),
-            Endpoint::Stream,
+            endpoint,
             "ethereum-mainnet".to_string(),
             reporter,
             7,
@@ -539,6 +543,23 @@ mod tests {
         assert_eq!(event.logical_bytes, data.len() as u64);
         assert_eq!(event.wire_bytes, wire);
         assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn legacy_query_gzip_recording_counts_json_body() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = meter_for(reporter.clone(), Endpoint::LegacyQuery);
+        let body = b"[{\"legacy\":true}]\n";
+        let encoded = gzip(body).await;
+
+        meter.record_gzip_body_and_complete(&encoded).unwrap();
+
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.endpoint, Endpoint::LegacyQuery);
+        assert_eq!(event.logical_bytes, body.len() as u64);
+        assert_eq!(event.wire_bytes, encoded.len() as u64);
+        assert_eq!(event.chunks, 1);
         assert_eq!(event.status, UsageStatus::Completed);
     }
 

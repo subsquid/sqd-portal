@@ -1491,6 +1491,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn hotblocks_head_status_forwards_stay_unmetered() {
+        let reporter = Arc::new(RecordingReporter::default());
+
+        for body in [
+            b"{\"number\":42}".as_slice(),
+            b"{\"status\":\"ok\"}".as_slice(),
+        ] {
+            let response = reqwest_response(body.to_vec()).await;
+            let forwarded = forward_hotblocks_response(Ok(response));
+            let forwarded_body = axum::body::to_bytes(forwarded.into_body(), usize::MAX)
+                .await
+                .unwrap();
+
+            assert_eq!(&forwarded_body[..], body);
+        }
+
+        assert!(reporter.events.lock().unwrap().is_empty());
+    }
+
+    async fn reqwest_response(body: Vec<u8>) -> reqwest::Response {
+        let app = axum::Router::new().route(
+            "/hotblocks",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { Body::from(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        reqwest::get(format!("http://{addr}/hotblocks"))
+            .await
+            .unwrap()
+    }
+
     #[tokio::test(start_paused = true)]
     async fn drive_serve_returns_ok_when_serve_finishes_before_drain_timeout() {
         let cancel = CancellationToken::new();
