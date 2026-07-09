@@ -56,24 +56,24 @@ pub async fn evaluate_with_store(
                     state.tally_bytes = tally.bytes_for(account_id, quota.version);
                 }
             }
-            let permit = snapshot
-                .as_deref()
-                .and_then(|snapshot| {
-                    Some((
-                        snapshot.account_id.as_deref()?,
-                        snapshot.limits.as_ref()?.concurrency?,
-                    ))
-                })
-                .and_then(|(account_id, limit)| {
-                    concurrency.and_then(|limiter| limiter.try_acquire(account_id, limit))
-                });
-            if snapshot
-                .as_deref()
-                .and_then(|snapshot| snapshot.limits.as_ref()?.concurrency)
-                .is_some()
+            if let Credential::Key {
+                key_id: _,
+                secret_sha256,
+            } = &req.credential
             {
-                state.concurrency_available = permit.is_some();
+                if let Err(rejected) = evaluate_key_prechecks(
+                    &req,
+                    snapshot.as_deref(),
+                    &view.defaults,
+                    state,
+                    secret_sha256,
+                ) {
+                    return Authorization::Rejected(rejected);
+                }
             }
+            let (permit, concurrency_available) =
+                acquire_key_permit(snapshot.as_deref(), concurrency);
+            state.concurrency_available = concurrency_available;
             match evaluate(&req, snapshot.as_deref(), &view.defaults, state) {
                 Authorization::Granted(mut granted) => {
                     granted.concurrency_permit = permit;
@@ -117,49 +117,10 @@ fn evaluate_key(
     key_id: &str,
     secret_sha256: &str,
 ) -> Authorization {
-    let Some(snapshot) = snapshot else {
-        return reject(defaults, INVALID_KEY, 401, None);
+    let snapshot = match evaluate_key_prechecks(req, snapshot, defaults, state, secret_sha256) {
+        Ok(snapshot) => snapshot,
+        Err(rejected) => return Authorization::Rejected(rejected),
     };
-    if !hash_matches(
-        secret_sha256,
-        snapshot.secret_sha256.as_deref().unwrap_or_default(),
-    ) {
-        return reject(defaults, INVALID_KEY, 401, None);
-    }
-    match snapshot.status {
-        KeyStatus::Revoked => return reject(defaults, INVALID_KEY, 401, None),
-        KeyStatus::Active | KeyStatus::Suspended => {}
-    }
-    if snapshot
-        .expires_at
-        .is_some_and(|expires_at| expires_at < state.now_secs)
-    {
-        return reject(defaults, EXPIRED, 401, None);
-    }
-    if snapshot.status == KeyStatus::Suspended {
-        return reject(defaults, SUSPENDED, 402, None);
-    }
-
-    let entitlements = snapshot.entitlements.as_ref();
-    if !entitlements.is_some_and(|entitlements| {
-        entitlements
-            .chains
-            .iter()
-            .any(|chain| chain == &req.dataset)
-    }) {
-        return reject(defaults, DATASET_NOT_ENTITLED, 403, None);
-    }
-    if req.query.chain_kind.as_deref() == Some("evm")
-        && (req.query.requires_traces || req.query.requires_statediffs)
-        && !entitlements.is_some_and(|entitlements| {
-            entitlements
-                .traces
-                .iter()
-                .any(|chain| chain == &req.dataset)
-        })
-    {
-        return reject(defaults, TRACES_NOT_ENTITLED, 403, None);
-    }
     if !state.concurrency_available {
         return reject(defaults, CONCURRENCY_LIMIT, 429, Some(1));
     }
@@ -203,6 +164,77 @@ fn evaluate_key(
         limits.max_response_bytes = min_optional(limits.max_response_bytes, Some(effective));
     }
     Authorization::Granted(grant(snapshot, key_id, limits, on_exceed))
+}
+
+fn evaluate_key_prechecks<'a>(
+    req: &AuthorizeRequest,
+    snapshot: Option<&'a KeySnapshot>,
+    defaults: &Defaults,
+    state: EvaluationState,
+    secret_sha256: &str,
+) -> Result<&'a KeySnapshot, Rejected> {
+    let Some(snapshot) = snapshot else {
+        return Err(rejected(defaults, INVALID_KEY, 401, None));
+    };
+    if !hash_matches(
+        secret_sha256,
+        snapshot.secret_sha256.as_deref().unwrap_or_default(),
+    ) {
+        return Err(rejected(defaults, INVALID_KEY, 401, None));
+    }
+    match snapshot.status {
+        KeyStatus::Revoked => return Err(rejected(defaults, INVALID_KEY, 401, None)),
+        KeyStatus::Active | KeyStatus::Suspended => {}
+    }
+    if snapshot
+        .expires_at
+        .is_some_and(|expires_at| expires_at < state.now_secs)
+    {
+        return Err(rejected(defaults, EXPIRED, 401, None));
+    }
+    if snapshot.status == KeyStatus::Suspended {
+        return Err(rejected(defaults, SUSPENDED, 402, None));
+    }
+
+    let entitlements = snapshot.entitlements.as_ref();
+    if !entitlements.is_some_and(|entitlements| {
+        entitlements
+            .chains
+            .iter()
+            .any(|chain| chain == &req.dataset)
+    }) {
+        return Err(rejected(defaults, DATASET_NOT_ENTITLED, 403, None));
+    }
+    if req.query.chain_kind.as_deref() == Some("evm")
+        && (req.query.requires_traces || req.query.requires_statediffs)
+        && !entitlements.is_some_and(|entitlements| {
+            entitlements
+                .traces
+                .iter()
+                .any(|chain| chain == &req.dataset)
+        })
+    {
+        return Err(rejected(defaults, TRACES_NOT_ENTITLED, 403, None));
+    }
+
+    Ok(snapshot)
+}
+
+fn acquire_key_permit(
+    snapshot: Option<&KeySnapshot>,
+    concurrency: Option<&ConcurrencyLimiter>,
+) -> (Option<super::concurrency::ConcurrencyPermit>, bool) {
+    let Some((account_id, limit)) = snapshot.and_then(|snapshot| {
+        Some((
+            snapshot.account_id.as_deref()?,
+            snapshot.limits.as_ref()?.concurrency?,
+        ))
+    }) else {
+        return (None, true);
+    };
+    let permit = concurrency.and_then(|limiter| limiter.try_acquire(account_id, limit));
+    let available = permit.is_some();
+    (permit, available)
 }
 
 fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
@@ -361,7 +393,16 @@ fn reject(
     http_status: u16,
     retry_after_secs: Option<u64>,
 ) -> Authorization {
-    Authorization::Rejected(Rejected {
+    Authorization::Rejected(rejected(defaults, reason, http_status, retry_after_secs))
+}
+
+fn rejected(
+    defaults: &Defaults,
+    reason: &str,
+    http_status: u16,
+    retry_after_secs: Option<u64>,
+) -> Rejected {
+    Rejected {
         reason: reason.to_string(),
         http_status,
         message: defaults
@@ -370,7 +411,7 @@ fn reject(
             .cloned()
             .unwrap_or_else(|| fallback_message(reason)),
         retry_after_secs,
-    })
+    }
 }
 
 fn hash_matches(presented: &str, expected: &str) -> bool {
@@ -418,10 +459,19 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, time::Duration};
+
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
     use crate::commercial::{
-        store::test_support::{active_snapshot, defaults_record, KEY_ID, SECRET_SHA256},
-        ConcurrencyLimiter, Credential, Endpoint, QueryDescriptor, TallyStore,
+        config::{CommercialConfig, PublicFallbackConfig},
+        store::test_support::{
+            active_snapshot, defaults_record, page, MockControlPlane, KEY_ID, SECRET_SHA256,
+            SERVICE_TOKEN,
+        },
+        ConcurrencyLimiter, Credential, Endpoint, QueryDescriptor, SnapshotRecord, SnapshotStore,
+        TallyStore,
     };
 
     const WRONG_SHA256: &str = "aac742262c66b43621baf5b5439b30aa0de646e131c665f1d2118372cdb9b0ed";
@@ -453,6 +503,37 @@ mod tests {
             tally_bytes: 0,
             concurrency_available: true,
         }
+    }
+
+    fn store_config(mock: &MockControlPlane, cache_path: PathBuf) -> CommercialConfig {
+        CommercialConfig {
+            control_plane_url: mock.url(),
+            service_token_env: "PORTAL_EVALUATE_TEST_TOKEN".to_string(),
+            sync_interval_secs: 1,
+            flush_interval_secs: 5,
+            flush_max_events: 500,
+            usage_buffer_max_events: 1000,
+            snapshot_cache_path: cache_path,
+            resolve_rate_per_sec: 10,
+            negative_cache_secs: 60,
+            pod_count: 1,
+            client_ip_header: "x-forwarded-for".to_string(),
+            public_fallback: PublicFallbackConfig {
+                throughput_bytes_per_sec: 1,
+                burst_bytes: 1,
+                max_response_bytes: 1,
+                volume_bytes: 1,
+                window_secs: 1,
+                concurrency: 1,
+            },
+        }
+    }
+
+    fn cache_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sqd-portal-evaluate-{name}-{}.json",
+            uuid::Uuid::new_v4()
+        ))
     }
 
     fn rejected_reason(result: Authorization) -> String {
@@ -731,5 +812,35 @@ mod tests {
             }
             Authorization::Granted(_) => panic!("expected concurrency rejection"),
         }
+    }
+
+    #[tokio::test]
+    async fn bad_secret_does_not_touch_concurrency_limiter() {
+        std::env::set_var("PORTAL_EVALUATE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        mock.push_page(
+            0,
+            page(vec![SnapshotRecord::Key(active_snapshot(1))], 1, false),
+        );
+        let path = cache_path("bad-secret");
+        let (store, task) =
+            SnapshotStore::spawn(&store_config(&mock, path.clone()), CancellationToken::new())
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let limiter = ConcurrencyLimiter::new(1);
+        let result = evaluate_with_store(&store, None, Some(&limiter), request(WRONG_SHA256)).await;
+
+        assert_eq!(rejected_reason(result), "invalid_key");
+        assert_eq!(limiter.sweep_idle(Duration::ZERO), 0);
+
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
     }
 }
