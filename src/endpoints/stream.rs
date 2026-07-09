@@ -161,11 +161,15 @@ async fn run_archival_stream_inner(
                 .unwrap()
         }
         Err(RequestError::NoData) => {
+            discard_meter(&meter);
             // Delay request from this client for 5 seconds to avoid unnecessary retries.
             tokio::time::sleep(Duration::from_secs(5)).await;
             res.status(StatusCode::NO_CONTENT).body(().into()).unwrap()
         }
-        Err(e) => e.into_response(),
+        Err(e) => {
+            discard_meter(&meter);
+            e.into_response()
+        }
     }
 }
 
@@ -350,7 +354,10 @@ async fn run_stream_internal(
             )
             .await
         }
-        Some(dataset_id) => stream_after_network_head(&network, dataset_id).await,
+        Some(dataset_id) => {
+            discard_meter(&meter);
+            stream_after_network_head(&network, dataset_id).await
+        }
         None => {
             unreachable!(
                 "invalid dataset name should have been handled in the ClientRequest parser"
@@ -389,6 +396,7 @@ async fn stream_from_network(
     let stream = match task_manager.spawn_stream(request).await {
         Ok(stream) => stream,
         Err(e) => {
+            discard_meter(&meter);
             let mut response = e.into_response();
             response
                 .headers_mut()
@@ -441,6 +449,7 @@ async fn stream_from_hotblocks(
                 )
                 .await
             {
+                discard_meter(&meter);
                 return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
             }
 
@@ -449,7 +458,10 @@ async fn stream_from_hotblocks(
             }
             forward_response_metered(response, meter)
         }
-        Err(e) => forward_hotblocks_response(Err(e)),
+        Err(e) => {
+            discard_meter(&meter);
+            forward_hotblocks_response(Err(e))
+        }
     };
 
     res.headers_mut()
@@ -556,6 +568,12 @@ fn meter_from_extensions(
     ))
 }
 
+fn discard_meter(meter: &Option<MeterHandle>) {
+    if let Some(meter) = meter {
+        meter.discard();
+    }
+}
+
 pub(crate) fn restrict_request(config: &Config, request: StreamRequest) -> StreamRequest {
     let max_chunks = match (request.max_chunks, config.max_chunks_per_stream) {
         (Some(requested), Some(limit)) => Some(requested.min(limit)),
@@ -637,7 +655,21 @@ const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static(DATA_SOURCE_R
 
 #[cfg(test)]
 mod tests {
-    use super::is_hotblocks_gap;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::commercial::{Principal, StreamUsageEvent, UsageReporter};
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: Mutex<Vec<StreamUsageEvent>>,
+    }
+
+    impl UsageReporter for RecordingReporter {
+        fn report(&self, event: StreamUsageEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     #[test]
     fn hotblocks_gap_detects_missing_blocks_after_archival_height() {
@@ -667,5 +699,30 @@ mod tests {
     #[test]
     fn hotblocks_gap_requires_actual_gap_between_sources() {
         assert!(!is_hotblocks_gap(101, 100, 101));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_no_content_discards_meter_without_usage_event() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = Some(MeterHandle::new(
+            Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some("key".to_string()),
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter.clone(),
+            0,
+        ));
+        discard_meter(&meter);
+
+        let task = tokio::spawn(delayed_no_content_response(DATA_SOURCE_REALTIME));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let response = task.await.unwrap();
+        drop(meter);
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(reporter.events.lock().unwrap().is_empty());
     }
 }

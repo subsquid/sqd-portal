@@ -118,6 +118,10 @@ impl MeterHandle {
         self.inner.flush_once();
     }
 
+    pub fn discard(&self) {
+        self.inner.flushed.store(true, Ordering::Release);
+    }
+
     pub fn record_plain_bytes_and_complete(&self, bytes: u64) {
         self.add_logical_bytes(bytes);
         self.add_wire_bytes(bytes);
@@ -473,6 +477,17 @@ mod tests {
         assert_eq!(event.logical_bytes, data.len() as u64);
         assert_eq!(event.wire_bytes, wire);
         assert_eq!(event.chunks, 1);
+    }
+
+    #[test]
+    fn discard_suppresses_drop_flush() {
+        let reporter = Arc::new(RecordingReporter::default());
+        {
+            let meter = meter(reporter.clone());
+            meter.discard();
+        }
+
+        assert!(reporter.events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
