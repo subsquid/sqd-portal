@@ -13,6 +13,7 @@ use dashmap::DashMap;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
+use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -40,6 +41,7 @@ struct SnapshotStoreInner {
     ready: AtomicBool,
     loaded_from_cache: AtomicBool,
     disk_cache_dirty: AtomicBool,
+    last_sync_success: Mutex<Option<TokioInstant>>,
     cache_path: PathBuf,
     sync_interval: Duration,
     negative_cache_ttl: Duration,
@@ -114,6 +116,7 @@ impl SnapshotStore {
                 ready: AtomicBool::new(false),
                 loaded_from_cache: AtomicBool::new(false),
                 disk_cache_dirty: AtomicBool::new(false),
+                last_sync_success: Mutex::new(None),
                 cache_path: config.snapshot_cache_path.clone(),
                 sync_interval: Duration::from_secs(config.sync_interval_secs.max(1)),
                 negative_cache_ttl: Duration::from_secs(config.negative_cache_secs.max(1)),
@@ -145,6 +148,7 @@ impl SnapshotStore {
                 ready: AtomicBool::new(true),
                 loaded_from_cache: AtomicBool::new(false),
                 disk_cache_dirty: AtomicBool::new(false),
+                last_sync_success: Mutex::new(Some(TokioInstant::now())),
                 cache_path: PathBuf::new(),
                 sync_interval: Duration::from_secs(10),
                 negative_cache_ttl: Duration::from_secs(15),
@@ -189,20 +193,40 @@ impl SnapshotStore {
 
     async fn run_sync_loop(self: Arc<Self>, cancel: CancellationToken) {
         loop {
-            if !self.is_ready() {
-                if let Err(err) = self.bootstrap().await {
-                    tracing::warn!(error = %err, "commercial snapshot bootstrap failed");
-                }
-            } else if let Err(err) = self.sync_once().await {
-                tracing::warn!(error = %err, "commercial snapshot sync failed");
-            }
-            self.persist_dirty_cache().await;
+            let _ = self.run_sync_tick().await;
 
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(self.inner.sync_interval) => {}
             }
         }
+    }
+
+    async fn run_sync_tick(&self) -> anyhow::Result<()> {
+        let result = if !self.is_ready() {
+            if let Err(err) = self.bootstrap().await {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        } else if let Err(err) = self.sync_once().await {
+            Err(err)
+        } else {
+            Ok(())
+        };
+
+        match &result {
+            Ok(()) => self.record_sync_success(),
+            Err(err) if self.is_ready() => {
+                tracing::warn!(error = %err, "commercial snapshot sync failed");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "commercial snapshot bootstrap failed");
+            }
+        }
+        self.update_sync_age_metrics();
+        self.persist_dirty_cache().await;
+        result
     }
 
     async fn bootstrap(&self) -> anyhow::Result<()> {
@@ -394,6 +418,8 @@ impl SnapshotStore {
         self.inner.ready.store(true, Ordering::Release);
         self.inner.loaded_from_cache.store(true, Ordering::Release);
         let age = now_secs().saturating_sub(cache.saved_at);
+        *self.inner.last_sync_success.lock().unwrap() =
+            Some(TokioInstant::now() - Duration::from_secs(age));
         metrics::set_commercial_snapshot_age(age as i64);
         metrics::set_commercial_sync_staleness(age as i64);
         metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
@@ -428,8 +454,6 @@ impl SnapshotStore {
         let tmp = tmp_path(path);
         tokio::fs::write(&tmp, bytes).await?;
         tokio::fs::rename(&tmp, path).await?;
-        metrics::set_commercial_snapshot_age(0);
-        metrics::set_commercial_sync_staleness(0);
         Ok(())
     }
 
@@ -446,6 +470,32 @@ impl SnapshotStore {
             metrics::report_commercial_snapshot_persist_error();
             tracing::warn!(error = %err, "commercial snapshot disk cache persist failed");
         }
+    }
+
+    fn record_sync_success(&self) {
+        *self.inner.last_sync_success.lock().unwrap() = Some(TokioInstant::now());
+    }
+
+    fn sync_age_seconds(&self) -> Option<i64> {
+        self.inner
+            .last_sync_success
+            .lock()
+            .unwrap()
+            .map(|last_success| {
+                TokioInstant::now()
+                    .duration_since(last_success)
+                    .as_secs()
+                    .try_into()
+                    .unwrap_or(i64::MAX)
+            })
+    }
+
+    fn update_sync_age_metrics(&self) {
+        let Some(seconds) = self.sync_age_seconds() else {
+            return;
+        };
+        metrics::set_commercial_sync_staleness(seconds);
+        metrics::set_commercial_snapshot_age(seconds);
     }
 
     fn negative_cached(&self, key_id: &str) -> bool {
@@ -962,6 +1012,35 @@ mod tests {
         assert_eq!(store.get(KEY_ID).unwrap().status, KeyStatus::Revoked);
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_staleness_gauges_grow_across_failed_ticks() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+
+        store.record_sync_success();
+        store.update_sync_age_metrics();
+        assert_eq!(metrics::COMMERCIAL_SYNC_STALENESS_SECONDS.get(), 0);
+        assert_eq!(metrics::COMMERCIAL_SNAPSHOT_AGE_SECONDS.get(), 0);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        store.update_sync_age_metrics();
+        let first_staleness = metrics::COMMERCIAL_SYNC_STALENESS_SECONDS.get();
+        let first_age = metrics::COMMERCIAL_SNAPSHOT_AGE_SECONDS.get();
+        assert!(first_staleness >= 1);
+        assert!(first_age >= 1);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        store.update_sync_age_metrics();
+        assert!(metrics::COMMERCIAL_SYNC_STALENESS_SECONDS.get() > first_staleness);
+        assert!(metrics::COMMERCIAL_SNAPSHOT_AGE_SECONDS.get() > first_age);
     }
 
     #[tokio::test]
