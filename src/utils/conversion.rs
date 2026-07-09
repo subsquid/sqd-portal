@@ -5,7 +5,7 @@ use futures::{pin_mut, Stream, StreamExt};
 use hex_literal::hex;
 use itertools::Itertools;
 use libz_ng_sys::crc32_combine;
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
 use tokio_util::{
     bytes::Bytes,
     io::{ReaderStream, StreamReader},
@@ -32,30 +32,96 @@ pub fn json_lines_to_json(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 pub fn recompress_gzip<S>(stream: S) -> impl futures::Stream<Item = std::io::Result<Bytes>>
 where
-    S: futures::Stream<Item = Vec<u8>>,
+    S: futures::Stream<Item = Vec<u8>> + Unpin,
+{
+    recompress_gzip_with_logical_counter(stream, |_| {})
+}
+
+pub fn recompress_gzip_with_logical_counter<S, F>(
+    stream: S,
+    on_logical_bytes: F,
+) -> impl futures::Stream<Item = std::io::Result<Bytes>>
+where
+    S: futures::Stream<Item = Vec<u8>> + Unpin,
+    F: FnMut(u64) + Unpin,
 {
     let reader =
         StreamReader::new(stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))));
 
     let mut decoder = GzipDecoder::new(reader);
     decoder.multiple_members(true);
+    let counted = LogicalCountingReader {
+        inner: decoder,
+        on_logical_bytes,
+    };
 
     let encoder =
-        GzipEncoder::with_quality(BufReader::new(decoder), async_compression::Level::Fastest);
+        GzipEncoder::with_quality(BufReader::new(counted), async_compression::Level::Fastest);
 
     ReaderStream::new(encoder)
+}
+
+struct LogicalCountingReader<R, F> {
+    inner: R,
+    on_logical_bytes: F,
+}
+
+impl<R, F> AsyncRead for LogicalCountingReader<R, F>
+where
+    R: AsyncRead + Unpin,
+    F: FnMut(u64) + Unpin,
+{
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &result {
+            let read = buf.filled().len().saturating_sub(before);
+            if read > 0 {
+                (self.on_logical_bytes)(read as u64);
+            }
+        }
+
+        result
+    }
 }
 
 pub fn join_gzip_default<S: Stream<Item = Vec<u8>>>(
     data: S,
 ) -> impl Stream<Item = Result<Bytes, anyhow::Error>> {
-    join_gzip(data, JOIN_GZIP_CHUNK_SIZE)
+    join_gzip_default_with_logical_counter(data, |_| {})
+}
+
+pub fn join_gzip_default_with_logical_counter<S, F>(
+    data: S,
+    on_logical_bytes: F,
+) -> impl Stream<Item = Result<Bytes, anyhow::Error>>
+where
+    S: Stream<Item = Vec<u8>>,
+    F: FnMut(u64),
+{
+    join_gzip_with_logical_counter(data, JOIN_GZIP_CHUNK_SIZE, on_logical_bytes)
 }
 
 pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
     data: S,
     gzip_chunk_size: usize,
 ) -> impl Stream<Item = Result<Bytes, anyhow::Error>> {
+    join_gzip_with_logical_counter(data, gzip_chunk_size, |_| {})
+}
+
+pub fn join_gzip_with_logical_counter<S, F>(
+    data: S,
+    gzip_chunk_size: usize,
+    mut on_logical_bytes: F,
+) -> impl Stream<Item = Result<Bytes, anyhow::Error>>
+where
+    S: Stream<Item = Vec<u8>>,
+    F: FnMut(u64),
+{
     stream! {
         let mut crc = unsafe { libz_ng_sys::crc32(0, std::ptr::null(), 0) };
         let mut tot = 0u32;
@@ -162,6 +228,7 @@ pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
             crc = unsafe { crc32_combine(crc, input.get4().await?, len.try_into()?) };
             let _ = input.get4().await?;
             tot += len as u32;
+            on_logical_bytes(len as u64);
             /* clean up */
             input.cleanup();
         }
@@ -192,7 +259,13 @@ where
 #[cfg(test)]
 mod tests {
     use futures::{future::join_all, lock::Mutex};
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use flate2::bufread::GzDecoder;
     use rand::rngs::StdRng;
@@ -244,6 +317,69 @@ mod tests {
         let mut buf_reader = BufReader::with_capacity(100_000_000, decoder);
         let result = buf_reader.fill_buf().await.unwrap();
         assert_eq!(result.to_vec(), gt);
+    }
+
+    async fn collect_bytes<S, E>(stream: S) -> Vec<u8>
+    where
+        S: Stream<Item = Result<Bytes, E>>,
+        E: std::fmt::Debug,
+    {
+        pin_mut!(stream);
+        let mut output = Vec::new();
+        while let Some(result) = stream.next().await {
+            output.extend(result.unwrap());
+        }
+
+        output
+    }
+
+    fn decode_gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut decoder = GzDecoder::new(bytes);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        decoded
+    }
+
+    #[tokio::test]
+    async fn join_gzip_reports_logical_bytes_from_internal_inflate() {
+        let testcase = vec![b"{\"a\":1}\n".to_vec(), b"{\"b\":2}\n".to_vec()];
+        let logical = Arc::new(AtomicU64::new(0));
+        let logical_counter = logical.clone();
+        let stream = join_gzip_default_with_logical_counter(
+            Box::pin(generate_data(testcase.clone(), 3)),
+            move |bytes| {
+                logical_counter.fetch_add(bytes, Ordering::Relaxed);
+            },
+        );
+
+        let output = collect_bytes(stream).await;
+
+        assert_eq!(decode_gzip(&output), testcase.concat());
+        assert_eq!(
+            logical.load(Ordering::Relaxed),
+            testcase.iter().map(Vec::len).sum::<usize>() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn recompress_gzip_reports_logical_bytes_from_internal_inflate() {
+        let testcase = vec![b"{\"a\":1}\n".to_vec(), b"{\"b\":2}\n".to_vec()];
+        let logical = Arc::new(AtomicU64::new(0));
+        let logical_counter = logical.clone();
+        let stream = recompress_gzip_with_logical_counter(
+            Box::pin(generate_data(testcase.clone(), 3)),
+            move |bytes| {
+                logical_counter.fetch_add(bytes, Ordering::Relaxed);
+            },
+        );
+
+        let output = collect_bytes(stream).await;
+
+        assert_eq!(decode_gzip(&output), testcase.concat());
+        assert_eq!(
+            logical.load(Ordering::Relaxed),
+            testcase.iter().map(Vec::len).sum::<usize>() as u64
+        );
     }
 
     async fn hierarchical_join_unpack(testcase: Vec<Vec<u8>>, final_fragmentation: usize) {

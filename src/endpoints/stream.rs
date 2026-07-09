@@ -11,7 +11,9 @@ use futures::{Stream, StreamExt};
 
 use crate::{
     commercial::{
-        meter::{tap_gzip_stream, tap_input_frames, tap_plain_stream, tap_wire_stream},
+        meter::{
+            tap_gzip_stream, tap_input_chunks, tap_input_frames, tap_plain_stream, tap_wire_stream,
+        },
         CommercialGrant, DataSource, Endpoint, MeterHandle, UsageReporter,
     },
     config::Config,
@@ -21,7 +23,10 @@ use crate::{
     http_server::forward_hotblocks_response,
     network::NetworkClient,
     types::{Compression, DatasetId, RequestError, StreamRequest},
-    utils::conversion::{join_gzip_default, recompress_gzip},
+    utils::conversion::{
+        join_gzip_default, join_gzip_default_with_logical_counter, recompress_gzip,
+        recompress_gzip_with_logical_counter,
+    },
 };
 
 /// [INTERNAL] Archival stream
@@ -491,18 +496,35 @@ fn response_body(
     use_gzjoin: bool,
     meter: Option<MeterHandle>,
 ) -> Body {
-    let stream: Pin<Box<dyn Stream<Item = Vec<u8>> + Send>> = match meter.clone() {
-        Some(meter) => Box::pin(tap_input_frames(stream, compression, meter)),
-        None => Box::pin(stream),
+    let stream: Pin<Box<dyn Stream<Item = Vec<u8>> + Send>> = match (meter.clone(), compression) {
+        (Some(meter), Compression::Gzip) => Box::pin(tap_input_chunks(stream, meter)),
+        (Some(meter), Compression::Zstd) => Box::pin(tap_input_frames(stream, compression, meter)),
+        (None, _) => Box::pin(stream),
     };
 
     match compression {
         Compression::Gzip if use_gzjoin => match meter {
-            Some(meter) => Body::from_stream(tap_wire_stream(join_gzip_default(stream), meter)),
+            Some(meter) => {
+                let logical_meter = meter.clone();
+                Body::from_stream(tap_wire_stream(
+                    join_gzip_default_with_logical_counter(stream, move |bytes| {
+                        logical_meter.add_logical_bytes(bytes);
+                    }),
+                    meter,
+                ))
+            }
             None => Body::from_stream(join_gzip_default(stream)),
         },
         Compression::Gzip => match meter {
-            Some(meter) => Body::from_stream(tap_wire_stream(recompress_gzip(stream), meter)),
+            Some(meter) => {
+                let logical_meter = meter.clone();
+                Body::from_stream(tap_wire_stream(
+                    recompress_gzip_with_logical_counter(stream, move |bytes| {
+                        logical_meter.add_logical_bytes(bytes);
+                    }),
+                    meter,
+                ))
+            }
             None => Body::from_stream(recompress_gzip(stream)),
         },
         Compression::Zstd => {

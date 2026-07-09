@@ -194,6 +194,19 @@ where
     }
 }
 
+pub fn tap_input_chunks<S>(input: S, meter: MeterHandle) -> impl Stream<Item = Vec<u8>> + Send
+where
+    S: Stream<Item = Vec<u8>> + Send + 'static,
+{
+    stream! {
+        futures::pin_mut!(input);
+        while let Some(frame) = input.next().await {
+            meter.add_chunk();
+            yield frame;
+        }
+    }
+}
+
 pub fn tap_plain_stream<S, E>(input: S, meter: MeterHandle) -> impl Stream<Item = Result<Bytes, E>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
