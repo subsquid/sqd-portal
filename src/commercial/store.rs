@@ -154,7 +154,10 @@ impl SnapshotStore {
                 negative_cache_ttl: Duration::from_secs(15),
                 negative_cache: DashMap::new(),
                 resolve_limiter: Mutex::new(ResolveLimiter::new(0)),
-                client: reqwest::Client::new(),
+                client: reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .expect("inactive snapshot store client should build"),
                 control_plane_url: "http://127.0.0.1/"
                     .parse()
                     .expect("static URL should parse"),
@@ -219,6 +222,13 @@ impl SnapshotStore {
     #[cfg(test)]
     pub(crate) fn set_ready_for_test(&self, ready: bool) {
         self.inner.ready.store(ready, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_records_for_test(&self, records: Vec<SnapshotRecord>, cursor: u64) {
+        self.replace_records(records, cursor)
+            .expect("test snapshot records should install");
+        self.inner.ready.store(true, Ordering::Release);
     }
 
     async fn run_sync_loop(self: Arc<Self>, cancel: CancellationToken) {

@@ -1421,14 +1421,19 @@ async fn sql_metadata(
 mod tests {
     use super::*;
     use axum::async_trait;
+    use std::future;
+    use std::io;
     use std::sync::Mutex;
     use std::time::Duration;
 
     use tower::ServiceExt;
 
     use crate::commercial::{
-        Authorization, ControlPlaneClient, Credential, Granted, GrantedLimits, OnExceed, Principal,
-        PublicFallbackConfig,
+        evaluate::EvaluationPolicy,
+        store::test_support::{active_snapshot, defaults_record, KEY_ID},
+        ActiveStreamRegistry, Authorization, ConcurrencyLimiter, ControlPlaneClient, Credential,
+        Granted, GrantedLimits, LocalControlPlane, OnExceed, Principal, PublicFallbackConfig,
+        SnapshotRecord, TallyStore,
     };
 
     #[test]
@@ -1599,6 +1604,129 @@ mod tests {
             "/sql/query" => "/sql/query",
             path => unreachable!("missing commercial route test sample for {path}"),
         }
+    }
+
+    async fn held_meter_stream_handler(
+        endpoint: Option<Extension<Endpoint>>,
+        grant: Option<Extension<CommercialGrant>>,
+        reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    ) -> Response {
+        let endpoint = endpoint
+            .map(|endpoint| endpoint.0)
+            .unwrap_or(Endpoint::Stream);
+        let meter = meter_from_extensions(
+            grant,
+            reporter,
+            endpoint,
+            "ethereum-mainnet".to_string(),
+            "request".to_string(),
+        )
+        .expect("commercial middleware should attach a grant");
+        let stream = futures::stream::once(async move {
+            let _meter = meter;
+            future::pending::<Result<bytes::Bytes, io::Error>>().await
+        });
+
+        Response::builder()
+            .header("x-meter-created", "true")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    }
+
+    fn held_meter_test_route(def: CommercialRouteDef) -> MethodRouter {
+        let route = match def.method {
+            CommercialRouteMethod::Get => get(held_meter_stream_handler),
+            CommercialRouteMethod::Post => post(held_meter_stream_handler),
+        };
+        route.layer(Extension(def.endpoint))
+    }
+
+    fn commercial_concurrency_test_app(store: Arc<SnapshotStore>) -> axum::Router {
+        let tally = Arc::new(TallyStore::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let concurrency = Arc::new(ConcurrencyLimiter::new(1));
+        let control_plane = Arc::new(LocalControlPlane::new(
+            store,
+            tally.clone(),
+            concurrency,
+            EvaluationPolicy {
+                throttle_residual_secs: 60,
+            },
+        )) as Arc<dyn ControlPlaneClient>;
+
+        register_commercial_routes(axum::Router::new(), true, held_meter_test_route)
+            .layer(Extension(control_plane))
+            .layer(Extension(
+                Arc::new(RecordingReporter::default()) as Arc<dyn UsageReporter>
+            ))
+            .layer(Extension(tally))
+            .layer(Extension(registry))
+    }
+
+    fn public_fallback_for_concurrency_test() -> PublicFallbackConfig {
+        PublicFallbackConfig {
+            throughput_bytes_per_sec: 1_000_000,
+            burst_bytes: 1_000_000,
+            max_response_bytes: 1_000_000,
+            volume_bytes: 1_000_000,
+            window_secs: 60,
+            // The runtime limiter adds one guardrail permit to the configured
+            // value, so 0 is the non-invasive way to test one effective permit.
+            concurrency: 0,
+        }
+    }
+
+    fn store_for_keyed_concurrency_test() -> Arc<SnapshotStore> {
+        let store = SnapshotStore::inactive(&public_fallback_for_concurrency_test());
+        let mut defaults = defaults_record(10);
+        defaults.messages.insert(
+            "concurrency_limit".to_string(),
+            "concurrency_limit".to_string(),
+        );
+        let mut snapshot = active_snapshot(11);
+        snapshot.limits.as_mut().unwrap().concurrency = Some(0);
+        store.install_records_for_test(
+            vec![
+                SnapshotRecord::Defaults(defaults),
+                SnapshotRecord::Key(snapshot),
+            ],
+            11,
+        );
+        store
+    }
+
+    fn store_for_anonymous_concurrency_test() -> Arc<SnapshotStore> {
+        let store = SnapshotStore::inactive(&public_fallback_for_concurrency_test());
+        let mut defaults = defaults_record(10);
+        defaults.public.limits.concurrency = Some(0);
+        defaults.public.quota.volume_bytes = 1_000_000;
+        defaults.messages.insert(
+            "concurrency_limit".to_string(),
+            "concurrency_limit".to_string(),
+        );
+        store.install_records_for_test(vec![SnapshotRecord::Defaults(defaults)], 10);
+        store
+    }
+
+    fn stream_request(uri: &str, forwarded_for: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method(Method::POST).uri(uri);
+        if let Some(forwarded_for) = forwarded_for {
+            builder = builder.header("x-forwarded-for", forwarded_for);
+        }
+        builder
+            .body(Body::from(
+                r#"{"type":"evm","fromBlock":1,"fields":{"block":{"number":true}}}"#,
+            ))
+            .unwrap()
+    }
+
+    async fn assert_concurrency_rejection(response: Response) {
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "1");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"concurrency_limit");
     }
 
     #[tokio::test]
@@ -1827,6 +1955,65 @@ mod tests {
             assert_eq!(event.endpoint, def.endpoint, "{}", def.path);
             assert_eq!(event.logical_bytes, 12, "{}", def.path);
         }
+    }
+
+    #[tokio::test]
+    async fn keyed_live_stream_concurrency_rejects_until_meter_drops() {
+        let app = commercial_concurrency_test_app(store_for_keyed_concurrency_test());
+        let keyed_uri = format!(
+            "/datasets/ethereum-mainnet/stream?api_key=sqd_data_{KEY_ID}_0123456789abcdefghijklmnopqrstuv"
+        );
+
+        let response_a = app
+            .clone()
+            .oneshot(stream_request(&keyed_uri, None))
+            .await
+            .unwrap();
+        assert_eq!(response_a.status(), StatusCode::OK);
+        assert_eq!(response_a.headers()["x-meter-created"], "true");
+
+        let response_b = app
+            .clone()
+            .oneshot(stream_request(&keyed_uri, None))
+            .await
+            .unwrap();
+        assert_concurrency_rejection(response_b).await;
+
+        drop(response_a);
+
+        let response_b_retry = app.oneshot(stream_request(&keyed_uri, None)).await.unwrap();
+        assert_eq!(response_b_retry.status(), StatusCode::OK);
+        assert_eq!(response_b_retry.headers()["x-meter-created"], "true");
+    }
+
+    #[tokio::test]
+    async fn anonymous_live_stream_concurrency_rejects_until_meter_drops() {
+        let app = commercial_concurrency_test_app(store_for_anonymous_concurrency_test());
+        let anon_uri = "/datasets/ethereum-mainnet/stream";
+
+        let response_a = app
+            .clone()
+            .oneshot(stream_request(anon_uri, Some("203.0.113.7")))
+            .await
+            .unwrap();
+        assert_eq!(response_a.status(), StatusCode::OK);
+        assert_eq!(response_a.headers()["x-meter-created"], "true");
+
+        let response_b = app
+            .clone()
+            .oneshot(stream_request(anon_uri, Some("203.0.113.7")))
+            .await
+            .unwrap();
+        assert_concurrency_rejection(response_b).await;
+
+        drop(response_a);
+
+        let response_b_retry = app
+            .oneshot(stream_request(anon_uri, Some("203.0.113.7")))
+            .await
+            .unwrap();
+        assert_eq!(response_b_retry.status(), StatusCode::OK);
+        assert_eq!(response_b_retry.headers()["x-meter-created"], "true");
     }
 
     #[tokio::test]
