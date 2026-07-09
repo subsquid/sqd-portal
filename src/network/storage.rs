@@ -51,6 +51,7 @@ impl StorageClient {
             latest_assignment_id: RwLock::new(None, "StorageClient::latest_assignment"),
             network_state_url,
             reqwest_client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
                 .read_timeout(Duration::from_secs(5))
                 .user_agent(format!("SQD Portal/{}", env!("CARGO_PKG_VERSION")))
                 .build()

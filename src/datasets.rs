@@ -4,11 +4,14 @@ use crate::{
     utils::RwLock,
 };
 use anyhow::Context;
+use reqwest_middleware::ClientBuilder;
+use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     fs::File,
     io::BufReader,
+    time::Duration,
 };
 
 pub struct Datasets {
@@ -194,8 +197,20 @@ async fn load_yaml<T: serde::de::DeserializeOwned>(url: &str) -> anyhow::Result<
         serde_yaml::from_reader(reader).with_context(|| format!("failed to parse {path}"))
     } else {
         tracing::debug!("Fetching remote file from {}", url);
-        let response = reqwest::get(url).await?;
-        let text = response.text().await?;
+        // Retry transient failures (timeouts, connection errors, 5xx, 429) so a slow
+        // or flaky datasets/metadata endpoint can't fail startup (Datasets::load is
+        // `?`-propagated in main); a permanent 4xx still fails fast.
+        let client = ClientBuilder::new(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
+                .build()?,
+        )
+        .with(RetryTransientMiddleware::new_with_policy(
+            ExponentialBackoff::builder().build_with_max_retries(3),
+        ))
+        .build();
+        let text = client.get(url).send().await?.error_for_status()?.text().await?;
         serde_yaml::from_str(&text).with_context(|| format!("failed to parse {url}"))
     }
 }
