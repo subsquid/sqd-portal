@@ -1,4 +1,8 @@
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -13,6 +17,7 @@ pub struct ConcurrencyLimiter {
 struct LimitSemaphore {
     permits: u64,
     semaphore: Arc<Semaphore>,
+    last_touched: Mutex<Instant>,
 }
 
 #[derive(Clone)]
@@ -45,16 +50,47 @@ impl ConcurrencyLimiter {
     fn semaphore(&self, account_id: &str, permits: u64) -> Arc<Semaphore> {
         if let Some(existing) = self.semaphores.get(account_id) {
             if existing.permits == permits {
+                existing.touch();
                 return existing.semaphore.clone();
             }
         }
         let replacement = Arc::new(LimitSemaphore {
             permits,
             semaphore: Arc::new(Semaphore::new(permits as usize)),
+            last_touched: Mutex::new(Instant::now()),
         });
         self.semaphores
             .insert(account_id.to_string(), replacement.clone());
         replacement.semaphore.clone()
+    }
+
+    pub fn sweep_idle(&self, horizon: Duration) -> usize {
+        let now = Instant::now();
+        let mut removed = 0;
+        self.semaphores.retain(|_, entry| {
+            let evict = entry.is_idle(now, horizon);
+            if evict {
+                removed += 1;
+            }
+            !evict
+        });
+        removed
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.semaphores.len()
+    }
+}
+
+impl LimitSemaphore {
+    fn touch(&self) {
+        *self.last_touched.lock().unwrap() = Instant::now();
+    }
+
+    fn is_idle(&self, now: Instant, horizon: Duration) -> bool {
+        self.semaphore.available_permits() == self.permits as usize
+            && now.duration_since(*self.last_touched.lock().unwrap()) >= horizon
     }
 }
 
@@ -107,5 +143,31 @@ mod tests {
         let _fourth = limiter.try_acquire("account", 3).unwrap();
         let _fifth = limiter.try_acquire("account", 3).unwrap();
         assert!(limiter.try_acquire("account", 3).is_none());
+    }
+
+    #[test]
+    fn sweep_evicts_idle_entries_after_horizon() {
+        let limiter = ConcurrencyLimiter::new(1);
+        let permit = limiter.try_acquire("anon:bucket", 1).unwrap();
+        drop(permit);
+
+        assert_eq!(limiter.len(), 1);
+        assert_eq!(limiter.sweep_idle(Duration::from_secs(60)), 0);
+        assert_eq!(limiter.len(), 1);
+        assert_eq!(limiter.sweep_idle(Duration::ZERO), 1);
+        assert_eq!(limiter.len(), 0);
+    }
+
+    #[test]
+    fn sweep_keeps_entries_with_held_permits() {
+        let limiter = ConcurrencyLimiter::new(1);
+        let permit = limiter.try_acquire("anon:bucket", 1).unwrap();
+
+        assert_eq!(limiter.sweep_idle(Duration::ZERO), 0);
+        assert_eq!(limiter.len(), 1);
+
+        drop(permit);
+        assert_eq!(limiter.sweep_idle(Duration::ZERO), 1);
+        assert_eq!(limiter.len(), 0);
     }
 }
