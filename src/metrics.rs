@@ -12,7 +12,11 @@ use prometheus_client::{
 use reqwest::StatusCode;
 use sqd_contract_client::PeerId;
 
-use crate::{types::DatasetId, utils::logging::StreamStats};
+use crate::{
+    commercial::{DataSource, Endpoint},
+    types::DatasetId,
+    utils::logging::StreamStats,
+};
 
 pub enum MutexLockMode {
     Read,
@@ -57,6 +61,8 @@ lazy_static::lazy_static! {
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(0.01, 2.0, 20)));
     pub static ref STREAM_BYTES: Family<Labels, Histogram> =
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1000., 2.0, 20)));
+    pub static ref STREAM_LOGICAL_BYTES: Family<Labels, Counter> = Default::default();
+    pub static ref STREAM_WIRE_BYTES: Family<Labels, Counter> = Default::default();
     pub static ref STREAM_BLOCKS: Family<Labels, Histogram> =
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 2.0, 30)));
     pub static ref STREAM_CHUNKS: Family<Labels, Histogram> =
@@ -67,6 +73,7 @@ lazy_static::lazy_static! {
     pub static ref STREAM_BLOCKS_PER_SECOND: Family<Labels, Histogram> =
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 3.0, 20)));
     pub static ref STREAM_THROTTLED_RATIO: Histogram = Histogram::new(iter::empty());
+    pub static ref COMMERCIAL_USAGE_DROPPED: Counter = Default::default();
 
     pub static ref CONGESTION_WINDOW: Gauge = Default::default();
     pub static ref CONGESTION_IN_FLIGHT: Gauge = Default::default();
@@ -152,6 +159,45 @@ pub fn report_stream_completed(
         .get_or_create(&labels)
         .observe(blocks as f64 / duration);
     STREAM_THROTTLED_RATIO.observe(throttled / duration);
+}
+
+pub fn report_commercial_stream_bytes(
+    endpoint: &Endpoint,
+    data_source: &DataSource,
+    logical: u64,
+    wire: u64,
+) {
+    let labels = vec![
+        ("endpoint".to_owned(), endpoint_label(endpoint).to_owned()),
+        (
+            "data_source".to_owned(),
+            data_source_label(data_source).to_owned(),
+        ),
+    ];
+    STREAM_LOGICAL_BYTES.get_or_create(&labels).inc_by(logical);
+    STREAM_WIRE_BYTES.get_or_create(&labels).inc_by(wire);
+}
+
+pub fn report_commercial_usage_dropped() {
+    COMMERCIAL_USAGE_DROPPED.inc();
+}
+
+fn endpoint_label(endpoint: &Endpoint) -> &'static str {
+    match endpoint {
+        Endpoint::Stream => "stream",
+        Endpoint::FinalizedStream => "finalized_stream",
+        Endpoint::ArchivalStream => "archival_stream",
+        Endpoint::SqlQuery => "sql_query",
+        Endpoint::TsLookup => "ts_lookup",
+        Endpoint::LegacyQuery => "legacy_query",
+    }
+}
+
+fn data_source_label(data_source: &DataSource) -> &'static str {
+    match data_source {
+        DataSource::Network => "network",
+        DataSource::RealTime => "real_time",
+    }
 }
 
 pub fn report_chunk_list_updated(
@@ -267,6 +313,16 @@ pub fn register_metrics(registry: &mut Registry) {
         STREAM_BYTES.clone(),
     );
     registry.register(
+        "stream_logical_bytes",
+        "Logical uncompressed bytes emitted by commercial shadow metering",
+        STREAM_LOGICAL_BYTES.clone(),
+    );
+    registry.register(
+        "stream_wire_bytes",
+        "Wire bytes emitted by commercial shadow metering",
+        STREAM_WIRE_BYTES.clone(),
+    );
+    registry.register(
         "stream_blocks",
         "Numbers of blocks per stream",
         STREAM_BLOCKS.clone(),
@@ -295,6 +351,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "stream_throttled_ratio",
         "Throttled time of completed streams relative to their duration",
         STREAM_THROTTLED_RATIO.clone(),
+    );
+    registry.register(
+        "commercial_usage_dropped_total",
+        "Commercial usage events dropped by the bounded reporter buffer",
+        COMMERCIAL_USAGE_DROPPED.clone(),
     );
 
     registry.register(

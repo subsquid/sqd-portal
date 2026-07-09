@@ -7892,6 +7892,7 @@ dependencies = [
  "utoipa-scalar",
  "utoipa-swagger-ui",
  "uuid 1.19.0",
+ "zstd 0.13.3",
 ]
 
 [[package]]

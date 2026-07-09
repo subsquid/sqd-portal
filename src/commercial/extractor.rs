@@ -196,7 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_attaches_oss_principal_without_changing_response() {
-        let runtime = build(None);
+        let runtime = build(None, tokio_util::sync::CancellationToken::new());
         let app = axum::Router::new()
             .route(
                 "/datasets/ethereum-mainnet/stream",

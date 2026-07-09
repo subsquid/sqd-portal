@@ -10,6 +10,10 @@ use futures::{pin_mut, StreamExt};
 use tower_http::request_id::RequestId;
 
 use crate::{
+    commercial::{
+        meter::{tap_input_frames, tap_wire_stream_no_complete},
+        CommercialGrant, DataSource, Endpoint, MeterHandle, UsageReporter,
+    },
     config::Config,
     controller::task_manager::TaskManager,
     datasets::DatasetConfig,
@@ -43,6 +47,7 @@ use super::stream::{DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_
     ),
     tag = "Datasets"
 )]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn get_blocknumber_by_timestamp(
     Path((_, timestamp)): Path<(DatasetId, u64)>,
     Extension(req): Extension<RequestId>,
@@ -50,9 +55,18 @@ pub(crate) async fn get_blocknumber_by_timestamp(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
     dataset: DatasetConfig,
 ) -> Response {
-    resolve(
+    let meter = meter_from_extensions(
+        grant,
+        reporter,
+        dataset.default_name.clone(),
+        req.header_value().to_str().unwrap_or("").to_string(),
+    );
+
+    let result = resolve(
         timestamp,
         &req,
         &network,
@@ -60,18 +74,25 @@ pub(crate) async fn get_blocknumber_by_timestamp(
         &config,
         &hotblocks,
         &dataset,
+        meter.clone(),
     )
-    .await
-    .map(|resolved| {
-        (
-            [(DATA_SOURCE_HEADER, resolved.data_source.as_str())],
-            axum::Json(BlockNumberResponse {
-                block_number: resolved.block_number,
-            }),
-        )
-            .into_response()
-    })
-    .unwrap_or_else(BlockNumberLookupError::into_response)
+    .await;
+
+    if result.is_err() {
+        finish_meter_error(&meter);
+    }
+
+    result
+        .map(|resolved| {
+            (
+                [(DATA_SOURCE_HEADER, resolved.data_source.as_str())],
+                axum::Json(BlockNumberResponse {
+                    block_number: resolved.block_number,
+                }),
+            )
+                .into_response()
+        })
+        .unwrap_or_else(BlockNumberLookupError::into_response)
 }
 
 pub struct ResolvedBlockNumber {
@@ -124,6 +145,7 @@ impl BlockNumberLookupError {
 /// Archive data is preferred when the dataset has an SQD Network mapping. If
 /// the archive lookup cannot find a matching chunk, the resolver falls back to
 /// HotblocksDB when the dataset has a real-time data source configured.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve(
     timestamp: u64,
     req: &RequestId,
@@ -132,6 +154,7 @@ pub async fn resolve(
     config: &Config,
     hotblocks: &HotblocksHandle,
     dataset: &DatasetConfig,
+    meter: Option<MeterHandle>,
 ) -> Result<ResolvedBlockNumber, BlockNumberLookupError> {
     get_blocknumber_by_timestamp_inner(
         dataset.network_id.is_some(),
@@ -151,10 +174,14 @@ pub async fn resolve(
                 config,
                 dataset,
                 dataset_id,
+                meter.clone(),
             )
             .await
         },
-        || async { get_hotblocks_blocknumber_by_timestamp(timestamp, hotblocks, dataset).await },
+        || async {
+            get_hotblocks_blocknumber_by_timestamp(timestamp, hotblocks, dataset, meter.clone())
+                .await
+        },
     )
     .await
 }
@@ -209,6 +236,7 @@ where
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn get_archival_blocknumber_by_timestamp(
     timestamp: u64,
     req: &RequestId,
@@ -217,6 +245,7 @@ async fn get_archival_blocknumber_by_timestamp(
     config: &Config,
     dataset: &DatasetConfig,
     dataset_id: &DatasetId,
+    meter: Option<MeterHandle>,
 ) -> Result<u64, BlockNumberLookupError> {
     let ts = timestamp
         .checked_mul(1000) // milliseconds
@@ -254,27 +283,46 @@ async fn get_archival_blocknumber_by_timestamp(
         }
     };
 
-    pin_mut!(stream);
+    if let Some(meter) = &meter {
+        meter.set_data_source(DataSource::Network);
+    }
 
-    let js = collect_to_string(
-        stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result))),
-    )
-    .await
+    let js = if let Some(meter) = meter.clone() {
+        let metered_frames = tap_input_frames(stream, Compression::Gzip, meter.clone());
+        let metered_bytes = metered_frames
+            .map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result)));
+        collect_to_string(Box::pin(tap_wire_stream_no_complete(
+            metered_bytes,
+            meter.clone(),
+        )))
+        .await
+    } else {
+        pin_mut!(stream);
+        collect_to_string(
+            stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result))),
+        )
+        .await
+    }
     .map_err(|e| {
         tracing::warn!("stream processing error: {:?}", e);
         BlockNumberLookupError::Internal("stream processing error".to_string())
     })?;
 
-    find_block_in_chunk(timestamp, &js).map_err(|e| {
+    let block = find_block_in_chunk(timestamp, &js).map_err(|e| {
         tracing::warn!("cannot find blocknumber in chunk: {:?}", e);
         BlockNumberLookupError::NotFound("block not in chunk".to_string())
-    })
+    })?;
+    if let Some(meter) = &meter {
+        meter.complete();
+    }
+    Ok(block)
 }
 
 async fn get_hotblocks_blocknumber_by_timestamp(
     timestamp: u64,
     hotblocks: &HotblocksHandle,
     dataset: &DatasetConfig,
+    meter: Option<MeterHandle>,
 ) -> Result<u64, BlockNumberLookupError> {
     let status = hotblocks
         .get_status(&dataset.default_name)
@@ -306,10 +354,14 @@ async fn get_hotblocks_blocknumber_by_timestamp(
                 )));
             }
 
-            collect_hotblocks_stream(response).await.map_err(|e| {
-                tracing::warn!("hotblocks stream processing error: {:?}", e);
-                BlockNumberLookupError::Internal("hotblocks stream processing error".to_string())
-            })
+            collect_hotblocks_stream(response, meter.clone())
+                .await
+                .map_err(|e| {
+                    tracing::warn!("hotblocks stream processing error: {:?}", e);
+                    BlockNumberLookupError::Internal(
+                        "hotblocks stream processing error".to_string(),
+                    )
+                })
         },
     )
     .await
@@ -357,14 +409,36 @@ where
     })
 }
 
-async fn collect_hotblocks_stream(response: reqwest::Response) -> anyhow::Result<String> {
+async fn collect_hotblocks_stream(
+    response: reqwest::Response,
+    meter: Option<MeterHandle>,
+) -> anyhow::Result<String> {
     let is_gzip = response
         .headers()
         .get(header::CONTENT_ENCODING)
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
+    if let Some(meter) = &meter {
+        meter.set_data_source(DataSource::RealTime);
+    }
     let bytes = response.bytes().await?;
+    if let Some(meter) = &meter {
+        meter.add_chunk();
+        meter.add_wire_bytes(bytes.len() as u64);
+    }
 
-    decode_hotblocks_stream_body(is_gzip, bytes.as_ref())
+    let decoded = decode_hotblocks_stream_body(is_gzip, bytes.as_ref());
+    match (&meter, &decoded) {
+        (Some(meter), Ok(body)) => {
+            meter.add_logical_bytes(body.len() as u64);
+            meter.complete();
+        }
+        (Some(meter), Err(_)) => {
+            meter.mark_error();
+            meter.complete();
+        }
+        (None, _) => {}
+    }
+    decoded
 }
 
 fn decode_hotblocks_stream_body(is_gzip: bool, bytes: &[u8]) -> anyhow::Result<String> {
@@ -376,6 +450,31 @@ fn decode_hotblocks_stream_body(is_gzip: bool, bytes: &[u8]) -> anyhow::Result<S
     }
 
     Ok(String::from_utf8(bytes.to_vec())?)
+}
+
+fn meter_from_extensions(
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    dataset: String,
+    request_id: String,
+) -> Option<MeterHandle> {
+    let grant = grant?;
+    let reporter = reporter?;
+    Some(MeterHandle::new(
+        grant.0 .0.principal.clone(),
+        request_id,
+        Endpoint::TsLookup,
+        dataset,
+        reporter.0,
+        grant.0 .0.quota_version,
+    ))
+}
+
+fn finish_meter_error(meter: &Option<MeterHandle>) {
+    if let Some(meter) = meter {
+        meter.mark_error();
+        meter.complete();
+    }
 }
 
 fn build_request(

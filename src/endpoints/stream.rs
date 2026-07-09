@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{pin::Pin, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -10,11 +10,15 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
 use crate::{
+    commercial::{
+        meter::{tap_gzip_stream, tap_input_frames, tap_plain_stream, tap_wire_stream},
+        CommercialGrant, DataSource, Endpoint, MeterHandle, UsageReporter,
+    },
     config::Config,
     controller::task_manager::TaskManager,
     datasets::DatasetConfig,
     hotblocks::{traceless_key, HotblocksHandle, StreamMode},
-    http_server::{forward_hotblocks_response, forward_response},
+    http_server::forward_hotblocks_response,
     network::NetworkClient,
     types::{Compression, DatasetId, RequestError, StreamRequest},
     utils::conversion::{join_gzip_default, recompress_gzip},
@@ -50,11 +54,20 @@ pub(crate) async fn run_archival_stream_restricted(
     task_manager: Extension<Arc<TaskManager>>,
     network: Extension<Arc<NetworkClient>>,
     config: Extension<Arc<Config>>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
     dataset_id: DatasetId,
     raw_request: StreamRequest,
 ) -> Response {
     let request = restrict_request(&config, raw_request);
-    run_archival_stream(task_manager, network, config, dataset_id, request).await
+    let meter = meter_from_extensions(
+        grant,
+        reporter,
+        Endpoint::ArchivalStream,
+        dataset_id.to_url().to_string(),
+        request.request_id.clone(),
+    );
+    run_archival_stream_inner(task_manager, network, config, dataset_id, request, meter).await
 }
 
 /// [INTERNAL] Archival stream (debug)
@@ -87,8 +100,36 @@ pub(crate) async fn run_archival_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(config): Extension<Arc<Config>>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    dataset_id: DatasetId,
+    request: StreamRequest,
+) -> Response {
+    let meter = meter_from_extensions(
+        grant,
+        reporter,
+        Endpoint::ArchivalStream,
+        dataset_id.to_url().to_string(),
+        request.request_id.clone(),
+    );
+    run_archival_stream_inner(
+        Extension(task_manager),
+        Extension(network),
+        Extension(config),
+        dataset_id,
+        request,
+        meter,
+    )
+    .await
+}
+
+async fn run_archival_stream_inner(
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(config): Extension<Arc<Config>>,
     dataset_id: DatasetId,
     mut request: StreamRequest,
+    meter: Option<MeterHandle>,
 ) -> Response {
     let mut res = Response::builder();
     res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
@@ -105,7 +146,10 @@ pub(crate) async fn run_archival_stream(
 
     match task_manager.spawn_stream(request).await {
         Ok(stream) => {
-            let body = response_body(stream, compression, config.use_gzjoin);
+            if let Some(meter) = &meter {
+                meter.set_data_source(DataSource::Network);
+            }
+            let body = response_body(stream, compression, config.use_gzjoin, meter);
             res.header(header::CONTENT_TYPE, "application/jsonl")
                 .header(header::CONTENT_ENCODING, compression.content_encoding())
                 .body(body)
@@ -155,11 +199,14 @@ found, request earlier blocks until one is."),
     ),
     tag = "Stream"
 )]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
     dataset: DatasetConfig,
     request: StreamRequest,
 ) -> Response {
@@ -171,6 +218,8 @@ pub(crate) async fn run_stream(
         dataset,
         request,
         StreamMode::RealTime,
+        grant,
+        reporter,
     )
     .await
 }
@@ -202,11 +251,14 @@ pub(crate) async fn run_stream(
     ),
     tag = "Stream"
 )]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_finalized_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
     dataset: DatasetConfig,
     request: StreamRequest,
 ) -> Response {
@@ -218,10 +270,13 @@ pub(crate) async fn run_finalized_stream(
         dataset,
         request,
         StreamMode::Finalized,
+        grant,
+        reporter,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_stream_internal(
     task_manager: Arc<TaskManager>,
     config: Arc<Config>,
@@ -230,8 +285,21 @@ async fn run_stream_internal(
     dataset: DatasetConfig,
     request: StreamRequest,
     mode: StreamMode,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
 ) -> Response {
     let request = restrict_request(&config, request);
+    let endpoint = match mode {
+        StreamMode::RealTime => Endpoint::Stream,
+        StreamMode::Finalized => Endpoint::FinalizedStream,
+    };
+    let meter = meter_from_extensions(
+        grant,
+        reporter,
+        endpoint,
+        dataset.default_name.clone(),
+        request.request_id.clone(),
+    );
 
     // Use the traceless hotblocks variant when the query doesn't need traces/statediffs
     let hotblocks_name = if dataset
@@ -261,11 +329,21 @@ async fn run_stream_internal(
                 mode,
                 dataset_id,
                 hotblocks_name,
+                meter,
             )
             .await
         }
         _ if dataset.hotblocks.is_some() => {
-            stream_from_hotblocks(network, hotblocks, dataset, request, mode, hotblocks_name).await
+            stream_from_hotblocks(
+                network,
+                hotblocks,
+                dataset,
+                request,
+                mode,
+                hotblocks_name,
+                meter,
+            )
+            .await
         }
         Some(dataset_id) => stream_after_network_head(&network, dataset_id).await,
         None => {
@@ -276,6 +354,7 @@ async fn run_stream_internal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_from_network(
     task_manager: Arc<TaskManager>,
     config: Arc<Config>,
@@ -285,6 +364,7 @@ async fn stream_from_network(
     mode: StreamMode,
     dataset_id: DatasetId,
     hotblocks_name: String,
+    meter: Option<MeterHandle>,
 ) -> Response {
     let archival_head = network.head(&dataset_id);
     let head_task = tokio::spawn({
@@ -320,7 +400,10 @@ async fn stream_from_network(
     if let Some(head) = head_task.await.unwrap() {
         res = res.header(HEAD_NUMBER_HEADER, head);
     }
-    let body = response_body(stream, compression, config.use_gzjoin);
+    if let Some(meter) = &meter {
+        meter.set_data_source(DataSource::Network);
+    }
+    let body = response_body(stream, compression, config.use_gzjoin, meter);
     res.header(header::CONTENT_TYPE, "application/jsonl")
         .header(header::CONTENT_ENCODING, compression.content_encoding())
         .body(body)
@@ -334,6 +417,7 @@ async fn stream_from_hotblocks(
     request: StreamRequest,
     mode: StreamMode,
     hotblocks_name: String,
+    meter: Option<MeterHandle>,
 ) -> Response {
     let first_block = request.query.first_block();
     let hotblocks_response = hotblocks
@@ -355,7 +439,10 @@ async fn stream_from_hotblocks(
                 return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
             }
 
-            forward_response(response)
+            if let Some(meter) = &meter {
+                meter.set_data_source(DataSource::RealTime);
+            }
+            forward_response_metered(response, meter)
         }
         Err(e) => forward_hotblocks_response(Err(e)),
     };
@@ -363,6 +450,28 @@ async fn stream_from_hotblocks(
     res.headers_mut()
         .insert(DATA_SOURCE_HEADER, DATA_SOURCE_REALTIME);
     res
+}
+
+fn forward_response_metered(
+    response: reqwest::Response,
+    meter: Option<MeterHandle>,
+) -> axum::response::Response {
+    let is_gzip = response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"gzip"));
+    let mut builder = Response::builder().status(response.status());
+    for (key, value) in response.headers() {
+        builder = builder.header(key, value);
+    }
+    let body = match meter {
+        Some(meter) if is_gzip => {
+            Body::from_stream(tap_gzip_stream(response.bytes_stream(), meter))
+        }
+        Some(meter) => Body::from_stream(tap_plain_stream(response.bytes_stream(), meter)),
+        None => Body::from_stream(response.bytes_stream()),
+    };
+    builder.body(body).unwrap()
 }
 
 async fn stream_after_network_head(network: &NetworkClient, dataset_id: DatasetId) -> Response {
@@ -380,14 +489,49 @@ fn response_body(
     stream: impl Stream<Item = Vec<u8>> + Send + 'static,
     compression: Compression,
     use_gzjoin: bool,
+    meter: Option<MeterHandle>,
 ) -> Body {
+    let stream: Pin<Box<dyn Stream<Item = Vec<u8>> + Send>> = match meter.clone() {
+        Some(meter) => Box::pin(tap_input_frames(stream, compression, meter)),
+        None => Box::pin(stream),
+    };
+
     match compression {
-        Compression::Gzip if use_gzjoin => Body::from_stream(join_gzip_default(stream)),
-        Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
+        Compression::Gzip if use_gzjoin => match meter {
+            Some(meter) => Body::from_stream(tap_wire_stream(join_gzip_default(stream), meter)),
+            None => Body::from_stream(join_gzip_default(stream)),
+        },
+        Compression::Gzip => match meter {
+            Some(meter) => Body::from_stream(tap_wire_stream(recompress_gzip(stream), meter)),
+            None => Body::from_stream(recompress_gzip(stream)),
+        },
         Compression::Zstd => {
-            Body::from_stream(stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))))
+            let output = stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result)));
+            match meter {
+                Some(meter) => Body::from_stream(tap_wire_stream(output, meter)),
+                None => Body::from_stream(output),
+            }
         }
     }
+}
+
+fn meter_from_extensions(
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    endpoint: Endpoint,
+    dataset: String,
+    request_id: String,
+) -> Option<MeterHandle> {
+    let grant = grant?;
+    let reporter = reporter?;
+    Some(MeterHandle::new(
+        grant.0 .0.principal.clone(),
+        request_id,
+        endpoint,
+        dataset,
+        reporter.0,
+        grant.0 .0.quota_version,
+    ))
 }
 
 pub(crate) fn restrict_request(config: &Config, request: StreamRequest) -> StreamRequest {

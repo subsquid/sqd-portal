@@ -42,7 +42,9 @@ use crate::types::Compression;
 use crate::utils::conversion::json_lines_to_json;
 use crate::utils::logging::MethodRouterExt;
 use crate::{
-    commercial::{extractor as commercial_extractor, Endpoint},
+    commercial::{
+        extractor as commercial_extractor, CommercialGrant, Endpoint, MeterHandle, UsageReporter,
+    },
     config::Config,
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
@@ -121,7 +123,8 @@ pub async fn run_server(
     show_internal_docs: bool,
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
-    let commercial = crate::commercial::build(config.commercial.as_ref());
+    let commercial =
+        crate::commercial::build(config.commercial.as_ref(), shutdown_signal.child_token());
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
         .allow_headers(Any)
@@ -899,6 +902,8 @@ async fn execute_query(
     Path((dataset_id_encoded, worker_id)): Path<(String, PeerId)>,
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(req): Extension<RequestId>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
     query: ParsedQuery, // request body
 ) -> Response {
     let dataset_id = match DatasetId::from_base64(&dataset_id_encoded) {
@@ -913,8 +918,16 @@ async fn execute_query(
     };
 
     let request_id = req.header_value().to_str().unwrap_or("").to_string();
+    let meter = meter_from_extensions(
+        grant,
+        reporter,
+        Endpoint::LegacyQuery,
+        dataset_id.to_url().to_string(),
+        request_id.clone(),
+    );
 
     let Ok(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
+        finish_meter_error(&meter);
         return RequestError::NoData.into_response();
     };
     let range = query
@@ -924,8 +937,9 @@ async fn execute_query(
     let lease = match client.reserve_worker(worker_id) {
         Some(lease) => lease,
         None => {
+            finish_meter_error(&meter);
             return RequestError::BadRequest(format!("Worker {} does not exist", worker_id))
-                .into_response()
+                .into_response();
         }
     };
     let fut = client.query_worker(
@@ -939,15 +953,28 @@ async fn execute_query(
     );
     let result = match fut.await {
         Ok(success) => success.ok,
-        Err(err) => return RequestError::from_query_error(err, worker_id).into_response(),
+        Err(err) => {
+            finish_meter_error(&meter);
+            return RequestError::from_query_error(err, worker_id).into_response();
+        }
     };
     match json_lines_to_json(&result.data) {
-        Ok(data) => Response::builder()
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CONTENT_ENCODING, "gzip")
-            .body(Body::from(data))
-            .unwrap(),
+        Ok(data) => {
+            if let Some(meter) = &meter {
+                if let Err(err) = meter.record_gzip_body_and_complete(&data) {
+                    tracing::warn!(error = %err, "cannot decode legacy query response for usage meter");
+                    meter.mark_error();
+                    meter.complete();
+                }
+            }
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_ENCODING, "gzip")
+                .body(Body::from(data))
+                .unwrap()
+        }
         Err(e) => {
+            finish_meter_error(&meter);
             RequestError::InternalError(format!("Couldn't convert response: {e}")).into_response()
         }
     }
@@ -1197,13 +1224,67 @@ pub(crate) fn forward_response(response: reqwest::Response) -> axum::response::R
 #[cfg(feature = "sql")]
 async fn sql_query(
     Extension(network): Extension<Arc<NetworkClient>>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    request_id: Option<Extension<RequestId>>,
     query: body::Bytes,
 ) -> impl axum::response::IntoResponse {
     match sql::query(query, &network).await {
-        Ok(res) => axum::Json(res).into_response(),
+        Ok(res) => {
+            if let Some(meter) = meter_from_extensions(
+                grant,
+                reporter,
+                Endpoint::SqlQuery,
+                "sql".to_string(),
+                request_id
+                    .and_then(|id| id.header_value().to_str().ok().map(str::to_owned))
+                    .unwrap_or_default(),
+            ) {
+                record_json_response_usage(meter, &res, "sql");
+            }
+            axum::Json(res).into_response()
+        }
         Err(e) => {
             tracing::warn!("cannot query data: {:?}", e);
             e.into_response()
+        }
+    }
+}
+
+fn meter_from_extensions(
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    endpoint: Endpoint,
+    dataset: String,
+    request_id: String,
+) -> Option<MeterHandle> {
+    let grant = grant?;
+    let reporter = reporter?;
+    Some(MeterHandle::new(
+        grant.0 .0.principal.clone(),
+        request_id,
+        endpoint,
+        dataset,
+        reporter.0,
+        grant.0 .0.quota_version,
+    ))
+}
+
+fn finish_meter_error(meter: &Option<MeterHandle>) {
+    if let Some(meter) = meter {
+        meter.mark_error();
+        meter.complete();
+    }
+}
+
+#[cfg(feature = "sql")]
+fn record_json_response_usage<T: serde::Serialize>(meter: MeterHandle, res: &T, endpoint: &str) {
+    match serde_json::to_vec(res) {
+        Ok(bytes) => meter.record_plain_bytes_and_complete(bytes.len() as u64),
+        Err(err) => {
+            tracing::warn!(error = %err, endpoint, "cannot serialize response for usage meter");
+            meter.mark_error();
+            meter.complete();
         }
     }
 }
@@ -1383,5 +1464,51 @@ mod tests {
         let res = drive_serve_with_drain(serve, cancel, drain_timeout).await;
         let err = res.expect_err("error from serve propagates");
         assert_eq!(err.to_string(), "boom");
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn sql_response_usage_records_serialized_body() {
+        use std::sync::Mutex;
+
+        use crate::commercial::{Principal, StreamUsageEvent, UsageReporter, UsageStatus};
+        use crate::sql::query::TableItem;
+
+        #[derive(Default)]
+        struct RecordingReporter {
+            events: Mutex<Vec<StreamUsageEvent>>,
+        }
+
+        impl UsageReporter for RecordingReporter {
+            fn report(&self, event: StreamUsageEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = MeterHandle::new(
+            Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some("key".to_string()),
+            },
+            "request".to_string(),
+            Endpoint::SqlQuery,
+            "sql".to_string(),
+            reporter.clone(),
+            3,
+        );
+        let response = crate::sql::query::SqlQueryResponse {
+            query_id: "sql-test".to_string(),
+            tables: Vec::<TableItem>::new(),
+        };
+        let expected = serde_json::to_vec(&response).unwrap().len() as u64;
+
+        record_json_response_usage(meter, &response, "sql");
+
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.endpoint, Endpoint::SqlQuery);
+        assert_eq!(event.logical_bytes, expected);
+        assert_eq!(event.wire_bytes, expected);
+        assert_eq!(event.status, UsageStatus::Completed);
     }
 }
