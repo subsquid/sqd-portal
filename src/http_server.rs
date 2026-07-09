@@ -43,7 +43,8 @@ use crate::utils::conversion::json_lines_to_json;
 use crate::utils::logging::MethodRouterExt;
 use crate::{
     commercial::{
-        extractor as commercial_extractor, CommercialGrant, Endpoint, MeterHandle, UsageReporter,
+        extractor as commercial_extractor, CommercialGrant, CommercialRuntime, Endpoint,
+        MeterHandle, UsageReporter,
     },
     config::Config,
     controller::task_manager::TaskManager,
@@ -125,6 +126,7 @@ fn build_openapi_spec(show_internal: bool) -> utoipa::openapi::OpenApi {
 }
 
 #[allow(deprecated)]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     task_manager: Arc<TaskManager>,
     network_client: Arc<NetworkClient>,
@@ -134,12 +136,11 @@ pub async fn run_server(
     hotblocks: Arc<HotblocksHandle>,
     shutting_down: Arc<AtomicBool>,
     shutdown_signal: CancellationToken,
+    commercial: CommercialRuntime,
     show_internal_docs: bool,
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
     let commercial_enabled = config.commercial.is_some();
-    let commercial =
-        crate::commercial::build(config.commercial.as_ref(), shutdown_signal.child_token());
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
         .allow_headers(Any)

@@ -149,6 +149,8 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let cancellation_token = CancellationToken::new();
+    let commercial =
+        sqd_portal::commercial::build(config.commercial.as_ref(), cancellation_token.child_token());
     let shutting_down = Arc::new(AtomicBool::new(false));
     let sigterm = {
         use anyhow::Context;
@@ -156,13 +158,15 @@ async fn main() -> anyhow::Result<()> {
         signal(SignalKind::terminate()).context("install SIGTERM handler")?
     };
 
-    tokio::spawn(watch_shutdown_signal(
+    let shutdown_task = tokio::spawn(watch_shutdown_signal(
         sigterm,
         shutting_down.clone(),
         cancellation_token.clone(),
         config.pre_drain_grace_period,
+        commercial.clone(),
     ));
 
+    let cancel_for_network = cancellation_token.clone();
     let (server_res, ()) = tokio::try_join!(
         tokio::spawn(run_server(
             task_manager,
@@ -173,11 +177,17 @@ async fn main() -> anyhow::Result<()> {
             hotblocks,
             shutting_down,
             cancellation_token.clone(),
+            commercial,
             args.show_internal_docs,
         )),
-        network_client.run(cancellation_token),
+        network_client.run(cancel_for_network),
     )?;
     server_res?;
+    if cancellation_token.is_cancelled() {
+        shutdown_task.await?;
+    } else {
+        shutdown_task.abort();
+    }
 
     Ok(())
 }
@@ -191,22 +201,25 @@ async fn watch_shutdown_signal(
     shutting_down: Arc<AtomicBool>,
     cancel: CancellationToken,
     pre_drain_grace: Duration,
+    commercial: sqd_portal::commercial::CommercialRuntime,
 ) {
     sigterm.recv().await;
     tracing::info!("SIGTERM received; starting shutdown sequence");
-    run_shutdown_sequence(shutting_down, cancel, pre_drain_grace).await;
+    run_shutdown_sequence(shutting_down, cancel, pre_drain_grace, commercial).await;
 }
 
 async fn run_shutdown_sequence(
     shutting_down: Arc<AtomicBool>,
     cancel: CancellationToken,
     pre_drain_grace: Duration,
+    commercial: sqd_portal::commercial::CommercialRuntime,
 ) {
     shutting_down.store(true, Ordering::Relaxed);
     tracing::info!("/ready will return 503 for {pre_drain_grace:?} before draining");
     tokio::time::sleep(pre_drain_grace).await;
     tracing::info!("Pre-drain grace elapsed; starting HTTP drain and stopping background tasks");
     cancel.cancel();
+    commercial.await_reporter_shutdown().await;
 }
 
 #[cfg(test)]
@@ -223,6 +236,7 @@ mod tests {
             shutting_down.clone(),
             cancel.clone(),
             grace,
+            sqd_portal::commercial::build(None, CancellationToken::new()),
         ));
 
         // Yield to let the spawned task run up to the `sleep`.

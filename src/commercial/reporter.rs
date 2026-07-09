@@ -6,11 +6,13 @@ use std::{
 
 use reqwest::StatusCode;
 use serde::Serialize;
-use tokio::sync::Notify;
+use tokio::{sync::Notify, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use super::{config::CommercialConfig, types::StreamUsageEvent};
 use crate::metrics;
+
+const MAX_RETRY_ATTEMPTS: usize = 5;
 
 pub trait UsageReporter: Send + Sync {
     fn report(&self, event: StreamUsageEvent);
@@ -49,7 +51,10 @@ struct UsageBatch<'a> {
 }
 
 impl BufferedUsageReporter {
-    pub fn spawn(config: &CommercialConfig, cancel: CancellationToken) -> Arc<Self> {
+    pub fn spawn(
+        config: &CommercialConfig,
+        cancel: CancellationToken,
+    ) -> (Arc<Self>, JoinHandle<()>) {
         let service_token = std::env::var(&config.service_token_env).unwrap_or_default();
         let reporter = Self::new(ReporterOptions {
             control_plane_url: config.control_plane_url.clone(),
@@ -59,11 +64,11 @@ impl BufferedUsageReporter {
             capacity: config.usage_buffer_max_events.max(1),
         });
         let task_reporter = reporter.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             task_reporter.run(cancel).await;
         });
 
-        reporter
+        (reporter, task)
     }
 
     fn new(options: ReporterOptions) -> Arc<Self> {
@@ -91,11 +96,11 @@ impl BufferedUsageReporter {
                 }
                 _ = self.inner.notify.notified() => {
                     if self.queue_len() >= self.inner.options.flush_max_events {
-                        self.flush_one_batch_with_retry().await;
+                        self.flush_one_batch_with_retry(&cancel).await;
                     }
                 }
                 _ = &mut tick => {
-                    self.flush_one_batch_with_retry().await;
+                    self.flush_one_batch_with_retry(&cancel).await;
                     tick.as_mut().reset(tokio::time::Instant::now() + self.inner.options.flush_interval);
                 }
             }
@@ -111,19 +116,31 @@ impl BufferedUsageReporter {
         }
     }
 
-    async fn flush_one_batch_with_retry(&self) {
+    async fn flush_one_batch_with_retry(&self, cancel: &CancellationToken) {
         let Some(batch) = self.pop_batch() else {
             return;
         };
 
-        self.send_with_retry(batch).await;
+        if let Some(batch) = self.send_with_retry(batch, cancel).await {
+            self.push_front_batch(batch);
+        }
     }
 
-    async fn send_with_retry(&self, batch: Vec<StreamUsageEvent>) {
+    async fn send_with_retry(
+        &self,
+        batch: Vec<StreamUsageEvent>,
+        cancel: &CancellationToken,
+    ) -> Option<Vec<StreamUsageEvent>> {
         let mut delay = Duration::from_secs(1);
+        let mut attempts = 0usize;
         loop {
-            match self.send_once(&batch).await {
-                Ok(()) => return,
+            attempts += 1;
+            let result = tokio::select! {
+                _ = cancel.cancelled() => return Some(batch),
+                result = self.send_once(&batch) => result,
+            };
+            match result {
+                Ok(()) => return None,
                 Err(SendBatchError::Drop(status)) => {
                     metrics::report_commercial_usage_dropped();
                     tracing::error!(
@@ -131,16 +148,29 @@ impl BufferedUsageReporter {
                         count = batch.len(),
                         "dropping commercial usage batch after control-plane 4xx"
                     );
-                    return;
+                    return None;
                 }
                 Err(SendBatchError::Retry(err)) => {
+                    if attempts >= MAX_RETRY_ATTEMPTS {
+                        metrics::report_commercial_usage_dropped();
+                        tracing::error!(
+                            error = %err,
+                            attempts,
+                            count = batch.len(),
+                            "dropping commercial usage batch after retry cap"
+                        );
+                        return None;
+                    }
                     tracing::warn!(
                         error = %err,
                         delay = ?delay,
                         count = batch.len(),
                         "commercial usage batch send failed; retrying"
                     );
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Some(batch),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
                     delay = (delay * 2).min(Duration::from_secs(30));
                 }
             }
@@ -187,6 +217,17 @@ impl BufferedUsageReporter {
 
         let count = queue.len().min(self.inner.options.flush_max_events);
         Some(queue.drain(..count).collect())
+    }
+
+    fn push_front_batch(&self, mut batch: Vec<StreamUsageEvent>) {
+        let mut queue = self.inner.queue.lock().unwrap();
+        while let Some(event) = batch.pop() {
+            queue.push_front(event);
+        }
+        while queue.len() > self.inner.options.capacity {
+            queue.pop_back();
+            metrics::report_commercial_usage_dropped();
+        }
     }
 }
 
@@ -306,7 +347,7 @@ mod tests {
         })
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn flushes_by_size() {
         let (url, mut rx) = mock_server(vec![]).await;
         let reporter = reporter(url, Duration::from_secs(60), 2, 10);
@@ -326,15 +367,15 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn flushes_by_tick() {
         let (url, mut rx) = mock_server(vec![]).await;
-        let reporter = reporter(url, Duration::from_secs(5), 10, 10);
+        let reporter = reporter(url, Duration::from_millis(50), 10, 10);
         let cancel = CancellationToken::new();
         tokio::spawn(reporter.clone().run(cancel));
 
         reporter.report(event("one"));
-        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let batch = rx.recv().await.unwrap();
         assert_eq!(batch[0].event_id, "one");
@@ -363,7 +404,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn retries_then_delivers_batch_once() {
         let (url, mut rx) = mock_server(vec![
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -375,12 +416,29 @@ mod tests {
         tokio::spawn(reporter.clone().run(cancel));
 
         reporter.report(event("retry-me"));
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         let batch = rx.recv().await.unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].event_id, "retry-me");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_during_retry_storm_exits_promptly() {
+        let (url, _rx) = mock_server(vec![StatusCode::INTERNAL_SERVER_ERROR; 16]).await;
+        let reporter = reporter(url, Duration::from_secs(60), 1, 10);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(reporter.clone().run(cancel.clone()));
+
+        reporter.report(event("retry-storm"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("reporter exits promptly")
+            .expect("reporter task should not panic");
     }
 
     #[tokio::test]
@@ -393,13 +451,15 @@ mod tests {
         reporter.report(event("shutdown"));
         cancel.cancel();
 
-        let batch = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        tokio::time::timeout(Duration::from_secs(2), task)
             .await
-            .unwrap()
-            .unwrap();
+            .expect("shutdown returns after final flush")
+            .expect("reporter task should not panic");
+        let batch = rx
+            .try_recv()
+            .expect("final flush delivered before shutdown");
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].event_id, "shutdown");
-        task.await.unwrap();
     }
 
     #[test]
