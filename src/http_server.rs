@@ -120,6 +120,7 @@ pub async fn run_server(
     show_internal_docs: bool,
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
+    let commercial = crate::commercial::build(config.commercial.as_ref());
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
         .allow_headers(Any)
@@ -235,6 +236,8 @@ pub async fn run_server(
         .layer(Extension(config))
         .layer(Extension(Arc::new(metrics_registry)))
         .layer(Extension(hotblocks))
+        .layer(Extension(commercial.control_plane))
+        .layer(Extension(commercial.usage_reporter))
         .layer(Extension(shutting_down));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

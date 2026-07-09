@@ -307,6 +307,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34ac096ce696dc2fcabef30516bb13c0a68a11d30131d3df6f04711467681b04"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "argminmax"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -559,6 +568,8 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "tokio 1.48.0",
+ "zstd 0.13.3",
+ "zstd-safe 7.2.4",
 ]
 
 [[package]]
@@ -7817,8 +7828,10 @@ name = "sqd-portal"
 version = "0.11.4"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-compression",
  "async-stream",
+ "async-trait",
  "atomic_enum",
  "axum",
  "axum-extra",
@@ -7827,6 +7840,7 @@ dependencies = [
  "bytes 1.11.1",
  "chrono",
  "clap",
+ "dashmap",
  "dotenv",
  "flate2",
  "futures 0.3.31",
@@ -7851,6 +7865,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "serde_yaml",
+ "sha2",
  "sqd-assignments",
  "sqd-contract-client",
  "sqd-messages",
@@ -7860,6 +7875,7 @@ dependencies = [
  "sql_query_plan",
  "static_assertions",
  "substrait",
+ "subtle",
  "thiserror 1.0.69",
  "tikv-jemallocator",
  "tokio 1.48.0",

@@ -1,3 +1,4 @@
+pub mod commercial;
 pub mod config;
 pub mod controller;
 pub mod datasets;
