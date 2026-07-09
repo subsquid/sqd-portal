@@ -19,7 +19,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant as TokioInstant;
 use uuid::{NoContext, Timestamp, Uuid};
 
-use crate::commercial::concurrency::ConcurrencyPermit;
+use crate::commercial::{concurrency::ConcurrencyPermit, tally::TallyHandle};
 use crate::{
     commercial::{
         registry::StreamRegistration, ActiveStreamRegistry, DataSource, Endpoint, Granted,
@@ -37,7 +37,6 @@ pub struct MeterHandle {
 
 struct MeterInner {
     principal: Principal,
-    tally_account_id: String,
     event_id: String,
     request_id: String,
     endpoint: Endpoint,
@@ -47,6 +46,7 @@ struct MeterInner {
     started_instant: StdInstant,
     logical: AtomicU64,
     unpaced_logical: AtomicU64,
+    pending_tally_logical: AtomicU64,
     wire: AtomicU64,
     blocks: AtomicU64,
     chunks: AtomicU64,
@@ -58,7 +58,7 @@ struct MeterInner {
     limits: GrantedLimits,
     on_exceed: OnExceed,
     quota_remaining_bytes: Option<i64>,
-    tally: Option<Arc<TallyStore>>,
+    tally: Option<TallyHandle>,
     kill: Arc<AtomicBool>,
     floor_bytes_per_sec: Arc<AtomicU64>,
     bucket: AsyncMutex<Option<TokenBucket>>,
@@ -146,6 +146,7 @@ impl MeterHandle {
         let kill = Arc::new(AtomicBool::new(false));
         let floor_bytes_per_sec = Arc::new(AtomicU64::new(0));
         let bucket = AsyncMutex::new(bucket_from_limits(&limits));
+        let tally = tally.map(|tally| tally.handle(&tally_account_id, quota_version));
         let registration = registry.as_ref().map(|registry| {
             registry.register(
                 event_id.clone(),
@@ -157,7 +158,6 @@ impl MeterHandle {
         Self {
             inner: Arc::new(MeterInner {
                 principal,
-                tally_account_id,
                 event_id,
                 request_id,
                 endpoint,
@@ -167,6 +167,7 @@ impl MeterHandle {
                 started_instant: StdInstant::now(),
                 logical: AtomicU64::new(0),
                 unpaced_logical: AtomicU64::new(0),
+                pending_tally_logical: AtomicU64::new(0),
                 wire: AtomicU64::new(0),
                 blocks: AtomicU64::new(0),
                 chunks: AtomicU64::new(0),
@@ -195,17 +196,7 @@ impl MeterHandle {
     }
 
     pub fn add_logical_bytes(&self, bytes: u64) {
-        self.inner.logical.fetch_add(bytes, Ordering::Relaxed);
-        self.inner
-            .unpaced_logical
-            .fetch_add(bytes, Ordering::Relaxed);
-        if let Some(tally) = &self.inner.tally {
-            tally.debit(
-                &self.inner.tally_account_id,
-                self.inner.quota_version,
-                bytes,
-            );
-        }
+        self.inner.add_logical_bytes(bytes);
     }
 
     pub fn add_wire_bytes(&self, bytes: u64) {
@@ -225,6 +216,7 @@ impl MeterHandle {
     }
 
     pub fn complete(&self) {
+        self.inner.flush_pending_tally();
         let _ = self.inner.status.compare_exchange(
             status_code(UsageStatus::ClientDisconnect),
             status_code(UsageStatus::Completed),
@@ -235,6 +227,7 @@ impl MeterHandle {
     }
 
     pub fn discard(&self) {
+        self.inner.flush_pending_tally();
         self.inner.flushed.store(true, Ordering::Release);
     }
 
@@ -266,7 +259,17 @@ impl MeterHandle {
 }
 
 impl MeterInner {
+    fn add_logical_bytes(&self, bytes: u64) {
+        self.logical.fetch_add(bytes, Ordering::Relaxed);
+        self.unpaced_logical.fetch_add(bytes, Ordering::Relaxed);
+        if self.tally.is_some() {
+            self.pending_tally_logical
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
     fn should_stop_after_chunk(&self) -> bool {
+        let effective_remaining = self.flush_pending_tally();
         if self.kill.load(Ordering::Acquire) {
             self.set_status(UsageStatus::CutSuspended);
             return true;
@@ -282,18 +285,10 @@ impl MeterInner {
             return true;
         }
 
-        let Some(tally) = &self.tally else {
+        let Some(effective_remaining) = effective_remaining else {
             return false;
         };
-        let Some(snapshot_remaining) = self.quota_remaining_bytes else {
-            return false;
-        };
-        if tally.effective_remaining(
-            &self.tally_account_id,
-            self.quota_version,
-            snapshot_remaining,
-        ) > 0
-        {
+        if effective_remaining > 0 {
             return false;
         }
 
@@ -308,6 +303,26 @@ impl MeterInner {
                 self.floor_bytes_per_sec
                     .store(floor_bytes_per_sec, Ordering::Release);
                 false
+            }
+        }
+    }
+
+    fn flush_pending_tally(&self) -> Option<i64> {
+        let Some(tally) = &self.tally else {
+            return None;
+        };
+        let bytes = self.pending_tally_logical.swap(0, Ordering::AcqRel);
+        match self.quota_remaining_bytes {
+            Some(snapshot_remaining) => Some(tally.debit_and_effective_remaining(
+                self.quota_version,
+                bytes,
+                snapshot_remaining,
+            )),
+            None => {
+                if bytes > 0 {
+                    tally.debit(self.quota_version, bytes);
+                }
+                None
             }
         }
     }
@@ -375,6 +390,7 @@ impl MeterInner {
         if self.flushed.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.flush_pending_tally();
 
         let logical = self.logical.load(Ordering::Relaxed);
         let wire = self.wire.load(Ordering::Relaxed);
@@ -918,6 +934,22 @@ mod tests {
         }
 
         assert!(reporter.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn drop_flushes_pending_tally_debits() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, tally, _) = enforced_meter(
+            reporter,
+            GrantedLimits::default(),
+            OnExceed::Reject,
+            Some(100),
+        );
+
+        meter.add_logical_bytes(4);
+        drop(meter);
+
+        assert_eq!(tally.bytes_for("account", 7), 4);
     }
 
     #[test]

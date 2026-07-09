@@ -13,6 +13,11 @@ pub struct TallyStore {
     entries: DashMap<String, Arc<Tally>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TallyHandle {
+    tally: Arc<Tally>,
+}
+
 #[derive(Debug)]
 struct Tally {
     version: AtomicU64,
@@ -23,39 +28,17 @@ struct Tally {
 
 impl TallyStore {
     pub fn rebase_account(&self, account_id: &str, version: u64) {
-        let tally = self.entry(account_id, version);
-        let _guard = tally.lock.lock().unwrap();
-        tally.touch();
-        let local = tally.version.load(Ordering::Acquire);
-        if version > local {
-            tally.bytes.store(0, Ordering::Release);
-            tally.version.store(version, Ordering::Release);
-        }
+        self.handle(account_id, version).rebase_to(version);
     }
 
     pub fn debit(&self, account_id: &str, grant_version: u64, bytes: u64) -> u64 {
-        let tally = self.entry(account_id, grant_version);
-        let _guard = tally.lock.lock().unwrap();
-        tally.touch();
-        let local = tally.version.load(Ordering::Acquire);
-        if grant_version > local {
-            tally.bytes.store(0, Ordering::Release);
-            tally.version.store(grant_version, Ordering::Release);
-        }
-        tally.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes
+        self.handle(account_id, grant_version)
+            .debit(grant_version, bytes)
     }
 
     pub fn bytes_for(&self, account_id: &str, snapshot_version: u64) -> u64 {
-        let tally = self.entry(account_id, snapshot_version);
-        let _guard = tally.lock.lock().unwrap();
-        tally.touch();
-        let local = tally.version.load(Ordering::Acquire);
-        if snapshot_version > local {
-            tally.bytes.store(0, Ordering::Release);
-            tally.version.store(snapshot_version, Ordering::Release);
-            return 0;
-        }
-        tally.bytes.load(Ordering::Acquire)
+        self.handle(account_id, snapshot_version)
+            .bytes_for(snapshot_version)
     }
 
     pub fn effective_remaining(
@@ -66,6 +49,12 @@ impl TallyStore {
     ) -> i64 {
         let served = self.bytes_for(account_id, grant_version);
         snapshot_remaining - served as i64
+    }
+
+    pub fn handle(&self, account_id: &str, version: u64) -> TallyHandle {
+        TallyHandle {
+            tally: self.entry(account_id, version),
+        }
     }
 
     #[cfg(test)]
@@ -101,6 +90,45 @@ impl TallyStore {
     }
 }
 
+impl TallyHandle {
+    pub fn debit(&self, grant_version: u64, bytes: u64) -> u64 {
+        let _guard = self.tally.lock.lock().unwrap();
+        self.tally.touch();
+        self.tally.rebase_if_newer(grant_version);
+        self.tally.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes
+    }
+
+    pub fn bytes_for(&self, snapshot_version: u64) -> u64 {
+        let _guard = self.tally.lock.lock().unwrap();
+        self.tally.touch();
+        self.tally.rebase_if_newer(snapshot_version);
+        self.tally.bytes.load(Ordering::Acquire)
+    }
+
+    pub fn debit_and_effective_remaining(
+        &self,
+        grant_version: u64,
+        bytes: u64,
+        snapshot_remaining: i64,
+    ) -> i64 {
+        let _guard = self.tally.lock.lock().unwrap();
+        self.tally.touch();
+        self.tally.rebase_if_newer(grant_version);
+        let served = if bytes == 0 {
+            self.tally.bytes.load(Ordering::Acquire)
+        } else {
+            self.tally.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes
+        };
+        snapshot_remaining - served as i64
+    }
+
+    fn rebase_to(&self, version: u64) {
+        let _guard = self.tally.lock.lock().unwrap();
+        self.tally.touch();
+        self.tally.rebase_if_newer(version);
+    }
+}
+
 impl Tally {
     fn new(version: u64) -> Self {
         Self {
@@ -113,6 +141,14 @@ impl Tally {
 
     fn touch(&self) {
         self.last_seen.store(now_secs(), Ordering::Release);
+    }
+
+    fn rebase_if_newer(&self, version: u64) {
+        let local = self.version.load(Ordering::Acquire);
+        if version > local {
+            self.bytes.store(0, Ordering::Release);
+            self.version.store(version, Ordering::Release);
+        }
     }
 }
 
@@ -153,6 +189,16 @@ mod tests {
         assert_eq!(tally.debit("account", 1, 50), 50);
         assert_eq!(tally.version_for("account"), Some(2));
         assert_eq!(tally.effective_remaining("account", 2, 100), 50);
+    }
+
+    #[test]
+    fn handle_debits_and_checks_remaining_under_one_lock() {
+        let tally = TallyStore::default();
+        let handle = tally.handle("account", 7);
+
+        assert_eq!(handle.debit_and_effective_remaining(7, 3, 5), 2);
+        assert_eq!(handle.debit_and_effective_remaining(7, 4, 5), -2);
+        assert_eq!(tally.bytes_for("account", 7), 7);
     }
 
     #[test]
