@@ -39,6 +39,7 @@ struct SnapshotStoreInner {
     cursor: AtomicU64,
     ready: AtomicBool,
     loaded_from_cache: AtomicBool,
+    disk_cache_dirty: AtomicBool,
     cache_path: PathBuf,
     sync_interval: Duration,
     negative_cache_ttl: Duration,
@@ -112,6 +113,7 @@ impl SnapshotStore {
                 cursor: AtomicU64::new(0),
                 ready: AtomicBool::new(false),
                 loaded_from_cache: AtomicBool::new(false),
+                disk_cache_dirty: AtomicBool::new(false),
                 cache_path: config.snapshot_cache_path.clone(),
                 sync_interval: Duration::from_secs(config.sync_interval_secs.max(1)),
                 negative_cache_ttl: Duration::from_secs(config.negative_cache_secs.max(1)),
@@ -142,6 +144,7 @@ impl SnapshotStore {
                 cursor: AtomicU64::new(0),
                 ready: AtomicBool::new(true),
                 loaded_from_cache: AtomicBool::new(false),
+                disk_cache_dirty: AtomicBool::new(false),
                 cache_path: PathBuf::new(),
                 sync_interval: Duration::from_secs(10),
                 negative_cache_ttl: Duration::from_secs(15),
@@ -193,6 +196,7 @@ impl SnapshotStore {
             } else if let Err(err) = self.sync_once().await {
                 tracing::warn!(error = %err, "commercial snapshot sync failed");
             }
+            self.persist_dirty_cache().await;
 
             tokio::select! {
                 _ = cancel.cancelled() => return,
@@ -213,7 +217,7 @@ impl SnapshotStore {
                 break;
             }
         }
-        self.replace_records(all, cursor).await?;
+        self.replace_records(all, cursor)?;
         self.inner.ready.store(true, Ordering::Release);
         tracing::info!(cursor, "commercial snapshot bootstrap applied");
         Ok(())
@@ -231,7 +235,7 @@ impl SnapshotStore {
             return Ok(());
         }
         let count = page.records.len();
-        self.apply_records(page.records, page.next_cursor).await?;
+        self.apply_records(page.records, page.next_cursor)?;
         tracing::info!(
             count,
             cursor = page.next_cursor,
@@ -286,7 +290,7 @@ impl SnapshotStore {
         match response.status() {
             StatusCode::OK => {
                 let record: KeySnapshot = response.json().await?;
-                let record = self.upsert_key(record).await?;
+                let record = self.upsert_key(record)?;
                 metrics::report_commercial_resolve("hit");
                 Ok(Some(record))
             }
@@ -305,11 +309,7 @@ impl SnapshotStore {
         }
     }
 
-    async fn replace_records(
-        &self,
-        records: Vec<SnapshotRecord>,
-        cursor: u64,
-    ) -> anyhow::Result<()> {
+    fn replace_records(&self, records: Vec<SnapshotRecord>, cursor: u64) -> anyhow::Result<()> {
         let mut map = HashMap::new();
         let mut defaults = None;
         for record in records {
@@ -327,12 +327,11 @@ impl SnapshotStore {
         self.inner.records.store(Arc::new(map));
         metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.inner.cursor.store(cursor, Ordering::Release);
-        self.persist_disk_cache().await?;
-        metrics::set_commercial_sync_staleness(0);
+        self.mark_disk_cache_dirty();
         Ok(())
     }
 
-    async fn apply_records(&self, records: Vec<SnapshotRecord>, cursor: u64) -> anyhow::Result<()> {
+    fn apply_records(&self, records: Vec<SnapshotRecord>, cursor: u64) -> anyhow::Result<()> {
         let mut map = (**self.inner.records.load()).clone();
         for record in records {
             match record {
@@ -351,12 +350,11 @@ impl SnapshotStore {
         self.inner.records.store(Arc::new(map));
         metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.inner.cursor.store(cursor, Ordering::Release);
-        self.persist_disk_cache().await?;
-        metrics::set_commercial_sync_staleness(0);
+        self.mark_disk_cache_dirty();
         Ok(())
     }
 
-    async fn upsert_key(&self, record: KeySnapshot) -> anyhow::Result<Arc<KeySnapshot>> {
+    fn upsert_key(&self, record: KeySnapshot) -> anyhow::Result<Arc<KeySnapshot>> {
         self.apply_snapshot_hooks(&record);
         let record = Arc::new(record);
         let mut map = (**self.inner.records.load()).clone();
@@ -365,8 +363,7 @@ impl SnapshotStore {
         self.inner.records.store(Arc::new(map));
         metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.inner.cursor.store(cursor, Ordering::Release);
-        self.persist_disk_cache().await?;
-        metrics::set_commercial_sync_staleness(0);
+        self.mark_disk_cache_dirty();
         Ok(record)
     }
 
@@ -434,6 +431,21 @@ impl SnapshotStore {
         metrics::set_commercial_snapshot_age(0);
         metrics::set_commercial_sync_staleness(0);
         Ok(())
+    }
+
+    fn mark_disk_cache_dirty(&self) {
+        self.inner.disk_cache_dirty.store(true, Ordering::Release);
+    }
+
+    async fn persist_dirty_cache(&self) {
+        if !self.inner.disk_cache_dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if let Err(err) = self.persist_disk_cache().await {
+            self.inner.disk_cache_dirty.store(true, Ordering::Release);
+            metrics::report_commercial_snapshot_persist_error();
+            tracing::warn!(error = %err, "commercial snapshot disk cache persist failed");
+        }
     }
 
     fn negative_cached(&self, key_id: &str) -> bool {
@@ -851,7 +863,7 @@ mod tests {
                 .unwrap();
 
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !store.is_ready() {
+            while !store.is_ready() || !path.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -860,6 +872,35 @@ mod tests {
 
         assert!(store.get(KEY_ID).is_some());
         assert!(path.exists());
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_disk_cache_is_ignored_and_bootstrap_continues() {
+        let path = cache_path("corrupt");
+        tokio::fs::write(&path, b"{not-json").await.unwrap();
+
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        mock.push_page(
+            0,
+            page(vec![SnapshotRecord::Key(active_snapshot(1))], 1, false),
+        );
+        let (store, task) =
+            SnapshotStore::spawn(&config(&mock, path.clone(), 10), CancellationToken::new())
+                .unwrap();
+
+        assert!(!store.loaded_from_cache());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(store.get(KEY_ID).is_some());
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -1055,5 +1096,32 @@ mod tests {
 
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_hit_grants_when_disk_cache_cannot_persist() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let mut resolved = active_snapshot(42);
+        resolved.key_id = "fresh-key".to_string();
+        mock.resolve_with("fresh-key", Some(resolved));
+
+        let blocking_file = cache_path("cache-parent-file");
+        tokio::fs::write(&blocking_file, b"not a directory")
+            .await
+            .unwrap();
+        let path = blocking_file.join("snapshots.json");
+        let (store, task) =
+            SnapshotStore::spawn(&config(&mock, path, 10), CancellationToken::new()).unwrap();
+        store.inner.ready.store(true, Ordering::Release);
+
+        let record = store.get_or_resolve("fresh-key").await;
+
+        assert_eq!(record.unwrap().key_id, "fresh-key");
+        assert_eq!(store.get("fresh-key").unwrap().seq, 42);
+        assert_eq!(mock.resolve_calls(), vec!["fresh-key".to_string()]);
+
+        task.abort();
+        let _ = tokio::fs::remove_file(blocking_file).await;
     }
 }
