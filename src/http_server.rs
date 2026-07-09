@@ -9,7 +9,7 @@ use axum::{
     extract::{FromRequest, FromRequestParts, Path, Query, Request},
     http::{header, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, MethodRouter},
     Extension, RequestExt, Router,
 };
 use prometheus_client::registry::Registry;
@@ -69,6 +69,20 @@ use axum::body;
 /// When shown, the marker is stripped from the summary for a clean UI.
 const INTERNAL_MARKER: &str = "[INTERNAL]";
 
+fn commercial_route_layer(
+    route: MethodRouter,
+    commercial_enabled: bool,
+    endpoint: Endpoint,
+) -> MethodRouter {
+    if commercial_enabled {
+        route.route_layer(axum::middleware::from_fn(move |req, next| {
+            commercial_extractor::middleware(req, next, endpoint)
+        }))
+    } else {
+        route
+    }
+}
+
 fn build_openapi_spec(show_internal: bool) -> utoipa::openapi::OpenApi {
     let mut spec = ApiDoc::openapi();
     spec.paths.paths.retain(|_, item| {
@@ -123,6 +137,7 @@ pub async fn run_server(
     show_internal_docs: bool,
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
+    let commercial_enabled = config.commercial.is_some();
     let commercial =
         crate::commercial::build(config.commercial.as_ref(), shutdown_signal.child_token());
     let cors = CorsLayer::new()
@@ -143,34 +158,34 @@ pub async fn run_server(
         // Streaming data
         .route(
             "/datasets/:dataset/archival-stream",
-            post(run_archival_stream_restricted)
-                .route_layer(axum::middleware::from_fn(|req, next| {
-                    commercial_extractor::middleware(req, next, Endpoint::ArchivalStream)
-                }))
-                .endpoint("/archival-stream"),
+            commercial_route_layer(
+                post(run_archival_stream_restricted),
+                commercial_enabled,
+                Endpoint::ArchivalStream,
+            )
+            .endpoint("/archival-stream"),
         )
         .route(
             "/datasets/:dataset/archival-stream/debug",
-            post(run_archival_stream)
-                .route_layer(axum::middleware::from_fn(|req, next| {
-                    commercial_extractor::middleware(req, next, Endpoint::ArchivalStream)
-                }))
-                .endpoint("/archival-stream/debug"),
+            commercial_route_layer(
+                post(run_archival_stream),
+                commercial_enabled,
+                Endpoint::ArchivalStream,
+            )
+            .endpoint("/archival-stream/debug"),
         )
         .route(
             "/datasets/:dataset/finalized-stream",
-            post(run_finalized_stream)
-                .route_layer(axum::middleware::from_fn(|req, next| {
-                    commercial_extractor::middleware(req, next, Endpoint::FinalizedStream)
-                }))
-                .endpoint("/finalized-stream"),
+            commercial_route_layer(
+                post(run_finalized_stream),
+                commercial_enabled,
+                Endpoint::FinalizedStream,
+            )
+            .endpoint("/finalized-stream"),
         )
         .route(
             "/datasets/:dataset/stream",
-            post(run_stream)
-                .route_layer(axum::middleware::from_fn(|req, next| {
-                    commercial_extractor::middleware(req, next, Endpoint::Stream)
-                }))
+            commercial_route_layer(post(run_stream), commercial_enabled, Endpoint::Stream)
                 .endpoint("/stream"),
         )
         // Getting head
@@ -198,11 +213,12 @@ pub async fn run_server(
         )
         .route(
             "/datasets/:dataset/timestamps/:timestamp/block",
-            get(get_blocknumber_by_timestamp)
-                .route_layer(axum::middleware::from_fn(|req, next| {
-                    commercial_extractor::middleware(req, next, Endpoint::TsLookup)
-                }))
-                .endpoint("/timestamps/block"),
+            commercial_route_layer(
+                get(get_blocknumber_by_timestamp),
+                commercial_enabled,
+                Endpoint::TsLookup,
+            )
+            .endpoint("/timestamps/block"),
         )
         // Backward compatibility routes
         .route(
@@ -215,11 +231,12 @@ pub async fn run_server(
         )
         .route(
             "/datasets/:dataset_id/query/:worker_id",
-            post(execute_query)
-                .route_layer(axum::middleware::from_fn(|req, next| {
-                    commercial_extractor::middleware(req, next, Endpoint::LegacyQuery)
-                }))
-                .endpoint("/query"),
+            commercial_route_layer(
+                post(execute_query),
+                commercial_enabled,
+                Endpoint::LegacyQuery,
+            )
+            .endpoint("/query"),
         )
         .route(
             "/datasets/:dataset/height",
@@ -248,10 +265,7 @@ pub async fn run_server(
     let app = app
         .route(
             "/sql/query",
-            post(sql_query)
-                .route_layer(axum::middleware::from_fn(|req, next| {
-                    commercial_extractor::middleware(req, next, Endpoint::SqlQuery)
-                }))
+            commercial_route_layer(post(sql_query), commercial_enabled, Endpoint::SqlQuery)
                 .endpoint("/sql/query"),
         )
         .route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
@@ -1305,7 +1319,10 @@ async fn sql_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    use tower::ServiceExt;
 
     #[test]
     fn hide_internal_drops_marked_ops_and_empty_tags() {
@@ -1405,6 +1422,72 @@ mod tests {
             .await
             .expect("server join")
             .expect("server drains cleanly");
+    }
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: Mutex<Vec<crate::commercial::StreamUsageEvent>>,
+    }
+
+    impl UsageReporter for RecordingReporter {
+        fn report(&self, event: crate::commercial::StreamUsageEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    async fn metered_test_handler(
+        grant: Option<Extension<CommercialGrant>>,
+        reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    ) -> Response {
+        const BODY: &[u8] = b"{\"ok\":true}\n";
+        let meter = meter_from_extensions(
+            grant,
+            reporter,
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            "request".to_string(),
+        );
+        let meter_created = meter.is_some();
+        if let Some(meter) = meter {
+            meter.record_plain_bytes_and_complete(BODY.len() as u64);
+        }
+
+        Response::builder()
+            .header("x-meter-created", meter_created.to_string())
+            .body(Body::from(BODY))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn commercial_disabled_skips_extractor_and_meter_on_metered_route() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let app = axum::Router::new()
+            .route(
+                "/datasets/ethereum-mainnet/stream",
+                commercial_route_layer(get(metered_test_handler), false, Endpoint::Stream),
+            )
+            .layer(Extension(reporter.clone() as Arc<dyn UsageReporter>));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/datasets/ethereum-mainnet/stream?api_key=sqd_data_key_secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-meter-created"], "false");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"{\"ok\":true}\n");
+        assert!(
+            reporter.events.lock().unwrap().is_empty(),
+            "no meter means no usage event or commercial metric side effect"
+        );
     }
 
     #[tokio::test(start_paused = true)]
