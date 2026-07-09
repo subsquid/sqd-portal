@@ -288,6 +288,7 @@ where
         futures::pin_mut!(input);
         while let Some(item) = input.next().await {
             if let Ok(bytes) = &item {
+                meter.add_chunk();
                 meter.add_wire_bytes(bytes.len() as u64);
             } else {
                 meter.mark_error();

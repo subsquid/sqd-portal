@@ -6,13 +6,13 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use futures::{pin_mut, StreamExt};
+use futures::StreamExt;
 use tower_http::request_id::RequestId;
 
 use crate::{
     commercial::{
-        meter::{tap_input_frames, tap_wire_stream_no_complete},
-        CommercialGrant, DataSource, Endpoint, MeterHandle, UsageReporter,
+        meter::tap_wire_stream_no_complete, CommercialGrant, DataSource, Endpoint, MeterHandle,
+        UsageReporter,
     },
     config::Config,
     controller::task_manager::TaskManager,
@@ -287,26 +287,12 @@ async fn get_archival_blocknumber_by_timestamp(
         meter.set_data_source(DataSource::Network);
     }
 
-    let js = if let Some(meter) = meter.clone() {
-        let metered_frames = tap_input_frames(stream, Compression::Gzip, meter.clone());
-        let metered_bytes = metered_frames
-            .map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result)));
-        collect_to_string(Box::pin(tap_wire_stream_no_complete(
-            metered_bytes,
-            meter.clone(),
-        )))
+    let js = collect_archive_stream(stream, meter.clone())
         .await
-    } else {
-        pin_mut!(stream);
-        collect_to_string(
-            stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result))),
-        )
-        .await
-    }
-    .map_err(|e| {
-        tracing::warn!("stream processing error: {:?}", e);
-        BlockNumberLookupError::Internal("stream processing error".to_string())
-    })?;
+        .map_err(|e| {
+            tracing::warn!("stream processing error: {:?}", e);
+            BlockNumberLookupError::Internal("stream processing error".to_string())
+        })?;
 
     let block = find_block_in_chunk(timestamp, &js).map_err(|e| {
         tracing::warn!("cannot find blocknumber in chunk: {:?}", e);
@@ -316,6 +302,22 @@ async fn get_archival_blocknumber_by_timestamp(
         meter.complete();
     }
     Ok(block)
+}
+
+async fn collect_archive_stream<S>(stream: S, meter: Option<MeterHandle>) -> anyhow::Result<String>
+where
+    S: futures::Stream<Item = Vec<u8>> + Send + 'static,
+{
+    let bytes =
+        stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result)));
+    if let Some(meter) = meter {
+        let decoded =
+            collect_to_string(Box::pin(tap_wire_stream_no_complete(bytes, meter.clone()))).await?;
+        meter.add_logical_bytes(decoded.len() as u64);
+        Ok(decoded)
+    } else {
+        collect_to_string(Box::pin(bytes)).await
+    }
 }
 
 async fn get_hotblocks_blocknumber_by_timestamp(
@@ -509,6 +511,7 @@ mod tests {
 
     use axum::{routing::get, Router};
     use flate2::{write::GzEncoder, Compression};
+    use futures::stream;
     use sqd_primitives::BlockRef;
     use std::io::Write;
 
@@ -558,6 +561,47 @@ mod tests {
         assert_eq!(result.data_source, BlockNumberDataSource::Network);
         assert_eq!(archive_calls.load(Ordering::Relaxed), 1);
         assert_eq!(hotblocks_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn collect_archive_stream_counts_split_gzip_members() {
+        let first = b"{\"header\":{\"number\":100,\"timestamp\":1700000000}}\n";
+        let second = b"{\"header\":{\"number\":101,\"timestamp\":1700000005}}\n";
+        let mut encoded = gzip(first);
+        encoded.extend(gzip(second));
+        let chunks = vec![
+            encoded[..11].to_vec(),
+            encoded[11..encoded.len() - 7].to_vec(),
+            encoded[encoded.len() - 7..].to_vec(),
+        ];
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = MeterHandle::new(
+            Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some("key".to_string()),
+            },
+            "request".to_string(),
+            Endpoint::TsLookup,
+            "ethereum-mainnet".to_string(),
+            reporter.clone(),
+            7,
+        );
+
+        let decoded = collect_archive_stream(stream::iter(chunks), Some(meter.clone()))
+            .await
+            .unwrap();
+        meter.complete();
+
+        let mut expected = first.to_vec();
+        expected.extend(second);
+        assert_eq!(decoded, String::from_utf8(expected).unwrap());
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.endpoint, Endpoint::TsLookup);
+        assert_eq!(event.data_source, DataSource::Network);
+        assert_eq!(event.logical_bytes, (first.len() + second.len()) as u64);
+        assert_eq!(event.wire_bytes, encoded.len() as u64);
+        assert_eq!(event.chunks, 3);
+        assert_eq!(event.status, UsageStatus::Completed);
     }
 
     #[tokio::test]
