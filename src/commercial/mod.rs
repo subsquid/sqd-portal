@@ -7,6 +7,7 @@ pub use types::*;
 
 mod client;
 mod config;
+pub mod extractor;
 mod reporter;
 pub mod types;
 

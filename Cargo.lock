@@ -7844,6 +7844,7 @@ dependencies = [
  "dotenv",
  "flate2",
  "futures 0.3.31",
+ "hex",
  "hex-literal",
  "itertools 0.12.1",
  "lazy_static",

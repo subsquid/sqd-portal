@@ -42,6 +42,7 @@ use crate::types::Compression;
 use crate::utils::conversion::json_lines_to_json;
 use crate::utils::logging::MethodRouterExt;
 use crate::{
+    commercial::{extractor as commercial_extractor, Endpoint},
     config::Config,
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
@@ -139,19 +140,35 @@ pub async fn run_server(
         // Streaming data
         .route(
             "/datasets/:dataset/archival-stream",
-            post(run_archival_stream_restricted).endpoint("/archival-stream"),
+            post(run_archival_stream_restricted)
+                .route_layer(axum::middleware::from_fn(|req, next| {
+                    commercial_extractor::middleware(req, next, Endpoint::ArchivalStream)
+                }))
+                .endpoint("/archival-stream"),
         )
         .route(
             "/datasets/:dataset/archival-stream/debug",
-            post(run_archival_stream).endpoint("/archival-stream/debug"),
+            post(run_archival_stream)
+                .route_layer(axum::middleware::from_fn(|req, next| {
+                    commercial_extractor::middleware(req, next, Endpoint::ArchivalStream)
+                }))
+                .endpoint("/archival-stream/debug"),
         )
         .route(
             "/datasets/:dataset/finalized-stream",
-            post(run_finalized_stream).endpoint("/finalized-stream"),
+            post(run_finalized_stream)
+                .route_layer(axum::middleware::from_fn(|req, next| {
+                    commercial_extractor::middleware(req, next, Endpoint::FinalizedStream)
+                }))
+                .endpoint("/finalized-stream"),
         )
         .route(
             "/datasets/:dataset/stream",
-            post(run_stream).endpoint("/stream"),
+            post(run_stream)
+                .route_layer(axum::middleware::from_fn(|req, next| {
+                    commercial_extractor::middleware(req, next, Endpoint::Stream)
+                }))
+                .endpoint("/stream"),
         )
         // Getting head
         .route(
@@ -178,7 +195,11 @@ pub async fn run_server(
         )
         .route(
             "/datasets/:dataset/timestamps/:timestamp/block",
-            get(get_blocknumber_by_timestamp).endpoint("/timestamps/block"),
+            get(get_blocknumber_by_timestamp)
+                .route_layer(axum::middleware::from_fn(|req, next| {
+                    commercial_extractor::middleware(req, next, Endpoint::TsLookup)
+                }))
+                .endpoint("/timestamps/block"),
         )
         // Backward compatibility routes
         .route(
@@ -191,7 +212,11 @@ pub async fn run_server(
         )
         .route(
             "/datasets/:dataset_id/query/:worker_id",
-            post(execute_query).endpoint("/query"),
+            post(execute_query)
+                .route_layer(axum::middleware::from_fn(|req, next| {
+                    commercial_extractor::middleware(req, next, Endpoint::LegacyQuery)
+                }))
+                .endpoint("/query"),
         )
         .route(
             "/datasets/:dataset/height",
@@ -218,7 +243,14 @@ pub async fn run_server(
     // SQL Query Engine
     #[cfg(feature = "sql")]
     let app = app
-        .route("/sql/query", post(sql_query).endpoint("/sql/query"))
+        .route(
+            "/sql/query",
+            post(sql_query)
+                .route_layer(axum::middleware::from_fn(|req, next| {
+                    commercial_extractor::middleware(req, next, Endpoint::SqlQuery)
+                }))
+                .endpoint("/sql/query"),
+        )
         .route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
 
     let drain_timeout = config.drain_timeout;

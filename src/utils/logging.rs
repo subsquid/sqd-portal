@@ -115,7 +115,13 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         .to_str()
         .expect("Request ID should be a valid string");
 
-    let span = tracing::span!(tracing::Level::INFO, "http_request", request_id);
+    let span = tracing::span!(
+        tracing::Level::INFO,
+        "http_request",
+        request_id,
+        key_id = tracing::field::Empty,
+        account_id = tracing::field::Empty
+    );
 
     let response = next.run(req).instrument(span.clone()).await;
 

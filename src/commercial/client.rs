@@ -13,15 +13,19 @@ pub struct NoopControlPlane;
 #[async_trait]
 impl ControlPlaneClient for NoopControlPlane {
     async fn authorize(&self, _req: AuthorizeRequest) -> Authorization {
-        Authorization::Granted(Granted {
-            principal: Principal {
-                account_id: "oss".to_string(),
-                api_key_id: None,
-            },
-            limits: GrantedLimits::default(),
-            on_exceed: OnExceed::Reject,
-            quota_version: 0,
-        })
+        Authorization::Granted(oss_grant())
+    }
+}
+
+pub fn oss_grant() -> Granted {
+    Granted {
+        principal: Principal {
+            account_id: "oss".to_string(),
+            api_key_id: None,
+        },
+        limits: GrantedLimits::default(),
+        on_exceed: OnExceed::Reject,
+        quota_version: 0,
     }
 }
 
@@ -48,17 +52,6 @@ mod tests {
 
         let result = NoopControlPlane.authorize(req).await;
 
-        assert_eq!(
-            result,
-            Authorization::Granted(Granted {
-                principal: Principal {
-                    account_id: "oss".to_string(),
-                    api_key_id: None,
-                },
-                limits: GrantedLimits::default(),
-                on_exceed: OnExceed::Reject,
-                quota_version: 0,
-            })
-        );
+        assert_eq!(result, Authorization::Granted(oss_grant()));
     }
 }
