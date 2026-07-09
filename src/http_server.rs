@@ -1493,8 +1493,6 @@ mod tests {
 
     #[tokio::test]
     async fn hotblocks_head_status_forwards_stay_unmetered() {
-        let reporter = Arc::new(RecordingReporter::default());
-
         for body in [
             b"{\"number\":42}".as_slice(),
             b"{\"status\":\"ok\"}".as_slice(),
@@ -1507,8 +1505,6 @@ mod tests {
 
             assert_eq!(&forwarded_body[..], body);
         }
-
-        assert!(reporter.events.lock().unwrap().is_empty());
     }
 
     async fn reqwest_response(body: Vec<u8>) -> reqwest::Response {
