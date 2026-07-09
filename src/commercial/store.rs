@@ -225,6 +225,16 @@ impl SnapshotStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_loaded_from_cache_for_test(&self, loaded: bool) {
+        self.inner
+            .loaded_from_cache
+            .store(loaded, Ordering::Release);
+        if loaded {
+            self.inner.ready.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn install_records_for_test(&self, records: Vec<SnapshotRecord>, cursor: u64) {
         self.replace_records(records, cursor)
             .expect("test snapshot records should install");

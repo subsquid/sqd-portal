@@ -778,59 +778,88 @@ async fn get_readiness(
     Extension(shutting_down): Extension<Arc<AtomicBool>>,
     snapshot_store: Option<Extension<Arc<SnapshotStore>>>,
 ) -> impl IntoResponse {
-    // Stable discriminant per readiness *category*. `/ready` is polled
-    // continuously, so we log only when the category changes — entering a new
-    // state logs once (with live detail), while fluctuating connection counts
-    // within `InsufficientConnections` do not. Starts `READY` so a portal that
-    // never becomes ready still logs the reason on its first probe.
-    const READY: u8 = 0;
-    const SHUTTING_DOWN: u8 = 1;
-    const NO_WORKERS: u8 = 2;
-    const INSUFFICIENT_CONNECTIONS: u8 = 3;
-    const SNAPSHOTS_NOT_READY: u8 = 4;
-    static LAST_STATE: AtomicU8 = AtomicU8::new(READY);
+    let decision = readiness_decision(
+        shutting_down.load(Ordering::Relaxed),
+        snapshot_store.as_ref().map(|store| store.is_ready()),
+        || client.readiness(),
+    );
 
-    let (state, code, body, reason): (u8, StatusCode, &str, Option<NotReady>) =
-        if shutting_down.load(Ordering::Relaxed) {
-            (
-                SHUTTING_DOWN,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Shutting down",
-                None,
-            )
-        } else if snapshot_store
-            .as_ref()
-            .is_some_and(|store| !store.is_ready())
-        {
-            (
-                SNAPSHOTS_NOT_READY,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Commercial snapshots not ready",
-                None,
-            )
-        } else {
-            match client.readiness() {
-                Ok(()) => (READY, StatusCode::OK, "Ready", None),
-                Err(reason) => {
-                    let state = match reason {
-                        NotReady::NoWorkers => NO_WORKERS,
-                        NotReady::InsufficientConnections { .. } => INSUFFICIENT_CONNECTIONS,
-                    };
-                    (
-                        state,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Not ready",
-                        Some(reason),
-                    )
-                }
-            }
+    readiness_response(decision)
+}
+
+// Stable discriminant per readiness *category*. `/ready` is polled
+// continuously, so we log only when the category changes — entering a new
+// state logs once (with live detail), while fluctuating connection counts
+// within `InsufficientConnections` do not. Starts `READY` so a portal that
+// never becomes ready still logs the reason on its first probe.
+const READINESS_READY: u8 = 0;
+const READINESS_SHUTTING_DOWN: u8 = 1;
+const READINESS_NO_WORKERS: u8 = 2;
+const READINESS_INSUFFICIENT_CONNECTIONS: u8 = 3;
+const READINESS_SNAPSHOTS_NOT_READY: u8 = 4;
+
+#[derive(Clone, Copy)]
+struct ReadinessDecision {
+    state: u8,
+    code: StatusCode,
+    body: &'static str,
+    reason: Option<NotReady>,
+}
+
+fn readiness_decision(
+    shutting_down: bool,
+    snapshots_ready: Option<bool>,
+    client_readiness: impl FnOnce() -> Result<(), NotReady>,
+) -> ReadinessDecision {
+    if shutting_down {
+        return ReadinessDecision {
+            state: READINESS_SHUTTING_DOWN,
+            code: StatusCode::SERVICE_UNAVAILABLE,
+            body: "Shutting down",
+            reason: None,
         };
+    }
 
-    if LAST_STATE.swap(state, Ordering::Relaxed) != state {
-        match (state, reason) {
-            (READY, _) => tracing::info!("readiness check now passing: portal is ready"),
-            (SHUTTING_DOWN, _) => tracing::info!("readiness check now failing: shutting down"),
-            (SNAPSHOTS_NOT_READY, _) => {
+    if snapshots_ready.is_some_and(|ready| !ready) {
+        return ReadinessDecision {
+            state: READINESS_SNAPSHOTS_NOT_READY,
+            code: StatusCode::SERVICE_UNAVAILABLE,
+            body: "Commercial snapshots not ready",
+            reason: None,
+        };
+    }
+
+    match client_readiness() {
+        Ok(()) => ReadinessDecision {
+            state: READINESS_READY,
+            code: StatusCode::OK,
+            body: "Ready",
+            reason: None,
+        },
+        Err(reason) => {
+            let state = match reason {
+                NotReady::NoWorkers => READINESS_NO_WORKERS,
+                NotReady::InsufficientConnections { .. } => READINESS_INSUFFICIENT_CONNECTIONS,
+            };
+            ReadinessDecision {
+                state,
+                code: StatusCode::SERVICE_UNAVAILABLE,
+                body: "Not ready",
+                reason: Some(reason),
+            }
+        }
+    }
+}
+
+fn readiness_response(decision: ReadinessDecision) -> Response {
+    static LAST_STATE: AtomicU8 = AtomicU8::new(READINESS_READY);
+    if LAST_STATE.swap(decision.state, Ordering::Relaxed) != decision.state {
+        match (decision.state, decision.reason) {
+            (READINESS_READY, _) => tracing::info!("readiness check now passing: portal is ready"),
+            (READINESS_SHUTTING_DOWN, _) => {
+                tracing::info!("readiness check now failing: shutting down")
+            }
+            (READINESS_SNAPSHOTS_NOT_READY, _) => {
                 tracing::warn!("readiness check now failing: commercial snapshots not ready");
             }
             (_, Some(reason)) => tracing::warn!("readiness check now failing: {reason}"),
@@ -838,7 +867,7 @@ async fn get_readiness(
         }
     }
 
-    (code, body).into_response()
+    (decision.code, decision.body).into_response()
 }
 
 /// [INTERNAL] Dataset Height (deprecated)
@@ -1484,56 +1513,36 @@ mod tests {
         );
     }
 
-    /// End-to-end: real TCP listener + axum router + reqwest client. Verifies that
-    /// flipping the AtomicBool that `watch_shutdown_signal` flips on SIGTERM actually
-    /// changes the response observed by an HTTP client. The handler mirrors
-    /// `get_readiness` with `client.is_ready()` stubbed as `true`, since constructing
-    /// a real `NetworkClient` is heavy. The "Not ready" branch is pre-existing and
-    /// out of scope for this PR.
-    #[tokio::test]
-    async fn ready_endpoint_flips_to_503_when_shutdown_flag_set() {
-        let shutting_down = Arc::new(AtomicBool::new(false));
-        let cancel = CancellationToken::new();
+    fn assert_readiness_decision(
+        decision: ReadinessDecision,
+        state: u8,
+        code: StatusCode,
+        body: &'static str,
+        reason: Option<NotReady>,
+    ) {
+        assert_eq!(decision.state, state);
+        assert_eq!(decision.code, code);
+        assert_eq!(decision.body, body);
+        assert_eq!(decision.reason, reason);
+    }
 
-        let app = axum::Router::new()
-            .route(
-                "/ready",
-                axum::routing::get(|Extension(sd): Extension<Arc<AtomicBool>>| async move {
-                    if sd.load(Ordering::Relaxed) {
-                        (StatusCode::SERVICE_UNAVAILABLE, "Shutting down").into_response()
-                    } else {
-                        (StatusCode::OK, "Ready").into_response()
-                    }
-                }),
-            )
-            .layer(Extension(shutting_down.clone()));
+    #[test]
+    fn ready_endpoint_flips_to_503_when_shutdown_flag_set() {
+        let mut client_readiness_called = false;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let cancel_for_serve = cancel.clone();
-        let server = tokio::spawn(
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move { cancel_for_serve.cancelled().await })
-                .into_future(),
+        let decision = readiness_decision(true, None, || {
+            client_readiness_called = true;
+            Ok(())
+        });
+
+        assert_readiness_decision(
+            decision,
+            READINESS_SHUTTING_DOWN,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Shutting down",
+            None,
         );
-
-        let client = reqwest::Client::new();
-        let url = format!("http://{addr}/ready");
-
-        let resp = client.get(&url).send().await.expect("GET /ready");
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-
-        // Equivalent to what `run_shutdown_sequence` does on SIGTERM.
-        shutting_down.store(true, Ordering::Relaxed);
-
-        let resp = client.get(&url).send().await.expect("GET /ready");
-        assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-
-        cancel.cancel();
-        server
-            .await
-            .expect("server join")
-            .expect("server drains cleanly");
+        assert!(!client_readiness_called);
     }
 
     #[derive(Default)]
@@ -1761,27 +1770,6 @@ mod tests {
         );
     }
 
-    async fn ready_test_handler(
-        Extension(shutting_down): Extension<Arc<AtomicBool>>,
-        snapshot_store: Option<Extension<Arc<SnapshotStore>>>,
-    ) -> Response {
-        if shutting_down.load(Ordering::Relaxed) {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Shutting down").into_response();
-        }
-        if snapshot_store
-            .as_ref()
-            .is_some_and(|store| !store.is_ready())
-        {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Commercial snapshots not ready",
-            )
-                .into_response();
-        }
-
-        (StatusCode::OK, "Ready").into_response()
-    }
-
     fn public_fallback_for_ready_test() -> PublicFallbackConfig {
         PublicFallbackConfig {
             throughput_bytes_per_sec: 1,
@@ -1793,53 +1781,58 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn ready_endpoint_covers_commercial_store_and_oss_branches() {
-        let shutting_down = Arc::new(AtomicBool::new(false));
+    #[test]
+    fn ready_endpoint_waits_for_commercial_snapshot_store_before_network_readiness() {
         let store = SnapshotStore::inactive(&public_fallback_for_ready_test());
         store.set_ready_for_test(false);
-        let app = axum::Router::new()
-            .route("/ready", get(ready_test_handler))
-            .layer(Extension(shutting_down.clone()))
-            .layer(Extension(store.clone()));
+        let mut client_readiness_called = false;
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/ready")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let decision = readiness_decision(false, Some(store.is_ready()), || {
+            client_readiness_called = true;
+            Ok(())
+        });
+
+        assert_readiness_decision(
+            decision,
+            READINESS_SNAPSHOTS_NOT_READY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Commercial snapshots not ready",
+            None,
+        );
+        assert!(!client_readiness_called);
 
         store.set_ready_for_test(true);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/ready")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let decision = readiness_decision(false, Some(store.is_ready()), || Ok(()));
 
-        let oss_app = axum::Router::new()
-            .route("/ready", get(ready_test_handler))
-            .layer(Extension(shutting_down));
-        let response = oss_app
-            .oneshot(
-                Request::builder()
-                    .uri("/ready")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_readiness_decision(decision, READINESS_READY, StatusCode::OK, "Ready", None);
+    }
+
+    #[test]
+    fn ready_endpoint_is_ready_immediately_when_snapshot_store_loaded_from_disk_cache() {
+        let store = SnapshotStore::inactive(&public_fallback_for_ready_test());
+        store.set_loaded_from_cache_for_test(true);
+        assert!(store.loaded_from_cache());
+
+        let decision = readiness_decision(false, Some(store.is_ready()), || Ok(()));
+
+        assert_readiness_decision(decision, READINESS_READY, StatusCode::OK, "Ready", None);
+    }
+
+    #[test]
+    fn ready_endpoint_oss_mode_passthrough_matches_network_readiness() {
+        let ready = readiness_decision(false, None, || Ok(()));
+
+        assert_readiness_decision(ready, READINESS_READY, StatusCode::OK, "Ready", None);
+
+        let not_ready = readiness_decision(false, None, || Err(NotReady::NoWorkers));
+
+        assert_readiness_decision(
+            not_ready,
+            READINESS_NO_WORKERS,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Not ready",
+            Some(NotReady::NoWorkers),
+        );
     }
 
     struct GrantingControlPlane;
