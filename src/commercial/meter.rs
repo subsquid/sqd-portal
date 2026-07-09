@@ -19,6 +19,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant as TokioInstant;
 use uuid::{NoContext, Timestamp, Uuid};
 
+use crate::commercial::concurrency::ConcurrencyPermit;
 use crate::{
     commercial::{
         registry::StreamRegistration, ActiveStreamRegistry, DataSource, Endpoint, Granted,
@@ -62,6 +63,7 @@ struct MeterInner {
     floor_bytes_per_sec: Arc<AtomicU64>,
     bucket: Option<AsyncMutex<TokenBucket>>,
     _registration: Option<StreamRegistration>,
+    _concurrency_permit: Option<ConcurrencyPermit>,
 }
 
 struct TokenBucket {
@@ -92,6 +94,7 @@ impl MeterHandle {
             reporter,
             None,
             None,
+            None,
         )
     }
 
@@ -104,6 +107,7 @@ impl MeterHandle {
         tally: Arc<TallyStore>,
         registry: Arc<ActiveStreamRegistry>,
     ) -> Self {
+        let concurrency_permit = granted.concurrency_permit;
         Self::from_parts(
             granted.principal,
             granted.tally_account_id,
@@ -117,6 +121,7 @@ impl MeterHandle {
             reporter,
             Some(tally),
             Some(registry),
+            concurrency_permit,
         )
     }
 
@@ -134,6 +139,7 @@ impl MeterHandle {
         reporter: Arc<dyn UsageReporter>,
         tally: Option<Arc<TallyStore>>,
         registry: Option<Arc<ActiveStreamRegistry>>,
+        concurrency_permit: Option<ConcurrencyPermit>,
     ) -> Self {
         let event_id = uuid_v7();
         let tally_account_id = tally_account_id.unwrap_or_else(|| principal.account_id.clone());
@@ -177,6 +183,7 @@ impl MeterHandle {
                 floor_bytes_per_sec,
                 bucket,
                 _registration: registration,
+                _concurrency_permit: concurrency_permit,
             }),
         }
     }
@@ -713,7 +720,7 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     use super::*;
-    use crate::commercial::UsageReporter;
+    use crate::commercial::{ConcurrencyLimiter, UsageReporter};
 
     #[derive(Default)]
     struct RecordingReporter {
@@ -783,6 +790,40 @@ mod tests {
             tally,
             registry,
         )
+    }
+
+    fn enforced_meter_with_grant(
+        reporter: Arc<RecordingReporter>,
+        granted: Granted,
+    ) -> MeterHandle {
+        MeterHandle::new_enforced(
+            granted,
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter,
+            Arc::new(TallyStore::default()),
+            Arc::new(ActiveStreamRegistry::default()),
+        )
+    }
+
+    fn assert_meter_holds_permit_until_last_handle_drops(account_key: &str, granted: Granted) {
+        let reporter = Arc::new(RecordingReporter::default());
+        let limiter = ConcurrencyLimiter::new(1);
+        let mut granted = granted;
+        granted.concurrency_permit = limiter.try_acquire(account_key, 1);
+
+        let meter = enforced_meter_with_grant(reporter, granted);
+        let other = limiter.try_acquire(account_key, 1).unwrap();
+        assert!(limiter.try_acquire(account_key, 1).is_none());
+
+        let cloned = meter.clone();
+        drop(meter);
+        assert!(limiter.try_acquire(account_key, 1).is_none());
+
+        drop(cloned);
+        assert!(limiter.try_acquire(account_key, 1).is_some());
+        drop(other);
     }
 
     async fn drive_metered_frames(
@@ -875,6 +916,44 @@ mod tests {
         }
 
         assert!(reporter.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn enforced_meter_holds_account_concurrency_permit_until_last_handle_drops() {
+        assert_meter_holds_permit_until_last_handle_drops(
+            "account",
+            Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: Some("key".to_string()),
+                },
+                tally_account_id: None,
+                limits: GrantedLimits::default(),
+                on_exceed: OnExceed::Reject,
+                quota_version: 7,
+                quota_remaining_bytes: Some(100),
+                concurrency_permit: None,
+            },
+        );
+    }
+
+    #[test]
+    fn enforced_meter_holds_anonymous_concurrency_permit_until_last_handle_drops() {
+        assert_meter_holds_permit_until_last_handle_drops(
+            "anon:203.0.113.7/32",
+            Granted {
+                principal: Principal {
+                    account_id: "anonymous".to_string(),
+                    api_key_id: None,
+                },
+                tally_account_id: Some("anon:203.0.113.7/32".to_string()),
+                limits: GrantedLimits::default(),
+                on_exceed: OnExceed::Reject,
+                quota_version: 120,
+                quota_remaining_bytes: Some(100),
+                concurrency_permit: None,
+            },
+        );
     }
 
     #[tokio::test]
