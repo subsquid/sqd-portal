@@ -108,28 +108,11 @@ impl SnapshotStore {
         hooks: SnapshotHooks,
     ) -> anyhow::Result<(Arc<Self>, JoinHandle<()>)> {
         let service_token = std::env::var(&config.service_token_env).unwrap_or_default();
-        let store = Arc::new(Self {
-            inner: Arc::new(SnapshotStoreInner {
-                records: ArcSwap::from_pointee(HashMap::new()),
-                defaults: ArcSwap::from_pointee(defaults_from_fallback(&config.public_fallback)),
-                cursor: AtomicU64::new(0),
-                ready: AtomicBool::new(false),
-                loaded_from_cache: AtomicBool::new(false),
-                disk_cache_dirty: AtomicBool::new(false),
-                last_sync_success: Mutex::new(None),
-                cache_path: config.snapshot_cache_path.clone(),
-                sync_interval: Duration::from_secs(config.sync_interval_secs.max(1)),
-                negative_cache_ttl: Duration::from_secs(config.negative_cache_secs.max(1)),
-                negative_cache: DashMap::new(),
-                resolve_limiter: Mutex::new(ResolveLimiter::new(config.resolve_rate_per_sec)),
-                client: reqwest::Client::builder()
-                    .timeout(Duration::from_secs(10))
-                    .build()?,
-                control_plane_url: config.control_plane_url.clone(),
-                service_token,
-                hooks,
-            }),
-        });
+        let sync_task_start = TokioInstant::now();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let store = Self::new(config, hooks, service_token, client, sync_task_start);
         store.load_disk_cache();
 
         let task_store = store.clone();
@@ -137,6 +120,35 @@ impl SnapshotStore {
             task_store.run_sync_loop(cancel).await;
         });
         Ok((store, task))
+    }
+
+    fn new(
+        config: &CommercialConfig,
+        hooks: SnapshotHooks,
+        service_token: String,
+        client: reqwest::Client,
+        sync_task_start: TokioInstant,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(SnapshotStoreInner {
+                records: ArcSwap::from_pointee(HashMap::new()),
+                defaults: ArcSwap::from_pointee(defaults_from_fallback(&config.public_fallback)),
+                cursor: AtomicU64::new(0),
+                ready: AtomicBool::new(false),
+                loaded_from_cache: AtomicBool::new(false),
+                disk_cache_dirty: AtomicBool::new(false),
+                last_sync_success: Mutex::new(Some(sync_task_start)),
+                cache_path: config.snapshot_cache_path.clone(),
+                sync_interval: Duration::from_secs(config.sync_interval_secs.max(1)),
+                negative_cache_ttl: Duration::from_secs(config.negative_cache_secs.max(1)),
+                negative_cache: DashMap::new(),
+                resolve_limiter: Mutex::new(ResolveLimiter::new(config.resolve_rate_per_sec)),
+                client,
+                control_plane_url: config.control_plane_url.clone(),
+                service_token,
+                hooks,
+            }),
+        })
     }
 
     pub fn inactive(fallback: &PublicFallbackConfig) -> Arc<Self> {
@@ -942,6 +954,19 @@ mod tests {
         }
     }
 
+    static STALENESS_GAUGE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn staleness_gauge_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        STALENESS_GAUGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn reset_staleness_gauges() {
+        metrics::set_commercial_sync_staleness(0);
+        metrics::set_commercial_snapshot_age(0);
+    }
+
     fn config(
         mock: &MockControlPlane,
         cache_path: PathBuf,
@@ -956,6 +981,32 @@ mod tests {
             usage_buffer_max_events: 1000,
             snapshot_cache_path: cache_path,
             resolve_rate_per_sec,
+            negative_cache_secs: 60,
+            pod_count: 1,
+            client_ip_header: "x-forwarded-for".to_string(),
+            throttle_residual_secs: 60,
+            sweep_horizon_window_multiplier: 2,
+            public_fallback: PublicFallbackConfig {
+                throughput_bytes_per_sec: 1,
+                burst_bytes: 1,
+                max_response_bytes: 1,
+                volume_bytes: 1,
+                window_secs: 1,
+                concurrency: 1,
+            },
+        }
+    }
+
+    fn offline_config(cache_path: PathBuf) -> CommercialConfig {
+        CommercialConfig {
+            control_plane_url: "http://127.0.0.1/".parse().unwrap(),
+            service_token_env: "PORTAL_STORE_TEST_TOKEN".to_string(),
+            sync_interval_secs: 1,
+            flush_interval_secs: 5,
+            flush_max_events: 500,
+            usage_buffer_max_events: 1000,
+            snapshot_cache_path: cache_path,
+            resolve_rate_per_sec: 0,
             negative_cache_secs: 60,
             pod_count: 1,
             client_ip_header: "x-forwarded-for".to_string(),
@@ -1099,7 +1150,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn sync_staleness_gauge_grows_from_boot_before_first_success() {
+        let _guard = staleness_gauge_test_guard();
+        reset_staleness_gauges();
+        let path = cache_path("from-boot-outage");
+        let _ = tokio::fs::remove_file(&path).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let store = SnapshotStore::new(
+            &offline_config(path.clone()),
+            SnapshotHooks::default(),
+            String::new(),
+            client,
+            TokioInstant::now(),
+        );
+        store.load_disk_cache();
+
+        assert!(!store.is_ready());
+        assert!(!store.loaded_from_cache());
+
+        store.update_sync_age_metrics();
+        assert_eq!(metrics::COMMERCIAL_SYNC_STALENESS_SECONDS.get(), 0);
+        assert_eq!(metrics::COMMERCIAL_SNAPSHOT_AGE_SECONDS.get(), 0);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        store.update_sync_age_metrics();
+
+        assert_eq!(metrics::COMMERCIAL_SYNC_STALENESS_SECONDS.get(), 2);
+        assert_eq!(metrics::COMMERCIAL_SNAPSHOT_AGE_SECONDS.get(), 2);
+        assert!(!store.is_ready());
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn sync_staleness_gauges_grow_across_failed_ticks() {
+        let _guard = staleness_gauge_test_guard();
+        reset_staleness_gauges();
         let store = SnapshotStore::inactive(&PublicFallbackConfig {
             throughput_bytes_per_sec: 1,
             burst_bytes: 1,
