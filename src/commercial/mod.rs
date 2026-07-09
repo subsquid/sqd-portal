@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use client::{ControlPlaneClient, LocalControlPlane, NoopControlPlane};
+pub use concurrency::ConcurrencyLimiter;
 pub use config::CommercialConfig;
 pub use extractor::CommercialGrant;
 pub use meter::MeterHandle;
@@ -14,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 pub use types::*;
 
 mod client;
+pub mod concurrency;
 mod config;
 pub mod evaluate;
 pub mod extractor;
@@ -50,6 +52,7 @@ pub fn build(config: Option<&CommercialConfig>, cancel: CancellationToken) -> Co
         Some(config) => {
             let tally = Arc::new(TallyStore::default());
             let registry = Arc::new(ActiveStreamRegistry::default());
+            let concurrency = Arc::new(ConcurrencyLimiter::new(config.pod_count));
             let (store, snapshot_task) = SnapshotStore::spawn_with_hooks(
                 config,
                 cancel.clone(),
@@ -61,7 +64,11 @@ pub fn build(config: Option<&CommercialConfig>, cancel: CancellationToken) -> Co
             .expect("snapshot store should build");
             let (reporter, reporter_task) = BufferedUsageReporter::spawn(config, cancel);
             BuildParts {
-                control_plane: Arc::new(LocalControlPlane::new(store.clone(), tally.clone())),
+                control_plane: Arc::new(LocalControlPlane::new(
+                    store.clone(),
+                    tally.clone(),
+                    concurrency,
+                )),
                 usage_reporter: reporter,
                 snapshot_store: Some(store),
                 tally: Some(tally),

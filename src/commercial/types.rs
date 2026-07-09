@@ -2,6 +2,8 @@ use std::{collections::HashMap, fmt};
 
 use serde::{Deserialize, Serialize};
 
+use super::concurrency::ConcurrencyPermit;
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Credential {
@@ -92,6 +94,8 @@ pub struct Granted {
     pub on_exceed: OnExceed,
     pub quota_version: u64,
     pub quota_remaining_bytes: Option<i64>,
+    #[serde(skip)]
+    pub concurrency_permit: Option<ConcurrencyPermit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

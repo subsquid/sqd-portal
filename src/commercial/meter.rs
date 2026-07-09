@@ -6,7 +6,7 @@ use std::{
         Arc, OnceLock,
     },
     task::{Context, Poll},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 
 use async_compression::tokio::write::GzipDecoder;
@@ -15,6 +15,8 @@ use bytes::Bytes;
 use flate2::bufread::MultiGzDecoder;
 use futures::{Stream, StreamExt};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::Instant as TokioInstant;
 use uuid::{NoContext, Timestamp, Uuid};
 
 use crate::{
@@ -40,8 +42,9 @@ struct MeterInner {
     dataset: String,
     data_source: AtomicU8,
     started_at: SystemTime,
-    started_instant: Instant,
+    started_instant: StdInstant,
     logical: AtomicU64,
+    unpaced_logical: AtomicU64,
     wire: AtomicU64,
     blocks: AtomicU64,
     chunks: AtomicU64,
@@ -56,7 +59,14 @@ struct MeterInner {
     tally: Option<Arc<TallyStore>>,
     kill: Arc<AtomicBool>,
     floor_bytes_per_sec: Arc<AtomicU64>,
+    bucket: Option<AsyncMutex<TokenBucket>>,
     _registration: Option<StreamRegistration>,
+}
+
+struct TokenBucket {
+    available: f64,
+    burst: f64,
+    last: TokioInstant,
 }
 
 impl MeterHandle {
@@ -124,6 +134,7 @@ impl MeterHandle {
         let event_id = uuid_v7();
         let kill = Arc::new(AtomicBool::new(false));
         let floor_bytes_per_sec = Arc::new(AtomicU64::new(0));
+        let bucket = bucket_from_limits(&limits);
         let registration = registry.as_ref().map(|registry| {
             registry.register(
                 event_id.clone(),
@@ -141,8 +152,9 @@ impl MeterHandle {
                 dataset,
                 data_source: AtomicU8::new(data_source_code(DataSource::Network)),
                 started_at: SystemTime::now(),
-                started_instant: Instant::now(),
+                started_instant: StdInstant::now(),
                 logical: AtomicU64::new(0),
+                unpaced_logical: AtomicU64::new(0),
                 wire: AtomicU64::new(0),
                 blocks: AtomicU64::new(0),
                 chunks: AtomicU64::new(0),
@@ -157,6 +169,7 @@ impl MeterHandle {
                 tally,
                 kill,
                 floor_bytes_per_sec,
+                bucket,
                 _registration: registration,
             }),
         }
@@ -170,6 +183,9 @@ impl MeterHandle {
 
     pub fn add_logical_bytes(&self, bytes: u64) {
         self.inner.logical.fetch_add(bytes, Ordering::Relaxed);
+        self.inner
+            .unpaced_logical
+            .fetch_add(bytes, Ordering::Relaxed);
         if let Some(tally) = &self.inner.tally {
             tally.debit(
                 &self.inner.principal.account_id,
@@ -211,6 +227,13 @@ impl MeterHandle {
 
     pub fn should_stop_after_chunk(&self) -> bool {
         self.inner.should_stop_after_chunk()
+    }
+
+    pub async fn pace_pending_logical(&self) {
+        let bytes = self.inner.unpaced_logical.swap(0, Ordering::AcqRel);
+        if bytes > 0 {
+            self.inner.pace(bytes).await;
+        }
     }
 
     pub fn record_plain_bytes_and_complete(&self, bytes: u64) {
@@ -278,6 +301,49 @@ impl MeterInner {
 
     fn set_status(&self, status: UsageStatus) {
         self.status.store(status_code(status), Ordering::Relaxed);
+    }
+
+    async fn pace(&self, bytes: u64) {
+        let Some(bucket) = &self.bucket else {
+            return;
+        };
+        let mut warned = false;
+        loop {
+            let Some((rate, burst)) = self.current_rate_and_burst() else {
+                return;
+            };
+            let wait = {
+                let mut bucket = bucket.lock().await;
+                bucket.refill(rate, burst);
+                if bucket.available > 0.0 {
+                    bucket.available -= bytes as f64;
+                    return;
+                }
+                Duration::from_secs_f64(((-bucket.available) + 1.0) / rate)
+            };
+            if wait > Duration::from_secs(30) && !warned {
+                tracing::warn!(
+                    stall_seconds = wait.as_secs_f64(),
+                    "commercial throttle stalled a response chunk for more than 30 seconds"
+                );
+                warned = true;
+            }
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    fn current_rate_and_burst(&self) -> Option<(f64, f64)> {
+        let floor = self.floor_bytes_per_sec.load(Ordering::Acquire);
+        if floor > 0 {
+            let floor = floor as f64;
+            return Some((floor, floor));
+        }
+        let rate = self.limits.throughput_bytes_per_sec? as f64;
+        if rate <= 0.0 {
+            return None;
+        }
+        let burst = self.limits.burst_bytes.unwrap_or(rate as u64) as f64;
+        Some((rate, burst.max(1.0)))
     }
 
     fn flush_once(&self) {
@@ -359,6 +425,7 @@ where
                 }
             }
             let stop = meter.should_stop_after_chunk();
+            meter.pace_pending_logical().await;
             yield frame;
             if stop {
                 break;
@@ -399,6 +466,7 @@ where
             } else {
                 meter.mark_error();
             }
+            meter.pace_pending_logical().await;
             let stop = meter.should_stop_after_chunk();
             yield item;
             if stop {
@@ -421,6 +489,7 @@ where
             } else {
                 meter.mark_error();
             }
+            meter.pace_pending_logical().await;
             let stop = meter.should_stop_after_chunk();
             yield item;
             if stop {
@@ -472,6 +541,7 @@ where
                 }
                 Err(_) => meter.mark_error(),
             }
+            meter.pace_pending_logical().await;
             let stop = meter.should_stop_after_chunk();
             yield item;
             if stop {
@@ -529,6 +599,29 @@ fn gzip_len(bytes: &[u8]) -> anyhow::Result<u64> {
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded)?;
     Ok(decoded.len() as u64)
+}
+
+fn bucket_from_limits(limits: &GrantedLimits) -> Option<AsyncMutex<TokenBucket>> {
+    let rate = limits.throughput_bytes_per_sec?;
+    if rate == 0 {
+        return None;
+    }
+    let burst = limits.burst_bytes.unwrap_or(rate).max(1);
+    Some(AsyncMutex::new(TokenBucket {
+        available: burst as f64,
+        burst: burst as f64,
+        last: TokioInstant::now(),
+    }))
+}
+
+impl TokenBucket {
+    fn refill(&mut self, rate: f64, burst: f64) {
+        let now = TokioInstant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.burst = burst.max(1.0);
+        self.available = (self.available + elapsed * rate).min(self.burst);
+    }
 }
 
 fn uuid_v7() -> String {
@@ -658,6 +751,7 @@ mod tests {
             on_exceed,
             quota_version: 7,
             quota_remaining_bytes,
+            concurrency_permit: None,
         };
         (
             MeterHandle::new_enforced(
@@ -892,5 +986,115 @@ mod tests {
         let event = reporter.events.lock().unwrap().pop().unwrap();
         assert_eq!(event.status, UsageStatus::CutSuspended);
         assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pacing_waits_between_chunks_after_burst_is_spent() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, _, _) = enforced_meter(
+            reporter.clone(),
+            GrantedLimits {
+                throughput_bytes_per_sec: Some(1),
+                burst_bytes: Some(1),
+                ..GrantedLimits::default()
+            },
+            OnExceed::Reject,
+            Some(100),
+        );
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"a")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"b")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"c")),
+        ];
+        let start = tokio::time::Instant::now();
+
+        let output = tap_plain_stream(stream::iter(chunks), meter);
+        let emitted: Vec<_> = output.collect().await;
+
+        assert_eq!(emitted.len(), 3);
+        assert!(start.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burst_allows_initial_chunks_without_waiting() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, _, _) = enforced_meter(
+            reporter.clone(),
+            GrantedLimits {
+                throughput_bytes_per_sec: Some(1),
+                burst_bytes: Some(2),
+                ..GrantedLimits::default()
+            },
+            OnExceed::Reject,
+            Some(100),
+        );
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"a")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"b")),
+        ];
+        let start = tokio::time::Instant::now();
+
+        let output = tap_plain_stream(stream::iter(chunks), meter);
+        let emitted: Vec<_> = output.collect().await;
+
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_chunk_creates_debt_without_deadlocking() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, _, _) = enforced_meter(
+            reporter.clone(),
+            GrantedLimits {
+                throughput_bytes_per_sec: Some(10),
+                burst_bytes: Some(5),
+                ..GrantedLimits::default()
+            },
+            OnExceed::Reject,
+            Some(100),
+        );
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"abcdefghijklmnopqrst")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"!")),
+        ];
+        let start = tokio::time::Instant::now();
+
+        let output = tap_plain_stream(stream::iter(chunks), meter);
+        let emitted: Vec<_> = output.collect().await;
+
+        assert_eq!(emitted.len(), 2);
+        assert!(start.elapsed() >= Duration::from_millis(1500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn throttle_floor_switch_slows_later_chunks() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, _, _) = enforced_meter(
+            reporter.clone(),
+            GrantedLimits {
+                throughput_bytes_per_sec: Some(100),
+                burst_bytes: Some(100),
+                ..GrantedLimits::default()
+            },
+            OnExceed::Throttle {
+                floor_bytes_per_sec: 1,
+            },
+            Some(1),
+        );
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"xx")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"y")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"z")),
+        ];
+        let start = tokio::time::Instant::now();
+
+        let output = tap_plain_stream(stream::iter(chunks), meter);
+        let emitted: Vec<_> = output.collect().await;
+
+        assert_eq!(emitted.len(), 3);
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.status, UsageStatus::Completed);
     }
 }

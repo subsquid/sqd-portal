@@ -5,7 +5,7 @@ use super::{
         Authorization, AuthorizeRequest, Credential, Defaults, Granted, GrantedLimits, KeySnapshot,
         KeyStatus, OnExceed, Principal, Rejected, SnapshotLimits,
     },
-    SnapshotStore, TallyStore,
+    ConcurrencyLimiter, SnapshotStore, TallyStore,
 };
 
 const INVALID_KEY: &str = "invalid_key";
@@ -37,6 +37,7 @@ impl Default for EvaluationState {
 pub async fn evaluate_with_store(
     store: &SnapshotStore,
     tally: Option<&TallyStore>,
+    concurrency: Option<&ConcurrencyLimiter>,
     req: AuthorizeRequest,
 ) -> Authorization {
     let view = store.view();
@@ -55,7 +56,31 @@ pub async fn evaluate_with_store(
                     state.tally_bytes = tally.bytes_for(account_id, quota.version);
                 }
             }
-            evaluate(&req, snapshot.as_deref(), &view.defaults, state)
+            let permit = snapshot
+                .as_deref()
+                .and_then(|snapshot| {
+                    Some((
+                        snapshot.account_id.as_deref()?,
+                        snapshot.limits.as_ref()?.concurrency?,
+                    ))
+                })
+                .and_then(|(account_id, limit)| {
+                    concurrency.and_then(|limiter| limiter.try_acquire(account_id, limit))
+                });
+            if snapshot
+                .as_deref()
+                .and_then(|snapshot| snapshot.limits.as_ref()?.concurrency)
+                .is_some()
+            {
+                state.concurrency_available = permit.is_some();
+            }
+            match evaluate(&req, snapshot.as_deref(), &view.defaults, state) {
+                Authorization::Granted(mut granted) => {
+                    granted.concurrency_permit = permit;
+                    Authorization::Granted(granted)
+                }
+                rejected => rejected,
+            }
         }
         Credential::None { .. } => evaluate(&req, None, &view.defaults, EvaluationState::default()),
         Credential::Internal { .. } => Authorization::Granted(super::client::oss_grant()),
@@ -189,6 +214,7 @@ fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
         on_exceed: defaults.public.quota.on_exceed.clone(),
         quota_version: defaults.seq,
         quota_remaining_bytes: None,
+        concurrency_permit: None,
     })
 }
 
@@ -223,6 +249,7 @@ fn grant(
             .map(|quota| quota.version)
             .unwrap_or(0),
         quota_remaining_bytes: snapshot.quota.as_ref().map(|quota| quota.remaining_bytes),
+        concurrency_permit: None,
     }
 }
 
