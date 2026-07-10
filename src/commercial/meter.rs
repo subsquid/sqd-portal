@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read, Write},
+    io::{self, Read},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
@@ -436,19 +436,8 @@ where
     S: Stream<Item = Vec<u8>> + Send + 'static,
 {
     stream! {
-        let mut zstd_decoder = match compression {
-            Compression::Gzip => None,
-            Compression::Zstd => match zstd::stream::write::Decoder::new(ZstdLogicalByteCounter {
-                meter: meter.clone(),
-            }) {
-                Ok(decoder) => Some(decoder),
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to initialize zstd usage decoder");
-                    meter.mark_error();
-                    None
-                }
-            },
-        };
+        let mut pending_zstd = Vec::new();
+        let mut pending_zstd_frames = Vec::new();
         futures::pin_mut!(input);
         while let Some(frame) = input.next().await {
             meter.add_chunk();
@@ -461,12 +450,23 @@ where
                     }
                 },
                 Compression::Zstd => {
-                    if let Some(decoder) = &mut zstd_decoder {
-                        if let Err(err) = decoder.write_all(&frame) {
-                            tracing::warn!(error = %err, "failed to decode portal usage zstd stream for logical byte count");
-                            meter.mark_error();
-                        }
+                    pending_zstd.extend_from_slice(&frame);
+                    pending_zstd_frames.push(frame);
+                    let decoded = match zstd::stream::decode_all(&pending_zstd[..]) {
+                        Ok(decoded) => decoded,
+                        Err(_) => continue,
+                    };
+                    meter.add_logical_bytes(decoded.len() as u64);
+                    let stop = meter.should_stop_after_chunk();
+                    meter.pace_pending_logical().await;
+                    for frame in pending_zstd_frames.drain(..) {
+                        yield frame;
                     }
+                    pending_zstd.clear();
+                    if stop {
+                        break;
+                    }
+                    continue;
                 }
             }
             let stop = meter.should_stop_after_chunk();
@@ -476,10 +476,10 @@ where
                 break;
             }
         }
-        if let Some(mut decoder) = zstd_decoder {
-            if let Err(err) = decoder.flush() {
-                tracing::warn!(error = %err, "failed to finish zstd stream usage decoder");
-                meter.mark_error();
+        if !pending_zstd_frames.is_empty() {
+            meter.mark_error();
+            for frame in pending_zstd_frames {
+                yield frame;
             }
         }
     }
@@ -490,10 +490,34 @@ where
     S: Stream<Item = Vec<u8>> + Send + 'static,
 {
     stream! {
+        let mut pending = Vec::new();
+        let mut pending_frames = Vec::new();
         futures::pin_mut!(input);
         while let Some(frame) = input.next().await {
             meter.add_chunk();
-            yield frame;
+            pending.extend_from_slice(&frame);
+            pending_frames.push(frame);
+
+            let len = match gzip_len(&pending) {
+                Ok(len) => len,
+                Err(_) => continue,
+            };
+            meter.add_logical_bytes(len);
+            let stop = meter.should_stop_after_chunk();
+            meter.pace_pending_logical().await;
+            for frame in pending_frames.drain(..) {
+                yield frame;
+            }
+            pending.clear();
+            if stop {
+                break;
+            }
+        }
+        if !pending_frames.is_empty() {
+            meter.mark_error();
+            for frame in pending_frames {
+                yield frame;
+            }
         }
     }
 }
@@ -540,6 +564,28 @@ where
             if stop {
                 break;
             }
+        }
+        meter.complete();
+    }
+}
+
+pub fn tap_wire_stream_without_cut<S, E>(
+    input: S,
+    meter: MeterHandle,
+) -> impl Stream<Item = Result<Bytes, E>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+{
+    stream! {
+        futures::pin_mut!(input);
+        while let Some(item) = input.next().await {
+            if let Ok(bytes) = &item {
+                meter.add_wire_bytes(bytes.len() as u64);
+            } else {
+                meter.mark_error();
+            }
+            meter.pace_pending_logical().await;
+            yield item;
         }
         meter.complete();
     }
@@ -621,21 +667,6 @@ impl AsyncWrite for LogicalByteCounter {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
-    }
-}
-
-struct ZstdLogicalByteCounter {
-    meter: MeterHandle,
-}
-
-impl Write for ZstdLogicalByteCounter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.meter.add_logical_bytes(buf.len() as u64);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 

@@ -13,6 +13,7 @@ use crate::{
     commercial::{
         meter::{
             tap_gzip_stream, tap_input_chunks, tap_input_frames, tap_plain_stream, tap_wire_stream,
+            tap_wire_stream_without_cut,
         },
         CommercialGrant, DataSource, Endpoint, GrantedLimits, MeterHandle, UsageReporter,
     },
@@ -23,10 +24,7 @@ use crate::{
     http_server::forward_hotblocks_response,
     network::NetworkClient,
     types::{Compression, DatasetId, RequestError, StreamRequest},
-    utils::conversion::{
-        join_gzip_default, join_gzip_default_with_logical_counter, recompress_gzip,
-        recompress_gzip_with_logical_counter,
-    },
+    utils::conversion::{join_gzip_default, recompress_gzip},
 };
 
 /// [INTERNAL] Archival stream
@@ -112,8 +110,7 @@ pub(crate) async fn run_archival_stream(
     dataset_id: DatasetId,
     request: StreamRequest,
 ) -> Response {
-    let request =
-        restrict_request_to_grant(request, grant.as_ref().map(|grant| &grant.0.granted.limits));
+    let request = restrict_archival_debug_request(&config, request, grant.as_ref().map(|g| &g.0));
     let meter = meter_from_extensions(
         grant,
         reporter,
@@ -489,6 +486,10 @@ fn forward_response_metered(
     }
     let body = match meter {
         Some(meter) if is_gzip => {
+            // Hotblocks arrive as an opaque proxied gzip byte stream, so there is
+            // no safe input-frame boundary where we can stop and flush a trailer.
+            // A cutoff here is an abrupt compressed-body termination; clients see
+            // it as a disconnect and receive the reject on their next poll.
             Body::from_stream(tap_gzip_stream(response.bytes_stream(), meter))
         }
         Some(meter) => Body::from_stream(tap_plain_stream(response.bytes_stream(), meter)),
@@ -522,26 +523,15 @@ fn response_body(
 
     match compression {
         Compression::Gzip if use_gzjoin => match meter {
-            Some(meter) => {
-                let logical_meter = meter.clone();
-                Body::from_stream(tap_wire_stream(
-                    join_gzip_default_with_logical_counter(stream, move |bytes| {
-                        logical_meter.add_logical_bytes(bytes);
-                    }),
-                    meter,
-                ))
-            }
+            Some(meter) => Body::from_stream(tap_wire_stream_without_cut(
+                join_gzip_default(stream),
+                meter,
+            )),
             None => Body::from_stream(join_gzip_default(stream)),
         },
         Compression::Gzip => match meter {
             Some(meter) => {
-                let logical_meter = meter.clone();
-                Body::from_stream(tap_wire_stream(
-                    recompress_gzip_with_logical_counter(stream, move |bytes| {
-                        logical_meter.add_logical_bytes(bytes);
-                    }),
-                    meter,
-                ))
+                Body::from_stream(tap_wire_stream_without_cut(recompress_gzip(stream), meter))
             }
             None => Body::from_stream(recompress_gzip(stream)),
         },
@@ -629,6 +619,19 @@ fn restrict_request_to_grant(
     }
 }
 
+fn restrict_archival_debug_request(
+    config: &Config,
+    request: StreamRequest,
+    grant: Option<&CommercialGrant>,
+) -> StreamRequest {
+    let request = if grant.is_some_and(|grant| grant.granted.principal.api_key_id.is_some()) {
+        restrict_request(config, request)
+    } else {
+        request
+    };
+    restrict_request_to_grant(request, grant.map(|grant| &grant.granted.limits))
+}
+
 async fn should_treat_as_hotblocks_gap(
     network: &NetworkClient,
     hotblocks: &HotblocksHandle,
@@ -693,17 +696,20 @@ const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static(DATA_SOURCE_R
 #[cfg(test)]
 mod tests {
     use std::{
-        io::Write,
+        io::{Read, Write},
         sync::{Arc, Mutex},
     };
 
     use axum::body::to_bytes;
-    use flate2::{write::GzEncoder, Compression as GzipCompression};
+    use flate2::{read::MultiGzDecoder, write::GzEncoder, Compression as GzipCompression};
     use futures::stream;
 
     use super::*;
     use crate::{
-        commercial::{Principal, StreamUsageEvent, UsageReporter, UsageStatus},
+        commercial::{
+            ActiveStreamRegistry, Granted, OnExceed, Principal, StreamUsageEvent, TallyStore,
+            UsageReporter, UsageStatus,
+        },
         types::ParsedQuery,
     };
 
@@ -732,10 +738,41 @@ mod tests {
         )
     }
 
+    fn enforced_meter(reporter: Arc<RecordingReporter>, quota_remaining: i64) -> MeterHandle {
+        MeterHandle::new_enforced(
+            Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: Some("key".to_string()),
+                },
+                tally_account_id: None,
+                limits: GrantedLimits::default(),
+                on_exceed: OnExceed::Reject,
+                quota_version: 7,
+                quota_remaining_bytes: Some(quota_remaining),
+                concurrency_permit: None,
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter,
+            Arc::new(TallyStore::default()),
+            Arc::new(ActiveStreamRegistry::default()),
+        )
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), GzipCompression::default());
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn gunzip_all(bytes: &[u8]) -> Vec<u8> {
+        let mut decoded = Vec::new();
+        MultiGzDecoder::new(bytes)
+            .read_to_end(&mut decoded)
+            .unwrap();
+        decoded
     }
 
     async fn collect_response_body(
@@ -777,6 +814,47 @@ mod tests {
         }
     }
 
+    fn config_for_restriction_test() -> Config {
+        serde_yaml::from_str(
+            r#"
+hostname: portal.example
+sqd_network:
+  datasets: https://example.invalid/datasets.yaml
+max_buffer_size: 4
+max_stored_results_per_chunk: 1
+max_chunks_per_stream: 2
+default_timeout_quantile: 0.25
+default_retries: 0
+"#,
+        )
+        .expect("test config should parse")
+    }
+
+    fn commercial_grant(
+        api_key_id: Option<&str>,
+        grant_max_chunks: Option<u64>,
+    ) -> CommercialGrant {
+        CommercialGrant {
+            granted: Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: api_key_id.map(str::to_string),
+                },
+                tally_account_id: None,
+                limits: GrantedLimits {
+                    max_chunks: grant_max_chunks,
+                    ..GrantedLimits::default()
+                },
+                on_exceed: OnExceed::Reject,
+                quota_version: 7,
+                quota_remaining_bytes: Some(100),
+                concurrency_permit: None,
+            },
+            tally: None,
+            registry: None,
+        }
+    }
+
     #[test]
     fn grant_caps_max_chunks_after_operator_restriction() {
         let capped = restrict_request_to_grant(
@@ -796,6 +874,36 @@ mod tests {
             }),
         );
         assert_eq!(capped.max_chunks, Some(4));
+    }
+
+    #[test]
+    fn archival_debug_applies_operator_restrictions_for_keyed_callers_only() {
+        let config = config_for_restriction_test();
+        let keyed = commercial_grant(Some("key"), Some(3));
+        let anonymous = commercial_grant(None, Some(3));
+        let request = stream_request(Some(10));
+
+        let keyed_request = restrict_archival_debug_request(&config, request.clone(), Some(&keyed));
+        assert_eq!(keyed_request.buffer_size, 4);
+        assert_eq!(keyed_request.max_stored_results_per_chunk, 1);
+        assert_eq!(keyed_request.max_chunks, Some(2));
+        assert_eq!(keyed_request.timeout_quantile, 0.25);
+        assert_eq!(keyed_request.retries, 0);
+
+        let anonymous_request =
+            restrict_archival_debug_request(&config, request.clone(), Some(&anonymous));
+        assert_eq!(anonymous_request.buffer_size, request.buffer_size);
+        assert_eq!(
+            anonymous_request.max_stored_results_per_chunk,
+            request.max_stored_results_per_chunk
+        );
+        assert_eq!(anonymous_request.max_chunks, Some(3));
+        assert_eq!(anonymous_request.timeout_quantile, request.timeout_quantile);
+        assert_eq!(anonymous_request.retries, request.retries);
+
+        let oss_request = restrict_archival_debug_request(&config, request.clone(), None);
+        assert_eq!(oss_request.buffer_size, request.buffer_size);
+        assert_eq!(oss_request.max_chunks, request.max_chunks);
     }
 
     #[test]
@@ -917,5 +1025,72 @@ mod tests {
         assert_eq!(event.wire_bytes, expected.len() as u64);
         assert_eq!(event.chunks, 2);
         assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    async fn assert_gzip_cut_by_quota_decodes(use_gzjoin: bool) {
+        let first = b"{\"block\":1}\n";
+        let second = b"{\"block\":2}\n";
+        let third = b"{\"block\":3}\n";
+        let frames = vec![gzip(first), gzip(second), gzip(third)];
+        let reporter = Arc::new(RecordingReporter::default());
+        let metered = collect_response_body(
+            frames,
+            Compression::Gzip,
+            use_gzjoin,
+            Some(enforced_meter(
+                reporter.clone(),
+                first.len().saturating_add(1) as i64,
+            )),
+        )
+        .await;
+
+        assert_eq!(
+            gunzip_all(&metered),
+            [first.as_slice(), second.as_slice()].concat()
+        );
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, (first.len() + second.len()) as u64);
+        assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::CutQuota);
+    }
+
+    #[tokio::test]
+    async fn response_body_gzjoin_cut_by_quota_finishes_decodable_gzip() {
+        assert_gzip_cut_by_quota_decodes(true).await;
+    }
+
+    #[tokio::test]
+    async fn response_body_recompress_cut_by_quota_finishes_decodable_gzip() {
+        assert_gzip_cut_by_quota_decodes(false).await;
+    }
+
+    #[tokio::test]
+    async fn response_body_zstd_cut_by_quota_keeps_decodable_frames() {
+        let first = b"{\"zstd\":1}\n";
+        let second = b"{\"zstd\":2}\n";
+        let third = b"{\"zstd\":3}\n";
+        let frames = vec![
+            zstd::stream::encode_all(&first[..], 0).unwrap(),
+            zstd::stream::encode_all(&second[..], 0).unwrap(),
+            zstd::stream::encode_all(&third[..], 0).unwrap(),
+        ];
+        let reporter = Arc::new(RecordingReporter::default());
+        let metered = collect_response_body(
+            frames,
+            Compression::Zstd,
+            false,
+            Some(enforced_meter(
+                reporter.clone(),
+                first.len().saturating_add(1) as i64,
+            )),
+        )
+        .await;
+
+        let decoded = zstd::stream::decode_all(&metered[..]).unwrap();
+        assert_eq!(decoded, [first.as_slice(), second.as_slice()].concat());
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, (first.len() + second.len()) as u64);
+        assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::CutQuota);
     }
 }
