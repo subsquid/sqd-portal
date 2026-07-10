@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt};
 use crate::{
     commercial::{
         meter::{
-            tap_gzip_stream, tap_input_chunks, tap_input_frames, tap_plain_stream, tap_wire_stream,
+            tap_gzip_stream, tap_input_chunks, tap_input_frames, tap_plain_stream,
             tap_wire_stream_without_cut,
         },
         CommercialGrant, DataSource, Endpoint, GrantedLimits, MeterHandle, UsageReporter,
@@ -516,8 +516,8 @@ fn response_body(
     meter: Option<MeterHandle>,
 ) -> Body {
     let stream: Pin<Box<dyn Stream<Item = Vec<u8>> + Send>> = match (meter.clone(), compression) {
-        (Some(meter), Compression::Gzip) => Box::pin(tap_input_chunks(stream, meter)),
-        (Some(meter), Compression::Zstd) => Box::pin(tap_input_frames(stream, compression, meter)),
+        (Some(meter), Compression::Gzip) => tap_input_chunks(stream, meter),
+        (Some(meter), Compression::Zstd) => tap_input_frames(stream, compression, meter),
         (None, _) => Box::pin(stream),
     };
 
@@ -538,7 +538,7 @@ fn response_body(
         Compression::Zstd => {
             let output = stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result)));
             match meter {
-                Some(meter) => Body::from_stream(tap_wire_stream(output, meter)),
+                Some(meter) => Body::from_stream(tap_wire_stream_without_cut(output, meter)),
                 None => Body::from_stream(output),
             }
         }
