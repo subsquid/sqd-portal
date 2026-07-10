@@ -441,11 +441,27 @@ impl SnapshotStore {
     }
 
     fn upsert_key(&self, record: KeySnapshot) -> anyhow::Result<Arc<KeySnapshot>> {
-        self.apply_snapshot_hooks(&record);
         let record = Arc::new(record);
-        let mut map = (**self.inner.records.load()).clone();
-        map.insert(record.key_id.clone(), record.clone());
-        self.inner.records.store(Arc::new(map));
+        loop {
+            let current = self.inner.records.load();
+            if let Some(existing) = current.get(&record.key_id) {
+                if existing.seq >= record.seq {
+                    return Ok(existing.clone());
+                }
+            }
+
+            let mut map = (**current).clone();
+            map.insert(record.key_id.clone(), record.clone());
+            let previous = self
+                .inner
+                .records
+                .compare_and_swap(&*current, Arc::new(map));
+            if Arc::ptr_eq(&*current, &*previous) {
+                break;
+            }
+        }
+
+        self.apply_snapshot_hooks(&record);
         metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.mark_disk_cache_dirty();
         Ok(record)
@@ -1176,6 +1192,31 @@ mod tests {
 
         assert_eq!(store.view().cursor, 11);
         assert_eq!(store.get(KEY_ID).unwrap().status, KeyStatus::Suspended);
+    }
+
+    #[test]
+    fn resolve_upsert_keeps_newer_same_key_delta() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        let mut suspended = active_snapshot(12);
+        suspended.status = KeyStatus::Suspended;
+        store
+            .apply_records(vec![SnapshotRecord::Key(suspended)], 12)
+            .unwrap();
+
+        let returned = store.upsert_key(active_snapshot(11)).unwrap();
+
+        assert_eq!(returned.seq, 12);
+        assert_eq!(returned.status, KeyStatus::Suspended);
+        let stored = store.get(KEY_ID).unwrap();
+        assert_eq!(stored.seq, 12);
+        assert_eq!(stored.status, KeyStatus::Suspended);
     }
 
     #[tokio::test(start_paused = true)]
