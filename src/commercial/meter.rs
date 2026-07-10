@@ -262,18 +262,26 @@ impl MeterHandle {
         }
     }
 
-    pub fn record_plain_bytes_and_complete(&self, bytes: u64) {
-        self.add_logical_bytes(bytes);
-        self.add_wire_bytes(bytes);
-        self.should_stop_after_chunk();
+    pub async fn complete_buffered_response(&self) {
+        self.inner.observe_buffered_body_after_materialization();
+        let bytes = self.inner.unpaced_logical.swap(0, Ordering::AcqRel);
+        if bytes > 0 {
+            self.inner.pace_buffered(bytes).await;
+        }
         self.complete();
     }
 
-    pub fn record_gzip_body_and_complete(&self, bytes: &[u8]) -> anyhow::Result<()> {
+    pub async fn record_plain_bytes_and_complete(&self, bytes: u64) {
+        self.add_logical_bytes(bytes);
+        self.add_wire_bytes(bytes);
+        self.complete_buffered_response().await;
+    }
+
+    pub async fn record_gzip_body_and_complete(&self, bytes: &[u8]) -> anyhow::Result<()> {
         self.add_chunk();
         self.add_wire_bytes(bytes.len() as u64);
         self.add_logical_bytes(gzip_len(bytes)?);
-        self.complete();
+        self.complete_buffered_response().await;
         Ok(())
     }
 }
@@ -327,6 +335,37 @@ impl MeterInner {
                 self.floor_bytes_per_sec
                     .store(floor_bytes_per_sec, Ordering::Release);
                 false
+            }
+        }
+    }
+
+    fn observe_buffered_body_after_materialization(&self) {
+        let effective_remaining = self.flush_pending_tally();
+        if self.kill.load(Ordering::Acquire) {
+            self.set_status(UsageStatus::CutSuspended);
+            return;
+        }
+
+        // Buffered endpoints already materialized the full response before
+        // metering can inspect its size, so max_response_bytes remains an
+        // admission-only guard here. Quota debiting and throttle pacing still
+        // happen before returning the buffered response.
+        let Some(effective_remaining) = effective_remaining else {
+            return;
+        };
+        if effective_remaining > 0 {
+            return;
+        }
+
+        match self.on_exceed {
+            OnExceed::Reject => {
+                self.set_status(UsageStatus::CutQuota);
+            }
+            OnExceed::Throttle {
+                floor_bytes_per_sec,
+            } => {
+                self.floor_bytes_per_sec
+                    .store(floor_bytes_per_sec, Ordering::Release);
             }
         }
     }
@@ -394,6 +433,39 @@ impl MeterInner {
             }
             tokio::time::sleep(wait).await;
         }
+    }
+
+    async fn pace_buffered(&self, bytes: u64) {
+        let Some((rate, burst)) = self.current_rate_and_burst() else {
+            return;
+        };
+        let wait = {
+            let mut bucket = self.bucket.lock().await;
+            let now = TokioInstant::now();
+            let bucket = bucket.get_or_insert_with(|| TokenBucket {
+                available: 0.0,
+                burst,
+                last: now,
+            });
+            if bucket.available > 0.0 {
+                bucket.available = 0.0;
+                bucket.last = now;
+            }
+            bucket.refill(rate, burst);
+            bucket.available -= bytes as f64;
+            if bucket.available >= 0.0 {
+                return;
+            }
+            Duration::from_secs_f64(-bucket.available / rate)
+        };
+        metrics::observe_commercial_throttle_stall(wait);
+        if wait > Duration::from_secs(30) {
+            tracing::warn!(
+                stall_seconds = wait.as_secs_f64(),
+                "commercial throttle stalled a buffered response for more than 30 seconds"
+            );
+        }
+        tokio::time::sleep(wait).await;
     }
 
     fn current_rate_and_burst(&self) -> Option<(f64, f64)> {
@@ -1886,13 +1958,37 @@ mod tests {
         let body = b"[{\"legacy\":true}]\n";
         let encoded = gzip(body).await;
 
-        meter.record_gzip_body_and_complete(&encoded).unwrap();
+        meter.record_gzip_body_and_complete(&encoded).await.unwrap();
 
         let event = reporter.events.lock().unwrap().pop().unwrap();
         assert_eq!(event.endpoint, Endpoint::LegacyQuery);
         assert_eq!(event.logical_bytes, body.len() as u64);
         assert_eq!(event.wire_bytes, encoded.len() as u64);
         assert_eq!(event.chunks, 1);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_plain_response_waits_for_token_bucket_before_completion() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, _, _) = enforced_meter(
+            reporter.clone(),
+            GrantedLimits {
+                throughput_bytes_per_sec: Some(10),
+                burst_bytes: Some(10),
+                ..GrantedLimits::default()
+            },
+            OnExceed::Reject,
+            Some(1_000),
+        );
+        let start = tokio::time::Instant::now();
+
+        meter.record_plain_bytes_and_complete(50).await;
+
+        assert!(start.elapsed() >= Duration::from_secs(5));
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, 50);
+        assert_eq!(event.wire_bytes, 50);
         assert_eq!(event.status, UsageStatus::Completed);
     }
 

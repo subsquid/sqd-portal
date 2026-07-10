@@ -432,7 +432,7 @@ async fn collect_hotblocks_stream(
     match (&meter, &decoded) {
         (Some(meter), Ok(body)) => {
             meter.add_logical_bytes(body.len() as u64);
-            meter.complete();
+            meter.complete_buffered_response().await;
         }
         (Some(meter), Err(_)) => {
             meter.mark_error();

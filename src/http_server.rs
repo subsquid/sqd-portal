@@ -1103,7 +1103,7 @@ async fn execute_query(
     match json_lines_to_json(&result.data) {
         Ok(data) => {
             if let Some(meter) = &meter {
-                if let Err(err) = meter.record_gzip_body_and_complete(&data) {
+                if let Err(err) = meter.record_gzip_body_and_complete(&data).await {
                     tracing::warn!(error = %err, "cannot decode legacy query response for usage meter");
                     meter.mark_error();
                     meter.complete();
@@ -1370,7 +1370,7 @@ async fn sql_query(
     reporter: Option<Extension<Arc<dyn UsageReporter>>>,
     request_id: Option<Extension<RequestId>>,
     query: body::Bytes,
-) -> impl axum::response::IntoResponse {
+) -> Response {
     match sql::query(
         query,
         &network,
@@ -1379,7 +1379,7 @@ async fn sql_query(
     .await
     {
         Ok(res) => {
-            if let Some(meter) = meter_from_extensions(
+            let meter = meter_from_extensions(
                 grant,
                 reporter,
                 Endpoint::SqlQuery,
@@ -1387,10 +1387,8 @@ async fn sql_query(
                 request_id
                     .and_then(|id| id.header_value().to_str().ok().map(str::to_owned))
                     .unwrap_or_default(),
-            ) {
-                record_json_response_usage(meter, &res, "sql");
-            }
-            axum::Json(res).into_response()
+            );
+            json_response_with_usage(meter, &res, "sql").await
         }
         Err(e) => {
             tracing::warn!("cannot query data: {:?}", e);
@@ -1439,13 +1437,30 @@ fn finish_meter_error(meter: &Option<MeterHandle>) {
 }
 
 #[cfg(feature = "sql")]
-fn record_json_response_usage<T: serde::Serialize>(meter: MeterHandle, res: &T, endpoint: &str) {
+async fn json_response_with_usage<T: serde::Serialize>(
+    meter: Option<MeterHandle>,
+    res: &T,
+    endpoint: &str,
+) -> Response {
     match serde_json::to_vec(res) {
-        Ok(bytes) => meter.record_plain_bytes_and_complete(bytes.len() as u64),
+        Ok(bytes) => {
+            if let Some(meter) = meter {
+                meter
+                    .record_plain_bytes_and_complete(bytes.len() as u64)
+                    .await;
+            }
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(bytes))
+                .unwrap()
+        }
         Err(err) => {
             tracing::warn!(error = %err, endpoint, "cannot serialize response for usage meter");
-            meter.mark_error();
-            meter.complete();
+            if let Some(meter) = meter {
+                meter.mark_error();
+                meter.complete();
+            }
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
@@ -1591,7 +1606,9 @@ mod tests {
         );
         let meter_created = meter.is_some();
         if let Some(meter) = meter {
-            meter.record_plain_bytes_and_complete(BODY.len() as u64);
+            meter
+                .record_plain_bytes_and_complete(BODY.len() as u64)
+                .await;
         }
 
         Response::builder()
@@ -2122,8 +2139,8 @@ mod tests {
     }
 
     #[cfg(feature = "sql")]
-    #[test]
-    fn sql_response_usage_records_serialized_body() {
+    #[tokio::test]
+    async fn sql_response_usage_records_serialized_body() {
         use std::sync::Mutex;
 
         use crate::commercial::{Principal, StreamUsageEvent, UsageReporter, UsageStatus};
@@ -2156,14 +2173,18 @@ mod tests {
             query_id: "sql-test".to_string(),
             tables: Vec::<TableItem>::new(),
         };
-        let expected = serde_json::to_vec(&response).unwrap().len() as u64;
+        let expected = serde_json::to_vec(&response).unwrap();
 
-        record_json_response_usage(meter, &response, "sql");
+        let response = json_response_with_usage(Some(meter), &response, "sql").await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), expected.as_slice());
 
         let event = reporter.events.lock().unwrap().pop().unwrap();
         assert_eq!(event.endpoint, Endpoint::SqlQuery);
-        assert_eq!(event.logical_bytes, expected);
-        assert_eq!(event.wire_bytes, expected);
+        assert_eq!(event.logical_bytes, expected.len() as u64);
+        assert_eq!(event.wire_bytes, expected.len() as u64);
         assert_eq!(event.status, UsageStatus::Completed);
     }
 }
