@@ -78,6 +78,7 @@ lazy_static::lazy_static! {
     pub static ref COMMERCIAL_SYNC_STALENESS_SECONDS: Gauge = Default::default();
     pub static ref COMMERCIAL_SNAPSHOT_RECORDS: Gauge = Default::default();
     pub static ref COMMERCIAL_SNAPSHOT_PERSIST_ERRORS: Counter = Default::default();
+    pub static ref COMMERCIAL_SNAPSHOT_PARSE_ERRORS: Counter = Default::default();
     pub static ref COMMERCIAL_AUTHORIZE: Family<Labels, Counter> = Default::default();
     pub static ref COMMERCIAL_RESOLVE: Family<Labels, Counter> = Default::default();
     pub static ref COMMERCIAL_USAGE_BUFFER_LEN: Gauge = Default::default();
@@ -206,6 +207,10 @@ pub fn set_commercial_snapshot_records(records: i64) {
 
 pub fn report_commercial_snapshot_persist_error() {
     COMMERCIAL_SNAPSHOT_PERSIST_ERRORS.inc();
+}
+
+pub fn report_commercial_snapshot_parse_error() {
+    COMMERCIAL_SNAPSHOT_PARSE_ERRORS.inc();
 }
 
 pub fn report_commercial_authorize(outcome: &str, reason: &str) {
@@ -445,6 +450,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "commercial_snapshot_persist_errors_total",
         "Commercial snapshot disk-cache persistence failures",
         COMMERCIAL_SNAPSHOT_PERSIST_ERRORS.clone(),
+    );
+    registry.register(
+        "commercial_snapshot_parse_errors_total",
+        "Commercial snapshot records skipped after parse failures",
+        COMMERCIAL_SNAPSHOT_PARSE_ERRORS.clone(),
     );
     registry.register(
         "commercial_authorize_total",

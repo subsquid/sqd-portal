@@ -185,7 +185,7 @@ pub struct Entitlements {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quota {
-    pub remaining_bytes: i64,
+    pub remaining_bytes: Option<i64>,
     pub period_end: Option<u64>,
     pub version: u64,
     pub on_exceed: OnExceed,
@@ -220,7 +220,7 @@ pub struct PublicLimits {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicQuota {
-    pub volume_bytes: u64,
+    pub volume_bytes: Option<u64>,
     pub window_secs: u64,
     pub on_exceed: OnExceed,
 }

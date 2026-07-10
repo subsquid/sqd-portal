@@ -72,6 +72,16 @@ pub struct SnapshotPage {
     next_cursor: u64,
     #[serde(default)]
     reset: bool,
+    #[serde(skip)]
+    raw_record_count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawSnapshotPage {
+    records: Vec<serde_json::Value>,
+    next_cursor: u64,
+    #[serde(default)]
+    reset: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,7 +92,7 @@ struct ResolveRequest<'a> {
 #[derive(Debug, Serialize, Deserialize)]
 struct DiskCache {
     cursor: u64,
-    records: Vec<SnapshotRecord>,
+    records: Vec<serde_json::Value>,
     defaults: Defaults,
     saved_at: u64,
 }
@@ -297,7 +307,7 @@ impl SnapshotStore {
         loop {
             let page = self.fetch_page(cursor).await?;
             cursor = page.next_cursor;
-            let len = page.records.len();
+            let len = page.raw_record_count;
             all.extend(page.records);
             if len < usize::from(DEFAULT_PAGE_LIMIT) {
                 break;
@@ -347,7 +357,14 @@ impl SnapshotStore {
             status.is_success(),
             "snapshot feed returned status {status}"
         );
-        Ok(response.json().await?)
+        let page: RawSnapshotPage = response.json().await?;
+        let raw_record_count = page.records.len();
+        Ok(SnapshotPage {
+            records: parse_snapshot_records(page.records, "snapshot_page"),
+            next_cursor: page.next_cursor,
+            reset: page.reset,
+            raw_record_count,
+        })
     }
 
     async fn resolve(&self, key_id: &str) -> anyhow::Result<Option<Arc<KeySnapshot>>> {
@@ -375,7 +392,11 @@ impl SnapshotStore {
             .await?;
         match response.status() {
             StatusCode::OK => {
-                let record: KeySnapshot = response.json().await?;
+                let value: serde_json::Value = response.json().await?;
+                let Some(record) = parse_key_snapshot(value, "resolve_response") else {
+                    metrics::report_commercial_resolve("parse_error");
+                    return Ok(None);
+                };
                 let record = self.upsert_key(record)?;
                 metrics::report_commercial_resolve("hit");
                 Ok(Some(record))
@@ -483,7 +504,7 @@ impl SnapshotStore {
             }
         };
         let mut map = HashMap::new();
-        for record in cache.records {
+        for record in parse_snapshot_records(cache.records, "disk_cache") {
             if let SnapshotRecord::Key(record) = record {
                 map.insert(record.key_id.clone(), Arc::new(record));
             }
@@ -518,7 +539,7 @@ impl SnapshotStore {
             .records
             .load()
             .values()
-            .map(|record| SnapshotRecord::Key((**record).clone()))
+            .map(|record| snapshot_record_to_value(SnapshotRecord::Key((**record).clone())))
             .collect();
         let cache = DiskCache {
             cursor: self.inner.cursor.load(Ordering::Relaxed),
@@ -651,7 +672,7 @@ fn defaults_from_fallback(config: &PublicFallbackConfig) -> Defaults {
                 concurrency: Some(config.concurrency as u64),
             },
             quota: PublicQuota {
-                volume_bytes: config.volume_bytes,
+                volume_bytes: Some(config.volume_bytes),
                 window_secs: config.window_secs,
                 on_exceed: OnExceed::Reject,
             },
@@ -685,6 +706,50 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn parse_snapshot_records(
+    records: Vec<serde_json::Value>,
+    source: &'static str,
+) -> Vec<SnapshotRecord> {
+    records
+        .into_iter()
+        .enumerate()
+        .filter_map(
+            |(index, value)| match serde_json::from_value::<SnapshotRecord>(value) {
+                Ok(record) => Some(record),
+                Err(err) => {
+                    metrics::report_commercial_snapshot_parse_error();
+                    tracing::warn!(
+                        source,
+                        index,
+                        error = %err,
+                        "skipping unparseable commercial snapshot record"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+fn parse_key_snapshot(value: serde_json::Value, source: &'static str) -> Option<KeySnapshot> {
+    match serde_json::from_value::<KeySnapshot>(value) {
+        Ok(record) => Some(record),
+        Err(err) => {
+            metrics::report_commercial_snapshot_parse_error();
+            tracing::warn!(
+                source,
+                error = %err,
+                "skipping unparseable commercial snapshot resolve record"
+            );
+            None
+        }
+    }
+}
+
+fn snapshot_record_to_value(record: SnapshotRecord) -> serde_json::Value {
+    serde_json::to_value(record).expect("commercial snapshot records should serialize")
 }
 
 #[cfg(test)]
@@ -734,7 +799,7 @@ pub mod test_support {
     #[derive(Clone)]
     struct MockPage {
         min_cursor: u64,
-        page: SnapshotPage,
+        page: serde_json::Value,
     }
 
     #[derive(Deserialize)]
@@ -769,6 +834,13 @@ pub mod test_support {
         }
 
         pub fn push_page(&self, min_cursor: u64, page: SnapshotPage) {
+            self.push_raw_page(
+                min_cursor,
+                serde_json::to_value(page).expect("mock snapshot page should serialize"),
+            );
+        }
+
+        pub fn push_raw_page(&self, min_cursor: u64, page: serde_json::Value) {
             self.state
                 .pages
                 .lock()
@@ -824,7 +896,7 @@ pub mod test_support {
                 traces: vec![],
             }),
             quota: Some(Quota {
-                remaining_bytes: 10_000,
+                remaining_bytes: Some(10_000),
                 period_end: Some(4_102_444_800),
                 version: seq,
                 on_exceed: OnExceed::Reject,
@@ -844,7 +916,7 @@ pub mod test_support {
                     concurrency: Some(2),
                 },
                 quota: PublicQuota {
-                    volume_bytes: 400,
+                    volume_bytes: Some(400),
                     window_secs: 60,
                     on_exceed: OnExceed::Reject,
                 },
@@ -855,10 +927,12 @@ pub mod test_support {
     }
 
     pub fn page(records: Vec<SnapshotRecord>, next_cursor: u64, reset: bool) -> SnapshotPage {
+        let raw_record_count = records.len();
         SnapshotPage {
             records,
             next_cursor,
             reset,
+            raw_record_count,
         }
     }
 
@@ -884,7 +958,7 @@ pub mod test_support {
         State(state): State<Arc<MockState>>,
         headers: HeaderMap,
         Query(query): Query<CursorQuery>,
-    ) -> Result<Json<SnapshotPage>, StatusCode> {
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
         if !authorized(&headers) {
             return Err(StatusCode::UNAUTHORIZED);
         }
@@ -896,10 +970,12 @@ pub mod test_support {
         let page = pages
             .remove(index)
             .map(|page| page.page)
-            .unwrap_or(SnapshotPage {
-                records: vec![],
-                next_cursor: query.cursor,
-                reset: false,
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "records": [],
+                    "next_cursor": query.cursor,
+                    "reset": false,
+                })
             });
         Ok(Json(page))
     }
@@ -1076,6 +1152,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_skips_bad_snapshot_records_and_advances_cursor() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let mut next = active_snapshot(2);
+        next.key_id = "next-key".to_string();
+        let before = metrics::COMMERCIAL_SNAPSHOT_PARSE_ERRORS.get();
+        mock.push_raw_page(
+            0,
+            serde_json::json!({
+                "records": [
+                    snapshot_record_to_value(SnapshotRecord::Key(active_snapshot(1))),
+                    {"key_id": "poison", "seq": 2, "status": null},
+                    snapshot_record_to_value(SnapshotRecord::Key(next.clone()))
+                ],
+                "next_cursor": 7,
+                "reset": false
+            }),
+        );
+        let path = cache_path("poison-page");
+        let (store, task) =
+            SnapshotStore::spawn(&config(&mock, path.clone(), 10), CancellationToken::new())
+                .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let view = store.view();
+        assert_eq!(view.cursor, 7);
+        assert!(store.get(KEY_ID).is_some());
+        assert!(store.get("next-key").is_some());
+        assert!(metrics::COMMERCIAL_SNAPSHOT_PARSE_ERRORS.get() > before);
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
     async fn corrupt_disk_cache_is_ignored_and_bootstrap_continues() {
         let path = cache_path("corrupt");
         tokio::fs::write(&path, b"{not-json").await.unwrap();
@@ -1109,7 +1226,9 @@ mod tests {
         let path = cache_path("round-trip");
         let cache = DiskCache {
             cursor: 2,
-            records: vec![SnapshotRecord::Key(active_snapshot(2))],
+            records: vec![snapshot_record_to_value(SnapshotRecord::Key(
+                active_snapshot(2),
+            ))],
             defaults: Defaults::from(defaults_record(1)),
             saved_at: now_secs(),
         };
