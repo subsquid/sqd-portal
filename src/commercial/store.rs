@@ -445,10 +445,8 @@ impl SnapshotStore {
         let record = Arc::new(record);
         let mut map = (**self.inner.records.load()).clone();
         map.insert(record.key_id.clone(), record.clone());
-        let cursor = self.inner.cursor.load(Ordering::Relaxed).max(record.seq);
         self.inner.records.store(Arc::new(map));
         metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
-        self.inner.cursor.store(cursor, Ordering::Release);
         self.mark_disk_cache_dirty();
         Ok(record)
     }
@@ -1147,6 +1145,37 @@ mod tests {
         assert_eq!(store.get(KEY_ID).unwrap().status, KeyStatus::Revoked);
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[test]
+    fn resolve_upsert_does_not_advance_cursor_or_hide_intervening_delta() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        store
+            .replace_records(vec![SnapshotRecord::Key(active_snapshot(10))], 10)
+            .unwrap();
+
+        let mut resolved = active_snapshot(12);
+        resolved.key_id = "fresh-key".to_string();
+        store.upsert_key(resolved).unwrap();
+
+        assert_eq!(store.view().cursor, 10);
+        assert!(store.get("fresh-key").is_some());
+
+        let mut suspended = active_snapshot(11);
+        suspended.status = KeyStatus::Suspended;
+        store
+            .apply_records(vec![SnapshotRecord::Key(suspended)], 11)
+            .unwrap();
+
+        assert_eq!(store.view().cursor, 11);
+        assert_eq!(store.get(KEY_ID).unwrap().status, KeyStatus::Suspended);
     }
 
     #[tokio::test(start_paused = true)]
