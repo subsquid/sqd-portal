@@ -254,14 +254,14 @@ fn query_api_key(query: Option<&str>) -> Option<String> {
 
 fn ip_bucket_from_headers(headers: &HeaderMap, client_ip_header: &str) -> String {
     let Some(value) = headers.get(client_ip_header) else {
-        return "local".to_string();
+        return fallback_ip_bucket("local");
     };
     let Ok(value) = value.to_str() else {
-        return "invalid".to_string();
+        return fallback_ip_bucket("invalid");
     };
     let rightmost = value.rsplit(',').next().unwrap_or_default().trim();
     let Some(ip) = parse_ip(rightmost) else {
-        return "invalid".to_string();
+        return fallback_ip_bucket("invalid");
     };
 
     match ip {
@@ -274,6 +274,11 @@ fn ip_bucket_from_headers(headers: &HeaderMap, client_ip_header: &str) -> String
             )
         }
     }
+}
+
+fn fallback_ip_bucket(bucket: &'static str) -> String {
+    metrics::report_commercial_anon_fallback_bucket(bucket);
+    bucket.to_string()
 }
 
 fn parse_ip(value: &str) -> Option<IpAddr> {
@@ -502,6 +507,7 @@ mod tests {
 
     #[test]
     fn keyless_requests_do_not_scan_left_past_invalid_rightmost_forwarded_ip() {
+        let before = anon_fallback_bucket_metric("invalid");
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "203.0.113.9, not-an-ip".parse().unwrap());
 
@@ -511,16 +517,27 @@ mod tests {
                 ip_bucket: "invalid".to_string(),
             }
         );
+        assert!(anon_fallback_bucket_metric("invalid") > before);
     }
 
     #[test]
     fn keyless_requests_without_forwarded_header_use_local_bucket() {
+        let before = anon_fallback_bucket_metric("local");
+
         assert_eq!(
             credential_from_request(&HeaderMap::new(), None, "x-forwarded-for").unwrap(),
             Credential::None {
                 ip_bucket: "local".to_string(),
             }
         );
+        assert!(anon_fallback_bucket_metric("local") > before);
+    }
+
+    fn anon_fallback_bucket_metric(bucket: &str) -> u64 {
+        let labels = vec![("bucket".to_owned(), bucket.to_owned())];
+        metrics::COMMERCIAL_ANON_FALLBACK_BUCKET
+            .get_or_create(&labels)
+            .get()
     }
 
     #[tokio::test]

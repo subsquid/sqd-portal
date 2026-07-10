@@ -74,6 +74,7 @@ lazy_static::lazy_static! {
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 3.0, 20)));
     pub static ref STREAM_THROTTLED_RATIO: Histogram = Histogram::new(iter::empty());
     pub static ref COMMERCIAL_USAGE_DROPPED: Counter = Default::default();
+    pub static ref COMMERCIAL_ANON_FALLBACK_BUCKET: Family<Labels, Counter> = Default::default();
     pub static ref COMMERCIAL_SNAPSHOT_AGE_SECONDS: Gauge = Default::default();
     pub static ref COMMERCIAL_SYNC_STALENESS_SECONDS: Gauge = Default::default();
     pub static ref COMMERCIAL_SNAPSHOT_RECORDS: Gauge = Default::default();
@@ -192,6 +193,12 @@ pub fn report_commercial_stream_bytes(
 
 pub fn report_commercial_usage_dropped() {
     COMMERCIAL_USAGE_DROPPED.inc();
+}
+
+pub fn report_commercial_anon_fallback_bucket(bucket: &str) {
+    COMMERCIAL_ANON_FALLBACK_BUCKET
+        .get_or_create(&vec![("bucket".to_owned(), bucket.to_owned())])
+        .inc();
 }
 
 pub fn set_commercial_snapshot_age(seconds: i64) {
@@ -437,6 +444,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "commercial_usage_dropped_total",
         "Commercial usage events dropped by the bounded reporter buffer",
         COMMERCIAL_USAGE_DROPPED.clone(),
+    );
+    registry.register(
+        "commercial_anon_fallback_bucket_total",
+        "Anonymous commercial requests attributed to fallback local/invalid IP buckets",
+        COMMERCIAL_ANON_FALLBACK_BUCKET.clone(),
     );
     registry.register(
         "commercial_snapshot_age_seconds",
