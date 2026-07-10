@@ -17,6 +17,7 @@ const DATASET_NOT_ENTITLED: &str = "dataset_not_entitled";
 const TRACES_NOT_ENTITLED: &str = "traces_not_entitled";
 const CONCURRENCY_LIMIT: &str = "concurrency_limit";
 const ANON_LIMITED: &str = "anon_limited";
+const WILDCARD_ENTITLEMENT: &str = "*";
 
 #[derive(Debug, Clone, Copy)]
 pub struct EvaluationState {
@@ -247,12 +248,9 @@ fn evaluate_key_prechecks<'a>(
 
     let entitlements = snapshot.entitlements.as_ref();
     if !matches!(req.endpoint, Endpoint::SqlQuery) {
-        if !entitlements.is_some_and(|entitlements| {
-            entitlements
-                .chains
-                .iter()
-                .any(|chain| chain == &req.dataset)
-        }) {
+        if !entitlements
+            .is_some_and(|entitlements| entitlement_matches(&entitlements.chains, &req.dataset))
+        {
             return Err(rejected(defaults, DATASET_NOT_ENTITLED, 403, None));
         }
     } else {
@@ -260,12 +258,8 @@ fn evaluate_key_prechecks<'a>(
     }
     if req.query.chain_kind.as_deref() == Some("evm")
         && (req.query.requires_traces || req.query.requires_statediffs)
-        && !entitlements.is_some_and(|entitlements| {
-            entitlements
-                .traces
-                .iter()
-                .any(|chain| chain == &req.dataset)
-        })
+        && !entitlements
+            .is_some_and(|entitlements| entitlement_matches(&entitlements.traces, &req.dataset))
     {
         return Err(rejected(defaults, TRACES_NOT_ENTITLED, 403, None));
     }
@@ -288,6 +282,12 @@ fn acquire_key_permit(
     let permit = concurrency.and_then(|limiter| limiter.try_acquire(account_id, limit));
     let available = permit.is_some();
     (permit, available)
+}
+
+fn entitlement_matches(entitlements: &[String], dataset: &str) -> bool {
+    entitlements
+        .iter()
+        .any(|chain| chain == WILDCARD_ENTITLEMENT || chain == dataset)
 }
 
 fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
@@ -724,6 +724,36 @@ mod tests {
                 &defaults(),
                 state()
             ),
+            Authorization::Granted(_)
+        ));
+    }
+
+    #[test]
+    fn wildcard_entitlements_allow_arbitrary_datasets_and_traces() {
+        let mut snapshot = active_snapshot(1);
+        snapshot.entitlements.as_mut().unwrap().chains = vec!["*".to_string()];
+        let mut wildcard_request = request(SECRET_SHA256);
+        wildcard_request.dataset = "new-dataset".to_string();
+
+        assert!(matches!(
+            evaluate(&wildcard_request, Some(&snapshot), &defaults(), state()),
+            Authorization::Granted(_)
+        ));
+
+        wildcard_request.query.requires_traces = true;
+        assert_eq!(
+            rejected_reason(evaluate(
+                &wildcard_request,
+                Some(&snapshot),
+                &defaults(),
+                state()
+            )),
+            "traces_not_entitled"
+        );
+
+        snapshot.entitlements.as_mut().unwrap().traces = vec!["*".to_string()];
+        assert!(matches!(
+            evaluate(&wildcard_request, Some(&snapshot), &defaults(), state()),
             Authorization::Granted(_)
         ));
     }

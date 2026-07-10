@@ -143,6 +143,9 @@ fn enforce_sql_entitlements(
     let Some(entitled_chains) = grant.and_then(|grant| grant.entitled_chains.as_ref()) else {
         return Ok(());
     };
+    if entitled_chains.contains("*") {
+        return Ok(());
+    }
 
     if sources
         .iter()
@@ -227,6 +230,19 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].dataset_slug, "solana-mainnet");
         assert_eq!(sources[0].dataset_id.to_string(), "s3://solana-mainnet");
+    }
+
+    #[test]
+    fn sql_entitlement_wildcard_allows_referenced_dataset() {
+        let grant = grant_with_entitlements(&["*"]);
+        let mut ctx = plan::TraversalContext::new(plan::Options::default());
+
+        let sources =
+            resolve_authorized_sources(sql_request(JSON_PLAN_SOLANA), &mut ctx, Some(&grant))
+                .unwrap();
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].dataset_slug, "solana-mainnet");
     }
 
     #[test]
