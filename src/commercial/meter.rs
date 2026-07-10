@@ -563,6 +563,9 @@ fn tap_gzip_input_with_pending_limit<S>(
 where
     S: Stream<Item = Vec<u8>> + Send + 'static,
 {
+    // DESIGN DEVIATION: this is not the "free tap" from the original design.
+    // We accept a second gzip inflate so member-boundary cutoffs stay clean and
+    // logical-byte counts do not trust workers; Phase-1 CPU review covers gzip.
     stream! {
         let mut decoder = GzipMemberCounter::new();
         let mut pending = PendingFrames::default();
