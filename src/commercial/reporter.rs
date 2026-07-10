@@ -1,5 +1,7 @@
 use std::{
     collections::VecDeque,
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -14,6 +16,7 @@ use crate::metrics;
 
 const MAX_RETRY_ATTEMPTS: usize = 5;
 const USAGE_PATH_SEGMENTS: [&str; 4] = ["internal", "portal", "v1", "usage"];
+type SendOnceFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SendBatchError>> + Send + 'a>>;
 
 pub trait UsageReporter: Send + Sync {
     fn report(&self, event: StreamUsageEvent);
@@ -35,6 +38,7 @@ struct ReporterOptions {
     capacity: usize,
 }
 
+#[derive(Clone)]
 pub struct BufferedUsageReporter {
     inner: Arc<BufferedUsageReporterInner>,
 }
@@ -132,13 +136,33 @@ impl BufferedUsageReporter {
         batch: Vec<StreamUsageEvent>,
         cancel: &CancellationToken,
     ) -> Option<Vec<StreamUsageEvent>> {
+        let reporter = self.clone();
+        self.send_with_retry_using(batch, cancel, move |batch| {
+            let reporter = reporter.clone();
+            let batch = batch.to_vec();
+            let future: SendOnceFuture<'_> =
+                Box::pin(async move { reporter.send_once(&batch).await });
+            future
+        })
+        .await
+    }
+
+    async fn send_with_retry_using<F>(
+        &self,
+        batch: Vec<StreamUsageEvent>,
+        cancel: &CancellationToken,
+        mut send_once: F,
+    ) -> Option<Vec<StreamUsageEvent>>
+    where
+        F: for<'a> FnMut(&'a [StreamUsageEvent]) -> SendOnceFuture<'a>,
+    {
         let mut delay = Duration::from_secs(1);
         let mut attempts = 0usize;
         loop {
             attempts += 1;
             let result = tokio::select! {
                 _ = cancel.cancelled() => return Some(batch),
-                result = self.send_once(&batch) => result,
+                result = send_once(&batch) => result,
             };
             match result {
                 Ok(()) => return None,
@@ -153,14 +177,18 @@ impl BufferedUsageReporter {
                 }
                 Err(SendBatchError::Retry(err)) => {
                     if attempts >= MAX_RETRY_ATTEMPTS {
-                        metrics::report_commercial_usage_dropped();
-                        tracing::error!(
+                        tracing::warn!(
                             error = %err,
                             attempts,
+                            delay = ?delay,
                             count = batch.len(),
-                            "dropping commercial usage batch after retry cap"
+                            "commercial usage batch exhausted retry budget; requeueing"
                         );
-                        return None;
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Some(batch),
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        return Some(batch);
                     }
                     tracing::warn!(
                         error = %err,
@@ -478,6 +506,58 @@ mod tests {
         assert!(reporter.pop_batch().is_none());
         assert!(rx.try_recv().is_err());
         assert!(metrics::COMMERCIAL_USAGE_DROPPED.get() > before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_exhaustion_requeues_batch_until_recovery() {
+        let reporter = reporter(
+            "http://127.0.0.1:1".parse().unwrap(),
+            Duration::from_secs(60),
+            1,
+            10,
+        );
+        let cancel = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let batch = vec![event("survives-outage")];
+
+        let requeued = reporter
+            .send_with_retry_using(batch, &cancel, {
+                let attempts = attempts.clone();
+                move |_| {
+                    let attempts = attempts.clone();
+                    Box::pin(async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err(SendBatchError::Retry("outage".to_string()))
+                    })
+                }
+            })
+            .await
+            .expect("retry exhaustion should requeue the batch");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_RETRY_ATTEMPTS);
+        reporter.push_front_batch(requeued);
+        assert_eq!(reporter.queue_len(), 1);
+
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let recovered = reporter.pop_batch().unwrap();
+        assert!(reporter
+            .send_with_retry_using(recovered, &cancel, {
+                let delivered = delivered.clone();
+                move |batch| {
+                    let delivered = delivered.clone();
+                    let batch = batch.to_vec();
+                    Box::pin(async move {
+                        delivered.lock().unwrap().extend(batch);
+                        Ok(())
+                    })
+                }
+            })
+            .await
+            .is_none());
+        let delivered = delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].event_id, "survives-outage");
+        assert!(reporter.pop_batch().is_none());
     }
 
     #[tokio::test]
