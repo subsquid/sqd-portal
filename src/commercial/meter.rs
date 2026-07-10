@@ -21,6 +21,7 @@ use uuid::{NoContext, Timestamp, Uuid};
 
 use crate::commercial::{concurrency::ConcurrencyPermit, tally::TallyHandle};
 use crate::{
+    commercial::zero_limits,
     commercial::{
         registry::StreamRegistration, ActiveStreamRegistry, DataSource, Endpoint, Granted,
         GrantedLimits, KeyStatus, OnExceed, Principal, SnapshotStore, StreamUsageEvent, TallyStore,
@@ -154,6 +155,15 @@ impl MeterHandle {
     ) -> Self {
         let event_id = uuid_v7();
         let tally_account_id = tally_account_id.unwrap_or_else(|| principal.account_id.clone());
+        if limits.throughput_bytes_per_sec == Some(0) {
+            zero_limits::report(
+                principal
+                    .api_key_id
+                    .as_deref()
+                    .unwrap_or(principal.account_id.as_str()),
+                "throughput_bytes_per_sec",
+            );
+        }
         let kill = Arc::new(AtomicBool::new(false));
         let floor_bytes_per_sec = Arc::new(AtomicU64::new(0));
         let bucket = AsyncMutex::new(bucket_from_limits(&limits));
@@ -1458,6 +1468,13 @@ mod tests {
         )
     }
 
+    fn zero_limit_metric(limit: &str) -> u64 {
+        let labels = vec![("limit".to_owned(), limit.to_owned())];
+        crate::metrics::COMMERCIAL_ZERO_VALUED_LIMITS
+            .get_or_create(&labels)
+            .get()
+    }
+
     fn enforced_meter(
         reporter: Arc<RecordingReporter>,
         limits: GrantedLimits,
@@ -2320,6 +2337,34 @@ mod tests {
             assert_eq!(emitted.len(), 2);
             assert_eq!(start.elapsed(), Duration::ZERO);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_throughput_reports_metric_and_remains_unpaced() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let before = zero_limit_metric("throughput_bytes_per_sec");
+        let (meter, _, _) = enforced_meter(
+            reporter,
+            GrantedLimits {
+                throughput_bytes_per_sec: Some(0),
+                burst_bytes: Some(0),
+                ..GrantedLimits::default()
+            },
+            OnExceed::Reject,
+            Some(100),
+        );
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"a")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"b")),
+        ];
+        let start = tokio::time::Instant::now();
+
+        let output = tap_plain_stream(stream::iter(chunks), meter);
+        let emitted: Vec<_> = output.collect().await;
+
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(zero_limit_metric("throughput_bytes_per_sec") > before);
     }
 
     #[tokio::test(start_paused = true)]

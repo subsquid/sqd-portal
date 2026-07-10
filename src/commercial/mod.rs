@@ -26,6 +26,7 @@ mod reporter;
 pub mod store;
 pub mod tally;
 pub mod types;
+pub(crate) mod zero_limits;
 
 #[derive(Clone)]
 pub struct CommercialRuntime {

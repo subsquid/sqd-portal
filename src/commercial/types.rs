@@ -77,9 +77,13 @@ pub struct Principal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GrantedLimits {
+    /// None means no response-size cap; Some(0) is a literal zero-byte cap.
     pub max_response_bytes: Option<u64>,
+    /// None means no throughput pacing; Some(0) fails open as no bucket and emits zero-limit telemetry.
     pub throughput_bytes_per_sec: Option<u64>,
+    /// None defaults to the throughput rate; Some(0) is coerced to the minimum bucket burst.
     pub burst_bytes: Option<u64>,
+    /// None means no chunk-count cap; Some(0) is a literal zero-chunk cap.
     pub max_chunks: Option<u64>,
 }
 
@@ -167,11 +171,16 @@ pub enum KeyStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SnapshotLimits {
+    /// None means no throughput pacing; Some(0) fails open as no bucket and emits zero-limit telemetry.
     pub throughput_bytes_per_sec: Option<u64>,
+    /// None defaults to the throughput rate; Some(0) is coerced to the minimum bucket burst.
     pub burst_bytes: Option<u64>,
+    /// None means no response-size cap; Some(0) is a literal zero-byte cap.
     pub max_response_bytes: Option<u64>,
+    /// None means no concurrency check; Some(0) fails open to the per-pod guardrail permit and emits zero-limit telemetry.
     pub concurrency: Option<u64>,
     #[serde(default)]
+    /// None means no chunk-count cap; Some(0) is a literal zero-chunk cap.
     pub max_chunks: Option<u64>,
 }
 
@@ -212,9 +221,13 @@ pub struct KeySnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicLimits {
+    /// None means no throughput pacing; Some(0) fails open as no bucket and emits zero-limit telemetry.
     pub throughput_bytes_per_sec: Option<u64>,
+    /// None defaults to the throughput rate; Some(0) is coerced to the minimum bucket burst.
     pub burst_bytes: Option<u64>,
+    /// None means no response-size cap; Some(0) is a literal zero-byte cap.
     pub max_response_bytes: Option<u64>,
+    /// None means no concurrency check; Some(0) fails open to the per-pod guardrail permit and emits zero-limit telemetry.
     pub concurrency: Option<u64>,
 }
 

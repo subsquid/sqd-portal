@@ -6,7 +6,7 @@ use super::{
         Authorization, AuthorizeRequest, Credential, Defaults, Endpoint, Granted, GrantedLimits,
         KeySnapshot, KeyStatus, OnExceed, Principal, Rejected, SnapshotLimits,
     },
-    ConcurrencyLimiter, SnapshotStore, TallyStore,
+    zero_limits, ConcurrencyLimiter, SnapshotStore, TallyStore,
 };
 
 const INVALID_KEY: &str = "invalid_key";
@@ -271,14 +271,18 @@ fn acquire_key_permit(
     snapshot: Option<&KeySnapshot>,
     concurrency: Option<&ConcurrencyLimiter>,
 ) -> (Option<super::concurrency::ConcurrencyPermit>, bool) {
-    let Some((account_id, limit)) = snapshot.and_then(|snapshot| {
+    let Some((key_id, account_id, limit)) = snapshot.and_then(|snapshot| {
         Some((
+            snapshot.key_id.as_str(),
             snapshot.account_id.as_deref()?,
             snapshot.limits.as_ref()?.concurrency?,
         ))
     }) else {
         return (None, true);
     };
+    if limit == 0 {
+        zero_limits::report(key_id, "concurrency");
+    }
     let permit = concurrency.and_then(|limiter| limiter.try_acquire(account_id, limit));
     let available = permit.is_some();
     (permit, available)
@@ -324,7 +328,12 @@ fn evaluate_anonymous_with_state(
     let window_start = now_secs - (now_secs % window_secs);
 
     let permit = match (defaults.public.limits.concurrency, concurrency) {
-        (Some(limit), Some(limiter)) => limiter.try_acquire(&account_key, limit),
+        (Some(limit), Some(limiter)) => {
+            if limit == 0 {
+                zero_limits::report("anonymous", "concurrency");
+            }
+            limiter.try_acquire(&account_key, limit)
+        }
         _ => None,
     };
     if concurrency.is_some() && defaults.public.limits.concurrency.is_some() && permit.is_none() {
@@ -609,6 +618,13 @@ mod tests {
             Authorization::Rejected(rejected) => rejected.reason,
             Authorization::Granted(_) => panic!("expected rejection"),
         }
+    }
+
+    fn zero_limit_metric(limit: &str) -> u64 {
+        let labels = vec![("limit".to_owned(), limit.to_owned())];
+        crate::metrics::COMMERCIAL_ZERO_VALUED_LIMITS
+            .get_or_create(&labels)
+            .get()
     }
 
     #[test]
@@ -1093,6 +1109,38 @@ mod tests {
             }
             Authorization::Granted(_) => panic!("expected concurrency rejection"),
         }
+    }
+
+    #[tokio::test]
+    async fn zero_concurrency_reports_metric_and_fails_open_to_guardrail() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        let mut snapshot = active_snapshot(1);
+        let account_id = snapshot.account_id.clone().unwrap();
+        snapshot.limits.as_mut().unwrap().concurrency = Some(0);
+        store.install_records_for_test(vec![SnapshotRecord::Key(snapshot)], 1);
+        let limiter = ConcurrencyLimiter::new(1);
+        let before = zero_limit_metric("concurrency");
+
+        let result =
+            evaluate_with_store(&store, None, Some(&limiter), request(SECRET_SHA256)).await;
+
+        let granted = match result {
+            Authorization::Granted(granted) => {
+                assert!(granted.concurrency_permit.is_some());
+                granted
+            }
+            Authorization::Rejected(rejected) => panic!("expected grant, got {rejected:?}"),
+        };
+        assert!(zero_limit_metric("concurrency") > before);
+        assert!(limiter.try_acquire(&account_id, 0).is_none());
+        drop(granted);
     }
 
     #[tokio::test]
