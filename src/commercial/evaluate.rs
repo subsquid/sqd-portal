@@ -3,8 +3,8 @@ use subtle::ConstantTimeEq;
 use super::{
     config::default_throttle_residual_secs,
     types::{
-        Authorization, AuthorizeRequest, Credential, Defaults, Granted, GrantedLimits, KeySnapshot,
-        KeyStatus, OnExceed, Principal, Rejected, SnapshotLimits,
+        Authorization, AuthorizeRequest, Credential, Defaults, Endpoint, Granted, GrantedLimits,
+        KeySnapshot, KeyStatus, OnExceed, Principal, Rejected, SnapshotLimits,
     },
     ConcurrencyLimiter, SnapshotStore, TallyStore,
 };
@@ -246,13 +246,17 @@ fn evaluate_key_prechecks<'a>(
     }
 
     let entitlements = snapshot.entitlements.as_ref();
-    if !entitlements.is_some_and(|entitlements| {
-        entitlements
-            .chains
-            .iter()
-            .any(|chain| chain == &req.dataset)
-    }) {
-        return Err(rejected(defaults, DATASET_NOT_ENTITLED, 403, None));
+    if !matches!(req.endpoint, Endpoint::SqlQuery) {
+        if !entitlements.is_some_and(|entitlements| {
+            entitlements
+                .chains
+                .iter()
+                .any(|chain| chain == &req.dataset)
+        }) {
+            return Err(rejected(defaults, DATASET_NOT_ENTITLED, 403, None));
+        }
+    } else {
+        // DECISION: SQL access gated per referenced dataset (Q5), not by a synthetic capability slug.
     }
     if req.query.chain_kind.as_deref() == Some("evm")
         && (req.query.requires_traces || req.query.requires_statediffs)
@@ -892,11 +896,8 @@ mod tests {
     #[test]
     fn keyed_sql_grant_carries_snapshot_entitled_chains() {
         let mut snapshot = active_snapshot(1);
-        snapshot.entitlements.as_mut().unwrap().chains = vec![
-            "sql".to_string(),
-            "solana-mainnet".to_string(),
-            "ethereum-mainnet".to_string(),
-        ];
+        snapshot.entitlements.as_mut().unwrap().chains =
+            vec!["solana-mainnet".to_string(), "ethereum-mainnet".to_string()];
         let mut req = request(SECRET_SHA256);
         req.dataset = "sql".to_string();
         req.endpoint = Endpoint::SqlQuery;
@@ -907,7 +908,7 @@ mod tests {
                     .entitled_chains
                     .expect("keyed grants should carry the snapshot chain set");
                 assert_eq!(grant.principal.api_key_id.as_deref(), Some(KEY_ID));
-                assert!(entitled.contains("sql"));
+                assert!(!entitled.contains("sql"));
                 assert!(entitled.contains("solana-mainnet"));
                 assert!(entitled.contains("ethereum-mainnet"));
             }
