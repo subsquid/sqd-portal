@@ -18,7 +18,8 @@ use super::{
 use crate::{
     config::Config,
     metrics,
-    types::{ParsedQuery, RequestError},
+    network::NetworkClient,
+    types::{DatasetId, ParsedQuery, RequestError},
 };
 
 const API_KEY_PREFIX: &str = "sqd_data_";
@@ -28,6 +29,21 @@ pub struct CommercialGrant {
     pub granted: Granted,
     pub tally: Option<Arc<TallyStore>>,
     pub registry: Option<Arc<ActiveStreamRegistry>>,
+}
+
+pub trait DatasetCanonicalizer: Send + Sync {
+    fn default_name_for_alias(&self, alias: &str) -> Option<String>;
+    fn default_name_for_id(&self, id: &DatasetId) -> Option<String>;
+}
+
+impl DatasetCanonicalizer for NetworkClient {
+    fn default_name_for_alias(&self, alias: &str) -> Option<String> {
+        self.dataset(alias).map(|dataset| dataset.default_name)
+    }
+
+    fn default_name_for_id(&self, id: &DatasetId) -> Option<String> {
+        self.datasets().read().default_name(id).map(str::to_string)
+    }
 }
 
 pub async fn middleware(mut req: Request, next: Next, endpoint: Endpoint) -> Response {
@@ -49,7 +65,11 @@ pub async fn middleware(mut req: Request, next: Next, endpoint: Endpoint) -> Res
                 return RequestError::from(rejected).into_response();
             }
         };
-    let dataset = dataset_from_path(req.uri().path(), &endpoint);
+    let canonicalizer = req
+        .extensions()
+        .get::<Arc<dyn DatasetCanonicalizer>>()
+        .map(Arc::as_ref);
+    let dataset = dataset_from_path(req.uri().path(), &endpoint, canonicalizer);
     let query = match query_descriptor_from_request(req, endpoint).await {
         Ok((next_req, query)) => {
             req = next_req;
@@ -263,21 +283,47 @@ fn secret_sha256(secret: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn dataset_from_path(path: &str, endpoint: &Endpoint) -> String {
+fn dataset_from_path(
+    path: &str,
+    endpoint: &Endpoint,
+    canonicalizer: Option<&dyn DatasetCanonicalizer>,
+) -> String {
     if matches!(endpoint, Endpoint::SqlQuery) {
         return "sql".to_string();
     }
 
     let mut segments = path.trim_start_matches('/').split('/');
     match (segments.next(), segments.next()) {
-        (Some("datasets"), Some(dataset)) if !dataset.is_empty() => dataset.to_string(),
+        (Some("datasets"), Some(dataset)) if !dataset.is_empty() => {
+            canonical_dataset_identifier(dataset, endpoint, canonicalizer)
+        }
         _ => "unknown".to_string(),
     }
 }
 
+fn canonical_dataset_identifier(
+    raw: &str,
+    endpoint: &Endpoint,
+    canonicalizer: Option<&dyn DatasetCanonicalizer>,
+) -> String {
+    let Some(canonicalizer) = canonicalizer else {
+        return raw.to_string();
+    };
+    if matches!(endpoint, Endpoint::LegacyQuery) {
+        return DatasetId::from_base64(raw)
+            .ok()
+            .and_then(|id| canonicalizer.default_name_for_id(&id))
+            .unwrap_or_else(|| raw.to_string());
+    }
+
+    canonicalizer
+        .default_name_for_alias(raw)
+        .unwrap_or_else(|| raw.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::HashMap, sync::Mutex};
 
     use async_trait::async_trait;
     use axum::{
@@ -289,7 +335,12 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::commercial::{build, Credential, Principal};
+    use crate::commercial::{
+        build,
+        evaluate::{evaluate, EvaluationState},
+        store::test_support::{active_snapshot, defaults_record},
+        Credential, Principal,
+    };
 
     const TOKEN: &str = "sqd_data_AbCdEfGhIjKlMnOp_0123456789abcdefghijklmnopqrstuv";
 
@@ -298,6 +349,26 @@ mod tests {
     #[derive(Default)]
     struct RecordingControlPlane {
         requests: Mutex<Vec<AuthorizeRequest>>,
+    }
+
+    #[derive(Default)]
+    struct StaticCanonicalizer {
+        aliases: HashMap<String, String>,
+        ids: HashMap<DatasetId, String>,
+    }
+
+    struct CanonicalEntitlementControlPlane {
+        requests: Mutex<Vec<AuthorizeRequest>>,
+    }
+
+    impl DatasetCanonicalizer for StaticCanonicalizer {
+        fn default_name_for_alias(&self, alias: &str) -> Option<String> {
+            self.aliases.get(alias).cloned()
+        }
+
+        fn default_name_for_id(&self, id: &DatasetId) -> Option<String> {
+            self.ids.get(id).cloned()
+        }
     }
 
     #[async_trait]
@@ -317,6 +388,26 @@ mod tests {
         async fn authorize(&self, req: AuthorizeRequest) -> Authorization {
             self.requests.lock().unwrap().push(req);
             Authorization::Granted(oss_grant())
+        }
+    }
+
+    #[async_trait]
+    impl ControlPlaneClient for CanonicalEntitlementControlPlane {
+        async fn authorize(&self, req: AuthorizeRequest) -> Authorization {
+            self.requests.lock().unwrap().push(req.clone());
+            let mut snapshot = active_snapshot(1);
+            snapshot.entitlements.as_mut().unwrap().chains = vec!["base-mainnet".to_string()];
+            let defaults = defaults_record(1).into();
+            evaluate(
+                &req,
+                Some(&snapshot),
+                &defaults,
+                EvaluationState {
+                    now_secs: 1_700_000_000,
+                    tally_bytes: 0,
+                    concurrency_available: true,
+                },
+            )
         }
     }
 
@@ -555,5 +646,92 @@ mod tests {
         assert_eq!(requests[0].query.chain_kind.as_deref(), Some("evm"));
         assert!(requests[0].query.requires_traces);
         assert!(!requests[0].query.requires_statediffs);
+    }
+
+    #[tokio::test]
+    async fn middleware_authorizes_alias_url_against_canonical_dataset() {
+        let control_plane = Arc::new(CanonicalEntitlementControlPlane {
+            requests: Mutex::new(Vec::new()),
+        });
+        let canonicalizer = Arc::new(StaticCanonicalizer {
+            aliases: HashMap::from([("base".to_string(), "base-mainnet".to_string())]),
+            ids: HashMap::new(),
+        });
+        let app = axum::Router::new()
+            .route("/datasets/base/stream", post(|| async move { "ok" }))
+            .route_layer(from_fn(|req, next| middleware(req, next, Endpoint::Stream)))
+            .layer(axum::Extension(
+                canonicalizer as Arc<dyn DatasetCanonicalizer>,
+            ))
+            .layer(axum::Extension(
+                control_plane.clone() as Arc<dyn ControlPlaneClient>
+            ));
+        let body = r#"{
+            "type": "evm",
+            "fromBlock": 1,
+            "fields": {"block": {"number": true}}
+        }"#;
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("/datasets/base/stream?api_key={TOKEN}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let requests = control_plane.requests.lock().unwrap();
+        assert_eq!(requests[0].dataset, "base-mainnet");
+    }
+
+    #[tokio::test]
+    async fn middleware_authorizes_legacy_base64_url_against_canonical_dataset() {
+        let dataset_id = DatasetId::from_url("s3://base-mainnet");
+        let encoded = dataset_id.to_base64();
+        let control_plane = Arc::new(CanonicalEntitlementControlPlane {
+            requests: Mutex::new(Vec::new()),
+        });
+        let canonicalizer = Arc::new(StaticCanonicalizer {
+            aliases: HashMap::new(),
+            ids: HashMap::from([(dataset_id, "base-mainnet".to_string())]),
+        });
+        let app = axum::Router::new()
+            .route(
+                "/datasets/:dataset_id/query/:worker_id",
+                post(|| async move { "ok" }),
+            )
+            .route_layer(from_fn(|req, next| {
+                middleware(req, next, Endpoint::LegacyQuery)
+            }))
+            .layer(axum::Extension(
+                canonicalizer as Arc<dyn DatasetCanonicalizer>,
+            ))
+            .layer(axum::Extension(
+                control_plane.clone() as Arc<dyn ControlPlaneClient>
+            ));
+        let body = r#"{
+            "type": "evm",
+            "fromBlock": 1,
+            "fields": {"block": {"number": true}}
+        }"#;
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("/datasets/{encoded}/query/worker?api_key={TOKEN}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let requests = control_plane.requests.lock().unwrap();
+        assert_eq!(requests[0].dataset, "base-mainnet");
     }
 }

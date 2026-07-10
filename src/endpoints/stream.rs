@@ -59,9 +59,19 @@ pub(crate) async fn run_archival_stream_restricted(
     config: Extension<Arc<Config>>,
     grant: Option<Extension<CommercialGrant>>,
     reporter: Option<Extension<Arc<dyn UsageReporter>>>,
-    dataset_id: DatasetId,
+    dataset: DatasetConfig,
     raw_request: StreamRequest,
 ) -> Response {
+    let Some(dataset_id) = dataset.network_id.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "Dataset {} doesn't have archival data",
+                dataset.default_name
+            ),
+        )
+            .into_response();
+    };
     let request = restrict_request(&config, raw_request);
     let request =
         restrict_request_to_grant(request, grant.as_ref().map(|grant| &grant.0.granted.limits));
@@ -69,7 +79,7 @@ pub(crate) async fn run_archival_stream_restricted(
         grant,
         reporter,
         Endpoint::ArchivalStream,
-        dataset_id.to_url().to_string(),
+        dataset.default_name,
         request.request_id.clone(),
     );
     run_archival_stream_inner(task_manager, network, config, dataset_id, request, meter).await
@@ -107,15 +117,25 @@ pub(crate) async fn run_archival_stream(
     Extension(config): Extension<Arc<Config>>,
     grant: Option<Extension<CommercialGrant>>,
     reporter: Option<Extension<Arc<dyn UsageReporter>>>,
-    dataset_id: DatasetId,
+    dataset: DatasetConfig,
     request: StreamRequest,
 ) -> Response {
+    let Some(dataset_id) = dataset.network_id.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "Dataset {} doesn't have archival data",
+                dataset.default_name
+            ),
+        )
+            .into_response();
+    };
     let request = restrict_archival_debug_request(&config, request, grant.as_ref().map(|g| &g.0));
     let meter = meter_from_extensions(
         grant,
         reporter,
         Endpoint::ArchivalStream,
-        dataset_id.to_url().to_string(),
+        dataset.default_name,
         request.request_id.clone(),
     );
     run_archival_stream_inner(

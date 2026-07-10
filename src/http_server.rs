@@ -262,6 +262,8 @@ pub async fn run_server(
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
     let commercial_enabled = config.commercial.is_some();
+    let dataset_canonicalizer =
+        network_client.clone() as Arc<dyn commercial_extractor::DatasetCanonicalizer>;
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
         .allow_headers(Any)
@@ -348,6 +350,7 @@ pub async fn run_server(
         )
         .layer(Extension(task_manager))
         .layer(Extension(network_client))
+        .layer(Extension(dataset_canonicalizer))
         .layer(Extension(config))
         .layer(Extension(Arc::new(metrics_registry)))
         .layer(Extension(hotblocks))
@@ -1049,13 +1052,19 @@ async fn execute_query(
                 .into_response()
         }
     };
+    let dataset_name = client
+        .datasets()
+        .read()
+        .default_name(&dataset_id)
+        .map(str::to_string)
+        .unwrap_or_else(|| dataset_id.to_url().to_string());
 
     let request_id = req.header_value().to_str().unwrap_or("").to_string();
     let meter = meter_from_extensions(
         grant,
         reporter,
         Endpoint::LegacyQuery,
-        dataset_id.to_url().to_string(),
+        dataset_name,
         request_id.clone(),
     );
 
