@@ -32,6 +32,7 @@ use crate::{
 
 const MAX_PENDING_COMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 const STREAMING_DECODE_BUFFER_BYTES: usize = 32 * 1024;
+const MAX_OUTPUT_ONLY_DECODE_STEPS: usize = 1024;
 
 #[derive(Clone)]
 pub struct MeterHandle {
@@ -489,28 +490,9 @@ where
             let mut offset = 0;
             while offset < frame.len() {
                 match decoder.decode(&frame[offset..]) {
-                    Ok(CompressedStep::Consumed {
-                        bytes,
-                        made_progress,
-                    }) => {
-                        if bytes > 0 {
-                            let segment = frame[offset..offset + bytes].to_vec();
-                            offset += bytes;
-                            if !pending.try_push(segment, pending_limit) {
-                                meter.mark_error();
-                                for frame in pending.drain() {
-                                    yield frame;
-                                }
-                                yield frame[offset - bytes..offset].to_vec();
-                                if offset < frame.len() {
-                                    yield frame[offset..].to_vec();
-                                }
-                                passthrough = true;
-                                continue 'input;
-                            }
-                        }
-                        if !made_progress {
-                            tracing::warn!("gzip usage decoder made no progress");
+                    Ok(CompressedStep::Consumed { bytes }) => {
+                        if bytes == 0 {
+                            tracing::warn!("gzip usage decoder consumed no input");
                             meter.mark_error();
                             for frame in pending.drain() {
                                 yield frame;
@@ -520,6 +502,17 @@ where
                             }
                             passthrough = true;
                             continue 'input;
+                        }
+                        if bytes > 0 {
+                            let segment = frame[offset..offset + bytes].to_vec();
+                            offset += bytes;
+                            if !pending.try_push(segment, pending_limit) {
+                                meter.mark_error();
+                                for frame in pending.drain() {
+                                    yield frame;
+                                }
+                                break 'input;
+                            }
                         }
                     }
                     Ok(CompressedStep::Completed {
@@ -534,12 +527,7 @@ where
                                 for frame in pending.drain() {
                                     yield frame;
                                 }
-                                yield frame[offset - consumed..offset].to_vec();
-                                if offset < frame.len() {
-                                    yield frame[offset..].to_vec();
-                                }
-                                passthrough = true;
-                                continue 'input;
+                                break 'input;
                             }
                         }
                         meter.add_logical_bytes(logical_bytes);
@@ -611,68 +599,72 @@ where
 
             let mut offset = 0;
             while offset < frame.len() {
-                match decoder.decode(&frame[offset..]) {
-                    Ok(step) => {
-                        if step.consumed > 0 {
-                            let segment = frame[offset..offset + step.consumed].to_vec();
-                            offset += step.consumed;
-                            if !pending.try_push(segment, pending_limit) {
+                let buffered = pending.bytes().saturating_add(decoder.held_len());
+                if buffered >= pending_limit {
+                    meter.mark_error();
+                    for frame in pending.drain() {
+                        yield frame;
+                    }
+                    if let Some(frame) = decoder.drain_held() {
+                        yield frame;
+                    }
+                    break 'input;
+                }
+
+                let capacity = pending_limit - buffered;
+                let take = capacity.min(frame.len() - offset);
+                decoder.push_input(&frame[offset..offset + take]);
+                offset += take;
+
+                loop {
+                    match decoder.decode() {
+                        Ok(ZstdStep::Consumed { bytes, completed }) => {
+                            if !bytes.is_empty() && !pending.try_push(bytes, pending_limit) {
                                 meter.mark_error();
                                 for frame in pending.drain() {
                                     yield frame;
                                 }
-                                yield frame[offset - step.consumed..offset].to_vec();
-                                if offset < frame.len() {
-                                    yield frame[offset..].to_vec();
+                                if let Some(frame) = decoder.drain_held() {
+                                    yield frame;
                                 }
-                                passthrough = true;
-                                continue 'input;
-                            }
-                        }
-
-                        if step.completed {
-                            meter.add_logical_bytes(decoder.take_completed_logical());
-                            let stop = meter.should_stop_after_chunk();
-                            meter.pace_pending_logical().await;
-                            for frame in pending.drain() {
-                                yield frame;
-                            }
-                            if stop {
                                 break 'input;
                             }
-                        }
 
-                        if !step.made_progress() {
-                            tracing::warn!("zstd usage decoder made no progress");
+                            if completed {
+                                meter.add_logical_bytes(decoder.take_completed_logical());
+                                let stop = meter.should_stop_after_chunk();
+                                meter.pace_pending_logical().await;
+                                for frame in pending.drain() {
+                                    yield frame;
+                                }
+                                if stop {
+                                    break 'input;
+                                }
+                            }
+                        }
+                        Ok(ZstdStep::NeedsMoreInput) => break,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "failed to decode portal usage zstd input for logical byte count");
                             meter.mark_error();
                             for frame in pending.drain() {
                                 yield frame;
                             }
-                            if offset < frame.len() {
-                                yield frame[offset..].to_vec();
+                            if let Some(frame) = decoder.drain_held() {
+                                yield frame;
                             }
                             passthrough = true;
                             continue 'input;
                         }
                     }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "failed to decode portal usage zstd input for logical byte count");
-                        meter.mark_error();
-                        for frame in pending.drain() {
-                            yield frame;
-                        }
-                        if offset < frame.len() {
-                            yield frame[offset..].to_vec();
-                        }
-                        passthrough = true;
-                        continue 'input;
-                    }
                 }
             }
         }
-        if !pending.is_empty() {
+        if !pending.is_empty() || decoder.held_len() > 0 {
             meter.mark_error();
             for frame in pending.drain() {
+                yield frame;
+            }
+            if let Some(frame) = decoder.drain_held() {
                 yield frame;
             }
         }
@@ -706,6 +698,10 @@ impl PendingFrames {
     fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 #[derive(Default)]
@@ -725,7 +721,7 @@ impl IoWrite for CountingWriter {
 }
 
 enum CompressedStep {
-    Consumed { bytes: usize, made_progress: bool },
+    Consumed { bytes: usize },
     Completed { consumed: usize, logical_bytes: u64 },
     NeedsMoreInput,
 }
@@ -753,12 +749,10 @@ impl GzipMemberCounter {
         }
 
         let mut offset = 0;
-        let mut made_progress = false;
         loop {
             match &mut self.state {
                 GzipDecodeState::Header(header) => {
                     while offset < input.len() {
-                        made_progress = true;
                         let done = header.consume(input[offset])?;
                         offset += 1;
                         if done {
@@ -767,10 +761,7 @@ impl GzipMemberCounter {
                         }
                     }
                     if offset == input.len() {
-                        return Ok(CompressedStep::Consumed {
-                            bytes: offset,
-                            made_progress,
-                        });
+                        return Ok(CompressedStep::Consumed { bytes: offset });
                     }
                 }
                 GzipDecodeState::Deflate => {
@@ -783,28 +774,20 @@ impl GzipMemberCounter {
                     let consumed = (self.decoder.total_in() - before_in) as usize;
                     let written = (self.decoder.total_out() - before_out) as usize;
                     offset += consumed;
-                    made_progress = made_progress || consumed > 0 || written > 0;
                     self.current_logical = self.current_logical.saturating_add(written as u64);
                     if status == Status::StreamEnd {
                         self.state = GzipDecodeState::Trailer(8);
                         if offset == input.len() {
-                            return Ok(CompressedStep::Consumed {
-                                bytes: offset,
-                                made_progress,
-                            });
+                            return Ok(CompressedStep::Consumed { bytes: offset });
                         }
                         continue;
                     }
-                    return Ok(CompressedStep::Consumed {
-                        bytes: offset,
-                        made_progress,
-                    });
+                    return Ok(CompressedStep::Consumed { bytes: offset });
                 }
                 GzipDecodeState::Trailer(remaining) => {
                     let consumed = (*remaining).min(input.len() - offset);
                     *remaining -= consumed;
                     offset += consumed;
-                    made_progress = made_progress || consumed > 0;
                     if *remaining == 0 {
                         let logical_bytes = std::mem::take(&mut self.current_logical);
                         self.state = GzipDecodeState::Header(GzipHeader::new());
@@ -814,10 +797,7 @@ impl GzipMemberCounter {
                             logical_bytes,
                         });
                     }
-                    return Ok(CompressedStep::Consumed {
-                        bytes: offset,
-                        made_progress,
-                    });
+                    return Ok(CompressedStep::Consumed { bytes: offset });
                 }
             }
         }
@@ -972,22 +952,16 @@ fn phase_after_comment(flags: u8) -> GzipHeaderPhase {
     }
 }
 
-struct ZstdStep {
-    consumed: usize,
-    written: usize,
-    completed: bool,
-}
-
-impl ZstdStep {
-    fn made_progress(&self) -> bool {
-        self.consumed > 0 || self.written > 0 || self.completed
-    }
+enum ZstdStep {
+    Consumed { bytes: Vec<u8>, completed: bool },
+    NeedsMoreInput,
 }
 
 struct ZstdFrameCounter {
     decoder: zstd::stream::raw::Decoder<'static>,
     output: Vec<u8>,
     current_logical: u64,
+    held_input: Vec<u8>,
 }
 
 impl ZstdFrameCounter {
@@ -996,25 +970,79 @@ impl ZstdFrameCounter {
             decoder: zstd::stream::raw::Decoder::new()?,
             output: vec![0; STREAMING_DECODE_BUFFER_BYTES],
             current_logical: 0,
+            held_input: Vec::new(),
         })
     }
 
-    fn decode(&mut self, input: &[u8]) -> io::Result<ZstdStep> {
+    fn push_input(&mut self, input: &[u8]) {
+        self.held_input.extend_from_slice(input);
+    }
+
+    fn held_len(&self) -> usize {
+        self.held_input.len()
+    }
+
+    fn drain_held(&mut self) -> Option<Vec<u8>> {
+        if self.held_input.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.held_input))
+        }
+    }
+
+    fn decode(&mut self) -> io::Result<ZstdStep> {
         use zstd::stream::raw::Operation as _;
 
-        let status = self.decoder.run_on_buffers(input, &mut self.output)?;
-        self.current_logical = self
-            .current_logical
-            .saturating_add(status.bytes_written as u64);
-        let completed = status.remaining == 0;
-        if completed {
-            self.decoder.reinit()?;
+        if self.held_input.is_empty() {
+            return Ok(ZstdStep::NeedsMoreInput);
         }
-        Ok(ZstdStep {
-            consumed: status.bytes_read,
-            written: status.bytes_written,
-            completed,
-        })
+
+        let mut output_only_steps = 0;
+        loop {
+            let status = self
+                .decoder
+                .run_on_buffers(&self.held_input, &mut self.output)?;
+            self.current_logical = self
+                .current_logical
+                .saturating_add(status.bytes_written as u64);
+            let completed = status.remaining == 0;
+
+            if status.bytes_read > 0 {
+                let bytes = self.held_input.drain(..status.bytes_read).collect();
+                if completed {
+                    self.decoder.reinit()?;
+                }
+                return Ok(ZstdStep::Consumed { bytes, completed });
+            }
+
+            if completed {
+                self.decoder.reinit()?;
+                return Ok(ZstdStep::Consumed {
+                    bytes: Vec::new(),
+                    completed: true,
+                });
+            }
+
+            if status.bytes_written > 0 {
+                output_only_steps += 1;
+                if output_only_steps > MAX_OUTPUT_ONLY_DECODE_STEPS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "zstd decoder made too many output-only steps",
+                    ));
+                }
+                continue;
+            }
+
+            if status.remaining > self.held_input.len() {
+                return Ok(ZstdStep::NeedsMoreInput);
+            }
+
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zstd decoder made no progress",
+            ));
+        }
     }
 
     fn take_completed_logical(&mut self) -> u64 {
@@ -1269,7 +1297,9 @@ mod tests {
     use std::sync::Mutex;
 
     use async_compression::tokio::bufread::GzipEncoder;
+    use flate2::{write::DeflateEncoder, Compression as FlateCompression, Crc};
     use futures::stream;
+    use std::io::Write;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     use super::*;
@@ -1449,6 +1479,66 @@ mod tests {
         bytes.chunks(chunk).map(<[u8]>::to_vec).collect()
     }
 
+    fn raw_deflate(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = DeflateEncoder::new(Vec::new(), FlateCompression::fast());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = Crc::new();
+        crc.update(bytes);
+        crc.sum()
+    }
+
+    #[derive(Default)]
+    struct GzipHeaderFixture<'a> {
+        extra: Option<&'a [u8]>,
+        name: Option<&'a [u8]>,
+        comment: Option<&'a [u8]>,
+        header_crc: bool,
+    }
+
+    fn gzip_fixture_member(payload: &[u8], fixture: GzipHeaderFixture<'_>) -> Vec<u8> {
+        let mut flags = 0;
+        if fixture.extra.is_some() {
+            flags |= 0x04;
+        }
+        if fixture.name.is_some() {
+            flags |= 0x08;
+        }
+        if fixture.comment.is_some() {
+            flags |= 0x10;
+        }
+        if fixture.header_crc {
+            flags |= 0x02;
+        }
+
+        let mut header = vec![0x1f, 0x8b, 8, flags, 0, 0, 0, 0, 0, 255];
+        if let Some(extra) = fixture.extra {
+            header.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+            header.extend_from_slice(extra);
+        }
+        if let Some(name) = fixture.name {
+            header.extend_from_slice(name);
+            header.push(0);
+        }
+        if let Some(comment) = fixture.comment {
+            header.extend_from_slice(comment);
+            header.push(0);
+        }
+        if fixture.header_crc {
+            let crc16 = crc32(&header) as u16;
+            header.extend_from_slice(&crc16.to_le_bytes());
+        }
+
+        let mut member = header;
+        member.extend_from_slice(&raw_deflate(payload));
+        member.extend_from_slice(&crc32(payload).to_le_bytes());
+        member.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        member
+    }
+
     #[tokio::test]
     async fn gzip_tap_counts_logical_and_wire_bytes() {
         let first = b"{\"a\":1}\n";
@@ -1538,10 +1628,10 @@ mod tests {
         let encoded = gzip(&data).await;
         let fragments = split_every(&encoded, 5);
 
-        let (event, emitted) = drive_metered_gzip_chunks_with_limit(fragments, 8).await;
+        let (event, emitted) = drive_metered_gzip_chunks_with_limit(fragments, 10).await;
 
-        assert_eq!(emitted, encoded);
-        assert_eq!(event.wire_bytes, encoded.len() as u64);
+        assert_eq!(emitted, encoded[..10]);
+        assert_eq!(event.wire_bytes, emitted.len() as u64);
         assert_eq!(event.status, UsageStatus::Error);
     }
 
@@ -1551,11 +1641,224 @@ mod tests {
         let encoded = zstd::stream::encode_all(&data[..], 0).unwrap();
         let fragments = split_every(&encoded, 5);
 
-        let (event, emitted) = drive_metered_zstd_frames_with_limit(fragments, 8).await;
+        let (event, emitted) = drive_metered_zstd_frames_with_limit(fragments, 10).await;
+
+        assert_eq!(emitted, encoded[..10]);
+        assert_eq!(event.wire_bytes, emitted.len() as u64);
+        assert_eq!(event.status, UsageStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn gzip_input_tap_counts_multi_member_with_split_trailer_and_next_header() {
+        let first_payload = b"first-member\n";
+        let second_payload = b"second-member\n";
+        let first = gzip_fixture_member(first_payload, GzipHeaderFixture::default());
+        let second = gzip_fixture_member(second_payload, GzipHeaderFixture::default());
+        let mut encoded = first.clone();
+        encoded.extend_from_slice(&second);
+        let split = first.len() - 4;
+        let frames = vec![
+            encoded[..split].to_vec(),
+            encoded[split..split + 7].to_vec(),
+            encoded[split + 7..].to_vec(),
+        ];
+
+        let (event, emitted) =
+            drive_metered_gzip_chunks_with_limit(frames, MAX_PENDING_COMPRESSED_BYTES).await;
 
         assert_eq!(emitted, encoded);
-        assert_eq!(event.wire_bytes, encoded.len() as u64);
+        assert_eq!(
+            event.logical_bytes,
+            (first_payload.len() + second_payload.len()) as u64
+        );
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn gzip_input_tap_counts_fname_header_spanning_frames() {
+        let payload = b"fname-payload";
+        let encoded = gzip_fixture_member(
+            payload,
+            GzipHeaderFixture {
+                name: Some(b"name-spans-frames.json"),
+                ..GzipHeaderFixture::default()
+            },
+        );
+        let frames = vec![
+            encoded[..12].to_vec(),
+            encoded[12..17].to_vec(),
+            encoded[17..].to_vec(),
+        ];
+
+        let (event, emitted) =
+            drive_metered_gzip_chunks_with_limit(frames, MAX_PENDING_COMPRESSED_BYTES).await;
+
+        assert_eq!(emitted, encoded);
+        assert_eq!(event.logical_bytes, payload.len() as u64);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn gzip_input_tap_counts_fextra_zero_and_spanning_payload_headers() {
+        let first_payload = b"extra-empty";
+        let second_payload = b"extra-payload";
+        let first = gzip_fixture_member(
+            first_payload,
+            GzipHeaderFixture {
+                extra: Some(b""),
+                ..GzipHeaderFixture::default()
+            },
+        );
+        let second = gzip_fixture_member(
+            second_payload,
+            GzipHeaderFixture {
+                extra: Some(b"abcdef"),
+                ..GzipHeaderFixture::default()
+            },
+        );
+        let mut encoded = first.clone();
+        encoded.extend_from_slice(&second);
+        let split = first.len() + 13;
+        let frames = vec![
+            encoded[..split].to_vec(),
+            encoded[split..split + 2].to_vec(),
+            encoded[split + 2..].to_vec(),
+        ];
+
+        let (event, emitted) =
+            drive_metered_gzip_chunks_with_limit(frames, MAX_PENDING_COMPRESSED_BYTES).await;
+
+        assert_eq!(emitted, encoded);
+        assert_eq!(
+            event.logical_bytes,
+            (first_payload.len() + second_payload.len()) as u64
+        );
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn gzip_input_tap_counts_fcomment_header() {
+        let payload = b"commented";
+        let encoded = gzip_fixture_member(
+            payload,
+            GzipHeaderFixture {
+                comment: Some(b"comment-spans-frames"),
+                ..GzipHeaderFixture::default()
+            },
+        );
+        let frames = vec![
+            encoded[..13].to_vec(),
+            encoded[13..19].to_vec(),
+            encoded[19..].to_vec(),
+        ];
+
+        let (event, emitted) =
+            drive_metered_gzip_chunks_with_limit(frames, MAX_PENDING_COMPRESSED_BYTES).await;
+
+        assert_eq!(emitted, encoded);
+        assert_eq!(event.logical_bytes, payload.len() as u64);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn gzip_input_tap_counts_fhcrc_header() {
+        let payload = b"fhcrc";
+        let encoded = gzip_fixture_member(
+            payload,
+            GzipHeaderFixture {
+                header_crc: true,
+                ..GzipHeaderFixture::default()
+            },
+        );
+        let frames = split_every(&encoded, 4);
+
+        let (event, emitted) =
+            drive_metered_gzip_chunks_with_limit(frames, MAX_PENDING_COMPRESSED_BYTES).await;
+
+        assert_eq!(emitted, encoded);
+        assert_eq!(event.logical_bytes, payload.len() as u64);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn gzip_input_tap_counts_combined_flags_header() {
+        let payload = b"combined";
+        let encoded = gzip_fixture_member(
+            payload,
+            GzipHeaderFixture {
+                extra: Some(b"xy"),
+                name: Some(b"combined-name"),
+                comment: Some(b"combined-comment"),
+                header_crc: true,
+            },
+        );
+        let frames = split_every(&encoded, 3);
+
+        let (event, emitted) =
+            drive_metered_gzip_chunks_with_limit(frames, MAX_PENDING_COMPRESSED_BYTES).await;
+
+        assert_eq!(emitted, encoded);
+        assert_eq!(event.logical_bytes, payload.len() as u64);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn gzip_input_tap_reserved_flags_mark_error_and_passthrough_raw_bytes() {
+        let raw = vec![
+            0x1f, 0x8b, 8, 0xe0, 0, 0, 0, 0, 0, 255, b't', b'a', b'i', b'l',
+        ];
+
+        let (event, emitted) = drive_metered_gzip_chunks_with_limit(
+            split_every(&raw, 3),
+            MAX_PENDING_COMPRESSED_BYTES,
+        )
+        .await;
+
+        assert_eq!(emitted, raw);
+        assert_eq!(event.logical_bytes, 0);
+        assert_eq!(event.wire_bytes, emitted.len() as u64);
         assert_eq!(event.status, UsageStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn gzip_input_tap_bad_magic_or_cm_mark_error_and_passthrough_raw_bytes() {
+        for raw in [
+            vec![0x00, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, b'x'],
+            vec![0x1f, 0x8b, 9, 0, 0, 0, 0, 0, 0, 255, b'x'],
+        ] {
+            let (event, emitted) = drive_metered_gzip_chunks_with_limit(
+                split_every(&raw, 3),
+                MAX_PENDING_COMPRESSED_BYTES,
+            )
+            .await;
+
+            assert_eq!(emitted, raw);
+            assert_eq!(event.logical_bytes, 0);
+            assert_eq!(event.wire_bytes, emitted.len() as u64);
+            assert_eq!(event.status, UsageStatus::Error);
+        }
+    }
+
+    #[tokio::test]
+    async fn zstd_input_tap_counts_concatenated_frames_exact_total() {
+        let first_payload = b"first-zstd-frame";
+        let second_payload = b"second-zstd-frame";
+        let first = zstd::stream::encode_all(&first_payload[..], 0).unwrap();
+        let second = zstd::stream::encode_all(&second_payload[..], 0).unwrap();
+        let mut encoded = first.clone();
+        encoded.extend_from_slice(&second);
+        let split = first.len() - 2;
+        let frames = vec![encoded[..split].to_vec(), encoded[split..].to_vec()];
+
+        let (event, emitted) =
+            drive_metered_zstd_frames_with_limit(frames, MAX_PENDING_COMPRESSED_BYTES).await;
+
+        assert_eq!(emitted, encoded);
+        assert_eq!(
+            event.logical_bytes,
+            (first_payload.len() + second_payload.len()) as u64
+        );
+        assert_eq!(event.status, UsageStatus::Completed);
     }
 
     #[tokio::test]
