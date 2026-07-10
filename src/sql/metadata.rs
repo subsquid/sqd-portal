@@ -180,8 +180,12 @@ pub fn get_dataset_stats(_dataset: &DatasetId) -> Option<Stats> {
 // datasets with schemas and stats should be kept as part of the program state,
 // so that we can retrieve them at any time.
 pub fn schema_name_to_dataset_id(schema: &str) -> DatasetId {
-    let s = format!("s3://{}", schema.replace("_", "-"));
+    let s = format!("s3://{}", schema_name_to_dataset_slug(schema));
     DatasetId::from_url(&s)
+}
+
+pub fn schema_name_to_dataset_slug(schema: &str) -> String {
+    schema.replace("_", "-")
 }
 
 pub fn bucket_to_schema_name(bucket: &str) -> String {

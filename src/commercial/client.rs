@@ -31,6 +31,7 @@ pub fn oss_grant() -> Granted {
             api_key_id: None,
         },
         tally_account_id: None,
+        entitled_chains: None,
         limits: GrantedLimits::default(),
         on_exceed: OnExceed::Reject,
         quota_version: 0,

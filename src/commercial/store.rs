@@ -1302,6 +1302,7 @@ mod tests {
                     api_key_id: Some(KEY_ID.to_string()),
                 },
                 tally_account_id: None,
+                entitled_chains: None,
                 limits: GrantedLimits::default(),
                 on_exceed: OnExceed::Reject,
                 quota_version: 1,

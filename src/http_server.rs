@@ -1362,7 +1362,13 @@ async fn sql_query(
     request_id: Option<Extension<RequestId>>,
     query: body::Bytes,
 ) -> impl axum::response::IntoResponse {
-    match sql::query(query, &network).await {
+    match sql::query(
+        query,
+        &network,
+        grant.as_ref().map(|grant| &grant.0.granted),
+    )
+    .await
+    {
         Ok(res) => {
             if let Some(meter) = meter_from_extensions(
                 grant,
@@ -1850,6 +1856,7 @@ mod tests {
                     api_key_id,
                 },
                 tally_account_id: None,
+                entitled_chains: None,
                 limits: GrantedLimits::default(),
                 on_exceed: OnExceed::Reject,
                 quota_version: 1,

@@ -291,6 +291,7 @@ fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
             api_key_id: None,
         },
         tally_account_id: None,
+        entitled_chains: None,
         limits: GrantedLimits {
             max_response_bytes: defaults.public.limits.max_response_bytes,
             throughput_bytes_per_sec: defaults.public.limits.throughput_bytes_per_sec,
@@ -390,6 +391,7 @@ fn anonymous_grant(
             api_key_id: None,
         },
         tally_account_id: Some(account_key),
+        entitled_chains: None,
         limits,
         on_exceed: defaults.public.quota.on_exceed.clone(),
         quota_version,
@@ -422,6 +424,13 @@ fn grant(
             api_key_id: Some(key_id.to_string()),
         },
         tally_account_id: None,
+        entitled_chains: snapshot.entitlements.as_ref().map(|entitlements| {
+            entitlements
+                .chains
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        }),
         limits,
         on_exceed,
         quota_version: snapshot
@@ -797,6 +806,12 @@ mod tests {
                 assert_eq!(grant.principal.api_key_id.as_deref(), Some(KEY_ID));
                 assert_eq!(grant.limits.max_response_bytes, Some(500));
                 assert_eq!(grant.quota_version, 1);
+                let entitled = grant
+                    .entitled_chains
+                    .as_ref()
+                    .expect("keyed grant should carry chain entitlements");
+                assert_eq!(entitled.len(), 1);
+                assert!(entitled.contains("ethereum-mainnet"));
             }
             Authorization::Rejected(_) => panic!("expected grant"),
         }
@@ -818,8 +833,35 @@ mod tests {
             Authorization::Granted(grant) => {
                 assert_eq!(grant.principal.account_id, "anonymous");
                 assert_eq!(grant.limits.max_response_bytes, Some(300));
+                assert_eq!(grant.entitled_chains, None);
             }
             Authorization::Rejected(_) => panic!("expected anonymous grant"),
+        }
+    }
+
+    #[test]
+    fn keyed_sql_grant_carries_snapshot_entitled_chains() {
+        let mut snapshot = active_snapshot(1);
+        snapshot.entitlements.as_mut().unwrap().chains = vec![
+            "sql".to_string(),
+            "solana-mainnet".to_string(),
+            "ethereum-mainnet".to_string(),
+        ];
+        let mut req = request(SECRET_SHA256);
+        req.dataset = "sql".to_string();
+        req.endpoint = Endpoint::SqlQuery;
+
+        match evaluate(&req, Some(&snapshot), &defaults(), state()) {
+            Authorization::Granted(grant) => {
+                let entitled = grant
+                    .entitled_chains
+                    .expect("keyed grants should carry the snapshot chain set");
+                assert_eq!(grant.principal.api_key_id.as_deref(), Some(KEY_ID));
+                assert!(entitled.contains("sql"));
+                assert!(entitled.contains("solana-mainnet"));
+                assert!(entitled.contains("ethereum-mainnet"));
+            }
+            Authorization::Rejected(rejected) => panic!("expected grant, got {rejected:?}"),
         }
     }
 

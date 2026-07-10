@@ -746,6 +746,7 @@ mod tests {
                     api_key_id: Some("key".to_string()),
                 },
                 tally_account_id: None,
+                entitled_chains: None,
                 limits: GrantedLimits::default(),
                 on_exceed: OnExceed::Reject,
                 quota_version: 7,
@@ -841,6 +842,7 @@ default_retries: 0
                     api_key_id: api_key_id.map(str::to_string),
                 },
                 tally_account_id: None,
+                entitled_chains: None,
                 limits: GrantedLimits {
                     max_chunks: grant_max_chunks,
                     ..GrantedLimits::default()

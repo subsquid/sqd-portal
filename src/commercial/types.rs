@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +95,8 @@ pub struct Granted {
     pub principal: Principal,
     #[serde(default)]
     pub tally_account_id: Option<String>,
+    #[serde(skip)]
+    pub entitled_chains: Option<HashSet<String>>,
     pub limits: GrantedLimits,
     pub on_exceed: OnExceed,
     pub quota_version: u64,
