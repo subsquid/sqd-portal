@@ -30,6 +30,9 @@ use crate::{
     types::Compression,
 };
 
+const PENDING_COMPRESSED_WARNING_BYTES: usize = 8 * 1024 * 1024;
+// The 64 MiB pending compressed cap is a worker-misbehavior guard; normal
+// gzip/zstd members should complete and drain well before reaching it.
 const MAX_PENDING_COMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 const STREAMING_DECODE_BUFFER_BYTES: usize = 32 * 1024;
 const MAX_OUTPUT_ONLY_DECODE_STEPS: usize = 1024;
@@ -597,7 +600,7 @@ where
                         if bytes > 0 {
                             let segment = frame[offset..offset + bytes].to_vec();
                             offset += bytes;
-                            if !pending.try_push(segment, pending_limit) {
+                            if !pending.try_push(segment, pending_limit, "gzip") {
                                 meter.mark_error();
                                 for frame in pending.drain() {
                                     yield frame;
@@ -613,7 +616,7 @@ where
                         if consumed > 0 {
                             let segment = frame[offset..offset + consumed].to_vec();
                             offset += consumed;
-                            if !pending.try_push(segment, pending_limit) {
+                            if !pending.try_push(segment, pending_limit, "gzip") {
                                 meter.mark_error();
                                 for frame in pending.drain() {
                                     yield frame;
@@ -691,6 +694,7 @@ where
             let mut offset = 0;
             while offset < frame.len() {
                 let buffered = pending.bytes().saturating_add(decoder.held_len());
+                pending.warn_if_above_threshold("zstd", decoder.held_len(), pending_limit);
                 if buffered >= pending_limit {
                     meter.mark_error();
                     for frame in pending.drain() {
@@ -710,7 +714,7 @@ where
                 loop {
                     match decoder.decode() {
                         Ok(ZstdStep::Consumed { bytes, completed }) => {
-                            if !bytes.is_empty() && !pending.try_push(bytes, pending_limit) {
+                            if !bytes.is_empty() && !pending.try_push(bytes, pending_limit, "zstd") {
                                 meter.mark_error();
                                 for frame in pending.drain() {
                                     yield frame;
@@ -766,10 +770,11 @@ where
 struct PendingFrames {
     frames: Vec<Vec<u8>>,
     bytes: usize,
+    warned_above_threshold: bool,
 }
 
 impl PendingFrames {
-    fn try_push(&mut self, frame: Vec<u8>, limit: usize) -> bool {
+    fn try_push(&mut self, frame: Vec<u8>, limit: usize, compression: &'static str) -> bool {
         let Some(next_bytes) = self.bytes.checked_add(frame.len()) else {
             return false;
         };
@@ -778,7 +783,29 @@ impl PendingFrames {
         }
         self.bytes = next_bytes;
         self.frames.push(frame);
+        self.warn_if_above_threshold(compression, 0, limit);
         true
+    }
+
+    fn warn_if_above_threshold(
+        &mut self,
+        compression: &'static str,
+        extra_bytes: usize,
+        limit: usize,
+    ) {
+        let buffered = self.bytes.saturating_add(extra_bytes);
+        if self.warned_above_threshold || buffered <= PENDING_COMPRESSED_WARNING_BYTES {
+            return;
+        }
+        self.warned_above_threshold = true;
+        tracing::warn!(
+            compression,
+            pending_compressed_bytes = buffered,
+            warning_bytes = PENDING_COMPRESSED_WARNING_BYTES,
+            cap_bytes = limit,
+            "commercial pending compressed response buffer exceeded early warning threshold"
+        );
+        metrics::report_commercial_pending_compressed_buffer_warning(compression);
     }
 
     fn drain(&mut self) -> impl Iterator<Item = Vec<u8>> + '_ {
@@ -1739,6 +1766,28 @@ mod tests {
         assert_eq!(emitted, encoded[..10]);
         assert_eq!(event.wire_bytes, emitted.len() as u64);
         assert_eq!(event.status, UsageStatus::Error);
+    }
+
+    #[test]
+    fn pending_frames_warns_once_after_early_threshold() {
+        let labels = vec![("compression".to_owned(), "gzip".to_owned())];
+        let counter =
+            crate::metrics::COMMERCIAL_PENDING_COMPRESSED_BUFFER_WARNINGS.get_or_create(&labels);
+        let before = counter.get();
+        let mut pending = PendingFrames::default();
+
+        assert!(pending.try_push(
+            vec![0; PENDING_COMPRESSED_WARNING_BYTES],
+            MAX_PENDING_COMPRESSED_BYTES,
+            "gzip",
+        ));
+        assert_eq!(counter.get(), before);
+
+        assert!(pending.try_push(vec![0], MAX_PENDING_COMPRESSED_BYTES, "gzip"));
+        assert_eq!(counter.get(), before + 1);
+
+        assert!(pending.try_push(vec![0], MAX_PENDING_COMPRESSED_BYTES, "gzip"));
+        assert_eq!(counter.get(), before + 1);
     }
 
     #[tokio::test]

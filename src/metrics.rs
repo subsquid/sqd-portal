@@ -83,6 +83,7 @@ lazy_static::lazy_static! {
     pub static ref COMMERCIAL_RESOLVE: Family<Labels, Counter> = Default::default();
     pub static ref COMMERCIAL_USAGE_BUFFER_LEN: Gauge = Default::default();
     pub static ref COMMERCIAL_CUTOFFS: Family<Labels, Counter> = Default::default();
+    pub static ref COMMERCIAL_PENDING_COMPRESSED_BUFFER_WARNINGS: Family<Labels, Counter> = Default::default();
     pub static ref COMMERCIAL_THROTTLE_STALL_SECONDS: Histogram =
         Histogram::new(exponential_buckets(0.01, 2.0, 20));
 
@@ -238,6 +239,12 @@ pub fn report_commercial_cutoff(status: &UsageStatus) {
             "status".to_owned(),
             usage_status_label(status).to_owned(),
         )])
+        .inc();
+}
+
+pub fn report_commercial_pending_compressed_buffer_warning(compression: &str) {
+    COMMERCIAL_PENDING_COMPRESSED_BUFFER_WARNINGS
+        .get_or_create(&vec![("compression".to_owned(), compression.to_owned())])
         .inc();
 }
 
@@ -475,6 +482,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "commercial_cutoffs_total",
         "Commercial stream cutoff count by terminal status",
         COMMERCIAL_CUTOFFS.clone(),
+    );
+    registry.register(
+        "commercial_pending_compressed_buffer_warning_total",
+        "Commercial streams whose pending compressed buffer crossed the early warning threshold",
+        COMMERCIAL_PENDING_COMPRESSED_BUFFER_WARNINGS.clone(),
     );
     registry.register(
         "commercial_throttle_stall_seconds",
