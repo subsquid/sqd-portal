@@ -1475,6 +1475,7 @@ mod tests {
             reporter.clone(),
             tally,
             registry.clone(),
+            None,
         );
         let start = tokio::time::Instant::now();
 
@@ -1491,6 +1492,64 @@ mod tests {
 
         assert_eq!(emitted.len(), 1);
         assert!(start.elapsed() <= Duration::from_secs(1));
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.status, UsageStatus::CutSuspended);
+    }
+
+    #[tokio::test]
+    async fn meter_registration_rechecks_current_snapshot_status() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        store.install_records_for_test(vec![SnapshotRecord::Key(active_snapshot(1))], 1);
+
+        let granted = Granted {
+            principal: Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some(KEY_ID.to_string()),
+            },
+            tally_account_id: None,
+            entitled_chains: None,
+            limits: GrantedLimits::default(),
+            on_exceed: OnExceed::Reject,
+            quota_version: 1,
+            quota_remaining_bytes: Some(1_000),
+            concurrency_permit: None,
+        };
+        let mut suspended = active_snapshot(2);
+        suspended.status = KeyStatus::Suspended;
+        store
+            .apply_records(vec![SnapshotRecord::Key(suspended)], 2)
+            .unwrap();
+
+        let tally = Arc::new(TallyStore::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = MeterHandle::new_enforced(
+            granted,
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter.clone(),
+            tally,
+            registry,
+            Some(store),
+        );
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"first")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"never")),
+        ];
+
+        let emitted: Vec<_> = tap_plain_stream(stream::iter(chunks), meter)
+            .collect()
+            .await;
+
+        assert_eq!(emitted.len(), 1);
         let event = reporter.events.lock().unwrap().pop().unwrap();
         assert_eq!(event.status, UsageStatus::CutSuspended);
     }

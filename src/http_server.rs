@@ -1408,6 +1408,7 @@ fn meter_from_extensions(
 ) -> Option<MeterHandle> {
     let grant = grant?;
     let reporter = reporter?;
+    let snapshot_store = grant.0.snapshot_store.clone();
     match (grant.0.tally.clone(), grant.0.registry.clone()) {
         (Some(tally), Some(registry)) => Some(MeterHandle::new_enforced(
             grant.0.granted.clone(),
@@ -1417,6 +1418,7 @@ fn meter_from_extensions(
             reporter.0,
             tally,
             registry,
+            snapshot_store,
         )),
         _ => Some(MeterHandle::new(
             grant.0.granted.principal.clone(),

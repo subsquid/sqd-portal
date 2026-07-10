@@ -13,7 +13,7 @@ use url::form_urlencoded;
 
 use super::{
     client::oss_grant, ActiveStreamRegistry, Authorization, AuthorizeRequest, ControlPlaneClient,
-    Credential, Endpoint, Granted, QueryDescriptor, Rejected, TallyStore,
+    Credential, Endpoint, Granted, QueryDescriptor, Rejected, SnapshotStore, TallyStore,
 };
 use crate::{
     config::Config,
@@ -24,11 +24,12 @@ use crate::{
 
 const API_KEY_PREFIX: &str = "sqd_data_";
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CommercialGrant {
     pub granted: Granted,
     pub tally: Option<Arc<TallyStore>>,
     pub registry: Option<Arc<ActiveStreamRegistry>>,
+    pub snapshot_store: Option<Arc<SnapshotStore>>,
 }
 
 pub trait DatasetCanonicalizer: Send + Sync {
@@ -118,10 +119,12 @@ pub async fn middleware(mut req: Request, next: Next, endpoint: Endpoint) -> Res
     req.extensions_mut().insert(granted.principal.clone());
     let tally = req.extensions().get::<Arc<TallyStore>>().cloned();
     let registry = req.extensions().get::<Arc<ActiveStreamRegistry>>().cloned();
+    let snapshot_store = req.extensions().get::<Arc<SnapshotStore>>().cloned();
     req.extensions_mut().insert(CommercialGrant {
         granted,
         tally,
         registry,
+        snapshot_store,
     });
 
     next.run(req).await

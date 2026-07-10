@@ -23,8 +23,8 @@ use crate::commercial::{concurrency::ConcurrencyPermit, tally::TallyHandle};
 use crate::{
     commercial::{
         registry::StreamRegistration, ActiveStreamRegistry, DataSource, Endpoint, Granted,
-        GrantedLimits, OnExceed, Principal, StreamUsageEvent, TallyStore, UsageReporter,
-        UsageStatus,
+        GrantedLimits, KeyStatus, OnExceed, Principal, SnapshotStore, StreamUsageEvent, TallyStore,
+        UsageReporter, UsageStatus,
     },
     metrics,
     types::Compression,
@@ -99,6 +99,7 @@ impl MeterHandle {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -110,6 +111,7 @@ impl MeterHandle {
         reporter: Arc<dyn UsageReporter>,
         tally: Arc<TallyStore>,
         registry: Arc<ActiveStreamRegistry>,
+        snapshot_store: Option<Arc<SnapshotStore>>,
     ) -> Self {
         let concurrency_permit = granted.concurrency_permit;
         Self::from_parts(
@@ -125,6 +127,7 @@ impl MeterHandle {
             reporter,
             Some(tally),
             Some(registry),
+            snapshot_store,
             concurrency_permit,
         )
     }
@@ -143,6 +146,7 @@ impl MeterHandle {
         reporter: Arc<dyn UsageReporter>,
         tally: Option<Arc<TallyStore>>,
         registry: Option<Arc<ActiveStreamRegistry>>,
+        snapshot_store: Option<Arc<SnapshotStore>>,
         concurrency_permit: Option<ConcurrencyPermit>,
     ) -> Self {
         let event_id = uuid_v7();
@@ -159,6 +163,18 @@ impl MeterHandle {
                 floor_bytes_per_sec.clone(),
             )
         });
+        if let (Some(store), Some(key_id)) = (&snapshot_store, principal.api_key_id.as_deref()) {
+            if store
+                .get(key_id)
+                .is_some_and(|snapshot| snapshot.status != KeyStatus::Active)
+            {
+                kill.store(true, Ordering::Release);
+                tracing::info!(
+                    key_id,
+                    "commercial key became non-active before meter registration completed"
+                );
+            }
+        }
         Self {
             inner: Arc::new(MeterInner {
                 principal,
@@ -1370,6 +1386,7 @@ mod tests {
                 reporter,
                 tally.clone(),
                 registry.clone(),
+                None,
             ),
             tally,
             registry,
@@ -1388,6 +1405,7 @@ mod tests {
             reporter,
             Arc::new(TallyStore::default()),
             Arc::new(ActiveStreamRegistry::default()),
+            None,
         )
     }
 
