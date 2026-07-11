@@ -327,7 +327,7 @@ impl SnapshotStore {
             self.bootstrap().await?;
             return Ok(());
         }
-        if page.records.is_empty() {
+        if page.raw_record_count == 0 {
             return Ok(());
         }
         let count = page.records.len();
@@ -1279,6 +1279,45 @@ mod tests {
 
         assert_eq!(store.get(KEY_ID).unwrap().status, KeyStatus::Revoked);
         task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn delta_skips_bad_snapshot_records_and_advances_cursor() {
+        let mock = MockControlPlane::spawn().await;
+        mock.push_page(
+            0,
+            page(vec![SnapshotRecord::Key(active_snapshot(1))], 10, false),
+        );
+        let path = cache_path("delta-poison-page");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let store = SnapshotStore::new(
+            &config(&mock, path.clone(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            client,
+            TokioInstant::now(),
+        );
+
+        store.run_sync_tick().await.unwrap();
+        assert_eq!(store.view().cursor, 10);
+
+        let before = metrics::COMMERCIAL_SNAPSHOT_PARSE_ERRORS.get();
+        mock.push_raw_page(
+            10,
+            serde_json::json!({
+                "records": [
+                    {"key_id": "poison", "seq": 2, "status": null}
+                ],
+                "next_cursor": 11,
+                "reset": false
+            }),
+        );
+
+        store.run_sync_tick().await.unwrap();
+
+        assert_eq!(store.view().cursor, 11);
+        assert!(metrics::COMMERCIAL_SNAPSHOT_PARSE_ERRORS.get() > before);
         let _ = tokio::fs::remove_file(path).await;
     }
 
