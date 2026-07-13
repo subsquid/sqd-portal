@@ -163,7 +163,6 @@ async fn main() -> anyhow::Result<()> {
         shutting_down.clone(),
         cancellation_token.clone(),
         config.pre_drain_grace_period,
-        commercial.clone(),
     ));
 
     let cancel_for_network = cancellation_token.clone();
@@ -177,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
             hotblocks,
             shutting_down,
             cancellation_token.clone(),
-            commercial,
+            commercial.clone(),
             args.show_internal_docs,
         )),
         network_client.run(cancel_for_network),
@@ -185,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
     server_res?;
     if cancellation_token.is_cancelled() {
         shutdown_task.await?;
+        commercial.await_reporter_shutdown().await;
     } else {
         shutdown_task.abort();
     }
@@ -201,25 +201,22 @@ async fn watch_shutdown_signal(
     shutting_down: Arc<AtomicBool>,
     cancel: CancellationToken,
     pre_drain_grace: Duration,
-    commercial: sqd_portal::commercial::CommercialRuntime,
 ) {
     sigterm.recv().await;
     tracing::info!("SIGTERM received; starting shutdown sequence");
-    run_shutdown_sequence(shutting_down, cancel, pre_drain_grace, commercial).await;
+    run_shutdown_sequence(shutting_down, cancel, pre_drain_grace).await;
 }
 
 async fn run_shutdown_sequence(
     shutting_down: Arc<AtomicBool>,
     cancel: CancellationToken,
     pre_drain_grace: Duration,
-    commercial: sqd_portal::commercial::CommercialRuntime,
 ) {
     shutting_down.store(true, Ordering::Relaxed);
     tracing::info!("/ready will return 503 for {pre_drain_grace:?} before draining");
     tokio::time::sleep(pre_drain_grace).await;
     tracing::info!("Pre-drain grace elapsed; starting HTTP drain and stopping background tasks");
     cancel.cancel();
-    commercial.await_reporter_shutdown().await;
 }
 
 #[cfg(test)]
@@ -236,7 +233,6 @@ mod tests {
             shutting_down.clone(),
             cancel.clone(),
             grace,
-            sqd_portal::commercial::build(None, CancellationToken::new()),
         ));
 
         // Yield to let the spawned task run up to the `sleep`.

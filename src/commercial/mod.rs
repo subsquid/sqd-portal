@@ -154,6 +154,7 @@ impl CommercialRuntime {
         self.await_snapshot_shutdown().await;
         let reporter_task = self.reporter_task.lock().unwrap().take();
         let Some(reporter_task) = reporter_task else {
+            self.usage_reporter.flush_shutdown().await;
             return;
         };
 
@@ -166,6 +167,7 @@ impl CommercialRuntime {
                 tracing::warn!("timed out waiting for commercial usage reporter shutdown");
             }
         }
+        self.usage_reporter.flush_shutdown().await;
     }
 
     async fn await_maintenance_shutdown(&self) {

@@ -20,6 +20,10 @@ type SendOnceFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SendBatchError>
 
 pub trait UsageReporter: Send + Sync {
     fn report(&self, event: StreamUsageEvent);
+
+    fn flush_shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
 }
 
 #[derive(Debug, Default)]
@@ -96,7 +100,6 @@ impl BufferedUsageReporter {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    let _ = tokio::time::timeout(Duration::from_secs(5), self.flush_remaining_once()).await;
                     return;
                 }
                 _ = self.inner.notify.notified() => {
@@ -113,8 +116,23 @@ impl BufferedUsageReporter {
     }
 
     async fn flush_remaining_once(&self) {
+        let reporter = self.clone();
+        self.flush_remaining_once_using(move |batch| {
+            let reporter = reporter.clone();
+            let batch = batch.to_vec();
+            let future: SendOnceFuture<'_> =
+                Box::pin(async move { reporter.send_once(&batch).await });
+            future
+        })
+        .await
+    }
+
+    async fn flush_remaining_once_using<F>(&self, mut send_once: F)
+    where
+        F: for<'a> FnMut(&'a [StreamUsageEvent]) -> SendOnceFuture<'a>,
+    {
         while let Some(batch) = self.pop_batch() {
-            if let Err(err) = self.send_once(&batch).await {
+            if let Err(err) = send_once(&batch).await {
                 tracing::warn!(error = %err, count = batch.len(), "final commercial usage flush failed");
                 return;
             }
@@ -279,6 +297,17 @@ impl UsageReporter for BufferedUsageReporter {
         metrics::set_commercial_usage_buffer_len(queue.len() as i64);
         drop(queue);
         self.inner.notify.notify_one();
+    }
+
+    fn flush_shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match tokio::time::timeout(Duration::from_secs(5), self.flush_remaining_once()).await {
+                Ok(()) => {}
+                Err(_) => {
+                    tracing::warn!("timed out flushing commercial usage reporter during shutdown");
+                }
+            }
+        })
     }
 }
 
@@ -648,25 +677,42 @@ mod tests {
             .expect("reporter task should not panic");
     }
 
-    #[tokio::test]
-    async fn final_flush_on_shutdown_attempts_buffered_events() {
-        let (url, mut rx) = mock_server(vec![]).await;
-        let reporter = reporter(url, Duration::from_secs(60), 10, 10);
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_flush_delivers_events_enqueued_after_reporter_cancel() {
+        let reporter = reporter(
+            "http://127.0.0.1:1".parse().unwrap(),
+            Duration::from_secs(60),
+            10,
+            10,
+        );
         let cancel = CancellationToken::new();
         let task = tokio::spawn(reporter.clone().run(cancel.clone()));
 
-        reporter.report(event("shutdown"));
         cancel.cancel();
-
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
-            .expect("shutdown returns after final flush")
+            .expect("reporter task exits after cancel")
             .expect("reporter task should not panic");
-        let batch = rx
-            .try_recv()
-            .expect("final flush delivered before shutdown");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].event_id, "shutdown");
+
+        reporter.report(event("during-drain"));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        reporter
+            .flush_remaining_once_using({
+                let delivered = delivered.clone();
+                move |batch| {
+                    let delivered = delivered.clone();
+                    let batch = batch.to_vec();
+                    Box::pin(async move {
+                        delivered.lock().unwrap().extend(batch);
+                        Ok(())
+                    })
+                }
+            })
+            .await;
+
+        let delivered = delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].event_id, "during-drain");
     }
 
     #[test]
