@@ -588,6 +588,9 @@ impl SnapshotStore {
             );
         }
         let hooks = self.replace_key_records(records_map, cursor, mode);
+        if matches!(mode, BootstrapMode::Authoritative) {
+            self.apply_authoritative_hooks();
+        }
         for record in hooks.changed {
             self.apply_snapshot_hooks(&record);
         }
@@ -897,6 +900,16 @@ impl SnapshotStore {
                     );
                 }
             }
+        }
+    }
+
+    fn apply_authoritative_hooks(&self) {
+        if let Some(tally) = &self.inner.hooks.tally {
+            let cleared = tally.clear();
+            tracing::info!(
+                cleared,
+                "commercial quota tallies cleared for authoritative snapshot replacement"
+            );
         }
     }
 
@@ -1324,8 +1337,8 @@ mod tests {
     use futures::{stream, StreamExt};
 
     use crate::commercial::{
-        meter::tap_plain_stream, Endpoint, Granted, GrantedLimits, MeterHandle, Principal,
-        StreamUsageEvent, UsageReporter, UsageStatus,
+        meter::tap_plain_stream, Authorization, Credential, Endpoint, Granted, GrantedLimits,
+        MeterHandle, Principal, QueryDescriptor, StreamUsageEvent, UsageReporter, UsageStatus,
     };
 
     #[derive(Default)]
@@ -1835,6 +1848,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.view().defaults.seq, 100);
+    }
+
+    #[tokio::test]
+    async fn authoritative_replacement_resets_quota_tallies_to_restored_version() {
+        let tally = Arc::new(TallyStore::default());
+        let store = SnapshotStore::new(
+            &offline_config(PathBuf::new()),
+            SnapshotHooks {
+                tally: Some(tally.clone()),
+                registry: None,
+            },
+            String::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Key(active_snapshot(100))],
+                100,
+                BootstrapMode::Normal,
+            )
+            .unwrap();
+        tally.debit("account", 100, 9_000);
+        tally.debit("anon:198.51.100.7/32", 100, 500);
+
+        let mut restored = active_snapshot(5);
+        restored.limits.as_mut().unwrap().concurrency = None;
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Key(restored)],
+                5,
+                BootstrapMode::Authoritative,
+            )
+            .unwrap();
+
+        assert_eq!(tally.version_for("account"), Some(5));
+        assert_eq!(tally.bytes_for("account", 5), 0);
+        assert_eq!(tally.version_for("anon:198.51.100.7/32"), None);
+
+        let admission = crate::commercial::evaluate::evaluate_with_store(
+            &store,
+            Some(&tally),
+            None,
+            crate::commercial::AuthorizeRequest {
+                credential: Credential::Key {
+                    key_id: KEY_ID.to_string(),
+                    secret_sha256: SECRET_SHA256.to_string(),
+                },
+                dataset: "ethereum-mainnet".to_string(),
+                endpoint: Endpoint::Stream,
+                query: QueryDescriptor {
+                    requires_traces: false,
+                    requires_statediffs: false,
+                    first_block: Some(1),
+                    chain_kind: Some("evm".to_string()),
+                },
+            },
+        )
+        .await;
+
+        match admission {
+            Authorization::Granted(grant) => {
+                assert_eq!(grant.quota_version, 5);
+                assert_eq!(grant.quota_remaining_bytes, Some(10_000));
+            }
+            Authorization::Rejected(rejected) => {
+                panic!("restored quota should admit with its full budget: {rejected:?}")
+            }
+        }
     }
 
     #[tokio::test]

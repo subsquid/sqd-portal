@@ -31,6 +31,12 @@ struct Tally {
 }
 
 impl TallyStore {
+    pub(crate) fn clear(&self) -> usize {
+        let cleared = self.entries.len();
+        self.entries.clear();
+        cleared
+    }
+
     pub fn rebase_account(&self, account_id: &str, version: u64) {
         self.handle(account_id, version).rebase_to(version);
     }
