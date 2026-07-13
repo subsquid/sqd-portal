@@ -250,7 +250,7 @@ impl MeterHandle {
     }
 
     pub fn mark_error(&self) {
-        self.inner.set_status(UsageStatus::Error);
+        self.inner.mark_error();
     }
 
     pub fn complete(&self) {
@@ -419,6 +419,15 @@ impl MeterInner {
         {
             metrics::report_commercial_cutoff(&status);
         }
+    }
+
+    fn mark_error(&self) {
+        let _ = self.status.compare_exchange(
+            status_code(UsageStatus::ClientDisconnect),
+            status_code(UsageStatus::Error),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 
     async fn pace(&self, bytes: u64) {
@@ -698,6 +707,7 @@ where
         };
         let mut pending = PendingFrames::default();
         let mut passthrough = false;
+        let mut stopped_after_cut = false;
         futures::pin_mut!(input);
         'input: while let Some(frame) = input.next().await {
             meter.add_chunk();
@@ -748,6 +758,8 @@ where
                                     yield frame;
                                 }
                                 if stop {
+                                    decoder.discard_held();
+                                    stopped_after_cut = true;
                                     break 'input;
                                 }
                             }
@@ -769,7 +781,7 @@ where
                 }
             }
         }
-        if !pending.is_empty() || decoder.held_len() > 0 {
+        if !stopped_after_cut && (!pending.is_empty() || decoder.held_len() > 0) {
             meter.mark_error();
             for frame in pending.drain() {
                 yield frame;
@@ -1121,6 +1133,10 @@ impl ZstdFrameCounter {
         } else {
             Some(std::mem::take(&mut self.held_input))
         }
+    }
+
+    fn discard_held(&mut self) {
+        self.held_input.clear();
     }
 
     fn decode(&mut self) -> io::Result<ZstdStep> {
@@ -2047,6 +2063,52 @@ mod tests {
             (first_payload.len() + second_payload.len()) as u64
         );
         assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn zstd_input_tap_cut_discards_next_frame_prefix_and_keeps_cut_status() {
+        let first_payload = b"first-frame";
+        let second_payload = b"second-frame";
+        let first = zstd::stream::encode_all(&first_payload[..], 0).unwrap();
+        let second = zstd::stream::encode_all(&second_payload[..], 0).unwrap();
+        let second_prefix_len = 4.min(second.len());
+        let mut chunk = first.clone();
+        chunk.extend_from_slice(&second[..second_prefix_len]);
+
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, tally, _) = enforced_meter(
+            reporter.clone(),
+            GrantedLimits::default(),
+            OnExceed::Reject,
+            Some(first_payload.len() as i64),
+        );
+        let input = tap_zstd_input_with_pending_limit(
+            stream::iter(vec![chunk]),
+            meter.clone(),
+            MAX_PENDING_COMPRESSED_BYTES,
+        );
+        let output = tap_wire_stream(
+            input.map(|frame| Ok::<_, std::io::Error>(Bytes::from(frame))),
+            meter,
+        );
+        let emitted = output
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .flat_map(|bytes| bytes.to_vec())
+            .collect::<Vec<_>>();
+
+        assert_eq!(emitted, first);
+        assert_eq!(
+            zstd::stream::decode_all(&emitted[..]).unwrap(),
+            first_payload
+        );
+        assert_eq!(tally.bytes_for("account", 7), first_payload.len() as u64);
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, first_payload.len() as u64);
+        assert_eq!(event.wire_bytes, first.len() as u64);
+        assert_eq!(event.status, UsageStatus::CutQuota);
     }
 
     #[tokio::test]
