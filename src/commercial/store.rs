@@ -419,12 +419,14 @@ impl SnapshotStore {
     fn replace_records(&self, records: Vec<SnapshotRecord>, cursor: u64) -> anyhow::Result<()> {
         let mut map = HashMap::new();
         let mut defaults = None;
+        let mut hook_records = Vec::new();
         for record in records {
             match record {
                 SnapshotRecord::Defaults(record) => defaults = Some(Defaults::from(record)),
                 SnapshotRecord::Key(record) => {
-                    self.apply_snapshot_hooks(&record);
-                    map.insert(record.key_id.clone(), Arc::new(record));
+                    let record = Arc::new(record);
+                    hook_records.push(record.clone());
+                    map.insert(record.key_id.clone(), record);
                 }
             }
         }
@@ -432,6 +434,9 @@ impl SnapshotStore {
             self.inner.defaults.store(Arc::new(defaults));
         }
         self.inner.records.store(Arc::new(map));
+        for record in hook_records {
+            self.apply_snapshot_hooks(&record);
+        }
         metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.inner.cursor.store(cursor, Ordering::Release);
         self.mark_disk_cache_dirty();
@@ -440,21 +445,26 @@ impl SnapshotStore {
 
     fn apply_records(&self, records: Vec<SnapshotRecord>, cursor: u64) -> anyhow::Result<()> {
         let mut map = (**self.inner.records.load()).clone();
+        let mut hook_records = Vec::new();
         for record in records {
             match record {
                 SnapshotRecord::Defaults(record) => {
                     self.inner.defaults.store(Arc::new(Defaults::from(record)));
                 }
                 SnapshotRecord::Key(record) => {
-                    self.apply_snapshot_hooks(&record);
                     if record.status != KeyStatus::Active {
                         tracing::info!(key_id = record.key_id, "commercial key became non-active");
                     }
-                    map.insert(record.key_id.clone(), Arc::new(record));
+                    let record = Arc::new(record);
+                    hook_records.push(record.clone());
+                    map.insert(record.key_id.clone(), record);
                 }
             }
         }
         self.inner.records.store(Arc::new(map));
+        for record in hook_records {
+            self.apply_snapshot_hooks(&record);
+        }
         metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.inner.cursor.store(cursor, Ordering::Release);
         self.mark_disk_cache_dirty();
@@ -1584,6 +1594,111 @@ mod tests {
             Ok::<_, std::io::Error>(Bytes::from_static(b"never")),
         ];
 
+        let emitted: Vec<_> = tap_plain_stream(stream::iter(chunks), meter)
+            .collect()
+            .await;
+
+        assert_eq!(emitted.len(), 1);
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.status, UsageStatus::CutSuspended);
+    }
+
+    #[tokio::test]
+    async fn suspension_delta_cuts_meter_registered_after_target_kill_hook() {
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let store = SnapshotStore::new(
+            &offline_config(PathBuf::new()),
+            SnapshotHooks {
+                tally: None,
+                registry: Some(registry.clone()),
+            },
+            String::new(),
+            client,
+            TokioInstant::now(),
+        );
+        store.install_records_for_test(vec![SnapshotRecord::Key(active_snapshot(1))], 1);
+
+        let marker_key = "marker-key";
+        let marker_kill = Arc::new(AtomicBool::new(false));
+        let _marker_registration = registry.register(
+            "marker-event".to_string(),
+            Some(marker_key.to_string()),
+            marker_kill.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        let mut records = Vec::new();
+        let mut suspended = active_snapshot(2);
+        suspended.status = KeyStatus::Suspended;
+        records.push(SnapshotRecord::Key(suspended));
+
+        let mut marker = active_snapshot(2);
+        marker.key_id = marker_key.to_string();
+        marker.status = KeyStatus::Suspended;
+        records.push(SnapshotRecord::Key(marker));
+
+        let mut dummy_registrations = Vec::new();
+        for index in 0..2048 {
+            let key_id = format!("dummy-key-{index}");
+            dummy_registrations.push(registry.register(
+                format!("dummy-event-{index}"),
+                Some(key_id.clone()),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)),
+            ));
+
+            let mut dummy = active_snapshot(2);
+            dummy.key_id = key_id;
+            dummy.status = KeyStatus::Suspended;
+            records.push(SnapshotRecord::Key(dummy));
+        }
+
+        let applying_store = store.clone();
+        let apply_thread = std::thread::spawn(move || {
+            applying_store.apply_records(records, 2).unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !marker_kill.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "marker hook should run before registering the late meter"
+            );
+            std::thread::yield_now();
+        }
+
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = MeterHandle::new_enforced(
+            Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: Some(KEY_ID.to_string()),
+                },
+                tally_account_id: None,
+                entitled_chains: None,
+                limits: GrantedLimits::default(),
+                on_exceed: OnExceed::Reject,
+                quota_version: 1,
+                quota_remaining_bytes: Some(1_000),
+                concurrency_permit: None,
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter.clone(),
+            Arc::new(TallyStore::default()),
+            registry,
+            Some(store),
+        );
+
+        apply_thread.join().unwrap();
+        drop(dummy_registrations);
+
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"first")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"never")),
+        ];
         let emitted: Vec<_> = tap_plain_stream(stream::iter(chunks), meter)
             .collect()
             .await;
