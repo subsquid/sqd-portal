@@ -171,7 +171,7 @@ impl BufferedUsageReporter {
                     tracing::error!(
                         status = status.as_u16(),
                         count = batch.len(),
-                        "dropping commercial usage batch after control-plane 4xx"
+                        "dropping commercial usage batch after control-plane payload validation error"
                     );
                     return None;
                 }
@@ -220,12 +220,8 @@ impl BufferedUsageReporter {
         let status = response.status();
         if status.is_success() {
             Ok(())
-        } else if status.is_client_error() {
-            Err(SendBatchError::Drop(status))
         } else {
-            Err(SendBatchError::Retry(format!(
-                "control plane status {status}"
-            )))
+            Err(error_for_status(status))
         }
     }
 
@@ -283,6 +279,13 @@ impl UsageReporter for BufferedUsageReporter {
         metrics::set_commercial_usage_buffer_len(queue.len() as i64);
         drop(queue);
         self.inner.notify.notify_one();
+    }
+}
+
+fn error_for_status(status: StatusCode) -> SendBatchError {
+    match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => SendBatchError::Drop(status),
+        _ => SendBatchError::Retry(format!("control plane status {status}")),
     }
 }
 
@@ -506,6 +509,74 @@ mod tests {
         assert!(reporter.pop_batch().is_none());
         assert!(rx.try_recv().is_err());
         assert!(metrics::COMMERCIAL_USAGE_DROPPED.get() > before);
+    }
+
+    #[test]
+    fn only_payload_validation_statuses_drop_usage_batches() {
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert!(matches!(error_for_status(status), SendBatchError::Retry(_)));
+        }
+
+        for status in [StatusCode::BAD_REQUEST, StatusCode::UNPROCESSABLE_ENTITY] {
+            assert!(matches!(error_for_status(status), SendBatchError::Drop(_)));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unauthorized_response_requeues_and_delivers_after_recovery() {
+        let reporter = reporter(
+            "http://127.0.0.1:1".parse().unwrap(),
+            Duration::from_secs(60),
+            1,
+            10,
+        );
+        let cancel = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let batch = vec![event("auth-rotation")];
+
+        let requeued = reporter
+            .send_with_retry_using(batch, &cancel, {
+                let attempts = attempts.clone();
+                move |_| {
+                    let attempts = attempts.clone();
+                    Box::pin(async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err(error_for_status(StatusCode::UNAUTHORIZED))
+                    })
+                }
+            })
+            .await
+            .expect("401 should exhaust retries and requeue the batch");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_RETRY_ATTEMPTS);
+        reporter.push_front_batch(requeued);
+        assert_eq!(reporter.queue_len(), 1);
+
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let recovered = reporter.pop_batch().unwrap();
+        assert!(reporter
+            .send_with_retry_using(recovered, &cancel, {
+                let delivered = delivered.clone();
+                move |batch| {
+                    let delivered = delivered.clone();
+                    let batch = batch.to_vec();
+                    Box::pin(async move {
+                        delivered.lock().unwrap().extend(batch);
+                        Ok(())
+                    })
+                }
+            })
+            .await
+            .is_none());
+
+        let delivered = delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].event_id, "auth-rotation");
+        assert!(reporter.pop_batch().is_none());
     }
 
     #[tokio::test(start_paused = true)]
