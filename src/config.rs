@@ -465,6 +465,22 @@ sqd_network:
     }
 
     #[test]
+    fn commercial_config_rejects_zero_flush_interval() {
+        std::env::set_var("PORTAL_CP_TOKEN_FOR_FLUSH_INTERVAL_TEST", "secret");
+        let yaml = format!(
+            "{MINIMAL_YAML}commercial:\n  control_plane_url: http://portal-api.internal:3005\n  service_token_env: PORTAL_CP_TOKEN_FOR_FLUSH_INTERVAL_TEST\n  sync_interval_secs: 10\n  flush_interval_secs: 0\n  flush_max_events: 500\n  usage_buffer_max_events: 100000\n  snapshot_cache_path: /tmp/snapshots.json\n  resolve_rate_per_sec: 20\n  negative_cache_secs: 15\n  pod_count: 4\n  public_fallback:\n    throughput_bytes_per_sec: 100000\n    burst_bytes: 300000\n    max_response_bytes: 52428800\n    volume_bytes: 52428800\n    window_secs: 86400\n    concurrency: 2\n"
+        );
+
+        let config: Config = serde_yaml::from_str(&yaml).expect("parse");
+        let err = config.validate().expect_err("zero flush interval rejects");
+        assert!(
+            err.to_string().contains("flush_interval_secs"),
+            "unexpected error: {err}"
+        );
+        std::env::remove_var("PORTAL_CP_TOKEN_FOR_FLUSH_INTERVAL_TEST");
+    }
+
+    #[test]
     fn shutdown_durations_can_be_overridden() {
         let yaml = format!("{MINIMAL_YAML}pre_drain_grace_period_sec: 3\ndrain_timeout_sec: 7\n");
         let config: Config = serde_yaml::from_str(&yaml).expect("parse");

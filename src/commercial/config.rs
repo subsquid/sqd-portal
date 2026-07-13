@@ -56,6 +56,10 @@ impl CommercialConfig {
             "commercial.flush_max_events must be at most 10000"
         );
         anyhow::ensure!(
+            self.flush_interval_secs >= 1,
+            "commercial.flush_interval_secs must be at least 1"
+        );
+        anyhow::ensure!(
             !self.client_ip_header.trim().is_empty(),
             "commercial.client_ip_header must not be empty"
         );
