@@ -510,6 +510,9 @@ fn rejected(
 }
 
 fn hash_matches(presented: &str, expected: &str) -> bool {
+    if presented.is_empty() || expected.is_empty() {
+        return false;
+    }
     let Ok(presented) = hex::decode(presented) else {
         return false;
     };
@@ -662,6 +665,24 @@ mod tests {
             rejected_reason(evaluate(
                 &request(WRONG_SHA256),
                 Some(&active_snapshot(1)),
+                &defaults(),
+                state()
+            )),
+            "invalid_key"
+        );
+    }
+
+    #[test]
+    fn empty_secret_hashes_never_match() {
+        assert!(!hash_matches("", ""));
+        assert!(!hash_matches(SECRET_SHA256, ""));
+
+        let mut snapshot = active_snapshot(1);
+        snapshot.secret_sha256 = Some(String::new());
+        assert_eq!(
+            rejected_reason(evaluate(
+                &request(""),
+                Some(&snapshot),
                 &defaults(),
                 state()
             )),
