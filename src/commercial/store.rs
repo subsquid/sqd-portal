@@ -346,6 +346,10 @@ impl SnapshotStore {
         let cursor = self.inner.cursor.load(Ordering::Relaxed);
         let page = self.fetch_page(cursor).await?;
         if page.reset {
+            // Reset means the local cursor fell behind the feed's retained
+            // range, not a once-in-a-lifetime control-plane event. Quota churn
+            // can advance the minimum retained sequence quickly, so a lagging
+            // pod may legitimately re-bootstrap more often than expected.
             tracing::info!(cursor, "commercial snapshot cursor reset requested");
             self.bootstrap().await?;
             return Ok(());
