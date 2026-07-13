@@ -5,16 +5,13 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, OnceLock,
     },
-    task::{Context, Poll},
     time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 
-use async_compression::tokio::write::GzipDecoder;
 use async_stream::stream;
 use bytes::Bytes;
 use flate2::{write::MultiGzDecoder as WriteMultiGzDecoder, Decompress, FlushDecompress, Status};
 use futures::{Stream, StreamExt};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant as TokioInstant;
 use uuid::{NoContext, Timestamp, Uuid};
@@ -1294,18 +1291,20 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
 {
     stream! {
-        let mut decoder = GzipDecoder::new(LogicalByteCounter {
-            meter: meter.clone(),
-        });
+        // Hotblocks currently proxies opaque gzip bytes. Be tolerant of
+        // concatenated members here, matching the network gzip path.
+        let mut decoder = WriteMultiGzDecoder::new(CountingWriter::default());
         futures::pin_mut!(input);
         while let Some(item) = input.next().await {
             match &item {
                 Ok(bytes) => {
                     meter.add_wire_bytes(bytes.len() as u64);
-                    if let Err(err) = decoder.write_all(bytes).await {
+                    let before = decoder.get_ref().bytes;
+                    if let Err(err) = decoder.write_all(bytes) {
                         tracing::warn!(error = %err, "failed to decode gzip stream for logical byte count");
                         meter.mark_error();
                     }
+                    add_gzip_decoder_delta(&meter, &decoder, before);
                 }
                 Err(_) => meter.mark_error(),
             }
@@ -1316,34 +1315,24 @@ where
                 break;
             }
         }
-        if let Err(err) = decoder.shutdown().await {
+        let before = decoder.get_ref().bytes;
+        if let Err(err) = decoder.try_finish() {
             tracing::warn!(error = %err, "failed to finish gzip stream usage decoder");
             meter.mark_error();
         }
+        add_gzip_decoder_delta(&meter, &decoder, before);
         meter.complete();
     }
 }
 
-struct LogicalByteCounter {
-    meter: MeterHandle,
-}
-
-impl AsyncWrite for LogicalByteCounter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.meter.add_logical_bytes(buf.len() as u64);
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+fn add_gzip_decoder_delta(
+    meter: &MeterHandle,
+    decoder: &WriteMultiGzDecoder<CountingWriter>,
+    before: u64,
+) {
+    let after = decoder.get_ref().bytes;
+    if after > before {
+        meter.add_logical_bytes(after - before);
     }
 }
 
@@ -2250,6 +2239,36 @@ mod tests {
 
         assert_eq!(event.logical_bytes, body.len() as u64);
         assert_eq!(event.wire_bytes, gzip.len() as u64);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn gzip_stream_tap_counts_concatenated_members() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = meter(reporter.clone());
+        let first = b"{\"header\":{\"number\":1}}\n";
+        let second = b"{\"header\":{\"number\":2}}\n";
+        let mut encoded = gzip(first).await;
+        encoded.extend_from_slice(&gzip(second).await);
+        let split = encoded.len() / 2;
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::copy_from_slice(&encoded[..split])),
+            Ok::<_, std::io::Error>(Bytes::copy_from_slice(&encoded[split..])),
+        ];
+
+        let output = tap_gzip_stream(stream::iter(chunks), meter);
+        let emitted = output
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .flat_map(|bytes| bytes.to_vec())
+            .collect::<Vec<_>>();
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+
+        assert_eq!(emitted, encoded);
+        assert_eq!(event.logical_bytes, (first.len() + second.len()) as u64);
+        assert_eq!(event.wire_bytes, encoded.len() as u64);
         assert_eq!(event.status, UsageStatus::Completed);
     }
 
