@@ -138,7 +138,7 @@ impl MeterHandle {
 
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
-        principal: Principal,
+        mut principal: Principal,
         tally_account_id: Option<String>,
         limits: GrantedLimits,
         on_exceed: OnExceed,
@@ -154,6 +154,11 @@ impl MeterHandle {
         concurrency_permit: Option<ConcurrencyPermit>,
     ) -> Self {
         let event_id = uuid_v7();
+        let request_id = non_empty_or_uuid(request_id);
+        principal.account_id = non_empty_or_unknown(principal.account_id, "account");
+        principal.api_key_id = principal
+            .api_key_id
+            .and_then(|api_key_id| non_empty_option(api_key_id));
         let tally_account_id = tally_account_id.unwrap_or_else(|| principal.account_id.clone());
         if limits.throughput_bytes_per_sec == Some(0) {
             zero_limits::report(
@@ -1366,6 +1371,30 @@ fn uuid_v7() -> String {
         now.subsec_nanos(),
     ))
     .to_string()
+}
+
+fn non_empty_or_uuid(value: String) -> String {
+    if value.trim().is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        value
+    }
+}
+
+fn non_empty_or_unknown(value: String, field: &str) -> String {
+    if value.trim().is_empty() {
+        format!("unknown-{field}-{}", Uuid::new_v4())
+    } else {
+        value
+    }
+}
+
+fn non_empty_option(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn pod_hostname() -> &'static str {

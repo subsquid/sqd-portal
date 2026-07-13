@@ -1617,6 +1617,32 @@ mod tests {
             .unwrap()
     }
 
+    async fn request_id_metered_test_handler(
+        Extension(req): Extension<RequestId>,
+        endpoint: Option<Extension<Endpoint>>,
+        grant: Option<Extension<CommercialGrant>>,
+        reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    ) -> Response {
+        const BODY: &[u8] = b"{\"ok\":true}\n";
+        let endpoint = endpoint
+            .map(|endpoint| endpoint.0)
+            .unwrap_or(Endpoint::Stream);
+        let meter = meter_from_extensions(
+            grant,
+            reporter,
+            endpoint,
+            "ethereum-mainnet".to_string(),
+            req.header_value().to_str().unwrap_or("").to_string(),
+        );
+        if let Some(meter) = meter {
+            meter
+                .record_plain_bytes_and_complete(BODY.len() as u64)
+                .await;
+        }
+
+        Response::builder().body(Body::from(BODY)).unwrap()
+    }
+
     fn test_commercial_route(def: CommercialRouteDef) -> MethodRouter {
         let route = match def.method {
             CommercialRouteMethod::Get => get(metered_test_handler),
@@ -1983,6 +2009,43 @@ mod tests {
             assert_eq!(event.endpoint, def.endpoint, "{}", def.path);
             assert_eq!(event.logical_bytes, 12, "{}", def.path);
         }
+    }
+
+    #[tokio::test]
+    async fn empty_x_request_id_is_regenerated_before_usage_event() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let app = axum::Router::new()
+            .route(
+                "/datasets/ethereum-mainnet/stream",
+                commercial_route_layer(
+                    post(request_id_metered_test_handler),
+                    true,
+                    Endpoint::Stream,
+                ),
+            )
+            .layer(Extension(reporter.clone() as Arc<dyn UsageReporter>))
+            .layer(Extension(
+                Arc::new(GrantingControlPlane) as Arc<dyn ControlPlaneClient>
+            ))
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/datasets/ethereum-mainnet/stream?api_key=sqd_data_key_secret")
+                    .header("x-request-id", "")
+                    .body(Body::from(
+                        r#"{"type":"evm","fromBlock":1,"fields":{"block":{"number":true}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let event = reporter.events.lock().unwrap().pop().expect("usage event");
+        assert!(!event.request_id.trim().is_empty());
     }
 
     #[tokio::test]
