@@ -33,7 +33,8 @@ const PENDING_COMPRESSED_WARNING_BYTES: usize = 8 * 1024 * 1024;
 // gzip/zstd members should complete and drain well before reaching it.
 const MAX_PENDING_COMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 const STREAMING_DECODE_BUFFER_BYTES: usize = 32 * 1024;
-const MAX_OUTPUT_ONLY_DECODE_STEPS: usize = 1024;
+const DECODE_YIELD_ITERATIONS: usize = 64;
+const OUTPUT_ONLY_DECODE_STEPS_PER_CALL: usize = 16;
 
 #[derive(Clone)]
 pub struct MeterHandle {
@@ -594,6 +595,7 @@ where
         let mut decoder = GzipMemberCounter::new();
         let mut pending = PendingFrames::default();
         let mut passthrough = false;
+        let mut decode_iterations = 0usize;
         futures::pin_mut!(input);
         'input: while let Some(frame) = input.next().await {
             meter.add_chunk();
@@ -604,6 +606,11 @@ where
 
             let mut offset = 0;
             while offset < frame.len() {
+                decode_iterations += 1;
+                if decode_iterations >= DECODE_YIELD_ITERATIONS {
+                    decode_iterations = 0;
+                    tokio::task::yield_now().await;
+                }
                 match decoder.decode(&frame[offset..]) {
                     Ok(CompressedStep::Consumed { bytes }) => {
                         if bytes == 0 {
@@ -705,6 +712,7 @@ where
         let mut pending = PendingFrames::default();
         let mut passthrough = false;
         let mut stopped_after_cut = false;
+        let mut decode_iterations = 0usize;
         futures::pin_mut!(input);
         'input: while let Some(frame) = input.next().await {
             meter.add_chunk();
@@ -734,6 +742,11 @@ where
                 offset += take;
 
                 loop {
+                    decode_iterations += 1;
+                    if decode_iterations >= DECODE_YIELD_ITERATIONS {
+                        decode_iterations = 0;
+                        tokio::task::yield_now().await;
+                    }
                     match decoder.decode() {
                         Ok(ZstdStep::Consumed { bytes, completed }) => {
                             if !bytes.is_empty() && !pending.try_push(bytes, pending_limit, "zstd") {
@@ -1171,11 +1184,11 @@ impl ZstdFrameCounter {
 
             if status.bytes_written > 0 {
                 output_only_steps += 1;
-                if output_only_steps > MAX_OUTPUT_ONLY_DECODE_STEPS {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "zstd decoder made too many output-only steps",
-                    ));
+                if output_only_steps >= OUTPUT_ONLY_DECODE_STEPS_PER_CALL {
+                    return Ok(ZstdStep::Consumed {
+                        bytes: Vec::new(),
+                        completed: false,
+                    });
                 }
                 continue;
             }
@@ -1459,7 +1472,10 @@ mod tests {
     use std::sync::Mutex;
 
     use async_compression::tokio::bufread::GzipEncoder;
-    use flate2::{write::DeflateEncoder, Compression as FlateCompression, Crc};
+    use flate2::{
+        write::{DeflateEncoder, GzEncoder},
+        Compression as FlateCompression, Crc,
+    };
     use futures::stream;
     use std::io::Write;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -2052,6 +2068,33 @@ mod tests {
             (first_payload.len() + second_payload.len()) as u64
         );
         assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn compressed_input_taps_count_large_single_members() {
+        let payload = vec![b'a'; 2 * 1024 * 1024];
+
+        let mut gzip_encoder = GzEncoder::new(Vec::new(), FlateCompression::fast());
+        gzip_encoder.write_all(&payload).unwrap();
+        let gzip_encoded = gzip_encoder.finish().unwrap();
+        let (gzip_event, gzip_emitted) = drive_metered_gzip_chunks_with_limit(
+            vec![gzip_encoded.clone()],
+            MAX_PENDING_COMPRESSED_BYTES,
+        )
+        .await;
+        assert_eq!(gzip_emitted, gzip_encoded);
+        assert_eq!(gzip_event.logical_bytes, payload.len() as u64);
+        assert_eq!(gzip_event.status, UsageStatus::Completed);
+
+        let zstd_encoded = zstd::stream::encode_all(&payload[..], 0).unwrap();
+        let (zstd_event, zstd_emitted) = drive_metered_zstd_frames_with_limit(
+            vec![zstd_encoded.clone()],
+            MAX_PENDING_COMPRESSED_BYTES,
+        )
+        .await;
+        assert_eq!(zstd_emitted, zstd_encoded);
+        assert_eq!(zstd_event.logical_bytes, payload.len() as u64);
+        assert_eq!(zstd_event.status, UsageStatus::Completed);
     }
 
     #[tokio::test]
