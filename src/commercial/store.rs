@@ -29,6 +29,7 @@ use crate::metrics;
 const SNAPSHOT_PATH_SEGMENTS: [&str; 4] = ["internal", "portal", "v1", "snapshots"];
 const RESOLVE_PATH_SEGMENTS: [&str; 4] = ["internal", "portal", "v1", "authorize"];
 const DEFAULT_PAGE_LIMIT: u16 = 1000;
+const MAX_BOOTSTRAP_PAGES: usize = 10_000;
 
 pub struct SnapshotStore {
     inner: Arc<SnapshotStoreInner>,
@@ -304,14 +305,36 @@ impl SnapshotStore {
     async fn bootstrap(&self) -> anyhow::Result<()> {
         let mut cursor = 0;
         let mut all = Vec::new();
+        let mut pages = 0usize;
         loop {
             let page = self.fetch_page(cursor).await?;
-            cursor = page.next_cursor;
+            pages += 1;
+            let next_cursor = page.next_cursor;
             let len = page.raw_record_count;
             all.extend(page.records);
             if len < usize::from(DEFAULT_PAGE_LIMIT) {
+                cursor = next_cursor;
                 break;
             }
+            if next_cursor <= cursor {
+                tracing::warn!(
+                    cursor,
+                    next_cursor,
+                    len,
+                    "aborting commercial snapshot bootstrap after stalled cursor"
+                );
+                anyhow::bail!("snapshot bootstrap cursor did not advance");
+            }
+            if pages >= MAX_BOOTSTRAP_PAGES {
+                tracing::warn!(
+                    pages,
+                    cursor,
+                    next_cursor,
+                    "aborting commercial snapshot bootstrap after too many pages"
+                );
+                anyhow::bail!("snapshot bootstrap exceeded {MAX_BOOTSTRAP_PAGES} pages");
+            }
+            cursor = next_cursor;
         }
         self.replace_records(all, cursor)?;
         self.inner.ready.store(true, Ordering::Release);
@@ -1279,6 +1302,34 @@ mod tests {
         assert!(store.get("next-key").is_some());
         assert!(metrics::COMMERCIAL_SNAPSHOT_PARSE_ERRORS.get() > before);
         task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_aborts_on_full_page_with_stalled_cursor() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let mut full_page = Vec::new();
+        for i in 0..DEFAULT_PAGE_LIMIT {
+            let mut record = active_snapshot(u64::from(i) + 1);
+            record.key_id = format!("key-{i}");
+            full_page.push(SnapshotRecord::Key(record));
+        }
+        mock.push_page(0, page(full_page, 0, false));
+        let path = cache_path("stalled-bootstrap-cursor");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let store = SnapshotStore::new(
+            &config(&mock, path.clone(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            client,
+            TokioInstant::now(),
+        );
+
+        let err = store.bootstrap().await.expect_err("stalled cursor aborts");
+
+        assert!(err.to_string().contains("cursor did not advance"));
+        assert!(!store.is_ready());
         let _ = tokio::fs::remove_file(path).await;
     }
 
