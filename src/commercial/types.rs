@@ -241,7 +241,8 @@ pub struct PublicQuota {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicDefaults {
     pub limits: PublicLimits,
-    pub quota: PublicQuota,
+    #[serde(default)]
+    pub quota: Option<PublicQuota>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

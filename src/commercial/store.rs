@@ -681,11 +681,11 @@ fn defaults_from_fallback(config: &PublicFallbackConfig) -> Defaults {
                 max_response_bytes: Some(config.max_response_bytes),
                 concurrency: Some(config.concurrency as u64),
             },
-            quota: PublicQuota {
+            quota: Some(PublicQuota {
                 volume_bytes: Some(config.volume_bytes),
                 window_secs: config.window_secs,
                 on_exceed: OnExceed::Reject,
-            },
+            }),
         },
         messages: HashMap::new(),
         seq: 0,
@@ -925,11 +925,11 @@ pub mod test_support {
                     max_response_bytes: Some(300),
                     concurrency: Some(2),
                 },
-                quota: PublicQuota {
+                quota: Some(PublicQuota {
                     volume_bytes: Some(400),
                     window_secs: 60,
                     on_exceed: OnExceed::Reject,
-                },
+                }),
             },
             messages: HashMap::from([("invalid_key".to_string(), "invalid".to_string())]),
             seq,

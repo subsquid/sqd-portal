@@ -294,6 +294,15 @@ fn entitlement_matches(entitlements: &[String], dataset: &str) -> bool {
         .any(|chain| chain == WILDCARD_ENTITLEMENT || chain == dataset)
 }
 
+fn public_on_exceed(defaults: &Defaults) -> OnExceed {
+    defaults
+        .public
+        .quota
+        .as_ref()
+        .map(|quota| quota.on_exceed.clone())
+        .unwrap_or(OnExceed::Reject)
+}
+
 fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
     Authorization::Granted(Granted {
         principal: Principal {
@@ -308,7 +317,7 @@ fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
             burst_bytes: defaults.public.limits.burst_bytes,
             max_chunks: None,
         },
-        on_exceed: defaults.public.quota.on_exceed.clone(),
+        on_exceed: public_on_exceed(defaults),
         quota_version: defaults.seq,
         quota_remaining_bytes: None,
         concurrency_permit: None,
@@ -324,7 +333,8 @@ fn evaluate_anonymous_with_state(
     now_secs: u64,
 ) -> Authorization {
     let account_key = format!("anon:{ip_bucket}");
-    let window_secs = defaults.public.quota.window_secs.max(1);
+    let quota = defaults.public.quota.as_ref();
+    let window_secs = quota.map(|quota| quota.window_secs.max(1)).unwrap_or(1);
     let window_start = now_secs - (now_secs % window_secs);
 
     let permit = match (defaults.public.limits.concurrency, concurrency) {
@@ -340,13 +350,17 @@ fn evaluate_anonymous_with_state(
         return reject(defaults, CONCURRENCY_LIMIT, 429, Some(1));
     }
 
-    let served = tally
-        .map(|tally| tally.bytes_for(&account_key, window_start))
-        .unwrap_or(0);
-    let volume_bytes = defaults.public.quota.volume_bytes;
+    let served = if quota.is_some() {
+        tally
+            .map(|tally| tally.bytes_for(&account_key, window_start))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let volume_bytes = quota.and_then(|quota| quota.volume_bytes);
     let effective = volume_bytes.map(|volume_bytes| volume_bytes as i64 - served as i64);
     if effective.is_some_and(|effective| effective <= 0) {
-        return match defaults.public.quota.on_exceed.clone() {
+        return match public_on_exceed(defaults) {
             OnExceed::Reject => reject(
                 defaults,
                 ANON_LIMITED,
@@ -369,6 +383,7 @@ fn evaluate_anonymous_with_state(
                 },
                 volume_bytes.map(|volume_bytes| volume_bytes as i64),
                 permit,
+                true,
             )),
         };
     }
@@ -390,6 +405,7 @@ fn evaluate_anonymous_with_state(
         limits,
         volume_bytes.map(|volume_bytes| volume_bytes as i64),
         permit,
+        quota.is_some(),
     ))
 }
 
@@ -400,16 +416,17 @@ fn anonymous_grant(
     limits: GrantedLimits,
     quota_remaining_bytes: Option<i64>,
     concurrency_permit: Option<super::concurrency::ConcurrencyPermit>,
+    tally_enabled: bool,
 ) -> Granted {
     Granted {
         principal: Principal {
             account_id: "anonymous".to_string(),
             api_key_id: None,
         },
-        tally_account_id: Some(account_key),
+        tally_account_id: tally_enabled.then_some(account_key),
         entitled_chains: None,
         limits,
-        on_exceed: defaults.public.quota.on_exceed.clone(),
+        on_exceed: public_on_exceed(defaults),
         quota_version,
         quota_remaining_bytes,
         concurrency_permit,
@@ -545,8 +562,8 @@ mod tests {
             active_snapshot, defaults_record, page, MockControlPlane, KEY_ID, SECRET_SHA256,
             SERVICE_TOKEN,
         },
-        ConcurrencyLimiter, Credential, Endpoint, QueryDescriptor, SnapshotRecord, SnapshotStore,
-        TallyStore,
+        ConcurrencyLimiter, Credential, DefaultsRecord, Endpoint, QueryDescriptor, SnapshotRecord,
+        SnapshotStore, TallyStore,
     };
 
     const WRONG_SHA256: &str = "aac742262c66b43621baf5b5439b30aa0de646e131c665f1d2118372cdb9b0ed";
@@ -918,7 +935,7 @@ mod tests {
         }
 
         let mut defaults = defaults();
-        defaults.public.quota.volume_bytes = None;
+        defaults.public.quota.as_mut().unwrap().volume_bytes = None;
         let tally = TallyStore::default();
         tally.debit("anon:local", 120, u64::MAX);
         match evaluate_anonymous_with_state(
@@ -935,6 +952,49 @@ mod tests {
             }
             Authorization::Rejected(rejected) => {
                 panic!("expected unlimited public quota grant, got {rejected:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn defaults_record_without_public_quota_keeps_limits_and_messages() {
+        let record: DefaultsRecord = serde_json::from_value(serde_json::json!({
+            "key_id": "__defaults__",
+            "seq": 77,
+            "public_tier": {
+                "limits": {
+                    "throughput_bytes_per_sec": 1234,
+                    "burst_bytes": 5678,
+                    "max_response_bytes": 91011,
+                    "concurrency": 3
+                }
+            },
+            "messages": {
+                "anon_limited": "custom anon limit"
+            }
+        }))
+        .expect("defaults without public quota should parse");
+        let defaults = Defaults::from(record);
+        let tally = TallyStore::default();
+        tally.debit("anon:local", defaults.seq, u64::MAX);
+
+        match evaluate_anonymous_with_state(
+            &defaults,
+            EvaluationPolicy::default(),
+            Some(&tally),
+            None,
+            "local",
+            120,
+        ) {
+            Authorization::Granted(grant) => {
+                assert_eq!(defaults.messages["anon_limited"], "custom anon limit");
+                assert_eq!(grant.limits.max_response_bytes, Some(91011));
+                assert_eq!(grant.limits.throughput_bytes_per_sec, Some(1234));
+                assert_eq!(grant.quota_remaining_bytes, None);
+                assert_eq!(grant.tally_account_id, None);
+            }
+            Authorization::Rejected(rejected) => {
+                panic!("missing public quota should mean unlimited public volume, got {rejected:?}")
             }
         }
     }
@@ -969,7 +1029,13 @@ mod tests {
         tally.debit(
             "anon:local",
             120,
-            defaults.public.quota.volume_bytes.unwrap(),
+            defaults
+                .public
+                .quota
+                .as_ref()
+                .unwrap()
+                .volume_bytes
+                .unwrap(),
         );
 
         match evaluate_anonymous_with_state(
@@ -1012,7 +1078,13 @@ mod tests {
         tally.debit(
             "anon:local",
             120,
-            defaults.public.quota.volume_bytes.unwrap(),
+            defaults
+                .public
+                .quota
+                .as_ref()
+                .unwrap()
+                .volume_bytes
+                .unwrap(),
         );
 
         match evaluate_anonymous_with_state(
@@ -1049,14 +1121,20 @@ mod tests {
     #[test]
     fn anonymous_throttle_grants_floor_when_window_exhausted() {
         let mut defaults = defaults();
-        defaults.public.quota.on_exceed = OnExceed::Throttle {
+        defaults.public.quota.as_mut().unwrap().on_exceed = OnExceed::Throttle {
             floor_bytes_per_sec: 7,
         };
         let tally = TallyStore::default();
         tally.debit(
             "anon:local",
             120,
-            defaults.public.quota.volume_bytes.unwrap(),
+            defaults
+                .public
+                .quota
+                .as_ref()
+                .unwrap()
+                .volume_bytes
+                .unwrap(),
         );
 
         match evaluate_anonymous_with_state(

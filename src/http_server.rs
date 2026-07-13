@@ -1768,7 +1768,7 @@ mod tests {
         let store = SnapshotStore::inactive(&public_fallback_for_concurrency_test());
         let mut defaults = defaults_record(10);
         defaults.public.limits.concurrency = Some(0);
-        defaults.public.quota.volume_bytes = Some(1_000_000);
+        defaults.public.quota.as_mut().unwrap().volume_bytes = Some(1_000_000);
         defaults.messages.insert(
             "concurrency_limit".to_string(),
             "concurrency_limit".to_string(),
