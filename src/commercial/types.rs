@@ -119,6 +119,9 @@ pub struct Rejected {
     pub retry_after_secs: Option<u64>,
 }
 
+// Granted carries the entitlement sets inline; the enum is built once per
+// request and immediately consumed, so the size imbalance is not worth boxing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Authorization {
     Granted(Granted),
