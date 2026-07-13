@@ -39,6 +39,7 @@ struct SnapshotStoreInner {
     records: ArcSwap<HashMap<String, Arc<KeySnapshot>>>,
     defaults: ArcSwap<Defaults>,
     cursor: AtomicU64,
+    epoch: Mutex<Option<String>>,
     ready: AtomicBool,
     loaded_from_cache: AtomicBool,
     disk_cache_dirty: AtomicBool,
@@ -73,6 +74,10 @@ pub struct SnapshotPage {
     next_cursor: u64,
     #[serde(default)]
     reset: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_seq: Option<u64>,
     #[serde(skip)]
     raw_record_count: usize,
 }
@@ -83,6 +88,8 @@ struct RawSnapshotPage {
     next_cursor: u64,
     #[serde(default)]
     reset: bool,
+    epoch: Option<String>,
+    head_seq: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,9 +100,28 @@ struct ResolveRequest<'a> {
 #[derive(Debug, Serialize, Deserialize)]
 struct DiskCache {
     cursor: u64,
+    #[serde(default)]
+    epoch: Option<String>,
     records: Vec<serde_json::Value>,
     defaults: Defaults,
     saved_at: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BootstrapMode {
+    Normal,
+    Authoritative,
+}
+
+#[derive(Debug)]
+enum AuthoritativeResetReason {
+    EpochChanged { stored: String, received: String },
+    HeadRolledBack { cursor: u64, head_seq: u64 },
+}
+
+struct KeyRecordHooks {
+    changed: Vec<Arc<KeySnapshot>>,
+    removed_key_ids: Vec<String>,
 }
 
 struct ResolveLimiter {
@@ -145,6 +171,7 @@ impl SnapshotStore {
                 records: ArcSwap::from_pointee(HashMap::new()),
                 defaults: ArcSwap::from_pointee(defaults_from_fallback(&config.public_fallback)),
                 cursor: AtomicU64::new(0),
+                epoch: Mutex::new(None),
                 ready: AtomicBool::new(false),
                 loaded_from_cache: AtomicBool::new(false),
                 disk_cache_dirty: AtomicBool::new(false),
@@ -168,6 +195,7 @@ impl SnapshotStore {
                 records: ArcSwap::from_pointee(HashMap::new()),
                 defaults: ArcSwap::from_pointee(defaults_from_fallback(fallback)),
                 cursor: AtomicU64::new(0),
+                epoch: Mutex::new(None),
                 ready: AtomicBool::new(true),
                 loaded_from_cache: AtomicBool::new(false),
                 disk_cache_dirty: AtomicBool::new(false),
@@ -277,7 +305,7 @@ impl SnapshotStore {
 
     async fn run_sync_tick(&self) -> anyhow::Result<()> {
         let result = if !self.is_ready() {
-            if let Err(err) = self.bootstrap().await {
+            if let Err(err) = self.bootstrap(BootstrapMode::Normal, None).await {
                 Err(err)
             } else {
                 Ok(())
@@ -302,12 +330,20 @@ impl SnapshotStore {
         result
     }
 
-    async fn bootstrap(&self) -> anyhow::Result<()> {
+    async fn bootstrap(
+        &self,
+        mode: BootstrapMode,
+        fallback_epoch: Option<String>,
+    ) -> anyhow::Result<()> {
         let mut cursor = 0;
         let mut all = Vec::new();
         let mut pages = 0usize;
+        let mut epoch = fallback_epoch;
         loop {
             let page = self.fetch_page(cursor).await?;
+            if let Some(page_epoch) = page.epoch.clone() {
+                epoch = Some(page_epoch);
+            }
             pages += 1;
             let next_cursor = page.next_cursor;
             let len = page.raw_record_count;
@@ -336,24 +372,55 @@ impl SnapshotStore {
             }
             cursor = next_cursor;
         }
-        self.replace_records(all, cursor)?;
+        self.replace_records_with_mode(all, cursor, mode)?;
+        match mode {
+            BootstrapMode::Normal => self.observe_epoch(epoch),
+            BootstrapMode::Authoritative => self.set_epoch(epoch),
+        }
         self.inner.ready.store(true, Ordering::Release);
-        tracing::info!(cursor, "commercial snapshot bootstrap applied");
+        tracing::info!(
+            cursor,
+            authoritative = matches!(mode, BootstrapMode::Authoritative),
+            "commercial snapshot bootstrap applied"
+        );
         Ok(())
     }
 
     async fn sync_once(&self) -> anyhow::Result<()> {
         let cursor = self.inner.cursor.load(Ordering::Relaxed);
         let page = self.fetch_page(cursor).await?;
+        if let Some(reason) = self.authoritative_reset_reason(cursor, &page) {
+            match &reason {
+                AuthoritativeResetReason::EpochChanged { stored, received } => {
+                    tracing::warn!(
+                        cursor,
+                        stored_epoch = stored,
+                        received_epoch = received,
+                        "commercial snapshot feed epoch changed; authoritative re-bootstrap requested"
+                    );
+                }
+                AuthoritativeResetReason::HeadRolledBack { cursor, head_seq } => {
+                    tracing::warn!(
+                        cursor,
+                        head_seq,
+                        "commercial snapshot feed head rolled back; authoritative re-bootstrap requested"
+                    );
+                }
+            }
+            self.bootstrap(BootstrapMode::Authoritative, page.epoch)
+                .await?;
+            return Ok(());
+        }
         if page.reset {
             // Reset means the local cursor fell behind the feed's retained
             // range, not a once-in-a-lifetime control-plane event. Quota churn
             // can advance the minimum retained sequence quickly, so a lagging
             // pod may legitimately re-bootstrap more often than expected.
             tracing::info!(cursor, "commercial snapshot cursor reset requested");
-            self.bootstrap().await?;
+            self.bootstrap(BootstrapMode::Normal, page.epoch).await?;
             return Ok(());
         }
+        self.observe_epoch(page.epoch.clone());
         if page.raw_record_count == 0 {
             return Ok(());
         }
@@ -390,8 +457,55 @@ impl SnapshotStore {
             records: parse_snapshot_records(page.records, "snapshot_page"),
             next_cursor: page.next_cursor,
             reset: page.reset,
+            epoch: page.epoch,
+            head_seq: page.head_seq,
             raw_record_count,
         })
+    }
+
+    fn authoritative_reset_reason(
+        &self,
+        cursor: u64,
+        page: &SnapshotPage,
+    ) -> Option<AuthoritativeResetReason> {
+        if let Some(head_seq) = page.head_seq {
+            if cursor > head_seq {
+                return Some(AuthoritativeResetReason::HeadRolledBack { cursor, head_seq });
+            }
+        }
+
+        let received = page.epoch.as_ref()?;
+        let stored = self.inner.epoch.lock().unwrap().clone()?;
+        if stored.as_str() != received.as_str() {
+            return Some(AuthoritativeResetReason::EpochChanged {
+                stored,
+                received: received.clone(),
+            });
+        }
+        None
+    }
+
+    fn observe_epoch(&self, epoch: Option<String>) {
+        let Some(epoch) = epoch else {
+            return;
+        };
+        let mut stored = self.inner.epoch.lock().unwrap();
+        if stored.as_deref() == Some(epoch.as_str()) {
+            return;
+        }
+        *stored = Some(epoch);
+        drop(stored);
+        self.mark_disk_cache_dirty();
+    }
+
+    fn set_epoch(&self, epoch: Option<String>) {
+        let mut stored = self.inner.epoch.lock().unwrap();
+        if *stored == epoch {
+            return;
+        }
+        *stored = epoch;
+        drop(stored);
+        self.mark_disk_cache_dirty();
     }
 
     async fn resolve(&self, key_id: &str) -> anyhow::Result<Option<Arc<KeySnapshot>>> {
@@ -443,7 +557,17 @@ impl SnapshotStore {
         }
     }
 
+    #[cfg(test)]
     fn replace_records(&self, records: Vec<SnapshotRecord>, cursor: u64) -> anyhow::Result<()> {
+        self.replace_records_with_mode(records, cursor, BootstrapMode::Normal)
+    }
+
+    fn replace_records_with_mode(
+        &self,
+        records: Vec<SnapshotRecord>,
+        cursor: u64,
+        mode: BootstrapMode,
+    ) -> anyhow::Result<()> {
         let mut defaults = None;
         let mut records_map = HashMap::new();
         for record in records {
@@ -458,9 +582,12 @@ impl SnapshotStore {
         if let Some(defaults) = defaults {
             self.store_defaults(defaults);
         }
-        let hook_records = self.replace_key_records(records_map, cursor);
-        for record in hook_records {
+        let hooks = self.replace_key_records(records_map, cursor, mode);
+        for record in hooks.changed {
             self.apply_snapshot_hooks(&record);
+        }
+        for key_id in hooks.removed_key_ids {
+            self.apply_removed_key_hook(&key_id);
         }
         metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.inner.cursor.store(cursor, Ordering::Release);
@@ -472,26 +599,34 @@ impl SnapshotStore {
         &self,
         records: HashMap<String, Arc<KeySnapshot>>,
         cursor: u64,
-    ) -> Vec<Arc<KeySnapshot>> {
+        mode: BootstrapMode,
+    ) -> KeyRecordHooks {
+        let preserve_higher_seq = matches!(mode, BootstrapMode::Normal);
         loop {
             let current = self.inner.records.load();
             let mut map = HashMap::with_capacity(records.len().max(current.len()));
-            let mut hook_records = Vec::new();
+            let mut changed = Vec::new();
+            let mut removed_key_ids = Vec::new();
 
             for (key_id, record) in &records {
                 if let Some(existing) = current.get(key_id) {
-                    if existing.seq > record.seq {
+                    if preserve_higher_seq && existing.seq > record.seq {
                         map.insert(key_id.clone(), existing.clone());
                         continue;
                     }
                 }
                 map.insert(key_id.clone(), record.clone());
-                hook_records.push(record.clone());
+                changed.push(record.clone());
             }
 
             for (key_id, existing) in current.iter() {
-                if !map.contains_key(key_id) && existing.seq > cursor {
+                if map.contains_key(key_id) {
+                    continue;
+                }
+                if preserve_higher_seq && existing.seq > cursor {
                     map.insert(key_id.clone(), existing.clone());
+                } else if !preserve_higher_seq {
+                    removed_key_ids.push(key_id.clone());
                 }
             }
 
@@ -500,7 +635,10 @@ impl SnapshotStore {
                 .records
                 .compare_and_swap(&*current, Arc::new(map));
             if Arc::ptr_eq(&*current, &*previous) {
-                return hook_records;
+                return KeyRecordHooks {
+                    changed,
+                    removed_key_ids,
+                };
             }
         }
     }
@@ -629,6 +767,7 @@ impl SnapshotStore {
         self.inner.records.store(Arc::new(map));
         self.inner.defaults.store(Arc::new(cache.defaults));
         self.inner.cursor.store(cache.cursor, Ordering::Release);
+        *self.inner.epoch.lock().unwrap() = cache.epoch;
         self.inner.ready.store(true, Ordering::Release);
         self.inner.loaded_from_cache.store(true, Ordering::Release);
         let age = now_secs().saturating_sub(cache.saved_at);
@@ -660,6 +799,7 @@ impl SnapshotStore {
             .collect();
         let cache = DiskCache {
             cursor: self.inner.cursor.load(Ordering::Relaxed),
+            epoch: self.inner.epoch.lock().unwrap().clone(),
             records,
             defaults: (**self.inner.defaults.load()).clone(),
             saved_at: now_secs(),
@@ -746,6 +886,19 @@ impl SnapshotStore {
                         "commercial key kill flag applied to active streams"
                     );
                 }
+            }
+        }
+    }
+
+    fn apply_removed_key_hook(&self, key_id: &str) {
+        if let Some(registry) = &self.inner.hooks.registry {
+            let killed = registry.kill_key(key_id);
+            if killed > 0 {
+                tracing::info!(
+                    key_id,
+                    killed,
+                    "commercial key removed from authoritative snapshot; active streams killed"
+                );
             }
         }
     }
@@ -1049,8 +1202,23 @@ pub mod test_support {
             records,
             next_cursor,
             reset,
+            epoch: None,
+            head_seq: None,
             raw_record_count,
         }
+    }
+
+    pub fn feed_page(
+        records: Vec<SnapshotRecord>,
+        next_cursor: u64,
+        reset: bool,
+        epoch: Option<&str>,
+        head_seq: Option<u64>,
+    ) -> SnapshotPage {
+        let mut page = page(records, next_cursor, reset);
+        page.epoch = epoch.map(str::to_string);
+        page.head_seq = head_seq;
+        page
     }
 
     #[derive(Deserialize)]
@@ -1330,7 +1498,10 @@ mod tests {
             TokioInstant::now(),
         );
 
-        let err = store.bootstrap().await.expect_err("stalled cursor aborts");
+        let err = store
+            .bootstrap(BootstrapMode::Normal, None)
+            .await
+            .expect_err("stalled cursor aborts");
 
         assert!(err.to_string().contains("cursor did not advance"));
         assert!(!store.is_ready());
@@ -1371,6 +1542,7 @@ mod tests {
         let path = cache_path("round-trip");
         let cache = DiskCache {
             cursor: 2,
+            epoch: None,
             records: vec![snapshot_record_to_value(SnapshotRecord::Key(
                 active_snapshot(2),
             ))],
@@ -1572,6 +1744,174 @@ mod tests {
 
         assert!(store.get("fresh-key").is_some());
         assert!(store.get(KEY_ID).is_some());
+    }
+
+    #[tokio::test]
+    async fn epoch_change_authoritatively_replaces_snapshot_and_kills_removed_key() {
+        let mock = MockControlPlane::spawn().await;
+        let removed_key = "revoked-after-restore";
+        let mut removed = active_snapshot(90);
+        removed.key_id = removed_key.to_string();
+        mock.push_page(
+            0,
+            feed_page(
+                vec![
+                    SnapshotRecord::Key(active_snapshot(100)),
+                    SnapshotRecord::Key(removed),
+                ],
+                100,
+                false,
+                Some("epoch-old"),
+                Some(100),
+            ),
+        );
+        mock.push_page(100, feed_page(vec![], 5, false, Some("epoch-new"), Some(5)));
+        let mut restored = active_snapshot(5);
+        restored.account_id = Some("restored".to_string());
+        mock.push_page(
+            0,
+            feed_page(
+                vec![SnapshotRecord::Key(restored.clone())],
+                5,
+                false,
+                Some("epoch-new"),
+                Some(5),
+            ),
+        );
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let path = cache_path("epoch-authoritative-reset");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let store = SnapshotStore::new(
+            &config(&mock, path.clone(), 10),
+            SnapshotHooks {
+                tally: None,
+                registry: Some(registry.clone()),
+            },
+            SERVICE_TOKEN.to_string(),
+            client,
+            TokioInstant::now(),
+        );
+
+        store.run_sync_tick().await.unwrap();
+        assert_eq!(store.view().cursor, 100);
+        assert_eq!(
+            store.inner.epoch.lock().unwrap().as_deref(),
+            Some("epoch-old")
+        );
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let _registration = registry.register(
+            "restore-victim".to_string(),
+            Some(removed_key.to_string()),
+            kill.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        store.run_sync_tick().await.unwrap();
+
+        assert_eq!(store.view().cursor, 5);
+        assert_eq!(
+            store.inner.epoch.lock().unwrap().as_deref(),
+            Some("epoch-new")
+        );
+        assert_eq!(store.get(KEY_ID).unwrap().seq, 5);
+        assert_eq!(
+            store.get(KEY_ID).unwrap().account_id.as_deref(),
+            Some("restored")
+        );
+        assert!(store.get(removed_key).is_none());
+        assert!(kill.load(Ordering::Acquire));
+
+        let cache: DiskCache =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(cache.cursor, 5);
+        assert_eq!(cache.epoch.as_deref(), Some("epoch-new"));
+        assert!(cache.records.iter().any(|record| {
+            record.get("key_id").and_then(|value| value.as_str()) == Some(KEY_ID)
+        }));
+        assert!(!cache.records.iter().any(|record| {
+            record.get("key_id").and_then(|value| value.as_str()) == Some(removed_key)
+        }));
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn head_seq_rollback_authoritatively_rebootstraps() {
+        let mock = MockControlPlane::spawn().await;
+        let removed_key = "ahead-of-restored-head";
+        let mut removed = active_snapshot(9);
+        removed.key_id = removed_key.to_string();
+        mock.push_page(
+            0,
+            page(
+                vec![
+                    SnapshotRecord::Key(active_snapshot(10)),
+                    SnapshotRecord::Key(removed),
+                ],
+                10,
+                false,
+            ),
+        );
+        mock.push_page(10, feed_page(vec![], 3, false, None, Some(3)));
+        mock.push_page(
+            0,
+            feed_page(
+                vec![SnapshotRecord::Key(active_snapshot(3))],
+                3,
+                false,
+                None,
+                Some(3),
+            ),
+        );
+        let path = cache_path("head-authoritative-reset");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let store = SnapshotStore::new(
+            &config(&mock, path.clone(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            client,
+            TokioInstant::now(),
+        );
+
+        store.run_sync_tick().await.unwrap();
+        assert_eq!(store.view().cursor, 10);
+
+        store.run_sync_tick().await.unwrap();
+
+        assert_eq!(store.view().cursor, 3);
+        assert_eq!(store.get(KEY_ID).unwrap().seq, 3);
+        assert!(store.get(removed_key).is_none());
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn absent_epoch_and_head_seq_do_not_signal_authoritative_reset() {
+        let mock = MockControlPlane::spawn().await;
+        mock.push_raw_page(
+            10,
+            serde_json::json!({
+                "records": [],
+                "next_cursor": 3,
+                "reset": false
+            }),
+        );
+        let path = cache_path("absent-feed-metadata");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let store = SnapshotStore::new(
+            &config(&mock, path.clone(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            client,
+            TokioInstant::now(),
+        );
+        store.install_records_for_test(vec![SnapshotRecord::Key(active_snapshot(10))], 10);
+
+        store.run_sync_tick().await.unwrap();
+
+        assert_eq!(store.view().cursor, 10);
+        assert_eq!(store.get(KEY_ID).unwrap().seq, 10);
+        assert!(store.inner.epoch.lock().unwrap().is_none());
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     #[tokio::test(start_paused = true)]
