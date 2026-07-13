@@ -239,6 +239,7 @@ impl MeterHandle {
         self.inner.wire.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Records an exact block count when an endpoint has one without parsing metered bytes.
     pub fn add_blocks(&self, blocks: u64) {
         self.inner.blocks.fetch_add(blocks, Ordering::Relaxed);
     }

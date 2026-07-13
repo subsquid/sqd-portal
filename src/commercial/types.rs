@@ -152,6 +152,9 @@ pub struct StreamUsageEvent {
     pub data_source: DataSource,
     pub logical_bytes: u64,
     pub wire_bytes: u64,
+    // Analytics-only. Current stream endpoints meter encoded response chunks,
+    // not decoded block records, so this remains 0 unless an endpoint has an
+    // exact count and calls MeterHandle::add_blocks.
     pub blocks: u64,
     pub chunks: u64,
     pub started_at: f64,
