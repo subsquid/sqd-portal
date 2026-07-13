@@ -476,10 +476,14 @@ async fn stream_from_hotblocks(
                 return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
             }
 
-            if let Some(meter) = &meter {
-                meter.set_data_source(DataSource::RealTime);
+            if response.status().is_success() {
+                if let Some(meter) = &meter {
+                    meter.set_data_source(DataSource::RealTime);
+                }
+                forward_response_metered(response, meter)
+            } else {
+                forward_hotblocks_error_response(response, meter)
             }
-            forward_response_metered(response, meter)
         }
         Err(e) => {
             discard_meter(&meter);
@@ -513,6 +517,31 @@ fn forward_response_metered(
             Body::from_stream(tap_gzip_stream(response.bytes_stream(), meter))
         }
         Some(meter) => Body::from_stream(tap_plain_stream(response.bytes_stream(), meter)),
+        None => Body::from_stream(response.bytes_stream()),
+    };
+    builder.body(body).unwrap()
+}
+
+fn forward_hotblocks_error_response(
+    response: reqwest::Response,
+    meter: Option<MeterHandle>,
+) -> axum::response::Response {
+    if let Some(meter) = &meter {
+        meter.set_data_source(DataSource::RealTime);
+        meter.mark_error();
+    }
+
+    let mut builder = Response::builder().status(response.status());
+    for (key, value) in response.headers() {
+        if meter.is_some() && key == header::CONTENT_LENGTH {
+            continue;
+        }
+        builder = builder.header(key, value);
+    }
+    let body = match meter {
+        Some(meter) => {
+            Body::from_stream(tap_wire_stream_without_cut(response.bytes_stream(), meter))
+        }
         None => Body::from_stream(response.bytes_stream()),
     };
     builder.body(body).unwrap()
@@ -819,6 +848,31 @@ mod tests {
         vec![frame[..split].to_vec(), frame[split..].to_vec()]
     }
 
+    async fn reqwest_response(status: StatusCode, body: Vec<u8>) -> reqwest::Response {
+        let app = axum::Router::new().route(
+            "/hotblocks",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move {
+                    (
+                        status,
+                        [(header::CONTENT_LENGTH, body.len().to_string())],
+                        Body::from(body),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        reqwest::get(format!("http://{addr}/hotblocks"))
+            .await
+            .unwrap()
+    }
+
     fn stream_request(max_chunks: Option<usize>) -> StreamRequest {
         StreamRequest {
             dataset_id: DatasetId::from_url("test-dataset"),
@@ -985,6 +1039,26 @@ default_retries: 0
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(reporter.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hotblocks_error_response_marks_meter_error_without_cutting_body() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let body = b"hotblocks failed with detail".to_vec();
+        let response = reqwest_response(StatusCode::BAD_GATEWAY, body.clone()).await;
+        let forwarded =
+            forward_hotblocks_error_response(response, Some(enforced_meter(reporter.clone(), 1)));
+
+        assert_eq!(forwarded.status(), StatusCode::BAD_GATEWAY);
+        assert!(!forwarded.headers().contains_key(header::CONTENT_LENGTH));
+        let forwarded_body = to_bytes(forwarded.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&forwarded_body[..], &body);
+
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.status, UsageStatus::Error);
+        assert_eq!(event.data_source, DataSource::RealTime);
+        assert_eq!(event.logical_bytes, 0);
+        assert_eq!(event.wire_bytes, body.len() as u64);
     }
 
     #[tokio::test]
