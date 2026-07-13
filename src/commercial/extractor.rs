@@ -259,6 +259,9 @@ fn ip_bucket_from_headers(headers: &HeaderMap, client_ip_header: &str) -> String
     let Ok(value) = value.to_str() else {
         return fallback_ip_bucket("invalid");
     };
+    // Anonymous quota/concurrency buckets assume the edge proxy strips or
+    // overwrites this header. If clients can spoof the rightmost value, they can
+    // force extra anon map entries; maintenance sweeps cap that damage.
     let rightmost = value.rsplit(',').next().unwrap_or_default().trim();
     let Some(ip) = parse_ip(rightmost) else {
         return fallback_ip_bucket("invalid");

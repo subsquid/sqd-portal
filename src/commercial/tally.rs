@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -7,6 +8,9 @@ use std::{
 };
 
 use dashmap::DashMap;
+
+const ANON_PREFIX: &str = "anon:";
+const ANON_TALLY_ENTRY_CAP: usize = 100_000;
 
 #[derive(Debug, Default)]
 pub struct TallyStore {
@@ -65,19 +69,53 @@ impl TallyStore {
     }
 
     pub fn sweep_anonymous(&self, now_secs: u64, idle_secs: u64) -> usize {
+        self.sweep_anonymous_with_cap(now_secs, idle_secs, ANON_TALLY_ENTRY_CAP)
+    }
+
+    fn sweep_anonymous_with_cap(&self, now_secs: u64, idle_secs: u64, cap: usize) -> usize {
         let cutoff = now_secs.saturating_sub(idle_secs);
         // A live meter caches its Tally handle, so a stream whose chunk gap
         // exceeds the sweep horizon can be orphaned from this map. Debits touch
         // last_seen, making that practically negligible for active streams.
-        let keys: Vec<String> = self
+        let mut keys: Vec<String> = self
             .entries
             .iter()
             .filter(|entry| {
-                entry.key().starts_with("anon:")
+                entry.key().starts_with(ANON_PREFIX)
                     && entry.value().last_seen.load(Ordering::Acquire) <= cutoff
             })
             .map(|entry| entry.key().clone())
             .collect();
+
+        let mut selected: HashSet<String> = keys.iter().cloned().collect();
+        let anon_count = self
+            .entries
+            .iter()
+            .filter(|entry| entry.key().starts_with(ANON_PREFIX))
+            .count();
+        let remaining_after_idle = anon_count.saturating_sub(selected.len());
+        if remaining_after_idle > cap {
+            let mut candidates: Vec<(u64, String)> = self
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.key().starts_with(ANON_PREFIX) && !selected.contains(entry.key())
+                })
+                .map(|entry| {
+                    (
+                        entry.value().last_seen.load(Ordering::Acquire),
+                        entry.key().clone(),
+                    )
+                })
+                .collect();
+            candidates
+                .sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+            for (_, key) in candidates.into_iter().take(remaining_after_idle - cap) {
+                selected.insert(key.clone());
+                keys.push(key);
+            }
+        }
+
         let count = keys.len();
         for key in keys {
             self.entries.remove(&key);
@@ -229,6 +267,30 @@ mod tests {
 
         assert_eq!(tally.sweep_anonymous(now + 120, 60), 1);
         assert!(tally.version_for("anon:one").is_none());
+        assert_eq!(tally.version_for("account"), Some(10));
+    }
+
+    #[test]
+    fn anonymous_sweep_caps_oldest_anon_entries() {
+        let tally = TallyStore::default();
+        for i in 0..5 {
+            let key = format!("anon:{i}");
+            tally.debit(&key, 10, 1);
+            tally
+                .entries
+                .get(&key)
+                .unwrap()
+                .last_seen
+                .store(i + 1, Ordering::Release);
+        }
+        tally.debit("account", 10, 1);
+
+        assert_eq!(tally.sweep_anonymous_with_cap(10, 20, 3), 2);
+        assert!(tally.version_for("anon:0").is_none());
+        assert!(tally.version_for("anon:1").is_none());
+        assert_eq!(tally.version_for("anon:2"), Some(10));
+        assert_eq!(tally.version_for("anon:3"), Some(10));
+        assert_eq!(tally.version_for("anon:4"), Some(10));
         assert_eq!(tally.version_for("account"), Some(10));
     }
 }

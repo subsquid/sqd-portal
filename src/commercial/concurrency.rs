@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -9,6 +10,9 @@ use tokio::{
     runtime::Handle,
     sync::{Notify, OwnedSemaphorePermit, Semaphore},
 };
+
+const ANON_PREFIX: &str = "anon:";
+const ANON_CONCURRENCY_ENTRY_CAP: usize = 100_000;
 
 #[derive(Debug)]
 pub struct ConcurrencyLimiter {
@@ -71,15 +75,50 @@ impl ConcurrencyLimiter {
     }
 
     pub fn sweep_idle(&self, horizon: Duration) -> usize {
+        self.sweep_idle_with_cap(horizon, ANON_CONCURRENCY_ENTRY_CAP)
+    }
+
+    fn sweep_idle_with_cap(&self, horizon: Duration, cap: usize) -> usize {
         let now = Instant::now();
+        let mut keys: Vec<String> = self
+            .semaphores
+            .iter()
+            .filter(|entry| entry.value().is_idle(now, horizon))
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        let mut selected: HashSet<String> = keys.iter().cloned().collect();
+        let anon_count = self
+            .semaphores
+            .iter()
+            .filter(|entry| entry.key().starts_with(ANON_PREFIX))
+            .count();
+        let remaining_after_idle = anon_count.saturating_sub(selected.len());
+        if remaining_after_idle > cap {
+            let mut candidates: Vec<(Instant, String)> = self
+                .semaphores
+                .iter()
+                .filter(|entry| {
+                    entry.key().starts_with(ANON_PREFIX)
+                        && !selected.contains(entry.key())
+                        && entry.value().all_permits_available()
+                })
+                .map(|entry| (entry.value().last_touched(), entry.key().clone()))
+                .collect();
+            candidates
+                .sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+            for (_, key) in candidates.into_iter().take(remaining_after_idle - cap) {
+                selected.insert(key.clone());
+                keys.push(key);
+            }
+        }
+
         let mut removed = 0;
-        self.semaphores.retain(|_, entry| {
-            let evict = entry.is_idle(now, horizon);
-            if evict {
+        for key in keys {
+            if self.semaphores.remove(&key).is_some() {
                 removed += 1;
             }
-            !evict
-        });
+        }
         removed
     }
 
@@ -208,6 +247,10 @@ impl LimitSemaphore {
     fn is_idle(&self, now: Instant, horizon: Duration) -> bool {
         self.all_permits_available()
             && now.duration_since(*self.last_touched.lock().unwrap()) >= horizon
+    }
+
+    fn last_touched(&self) -> Instant {
+        *self.last_touched.lock().unwrap()
     }
 }
 
@@ -363,6 +406,37 @@ mod tests {
         drop(permit);
         assert_eq!(limiter.sweep_idle(Duration::ZERO), 1);
         assert_eq!(limiter.len(), 0);
+    }
+
+    #[test]
+    fn sweep_caps_oldest_idle_anonymous_entries() {
+        let limiter = ConcurrencyLimiter::new(1);
+        let base = Instant::now() - Duration::from_secs(60);
+        for i in 0..5 {
+            let key = format!("anon:{i}");
+            let permit = limiter.try_acquire(&key, 1).unwrap();
+            drop(permit);
+            *limiter
+                .semaphores
+                .get(&key)
+                .unwrap()
+                .last_touched
+                .lock()
+                .unwrap() = base + Duration::from_secs(i as u64);
+        }
+        let held = limiter.try_acquire("anon:held", 1).unwrap();
+        limiter.try_acquire("account", 1).unwrap();
+
+        assert_eq!(limiter.sweep_idle_with_cap(Duration::from_secs(3600), 3), 3);
+        assert!(!limiter.semaphores.contains_key("anon:0"));
+        assert!(!limiter.semaphores.contains_key("anon:1"));
+        assert!(!limiter.semaphores.contains_key("anon:2"));
+        assert!(limiter.semaphores.contains_key("anon:3"));
+        assert!(limiter.semaphores.contains_key("anon:4"));
+        assert!(limiter.semaphores.contains_key("anon:held"));
+        assert!(limiter.semaphores.contains_key("account"));
+
+        drop(held);
     }
 
     async fn yield_reclaimer() {
