@@ -52,6 +52,10 @@ impl CommercialConfig {
             "commercial.pod_count must be greater than zero"
         );
         anyhow::ensure!(
+            self.flush_max_events <= 10_000,
+            "commercial.flush_max_events must be at most 10000"
+        );
+        anyhow::ensure!(
             !self.client_ip_header.trim().is_empty(),
             "commercial.client_ip_header must not be empty"
         );
