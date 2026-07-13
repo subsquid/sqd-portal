@@ -140,8 +140,15 @@ fn enforce_sql_entitlements(
     grant: Option<&Granted>,
     sources: &[ResolvedSqlSource],
 ) -> Result<(), SqlErr> {
-    let Some(entitled_chains) = grant.and_then(|grant| grant.entitled_chains.as_ref()) else {
+    let Some(grant) = grant else {
         return Ok(());
+    };
+    let Some(entitled_chains) = grant.entitled_chains.as_ref() else {
+        return if grant.principal.api_key_id.is_some() {
+            Err(sql_entitlement_rejection())
+        } else {
+            Ok(())
+        };
     };
     if entitled_chains.contains("*") {
         return Ok(());
@@ -151,15 +158,19 @@ fn enforce_sql_entitlements(
         .iter()
         .any(|source| !entitled_chains.contains(&source.dataset_slug))
     {
-        return Err(SqlErr::Rejected(Rejected {
-            reason: "dataset_not_entitled".to_string(),
-            http_status: 403,
-            message: "Dataset is not enabled for this key".to_string(),
-            retry_after_secs: None,
-        }));
+        return Err(sql_entitlement_rejection());
     }
 
     Ok(())
+}
+
+fn sql_entitlement_rejection() -> SqlErr {
+    SqlErr::Rejected(Rejected {
+        reason: "dataset_not_entitled".to_string(),
+        http_status: 403,
+        message: "Dataset is not enabled for this key".to_string(),
+        retry_after_secs: None,
+    })
 }
 
 #[cfg(test)]
@@ -195,6 +206,12 @@ mod tests {
             quota_remaining_bytes: Some(1_000_000),
             concurrency_permit: None,
         }
+    }
+
+    fn grant_without_entitlements() -> Granted {
+        let mut grant = grant_with_entitlements(&[]);
+        grant.entitled_chains = None;
+        grant
     }
 
     #[test]
@@ -246,11 +263,46 @@ mod tests {
     }
 
     #[test]
+    fn sql_entitlement_rejects_keyed_grant_without_entitlement_data() {
+        let grant = grant_without_entitlements();
+        let mut ctx = plan::TraversalContext::new(plan::Options::default());
+        let err =
+            match resolve_authorized_sources(sql_request(JSON_PLAN_SOLANA), &mut ctx, Some(&grant))
+            {
+                Ok(_) => panic!("expected SQL entitlement rejection"),
+                Err(err) => err,
+            };
+
+        match &err {
+            SqlErr::Rejected(rejected) => {
+                assert_eq!(rejected.reason, "dataset_not_entitled");
+                assert_eq!(rejected.http_status, 403);
+            }
+            other => panic!("expected commercial rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sql_entitlement_allows_oss_no_grant() {
         let mut ctx = plan::TraversalContext::new(plan::Options::default());
 
         let sources = resolve_authorized_sources(sql_request(JSON_PLAN_SOLANA), &mut ctx, None)
             .expect("OSS SQL requests should be unrestricted");
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].dataset_slug, "solana-mainnet");
+    }
+
+    #[test]
+    fn sql_entitlement_allows_anonymous_grant_without_entitlement_data() {
+        let mut grant = grant_without_entitlements();
+        grant.principal.account_id = "anonymous".to_string();
+        grant.principal.api_key_id = None;
+        let mut ctx = plan::TraversalContext::new(plan::Options::default());
+
+        let sources =
+            resolve_authorized_sources(sql_request(JSON_PLAN_SOLANA), &mut ctx, Some(&grant))
+                .expect("anonymous SQL requests should use public access");
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].dataset_slug, "solana-mainnet");
