@@ -104,13 +104,21 @@ impl BufferedUsageReporter {
                 }
                 _ = self.inner.notify.notified() => {
                     if self.queue_len() >= self.inner.options.flush_max_events {
-                        self.flush_one_batch_with_retry(&cancel).await;
+                        self.flush_threshold_backlog(&cancel).await;
                     }
                 }
                 _ = &mut tick => {
                     self.flush_one_batch_with_retry(&cancel).await;
                     tick.as_mut().reset(tokio::time::Instant::now() + self.inner.options.flush_interval);
                 }
+            }
+        }
+    }
+
+    async fn flush_threshold_backlog(&self, cancel: &CancellationToken) {
+        while self.queue_len() >= self.inner.options.flush_max_events {
+            if !self.flush_one_batch_with_retry(cancel).await || cancel.is_cancelled() {
+                return;
             }
         }
     }
@@ -139,13 +147,39 @@ impl BufferedUsageReporter {
         }
     }
 
-    async fn flush_one_batch_with_retry(&self, cancel: &CancellationToken) {
+    async fn flush_one_batch_with_retry(&self, cancel: &CancellationToken) -> bool {
         let Some(batch) = self.pop_batch() else {
-            return;
+            return true;
         };
 
         if let Some(batch) = self.send_with_retry(batch, cancel).await {
             self.push_front_batch(batch);
+            return false;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    async fn flush_threshold_backlog_using<F>(&self, cancel: &CancellationToken, mut send_once: F)
+    where
+        F: for<'a> FnMut(&'a [StreamUsageEvent]) -> SendOnceFuture<'a>,
+    {
+        while self.queue_len() >= self.inner.options.flush_max_events {
+            let Some(batch) = self.pop_batch() else {
+                return;
+            };
+
+            if let Some(batch) = self
+                .send_with_retry_using(batch, cancel, &mut send_once)
+                .await
+            {
+                self.push_front_batch(batch);
+                return;
+            }
+
+            if cancel.is_cancelled() {
+                return;
+            }
         }
     }
 
@@ -464,6 +498,102 @@ mod tests {
                 .map(|event| event.event_id.as_str())
                 .collect::<Vec<_>>(),
             ["one", "two"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn threshold_notify_drains_burst_without_interval_ticks() {
+        let reporter = reporter(
+            "http://127.0.0.1:1".parse().unwrap(),
+            Duration::from_secs(60),
+            2,
+            10,
+        );
+        let cancel = CancellationToken::new();
+        {
+            let mut queue = reporter.lock_queue();
+            for index in 0..6 {
+                queue.push_back(event(&format!("burst-{index}")));
+            }
+        }
+        metrics::set_commercial_usage_buffer_len(reporter.queue_len() as i64);
+
+        reporter.inner.notify.notify_one();
+        reporter.inner.notify.notified().await;
+
+        let start = tokio::time::Instant::now();
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        reporter
+            .flush_threshold_backlog_using(&cancel, {
+                let delivered = delivered.clone();
+                move |batch: &[StreamUsageEvent]| -> SendOnceFuture<'_> {
+                    let delivered = delivered.clone();
+                    let batch = batch
+                        .iter()
+                        .map(|event| event.event_id.clone())
+                        .collect::<Vec<_>>();
+                    Box::pin(async move {
+                        delivered.lock().unwrap().extend(batch);
+                        Ok(())
+                    })
+                }
+            })
+            .await;
+
+        let delivered = delivered.lock().unwrap().clone();
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "drain waited for the flush interval"
+        );
+        assert_eq!(
+            delivered,
+            ["burst-0", "burst-1", "burst-2", "burst-3", "burst-4", "burst-5"]
+                .map(str::to_string)
+                .to_vec()
+        );
+        assert_eq!(reporter.queue_len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn threshold_drain_stops_when_send_requeues_batch() {
+        let reporter = reporter(
+            "http://127.0.0.1:1".parse().unwrap(),
+            Duration::from_secs(60),
+            2,
+            10,
+        );
+        let cancel = CancellationToken::new();
+        {
+            let mut queue = reporter.lock_queue();
+            for index in 0..6 {
+                queue.push_back(event(&format!("outage-{index}")));
+            }
+        }
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        reporter
+            .flush_threshold_backlog_using(&cancel, {
+                let attempts = attempts.clone();
+                move |_: &[StreamUsageEvent]| -> SendOnceFuture<'_> {
+                    let attempts = attempts.clone();
+                    Box::pin(async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err(SendBatchError::Retry("outage".to_string()))
+                    })
+                }
+            })
+            .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_RETRY_ATTEMPTS);
+        assert_eq!(reporter.queue_len(), 6);
+        assert_eq!(
+            reporter
+                .pop_batch()
+                .unwrap()
+                .iter()
+                .map(|event| event.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["outage-0", "outage-1"]
         );
     }
 
