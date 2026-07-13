@@ -2,6 +2,7 @@ use subtle::ConstantTimeEq;
 
 use super::{
     config::default_throttle_residual_secs,
+    tally::effective_remaining_after_served,
     types::{
         Authorization, AuthorizeRequest, Credential, Defaults, Endpoint, Granted, GrantedLimits,
         KeySnapshot, KeyStatus, OnExceed, Principal, Rejected, SnapshotLimits,
@@ -177,7 +178,9 @@ fn evaluate_key(
         .unwrap_or(OnExceed::Reject);
     let effective = quota
         .and_then(|quota| quota.remaining_bytes)
-        .map(|remaining_bytes| remaining_bytes - state.tally_bytes as i64);
+        .map(|remaining_bytes| {
+            effective_remaining_after_served(remaining_bytes, state.tally_bytes)
+        });
     if effective.is_some_and(|effective| effective <= 0) {
         return match on_exceed {
             OnExceed::Reject => reject(
@@ -953,6 +956,27 @@ mod tests {
             Authorization::Rejected(rejected) => {
                 panic!("expected unlimited public quota grant, got {rejected:?}")
             }
+        }
+    }
+
+    #[test]
+    fn negative_quota_remaining_fails_closed_without_overflow() {
+        let mut snapshot = active_snapshot(1);
+        snapshot.quota.as_mut().unwrap().remaining_bytes = Some(i64::MIN);
+        let mut quota_state = state();
+        quota_state.tally_bytes = 1;
+
+        match evaluate(
+            &request(SECRET_SHA256),
+            Some(&snapshot),
+            &defaults(),
+            quota_state,
+        ) {
+            Authorization::Rejected(rejected) => {
+                assert_eq!(rejected.reason, "quota_exhausted");
+                assert_eq!(rejected.http_status, 402);
+            }
+            Authorization::Granted(_) => panic!("negative remaining should fail closed"),
         }
     }
 

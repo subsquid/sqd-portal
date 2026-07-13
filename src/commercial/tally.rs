@@ -48,7 +48,7 @@ impl TallyStore {
         snapshot_remaining: i64,
     ) -> i64 {
         let served = self.bytes_for(account_id, grant_version);
-        snapshot_remaining - served as i64
+        effective_remaining_after_served(snapshot_remaining, served)
     }
 
     pub fn handle(&self, account_id: &str, version: u64) -> TallyHandle {
@@ -122,7 +122,7 @@ impl TallyHandle {
         } else {
             self.tally.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes
         };
-        snapshot_remaining - served as i64
+        effective_remaining_after_served(snapshot_remaining, served)
     }
 
     fn rebase_to(&self, version: u64) {
@@ -160,6 +160,12 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+pub(crate) fn effective_remaining_after_served(snapshot_remaining: i64, served: u64) -> i64 {
+    snapshot_remaining
+        .max(0)
+        .saturating_sub(i64::try_from(served).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]
@@ -202,6 +208,16 @@ mod tests {
         assert_eq!(handle.debit_and_effective_remaining(7, 3, 5), 2);
         assert_eq!(handle.debit_and_effective_remaining(7, 4, 5), -2);
         assert_eq!(tally.bytes_for("account", 7), 7);
+    }
+
+    #[test]
+    fn effective_remaining_clamps_negative_snapshots_and_saturates_served_bytes() {
+        assert_eq!(effective_remaining_after_served(i64::MIN, 0), 0);
+        assert_eq!(effective_remaining_after_served(i64::MIN, 1), -1);
+        assert_eq!(
+            effective_remaining_after_served(5, u64::MAX),
+            5i64.saturating_sub(i64::MAX)
+        );
     }
 
     #[test]
