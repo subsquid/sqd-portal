@@ -52,7 +52,7 @@ pub fn join_gzip_default<S: Stream<Item = Vec<u8>>>(
     join_gzip(data, JOIN_GZIP_CHUNK_SIZE)
 }
 
-pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
+pub fn join_gzip<S>(
     data: S,
     gzip_chunk_size: usize,
 ) -> impl Stream<Item = Result<Bytes, anyhow::Error>>

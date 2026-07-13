@@ -105,6 +105,7 @@ impl MeterHandle {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_enforced(
         granted: Granted,
         request_id: String,
@@ -154,9 +155,7 @@ impl MeterHandle {
         let event_id = uuid_v7();
         let request_id = non_empty_or_uuid(request_id);
         principal.account_id = non_empty_or_unknown(principal.account_id, "account");
-        principal.api_key_id = principal
-            .api_key_id
-            .and_then(|api_key_id| non_empty_option(api_key_id));
+        principal.api_key_id = principal.api_key_id.and_then(non_empty_option);
         let tally_account_id = tally_account_id.unwrap_or_else(|| principal.account_id.clone());
         if limits.throughput_bytes_per_sec == Some(0) {
             zero_limits::report(

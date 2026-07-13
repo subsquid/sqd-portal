@@ -1329,12 +1329,10 @@ mod tests {
         }
     }
 
-    static STALENESS_GAUGE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static STALENESS_GAUGE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn staleness_gauge_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        STALENESS_GAUGE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    async fn staleness_gauge_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        STALENESS_GAUGE_TEST_LOCK.lock().await
     }
 
     fn reset_staleness_gauges() {
@@ -1916,7 +1914,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn sync_staleness_gauge_grows_from_boot_before_first_success() {
-        let _guard = staleness_gauge_test_guard();
+        let _guard = staleness_gauge_test_guard().await;
         reset_staleness_gauges();
         let path = cache_path("from-boot-outage");
         let _ = tokio::fs::remove_file(&path).await;
@@ -1949,7 +1947,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn sync_staleness_gauges_grow_across_failed_ticks() {
-        let _guard = staleness_gauge_test_guard();
+        let _guard = staleness_gauge_test_guard().await;
         reset_staleness_gauges();
         let store = SnapshotStore::inactive(&PublicFallbackConfig {
             throughput_bytes_per_sec: 1,
