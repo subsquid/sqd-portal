@@ -417,23 +417,21 @@ impl SnapshotStore {
     }
 
     fn replace_records(&self, records: Vec<SnapshotRecord>, cursor: u64) -> anyhow::Result<()> {
-        let mut map = HashMap::new();
         let mut defaults = None;
-        let mut hook_records = Vec::new();
+        let mut records_map = HashMap::new();
         for record in records {
             match record {
                 SnapshotRecord::Defaults(record) => defaults = Some(Defaults::from(record)),
                 SnapshotRecord::Key(record) => {
                     let record = Arc::new(record);
-                    hook_records.push(record.clone());
-                    map.insert(record.key_id.clone(), record);
+                    records_map.insert(record.key_id.clone(), record);
                 }
             }
         }
         if let Some(defaults) = defaults {
-            self.inner.defaults.store(Arc::new(defaults));
+            self.store_defaults(defaults);
         }
-        self.inner.records.store(Arc::new(map));
+        let hook_records = self.replace_key_records(records_map, cursor);
         for record in hook_records {
             self.apply_snapshot_hooks(&record);
         }
@@ -443,25 +441,107 @@ impl SnapshotStore {
         Ok(())
     }
 
+    fn replace_key_records(
+        &self,
+        records: HashMap<String, Arc<KeySnapshot>>,
+        cursor: u64,
+    ) -> Vec<Arc<KeySnapshot>> {
+        loop {
+            let current = self.inner.records.load();
+            let mut map = HashMap::with_capacity(records.len().max(current.len()));
+            let mut hook_records = Vec::new();
+
+            for (key_id, record) in &records {
+                if let Some(existing) = current.get(key_id) {
+                    if existing.seq > record.seq {
+                        map.insert(key_id.clone(), existing.clone());
+                        continue;
+                    }
+                }
+                map.insert(key_id.clone(), record.clone());
+                hook_records.push(record.clone());
+            }
+
+            for (key_id, existing) in current.iter() {
+                if !map.contains_key(key_id) && existing.seq > cursor {
+                    map.insert(key_id.clone(), existing.clone());
+                }
+            }
+
+            let previous = self
+                .inner
+                .records
+                .compare_and_swap(&*current, Arc::new(map));
+            if Arc::ptr_eq(&*current, &*previous) {
+                return hook_records;
+            }
+        }
+    }
+
+    fn store_defaults(&self, defaults: Defaults) {
+        let defaults = Arc::new(defaults);
+        loop {
+            let current = self.inner.defaults.load();
+            if current.seq > defaults.seq {
+                return;
+            }
+            let previous = self
+                .inner
+                .defaults
+                .compare_and_swap(&*current, defaults.clone());
+            if Arc::ptr_eq(&*current, &*previous) {
+                return;
+            }
+        }
+    }
+
+    fn apply_key_records(&self, records: &[Arc<KeySnapshot>]) -> Vec<Arc<KeySnapshot>> {
+        loop {
+            let current = self.inner.records.load();
+            let mut map = (**current).clone();
+            let mut hook_records = Vec::new();
+
+            for record in records {
+                if current
+                    .get(&record.key_id)
+                    .is_some_and(|existing| existing.seq >= record.seq)
+                {
+                    continue;
+                }
+                map.insert(record.key_id.clone(), record.clone());
+                hook_records.push(record.clone());
+            }
+
+            if hook_records.is_empty() {
+                return hook_records;
+            }
+
+            let previous = self
+                .inner
+                .records
+                .compare_and_swap(&*current, Arc::new(map));
+            if Arc::ptr_eq(&*current, &*previous) {
+                return hook_records;
+            }
+        }
+    }
+
     fn apply_records(&self, records: Vec<SnapshotRecord>, cursor: u64) -> anyhow::Result<()> {
-        let mut map = (**self.inner.records.load()).clone();
-        let mut hook_records = Vec::new();
+        let mut key_records = Vec::new();
         for record in records {
             match record {
                 SnapshotRecord::Defaults(record) => {
-                    self.inner.defaults.store(Arc::new(Defaults::from(record)));
+                    self.store_defaults(Defaults::from(record));
                 }
                 SnapshotRecord::Key(record) => {
                     if record.status != KeyStatus::Active {
                         tracing::info!(key_id = record.key_id, "commercial key became non-active");
                     }
-                    let record = Arc::new(record);
-                    hook_records.push(record.clone());
-                    map.insert(record.key_id.clone(), record);
+                    key_records.push(Arc::new(record));
                 }
             }
         }
-        self.inner.records.store(Arc::new(map));
+        let hook_records = self.apply_key_records(&key_records);
         for record in hook_records {
             self.apply_snapshot_hooks(&record);
         }
@@ -1385,6 +1465,58 @@ mod tests {
         let stored = store.get(KEY_ID).unwrap();
         assert_eq!(stored.seq, 12);
         assert_eq!(stored.status, KeyStatus::Suspended);
+    }
+
+    #[test]
+    fn delta_application_keeps_newer_resolved_record() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        let mut resolved = active_snapshot(12);
+        resolved.account_id = Some("resolved".to_string());
+        store.upsert_key(resolved).unwrap();
+
+        let mut older_delta = active_snapshot(11);
+        older_delta.status = KeyStatus::Suspended;
+        store
+            .apply_records(vec![SnapshotRecord::Key(older_delta)], 11)
+            .unwrap();
+
+        let stored = store.get(KEY_ID).unwrap();
+        assert_eq!(stored.seq, 12);
+        assert_eq!(stored.account_id.as_deref(), Some("resolved"));
+        assert_eq!(stored.status, KeyStatus::Active);
+    }
+
+    #[test]
+    fn replacement_preserves_resolved_records_newer_than_cursor() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        store
+            .replace_records(vec![SnapshotRecord::Key(active_snapshot(10))], 10)
+            .unwrap();
+
+        let mut resolved = active_snapshot(12);
+        resolved.key_id = "fresh-key".to_string();
+        store.upsert_key(resolved).unwrap();
+
+        store
+            .replace_records(vec![SnapshotRecord::Key(active_snapshot(10))], 10)
+            .unwrap();
+
+        assert!(store.get("fresh-key").is_some());
+        assert!(store.get(KEY_ID).is_some());
     }
 
     #[tokio::test(start_paused = true)]
