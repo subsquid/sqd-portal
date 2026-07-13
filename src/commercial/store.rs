@@ -580,7 +580,12 @@ impl SnapshotStore {
             }
         }
         if let Some(defaults) = defaults {
-            self.store_defaults(defaults);
+            self.store_defaults_with_mode(defaults, mode);
+        } else if matches!(mode, BootstrapMode::Authoritative) {
+            tracing::warn!(
+                current_seq = self.inner.defaults.load().seq,
+                "authoritative commercial snapshot contained no defaults; keeping current defaults"
+            );
         }
         let hooks = self.replace_key_records(records_map, cursor, mode);
         for record in hooks.changed {
@@ -644,10 +649,15 @@ impl SnapshotStore {
     }
 
     fn store_defaults(&self, defaults: Defaults) {
+        self.store_defaults_with_mode(defaults, BootstrapMode::Normal);
+    }
+
+    fn store_defaults_with_mode(&self, defaults: Defaults, mode: BootstrapMode) {
         let defaults = Arc::new(defaults);
+        let preserve_higher_seq = matches!(mode, BootstrapMode::Normal);
         loop {
             let current = self.inner.defaults.load();
-            if current.seq > defaults.seq {
+            if preserve_higher_seq && current.seq > defaults.seq {
                 return;
             }
             let previous = self
@@ -1742,6 +1752,89 @@ mod tests {
 
         assert!(store.get("fresh-key").is_some());
         assert!(store.get(KEY_ID).is_some());
+    }
+
+    #[test]
+    fn normal_replacement_refuses_lower_seq_defaults() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Defaults(defaults_record(100))],
+                100,
+                BootstrapMode::Normal,
+            )
+            .unwrap();
+
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Defaults(defaults_record(5))],
+                5,
+                BootstrapMode::Normal,
+            )
+            .unwrap();
+
+        assert_eq!(store.view().defaults.seq, 100);
+    }
+
+    #[test]
+    fn authoritative_replacement_accepts_lower_seq_defaults() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Defaults(defaults_record(100))],
+                100,
+                BootstrapMode::Normal,
+            )
+            .unwrap();
+
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Defaults(defaults_record(5))],
+                5,
+                BootstrapMode::Authoritative,
+            )
+            .unwrap();
+
+        assert_eq!(store.view().defaults.seq, 5);
+    }
+
+    #[test]
+    fn authoritative_replacement_without_defaults_keeps_current_defaults() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Defaults(defaults_record(100))],
+                100,
+                BootstrapMode::Normal,
+            )
+            .unwrap();
+
+        store
+            .replace_records_with_mode(vec![], 5, BootstrapMode::Authoritative)
+            .unwrap();
+
+        assert_eq!(store.view().defaults.seq, 100);
     }
 
     #[tokio::test]
