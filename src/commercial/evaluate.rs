@@ -314,6 +314,7 @@ fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
         },
         tally_account_id: None,
         entitled_chains: None,
+        entitled_traces: None,
         limits: GrantedLimits {
             max_response_bytes: defaults.public.limits.max_response_bytes,
             throughput_bytes_per_sec: defaults.public.limits.throughput_bytes_per_sec,
@@ -428,6 +429,7 @@ fn anonymous_grant(
         },
         tally_account_id: tally_enabled.then_some(account_key),
         entitled_chains: None,
+        entitled_traces: None,
         limits,
         on_exceed: public_on_exceed(defaults),
         quota_version,
@@ -463,6 +465,13 @@ fn grant(
         entitled_chains: snapshot.entitlements.as_ref().map(|entitlements| {
             entitlements
                 .chains
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        }),
+        entitled_traces: snapshot.entitlements.as_ref().map(|entitlements| {
+            entitlements
+                .traces
                 .iter()
                 .cloned()
                 .collect::<std::collections::HashSet<_>>()
@@ -1045,10 +1054,11 @@ mod tests {
     }
 
     #[test]
-    fn keyed_sql_grant_carries_snapshot_entitled_chains() {
+    fn keyed_sql_grant_carries_snapshot_entitlements() {
         let mut snapshot = active_snapshot(1);
         snapshot.entitlements.as_mut().unwrap().chains =
             vec!["solana-mainnet".to_string(), "ethereum-mainnet".to_string()];
+        snapshot.entitlements.as_mut().unwrap().traces = vec!["ethereum-mainnet".to_string()];
         let mut req = request(SECRET_SHA256);
         req.dataset = "sql".to_string();
         req.endpoint = Endpoint::SqlQuery;
@@ -1062,6 +1072,11 @@ mod tests {
                 assert!(!entitled.contains("sql"));
                 assert!(entitled.contains("solana-mainnet"));
                 assert!(entitled.contains("ethereum-mainnet"));
+                let trace_entitled = grant
+                    .entitled_traces
+                    .expect("keyed grants should carry the snapshot trace set");
+                assert_eq!(trace_entitled.len(), 1);
+                assert!(trace_entitled.contains("ethereum-mainnet"));
             }
             Authorization::Rejected(rejected) => panic!("expected grant, got {rejected:?}"),
         }

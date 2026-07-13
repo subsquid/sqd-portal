@@ -150,15 +150,35 @@ fn enforce_sql_entitlements(
             Ok(())
         };
     };
-    if entitled_chains.contains("*") {
+    if !entitled_chains.contains("*")
+        && sources
+            .iter()
+            .any(|source| !entitled_chains.contains(&source.dataset_slug))
+    {
+        return Err(sql_entitlement_rejection());
+    }
+
+    let touches_traces = sources
+        .iter()
+        .any(|source| metadata::is_trace_sensitive_table(&source.source.table_name));
+    if !touches_traces {
         return Ok(());
     }
 
-    if sources
-        .iter()
-        .any(|source| !entitled_chains.contains(&source.dataset_slug))
+    // DECISION(#13): the stream path checks trace entitlements only for EVM
+    // datasets. SQL sources do not carry chain-kind metadata at authorization
+    // time, so fail closed for every dataset that references a trace-sensitive
+    // table. The embedded schemas currently expose these tables only for EVM.
+    let Some(entitled_traces) = grant.entitled_traces.as_ref() else {
+        return Err(sql_trace_entitlement_rejection());
+    };
+    if !entitled_traces.contains("*")
+        && sources.iter().any(|source| {
+            metadata::is_trace_sensitive_table(&source.source.table_name)
+                && !entitled_traces.contains(&source.dataset_slug)
+        })
     {
-        return Err(sql_entitlement_rejection());
+        return Err(sql_trace_entitlement_rejection());
     }
 
     Ok(())
@@ -169,6 +189,15 @@ fn sql_entitlement_rejection() -> SqlErr {
         reason: "dataset_not_entitled".to_string(),
         http_status: 403,
         message: "Dataset is not enabled for this key".to_string(),
+        retry_after_secs: None,
+    })
+}
+
+fn sql_trace_entitlement_rejection() -> SqlErr {
+    SqlErr::Rejected(Rejected {
+        reason: "traces_not_entitled".to_string(),
+        http_status: 403,
+        message: "Traces are not enabled for this key".to_string(),
         retry_after_secs: None,
     })
 }
@@ -192,6 +221,17 @@ mod tests {
         body::Bytes::from(bytes)
     }
 
+    fn sql_request_for_table(schema: &str, table: &str) -> body::Bytes {
+        let mut json: serde_json::Value = serde_json::from_str(JSON_PLAN_SOLANA).unwrap();
+        json["relations"][0]["root"]["input"]["project"]["input"]["filter"]["input"]["read"]
+            ["namedTable"]["names"] =
+            serde_json::json!(["d40ebe93_89e7_4e92_b6ed_452340d405bb", schema, table]);
+        let plan: Plan = serde_json::from_value(json).unwrap();
+        let mut bytes = Vec::new();
+        plan.encode(&mut bytes).unwrap();
+        body::Bytes::from(bytes)
+    }
+
     fn grant_with_entitlements(chains: &[&str]) -> Granted {
         Granted {
             principal: Principal {
@@ -200,6 +240,7 @@ mod tests {
             },
             tally_account_id: None,
             entitled_chains: Some(chains.iter().map(|chain| (*chain).to_string()).collect()),
+            entitled_traces: Some(Default::default()),
             limits: GrantedLimits::default(),
             on_exceed: OnExceed::Reject,
             quota_version: 1,
@@ -212,6 +253,15 @@ mod tests {
         let mut grant = grant_with_entitlements(&[]);
         grant.entitled_chains = None;
         grant
+    }
+
+    fn set_trace_entitlements(grant: &mut Granted, traces: &[&str]) {
+        grant.entitled_traces = Some(
+            traces
+                .iter()
+                .map(|dataset| (*dataset).to_string())
+                .collect(),
+        );
     }
 
     #[test]
@@ -306,5 +356,77 @@ mod tests {
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].dataset_slug, "solana-mainnet");
+    }
+
+    #[test]
+    fn sql_trace_table_rejects_key_entitled_to_chain_but_not_traces() {
+        let grant = grant_with_entitlements(&["ethereum-mainnet"]);
+        let mut ctx = plan::TraversalContext::new(plan::Options::default());
+        let err = resolve_authorized_sources(
+            sql_request_for_table("ethereum_mainnet", "traces"),
+            &mut ctx,
+            Some(&grant),
+        )
+        .expect_err("trace table should require its dataset trace entitlement");
+
+        match &err {
+            SqlErr::Rejected(rejected) => {
+                assert_eq!(rejected.reason, "traces_not_entitled");
+                assert_eq!(rejected.http_status, 403);
+            }
+            other => panic!("expected commercial rejection, got {other:?}"),
+        }
+        assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn sql_non_trace_table_allows_key_entitled_to_chain_without_traces() {
+        let grant = grant_with_entitlements(&["ethereum-mainnet"]);
+        let mut ctx = plan::TraversalContext::new(plan::Options::default());
+
+        let sources = resolve_authorized_sources(
+            sql_request_for_table("ethereum_mainnet", "blocks"),
+            &mut ctx,
+            Some(&grant),
+        )
+        .unwrap();
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source.table_name, "blocks");
+    }
+
+    #[test]
+    fn sql_trace_table_allows_wildcard_trace_entitlement() {
+        let mut grant = grant_with_entitlements(&["ethereum-mainnet"]);
+        set_trace_entitlements(&mut grant, &["*"]);
+        let mut ctx = plan::TraversalContext::new(plan::Options::default());
+
+        let sources = resolve_authorized_sources(
+            sql_request_for_table("ethereum_mainnet", "statediffs"),
+            &mut ctx,
+            Some(&grant),
+        )
+        .unwrap();
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source.table_name, "statediffs");
+    }
+
+    #[test]
+    fn sql_trace_table_keeps_anonymous_public_access() {
+        let mut grant = grant_without_entitlements();
+        grant.principal.account_id = "anonymous".to_string();
+        grant.principal.api_key_id = None;
+        grant.entitled_traces = None;
+        let mut ctx = plan::TraversalContext::new(plan::Options::default());
+
+        let sources = resolve_authorized_sources(
+            sql_request_for_table("ethereum_mainnet", "traces"),
+            &mut ctx,
+            Some(&grant),
+        )
+        .expect("anonymous SQL trace requests should keep public access semantics");
+
+        assert_eq!(sources.len(), 1);
     }
 }

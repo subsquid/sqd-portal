@@ -172,6 +172,11 @@ pub fn table_type(name: &str) -> TableType {
     TableType::Unknown
 }
 
+pub fn is_trace_sensitive_table(name: &str) -> bool {
+    // These are the trace-bearing table names exposed by the embedded EVM schema.
+    name.eq_ignore_ascii_case("traces") || name.eq_ignore_ascii_case("statediffs")
+}
+
 pub fn get_dataset_stats(_dataset: &DatasetId) -> Option<Stats> {
     None
 }

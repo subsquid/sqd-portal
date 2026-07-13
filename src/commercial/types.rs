@@ -101,6 +101,8 @@ pub struct Granted {
     pub tally_account_id: Option<String>,
     #[serde(skip)]
     pub entitled_chains: Option<HashSet<String>>,
+    #[serde(skip)]
+    pub entitled_traces: Option<HashSet<String>>,
     pub limits: GrantedLimits,
     pub on_exceed: OnExceed,
     pub quota_version: u64,
