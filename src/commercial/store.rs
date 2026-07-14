@@ -118,6 +118,7 @@ enum BootstrapMode {
 #[derive(Debug)]
 enum AuthoritativeResetReason {
     EpochChanged { stored: String, received: String },
+    ResetWithUnknownEpoch { received: String },
     HeadRolledBack { cursor: u64, head_seq: u64 },
 }
 
@@ -451,6 +452,13 @@ impl SnapshotStore {
                         "commercial snapshot feed epoch changed; authoritative re-bootstrap requested"
                     );
                 }
+                AuthoritativeResetReason::ResetWithUnknownEpoch { received } => {
+                    tracing::warn!(
+                        cursor,
+                        received_epoch = received,
+                        "commercial snapshot reset arrived without a stored epoch; authoritative re-bootstrap requested"
+                    );
+                }
                 AuthoritativeResetReason::HeadRolledBack { cursor, head_seq } => {
                     tracing::warn!(
                         cursor,
@@ -527,14 +535,18 @@ impl SnapshotStore {
         }
 
         let received = page.epoch.as_ref()?;
-        let stored = self.inner.epoch.lock().unwrap().clone()?;
-        if stored.as_str() != received.as_str() {
-            return Some(AuthoritativeResetReason::EpochChanged {
-                stored,
+        match self.inner.epoch.lock().unwrap().clone() {
+            Some(stored) if stored.as_str() != received.as_str() => {
+                Some(AuthoritativeResetReason::EpochChanged {
+                    stored,
+                    received: received.clone(),
+                })
+            }
+            None if page.reset => Some(AuthoritativeResetReason::ResetWithUnknownEpoch {
                 received: received.clone(),
-            });
+            }),
+            _ => None,
         }
-        None
     }
 
     fn observe_epoch(&self, epoch: Option<String>) {
@@ -2467,6 +2479,58 @@ mod tests {
         assert_eq!(store.get(KEY_ID).unwrap().seq, 10);
         assert!(store.inner.epoch.lock().unwrap().is_none());
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn reset_with_received_epoch_and_no_stored_epoch_is_authoritative() {
+        let mock = MockControlPlane::spawn().await;
+        mock.push_page(
+            100,
+            feed_page(vec![], 5, true, Some("epoch-new"), Some(100)),
+        );
+        let mut restored = active_snapshot(5);
+        restored.account_id = Some("restored".to_string());
+        mock.push_page(
+            0,
+            feed_page(
+                vec![SnapshotRecord::Key(restored)],
+                5,
+                false,
+                Some("epoch-new"),
+                Some(5),
+            ),
+        );
+        let store = SnapshotStore::new(
+            &config(&mock, PathBuf::new(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        let mut leftover = active_snapshot(90);
+        leftover.key_id = "pre-restore-leftover".to_string();
+        store.install_records_for_test(
+            vec![
+                SnapshotRecord::Key(active_snapshot(100)),
+                SnapshotRecord::Key(leftover),
+            ],
+            100,
+        );
+        assert!(store.inner.epoch.lock().unwrap().is_none());
+
+        store.sync_once().await.unwrap();
+
+        assert_eq!(store.view().cursor, 5);
+        assert_eq!(store.get(KEY_ID).unwrap().seq, 5);
+        assert_eq!(
+            store.get(KEY_ID).unwrap().account_id.as_deref(),
+            Some("restored")
+        );
+        assert!(store.get("pre-restore-leftover").is_none());
+        assert_eq!(
+            store.inner.epoch.lock().unwrap().as_deref(),
+            Some("epoch-new")
+        );
     }
 
     #[tokio::test(start_paused = true)]
