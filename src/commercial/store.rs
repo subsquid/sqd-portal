@@ -378,7 +378,16 @@ impl SnapshotStore {
         self.replace_records_with_mode(all, cursor, mode)?;
         match mode {
             BootstrapMode::Normal => self.observe_epoch(epoch),
-            BootstrapMode::Authoritative => self.set_epoch(epoch),
+            BootstrapMode::Authoritative => {
+                self.set_epoch(epoch);
+                if let Err(err) = self.persist_disk_cache().await {
+                    metrics::report_commercial_snapshot_persist_error();
+                    tracing::warn!(
+                        error = %err,
+                        "authoritative commercial snapshot cache persist failed"
+                    );
+                }
+            }
         }
         self.inner.ready.store(true, Ordering::Release);
         tracing::info!(
@@ -2154,6 +2163,63 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.view().defaults.seq, 6);
+    }
+
+    #[tokio::test]
+    async fn authoritative_bootstrap_persists_restored_cache_before_return() {
+        let mock = MockControlPlane::spawn().await;
+        let path = cache_path("authoritative-bootstrap-sync-persist");
+        let store = SnapshotStore::new(
+            &config(&mock, path.clone(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store.install_records_for_test(vec![SnapshotRecord::Key(active_snapshot(100))], 100);
+        store.set_epoch(Some("epoch-old".to_string()));
+        store.persist_disk_cache().await.unwrap();
+
+        let mut restored = active_snapshot(5);
+        restored.account_id = Some("restored".to_string());
+        mock.push_page(
+            0,
+            feed_page(
+                vec![SnapshotRecord::Key(restored)],
+                5,
+                false,
+                Some("epoch-new"),
+                Some(5),
+            ),
+        );
+
+        store
+            .bootstrap(
+                BootstrapMode::Authoritative,
+                Some("epoch-new".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let restarted = SnapshotStore::new(
+            &config(&mock, path.clone(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        restarted.load_disk_cache();
+
+        assert_eq!(restarted.view().cursor, 5);
+        assert_eq!(
+            restarted.inner.epoch.lock().unwrap().as_deref(),
+            Some("epoch-new")
+        );
+        assert_eq!(
+            restarted.get(KEY_ID).unwrap().account_id.as_deref(),
+            Some("restored")
+        );
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     #[tokio::test]
