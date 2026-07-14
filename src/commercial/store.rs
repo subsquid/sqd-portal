@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -40,6 +40,7 @@ struct SnapshotStoreInner {
     defaults: ArcSwap<Defaults>,
     defaults_pending_authoritative_replace: AtomicBool,
     generation: AtomicU64,
+    authoritative_lock: RwLock<()>,
     cursor: AtomicU64,
     epoch: Mutex<Option<String>>,
     ready: AtomicBool,
@@ -68,6 +69,7 @@ pub struct StoreView {
     pub records: Arc<HashMap<String, Arc<KeySnapshot>>>,
     pub defaults: Arc<Defaults>,
     pub cursor: u64,
+    pub(crate) generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +182,7 @@ impl SnapshotStore {
                 defaults: ArcSwap::from_pointee(defaults_from_fallback(&config.public_fallback)),
                 defaults_pending_authoritative_replace: AtomicBool::new(false),
                 generation: AtomicU64::new(0),
+                authoritative_lock: RwLock::new(()),
                 cursor: AtomicU64::new(0),
                 epoch: Mutex::new(None),
                 ready: AtomicBool::new(false),
@@ -206,6 +209,7 @@ impl SnapshotStore {
                 defaults: ArcSwap::from_pointee(defaults_from_fallback(fallback)),
                 defaults_pending_authoritative_replace: AtomicBool::new(false),
                 generation: AtomicU64::new(0),
+                authoritative_lock: RwLock::new(()),
                 cursor: AtomicU64::new(0),
                 epoch: Mutex::new(None),
                 ready: AtomicBool::new(true),
@@ -239,11 +243,18 @@ impl SnapshotStore {
     }
 
     pub fn view(&self) -> StoreView {
+        let _authoritative_guard = self.inner.authoritative_lock.read().unwrap();
         StoreView {
             records: self.inner.records.load_full(),
             defaults: self.inner.defaults.load_full(),
             cursor: self.inner.cursor.load(Ordering::Relaxed),
+            generation: self.inner.generation.load(Ordering::Acquire),
         }
+    }
+
+    pub(crate) fn with_authoritative_generation<R>(&self, operation: impl FnOnce(u64) -> R) -> R {
+        let _authoritative_guard = self.inner.authoritative_lock.read().unwrap();
+        operation(self.inner.generation.load(Ordering::Acquire))
     }
 
     pub fn get(&self, key_id: &str) -> Option<Arc<KeySnapshot>> {
@@ -648,6 +659,8 @@ impl SnapshotStore {
         cursor: u64,
         mode: BootstrapMode,
     ) -> anyhow::Result<()> {
+        let _authoritative_guard = matches!(mode, BootstrapMode::Authoritative)
+            .then(|| self.inner.authoritative_lock.write().unwrap());
         let mut defaults = None;
         let mut records_map = HashMap::new();
         for record in records {
@@ -1595,6 +1608,7 @@ mod tests {
                 on_exceed: OnExceed::Reject,
                 quota_version: 1,
                 quota_remaining_bytes: Some(1_000),
+                snapshot_generation: None,
                 concurrency_permit: None,
             },
             "request".to_string(),
@@ -1615,6 +1629,56 @@ mod tests {
         .collect::<Vec<_>>()
         .await
         .len()
+    }
+
+    fn authorization_request(credential: Credential) -> crate::commercial::AuthorizeRequest {
+        crate::commercial::AuthorizeRequest {
+            credential,
+            dataset: "ethereum-mainnet".to_string(),
+            endpoint: Endpoint::Stream,
+            query: QueryDescriptor {
+                requires_traces: false,
+                requires_statediffs: false,
+                first_block: Some(1),
+                chain_kind: Some("evm".to_string()),
+            },
+        }
+    }
+
+    async fn grant_for(
+        store: &SnapshotStore,
+        tally: &TallyStore,
+        credential: Credential,
+    ) -> Granted {
+        match crate::commercial::evaluate::evaluate_with_store(
+            store,
+            Some(tally),
+            None,
+            authorization_request(credential),
+        )
+        .await
+        {
+            Authorization::Granted(grant) => grant,
+            Authorization::Rejected(rejected) => panic!("expected grant, got {rejected:?}"),
+        }
+    }
+
+    fn meter_from_grant(
+        store: Arc<SnapshotStore>,
+        tally: Arc<TallyStore>,
+        registry: Arc<ActiveStreamRegistry>,
+        grant: Granted,
+    ) -> MeterHandle {
+        MeterHandle::new_enforced(
+            grant,
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            Arc::new(RecordingReporter::default()),
+            tally,
+            registry,
+            Some(store),
+        )
     }
 
     #[tokio::test]
@@ -2663,6 +2727,7 @@ mod tests {
                 on_exceed: OnExceed::Reject,
                 quota_version: 1,
                 quota_remaining_bytes: Some(1_000),
+                snapshot_generation: None,
                 concurrency_permit: None,
             },
             "request".to_string(),
@@ -2716,6 +2781,7 @@ mod tests {
             on_exceed: OnExceed::Reject,
             quota_version: 1,
             quota_remaining_bytes: Some(1_000),
+            snapshot_generation: None,
             concurrency_permit: None,
         };
         let mut suspended = active_snapshot(2);
@@ -2770,6 +2836,162 @@ mod tests {
             registered_meter_emitted_chunks(store, Some(KEY_ID)).await,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn grant_before_authoritative_reset_cannot_register_or_rebase_restored_tally() {
+        let tally = Arc::new(TallyStore::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let store = SnapshotStore::new(
+            &offline_config(PathBuf::new()),
+            SnapshotHooks {
+                tally: Some(tally.clone()),
+                registry: Some(registry.clone()),
+            },
+            String::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        let mut original = active_snapshot(100);
+        original.limits.as_mut().unwrap().concurrency = None;
+        store.install_records_for_test(vec![SnapshotRecord::Key(original)], 100);
+        let grant = grant_for(
+            &store,
+            &tally,
+            Credential::Key {
+                key_id: KEY_ID.to_string(),
+                secret_sha256: SECRET_SHA256.to_string(),
+            },
+        )
+        .await;
+
+        let mut restored = active_snapshot(5);
+        restored.limits.as_mut().unwrap().concurrency = None;
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Key(restored)],
+                5,
+                BootstrapMode::Authoritative,
+            )
+            .unwrap();
+        let meter = meter_from_grant(store, tally.clone(), registry, grant);
+
+        assert!(meter.should_stop_after_chunk());
+        meter.add_logical_bytes(1_000);
+        assert!(meter.should_stop_after_chunk());
+        assert_eq!(tally.version_for("account"), Some(5));
+        assert_eq!(tally.effective_remaining("account", 5, 10_000), 10_000);
+    }
+
+    #[tokio::test]
+    async fn anonymous_grant_before_authoritative_reset_cannot_register() {
+        let tally = Arc::new(TallyStore::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let store = SnapshotStore::new(
+            &offline_config(PathBuf::new()),
+            SnapshotHooks {
+                tally: Some(tally.clone()),
+                registry: Some(registry.clone()),
+            },
+            String::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store.set_ready_for_test(true);
+        let grant = grant_for(
+            &store,
+            &tally,
+            Credential::None {
+                ip_bucket: "198.51.100.7/32".to_string(),
+            },
+        )
+        .await;
+
+        store
+            .replace_records_with_mode(vec![], 5, BootstrapMode::Authoritative)
+            .unwrap();
+        let meter = meter_from_grant(store, tally, registry, grant);
+
+        assert!(meter.should_stop_after_chunk());
+    }
+
+    #[tokio::test]
+    async fn grant_registered_without_reset_remains_live() {
+        let tally = Arc::new(TallyStore::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let store = SnapshotStore::new(
+            &offline_config(PathBuf::new()),
+            SnapshotHooks::default(),
+            String::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        let mut snapshot = active_snapshot(5);
+        snapshot.limits.as_mut().unwrap().concurrency = None;
+        store.install_records_for_test(vec![SnapshotRecord::Key(snapshot)], 5);
+        let grant = grant_for(
+            &store,
+            &tally,
+            Credential::Key {
+                key_id: KEY_ID.to_string(),
+                secret_sha256: SECRET_SHA256.to_string(),
+            },
+        )
+        .await;
+
+        let meter = meter_from_grant(store, tally, registry, grant);
+
+        assert!(!meter.should_stop_after_chunk());
+    }
+
+    #[tokio::test]
+    async fn grant_between_successive_authoritative_resets_is_stale_for_second_reset() {
+        let tally = Arc::new(TallyStore::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let store = SnapshotStore::new(
+            &offline_config(PathBuf::new()),
+            SnapshotHooks {
+                tally: Some(tally.clone()),
+                registry: Some(registry.clone()),
+            },
+            String::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        let mut original = active_snapshot(100);
+        original.limits.as_mut().unwrap().concurrency = None;
+        store.install_records_for_test(vec![SnapshotRecord::Key(original)], 100);
+        let mut first_restored = active_snapshot(20);
+        first_restored.limits.as_mut().unwrap().concurrency = None;
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Key(first_restored)],
+                20,
+                BootstrapMode::Authoritative,
+            )
+            .unwrap();
+        let grant = grant_for(
+            &store,
+            &tally,
+            Credential::Key {
+                key_id: KEY_ID.to_string(),
+                secret_sha256: SECRET_SHA256.to_string(),
+            },
+        )
+        .await;
+
+        let mut second_restored = active_snapshot(5);
+        second_restored.limits.as_mut().unwrap().concurrency = None;
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Key(second_restored)],
+                5,
+                BootstrapMode::Authoritative,
+            )
+            .unwrap();
+        let meter = meter_from_grant(store, tally, registry, grant);
+
+        assert!(meter.should_stop_after_chunk());
     }
 
     #[tokio::test]
@@ -2882,6 +3104,7 @@ mod tests {
                 on_exceed: OnExceed::Reject,
                 quota_version: 1,
                 quota_remaining_bytes: Some(1_000),
+                snapshot_generation: None,
                 concurrency_permit: None,
             },
             "request".to_string(),

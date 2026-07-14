@@ -108,6 +108,8 @@ pub struct Granted {
     pub quota_version: u64,
     pub quota_remaining_bytes: Option<i64>,
     #[serde(skip)]
+    pub(crate) snapshot_generation: Option<u64>,
+    #[serde(skip)]
     pub concurrency_permit: Option<ConcurrencyPermit>,
 }
 

@@ -102,6 +102,7 @@ impl MeterHandle {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -117,6 +118,7 @@ impl MeterHandle {
         snapshot_store: Option<Arc<SnapshotStore>>,
     ) -> Self {
         let concurrency_permit = granted.concurrency_permit;
+        let snapshot_generation = granted.snapshot_generation;
         Self::from_parts(
             granted.principal,
             granted.tally_account_id,
@@ -131,6 +133,7 @@ impl MeterHandle {
             Some(tally),
             Some(registry),
             snapshot_store,
+            snapshot_generation,
             concurrency_permit,
         )
     }
@@ -150,6 +153,7 @@ impl MeterHandle {
         tally: Option<Arc<TallyStore>>,
         registry: Option<Arc<ActiveStreamRegistry>>,
         snapshot_store: Option<Arc<SnapshotStore>>,
+        snapshot_generation: Option<u64>,
         concurrency_permit: Option<ConcurrencyPermit>,
     ) -> Self {
         let event_id = uuid_v7();
@@ -169,29 +173,49 @@ impl MeterHandle {
         let kill = Arc::new(AtomicBool::new(false));
         let floor_bytes_per_sec = Arc::new(AtomicU64::new(0));
         let bucket = AsyncMutex::new(bucket_from_limits(&limits));
-        let tally = tally.map(|tally| tally.handle(&tally_account_id, quota_version));
-        let registration = registry.as_ref().map(|registry| {
-            registry.register(
-                event_id.clone(),
-                principal.api_key_id.clone(),
-                kill.clone(),
-                floor_bytes_per_sec.clone(),
-            )
-        });
-        if let (Some(store), Some(key_id)) = (&snapshot_store, principal.api_key_id.as_deref()) {
-            let snapshot = store.get(key_id);
-            if store.is_ready()
-                && snapshot
-                    .as_ref()
-                    .is_none_or(|snapshot| snapshot.status != KeyStatus::Active)
-            {
+        let register = |current_generation: Option<u64>| {
+            if snapshot_generation.is_some() && snapshot_generation != current_generation {
                 kill.store(true, Ordering::Release);
                 tracing::info!(
-                    key_id,
-                    "commercial key became missing or non-active before meter registration completed"
+                    grant_generation = snapshot_generation,
+                    current_generation,
+                    "commercial grant became stale before meter registration"
                 );
+                return (None, None);
             }
-        }
+            let tally = tally
+                .as_ref()
+                .map(|tally| tally.handle(&tally_account_id, quota_version));
+            let registration = registry.as_ref().map(|registry| {
+                registry.register(
+                    event_id.clone(),
+                    principal.api_key_id.clone(),
+                    kill.clone(),
+                    floor_bytes_per_sec.clone(),
+                )
+            });
+            if let (Some(store), Some(key_id)) = (&snapshot_store, principal.api_key_id.as_deref())
+            {
+                let snapshot = store.get(key_id);
+                if store.is_ready()
+                    && snapshot
+                        .as_ref()
+                        .is_none_or(|snapshot| snapshot.status != KeyStatus::Active)
+                {
+                    kill.store(true, Ordering::Release);
+                    tracing::info!(
+                        key_id,
+                        "commercial key became missing or non-active before meter registration completed"
+                    );
+                }
+            }
+            (tally, registration)
+        };
+        let (tally, registration) = if let Some(store) = &snapshot_store {
+            store.with_authoritative_generation(|generation| register(Some(generation)))
+        } else {
+            register(None)
+        };
         Self {
             inner: Arc::new(MeterInner {
                 principal,
@@ -1547,6 +1571,7 @@ mod tests {
             on_exceed,
             quota_version: 7,
             quota_remaining_bytes,
+            snapshot_generation: None,
             concurrency_permit: None,
         };
         (
@@ -2230,6 +2255,7 @@ mod tests {
                 on_exceed: OnExceed::Reject,
                 quota_version: 7,
                 quota_remaining_bytes: Some(100),
+                snapshot_generation: None,
                 concurrency_permit: None,
             },
         );
@@ -2251,6 +2277,7 @@ mod tests {
                 on_exceed: OnExceed::Reject,
                 quota_version: 120,
                 quota_remaining_bytes: Some(100),
+                snapshot_generation: None,
                 concurrency_permit: None,
             },
         );

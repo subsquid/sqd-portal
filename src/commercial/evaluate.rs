@@ -68,7 +68,7 @@ pub async fn evaluate_with_store_and_policy(
     policy: EvaluationPolicy,
 ) -> Authorization {
     let view = store.view();
-    match &req.credential {
+    let mut authorization = match &req.credential {
         Credential::Key { key_id, .. } => {
             let snapshot = if let Some(snapshot) = view.records.get(key_id).cloned() {
                 Some(snapshot)
@@ -118,7 +118,11 @@ pub async fn evaluate_with_store_and_policy(
             EvaluationState::default().now_secs,
         ),
         Credential::Internal { .. } => Authorization::Granted(super::client::oss_grant()),
+    };
+    if let Authorization::Granted(granted) = &mut authorization {
+        granted.snapshot_generation = Some(view.generation);
     }
+    authorization
 }
 
 pub fn evaluate(
@@ -324,6 +328,7 @@ fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
         on_exceed: public_on_exceed(defaults),
         quota_version: defaults.seq,
         quota_remaining_bytes: None,
+        snapshot_generation: None,
         concurrency_permit: None,
     })
 }
@@ -434,6 +439,7 @@ fn anonymous_grant(
         on_exceed: public_on_exceed(defaults),
         quota_version,
         quota_remaining_bytes,
+        snapshot_generation: None,
         concurrency_permit,
     }
 }
@@ -487,6 +493,7 @@ fn grant(
             .quota
             .as_ref()
             .and_then(|quota| quota.remaining_bytes),
+        snapshot_generation: None,
         concurrency_permit: None,
     }
 }

@@ -37,6 +37,7 @@ pub fn oss_grant() -> Granted {
         on_exceed: OnExceed::Reject,
         quota_version: 0,
         quota_remaining_bytes: None,
+        snapshot_generation: None,
         concurrency_permit: None,
     }
 }

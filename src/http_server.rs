@@ -1918,6 +1918,7 @@ mod tests {
                 on_exceed: OnExceed::Reject,
                 quota_version: 1,
                 quota_remaining_bytes: Some(1_000_000),
+                snapshot_generation: None,
                 concurrency_permit: None,
             })
         }
