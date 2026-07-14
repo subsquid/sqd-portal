@@ -56,6 +56,7 @@ struct SnapshotStoreInner {
     sync_interval: Duration,
     negative_cache_ttl: Duration,
     negative_cache: DashMap<String, NegativeCacheEntry>,
+    inflight_resolves: DashMap<String, Arc<ResolveFlight>>,
     resolve_limiter: Mutex<ResolveLimiter>,
     client: reqwest::Client,
     control_plane_url: url::Url,
@@ -164,6 +165,28 @@ struct NegativeCacheEntry {
     generation: u64,
 }
 
+struct ResolveFlight {
+    result: Mutex<Option<Option<Arc<KeySnapshot>>>>,
+    notify: tokio::sync::Notify,
+}
+
+struct ResolveFlightGuard<'a> {
+    store: &'a SnapshotStore,
+    key_id: String,
+    flight: Arc<ResolveFlight>,
+    completed: bool,
+}
+
+impl Drop for ResolveFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.store.remove_resolve_flight(&self.key_id, &self.flight);
+        self.flight.notify.notify_waiters();
+    }
+}
+
 struct ResolveLimiter {
     rate_per_sec: f64,
     capacity: f64,
@@ -223,6 +246,7 @@ impl SnapshotStore {
                 sync_interval: Duration::from_secs(config.sync_interval_secs.max(1)),
                 negative_cache_ttl: Duration::from_secs(config.negative_cache_secs.max(1)),
                 negative_cache: DashMap::new(),
+                inflight_resolves: DashMap::new(),
                 resolve_limiter: Mutex::new(ResolveLimiter::new(config.resolve_rate_per_sec)),
                 client,
                 control_plane_url: config.control_plane_url.clone(),
@@ -254,6 +278,7 @@ impl SnapshotStore {
                 sync_interval: Duration::from_secs(10),
                 negative_cache_ttl: Duration::from_secs(15),
                 negative_cache: DashMap::new(),
+                inflight_resolves: DashMap::new(),
                 resolve_limiter: Mutex::new(ResolveLimiter::new(0)),
                 client: reqwest::Client::builder()
                     .no_proxy()
@@ -300,10 +325,52 @@ impl SnapshotStore {
     }
 
     pub async fn get_or_resolve(&self, key_id: &str) -> Option<Arc<KeySnapshot>> {
-        if let Some(record) = self.get(key_id) {
-            return Some(record);
+        loop {
+            if let Some(record) = self.get(key_id) {
+                return Some(record);
+            }
+            let (flight, leader) = match self.inner.inflight_resolves.entry(key_id.to_string()) {
+                Entry::Occupied(entry) => (entry.get().clone(), false),
+                Entry::Vacant(entry) => {
+                    let flight = Arc::new(ResolveFlight {
+                        result: Mutex::new(None),
+                        notify: tokio::sync::Notify::new(),
+                    });
+                    entry.insert(flight.clone());
+                    (flight, true)
+                }
+            };
+            if leader {
+                let mut guard = ResolveFlightGuard {
+                    store: self,
+                    key_id: key_id.to_string(),
+                    flight: flight.clone(),
+                    completed: false,
+                };
+                let result = self.resolve(key_id).await.ok().flatten();
+                *flight.result.lock().unwrap() = Some(result.clone());
+                self.remove_resolve_flight(key_id, &flight);
+                guard.completed = true;
+                flight.notify.notify_waiters();
+                return result;
+            }
+            let notified = flight.notify.notified();
+            if let Some(result) = flight.result.lock().unwrap().clone() {
+                return result;
+            }
+            notified.await;
+            if let Some(result) = flight.result.lock().unwrap().clone() {
+                return result;
+            };
         }
-        self.resolve(key_id).await.ok().flatten()
+    }
+
+    fn remove_resolve_flight(&self, key_id: &str, flight: &Arc<ResolveFlight>) {
+        if let Entry::Occupied(entry) = self.inner.inflight_resolves.entry(key_id.to_string()) {
+            if Arc::ptr_eq(entry.get(), flight) {
+                entry.remove();
+            }
+        }
     }
 
     pub(crate) fn sweep_negative_cache(&self) -> usize {
@@ -3519,6 +3586,67 @@ mod tests {
 
         assert!(store.get_or_resolve("rate-limited").await.is_none());
         assert_eq!(mock.resolve_calls(), vec!["missing".to_string()]);
+
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolves_for_one_missing_key_are_single_flight() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let key_id = "same-missing-key";
+        let gate = mock.pause_resolve(key_id);
+        let path = cache_path("resolve-single-flight");
+        let config = config(&mock, path.clone(), 10);
+        let (store, task) = SnapshotStore::spawn(&config, CancellationToken::new()).unwrap();
+        store.inner.ready.store(true, Ordering::Release);
+
+        let resolves = (0..10)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move { store.get_or_resolve(key_id).await })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while mock.resolve_calls().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(mock.resolve_calls(), vec![key_id.to_string()]);
+
+        gate.notify_waiters();
+        for resolve in resolves {
+            assert!(resolve.await.unwrap().is_none());
+        }
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn negative_cache_preserves_exact_case_sensitive_key_identity() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let path = cache_path("resolve-exact-identity");
+        let config = config(&mock, path.clone(), 3);
+        let (store, task) = SnapshotStore::spawn(&config, CancellationToken::new()).unwrap();
+        store.inner.ready.store(true, Ordering::Release);
+
+        assert!(store.get_or_resolve("MissingKey").await.is_none());
+        assert!(store.get_or_resolve("missingkey").await.is_none());
+        assert!(store.get_or_resolve(" MissingKey ").await.is_none());
+        assert_eq!(
+            mock.resolve_calls(),
+            vec![
+                "MissingKey".to_string(),
+                "missingkey".to_string(),
+                " MissingKey ".to_string(),
+            ]
+        );
+        assert_eq!(store.negative_cache_len(), 3);
 
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
