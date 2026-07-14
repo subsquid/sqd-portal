@@ -38,6 +38,7 @@ pub struct SnapshotStore {
 struct SnapshotStoreInner {
     records: ArcSwap<HashMap<String, Arc<KeySnapshot>>>,
     defaults: ArcSwap<Defaults>,
+    defaults_pending_authoritative_replace: AtomicBool,
     cursor: AtomicU64,
     epoch: Mutex<Option<String>>,
     ready: AtomicBool,
@@ -170,6 +171,7 @@ impl SnapshotStore {
             inner: Arc::new(SnapshotStoreInner {
                 records: ArcSwap::from_pointee(HashMap::new()),
                 defaults: ArcSwap::from_pointee(defaults_from_fallback(&config.public_fallback)),
+                defaults_pending_authoritative_replace: AtomicBool::new(false),
                 cursor: AtomicU64::new(0),
                 epoch: Mutex::new(None),
                 ready: AtomicBool::new(false),
@@ -194,6 +196,7 @@ impl SnapshotStore {
             inner: Arc::new(SnapshotStoreInner {
                 records: ArcSwap::from_pointee(HashMap::new()),
                 defaults: ArcSwap::from_pointee(defaults_from_fallback(fallback)),
+                defaults_pending_authoritative_replace: AtomicBool::new(false),
                 cursor: AtomicU64::new(0),
                 epoch: Mutex::new(None),
                 ready: AtomicBool::new(true),
@@ -582,6 +585,9 @@ impl SnapshotStore {
         if let Some(defaults) = defaults {
             self.store_defaults_with_mode(defaults, mode);
         } else if matches!(mode, BootstrapMode::Authoritative) {
+            self.inner
+                .defaults_pending_authoritative_replace
+                .store(true, Ordering::Release);
             tracing::warn!(
                 current_seq = self.inner.defaults.load().seq,
                 "authoritative commercial snapshot contained no defaults; keeping current defaults"
@@ -657,7 +663,19 @@ impl SnapshotStore {
 
     fn store_defaults_with_mode(&self, defaults: Defaults, mode: BootstrapMode) {
         let defaults = Arc::new(defaults);
-        let preserve_higher_seq = matches!(mode, BootstrapMode::Normal);
+        let force_replace = match mode {
+            BootstrapMode::Normal => self
+                .inner
+                .defaults_pending_authoritative_replace
+                .swap(false, Ordering::AcqRel),
+            BootstrapMode::Authoritative => {
+                self.inner
+                    .defaults_pending_authoritative_replace
+                    .store(false, Ordering::Release);
+                true
+            }
+        };
+        let preserve_higher_seq = matches!(mode, BootstrapMode::Normal) && !force_replace;
         loop {
             let current = self.inner.defaults.load();
             if preserve_higher_seq && current.seq > defaults.seq {
@@ -2110,6 +2128,32 @@ mod tests {
             .unwrap();
 
         assert!(kill.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn missing_authoritative_defaults_allows_next_lower_sequence_defaults() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        store.store_defaults(Defaults::from(defaults_record(100)));
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Key(active_snapshot(5))],
+                5,
+                BootstrapMode::Authoritative,
+            )
+            .unwrap();
+
+        store
+            .apply_records(vec![SnapshotRecord::Defaults(defaults_record(6))], 6)
+            .unwrap();
+
+        assert_eq!(store.view().defaults.seq, 6);
     }
 
     #[tokio::test]
