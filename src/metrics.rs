@@ -74,6 +74,7 @@ lazy_static::lazy_static! {
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 3.0, 20)));
     pub static ref STREAM_THROTTLED_RATIO: Histogram = Histogram::new(iter::empty());
     pub static ref COMMERCIAL_USAGE_DROPPED: Counter = Default::default();
+    pub static ref COMMERCIAL_USAGE_REJECTED: Counter = Default::default();
     pub static ref COMMERCIAL_ANON_FALLBACK_BUCKET: Family<Labels, Counter> = Default::default();
     pub static ref COMMERCIAL_SNAPSHOT_AGE_SECONDS: Gauge = Default::default();
     pub static ref COMMERCIAL_SYNC_STALENESS_SECONDS: Gauge = Default::default();
@@ -194,6 +195,10 @@ pub fn report_commercial_stream_bytes(
 
 pub fn report_commercial_usage_dropped() {
     COMMERCIAL_USAGE_DROPPED.inc();
+}
+
+pub fn report_commercial_usage_rejected(count: u64) {
+    COMMERCIAL_USAGE_REJECTED.inc_by(count);
 }
 
 pub fn report_commercial_anon_fallback_bucket(bucket: &str) {
@@ -451,6 +456,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "commercial_usage_dropped_total",
         "Commercial usage events dropped by the bounded reporter buffer",
         COMMERCIAL_USAGE_DROPPED.clone(),
+    );
+    registry.register(
+        "commercial_usage_rejected_total",
+        "Commercial usage events rejected by control-plane validation",
+        COMMERCIAL_USAGE_REJECTED.clone(),
     );
     registry.register(
         "commercial_anon_fallback_bucket_total",

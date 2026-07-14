@@ -7,7 +7,7 @@ use std::{
 };
 
 use reqwest::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{sync::Notify, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -57,6 +57,13 @@ struct BufferedUsageReporterInner {
 #[derive(Serialize)]
 struct UsageBatch<'a> {
     events: &'a [StreamUsageEvent],
+}
+
+#[derive(Deserialize)]
+struct UsageAck {
+    accepted: u64,
+    duplicates: u64,
+    rejected: u64,
 }
 
 impl BufferedUsageReporter {
@@ -271,6 +278,25 @@ impl BufferedUsageReporter {
             .map_err(|err| SendBatchError::Retry(err.to_string()))?;
         let status = response.status();
         if status.is_success() {
+            match response.json::<UsageAck>().await {
+                Ok(ack) if ack.rejected > 0 => {
+                    metrics::report_commercial_usage_rejected(ack.rejected);
+                    tracing::error!(
+                        accepted = ack.accepted,
+                        duplicates = ack.duplicates,
+                        rejected = ack.rejected,
+                        "control plane rejected commercial usage events"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        status = status.as_u16(),
+                        "could not parse successful commercial usage acknowledgement"
+                    );
+                }
+            }
             Ok(())
         } else {
             Err(error_for_status(status))
@@ -388,6 +414,7 @@ mod tests {
 
     use axum::{routing::post, Json, Router};
     use tokio::sync::mpsc;
+    use tracing::{span, Event, Metadata, Subscriber};
 
     use super::*;
     use crate::{
@@ -439,10 +466,18 @@ mod tests {
                             .get(attempt)
                             .copied()
                             .unwrap_or(StatusCode::ACCEPTED);
+                        let accepted = events.len();
                         if status.is_success() {
                             tx.send(events).await.unwrap();
                         }
-                        status
+                        (
+                            status,
+                            Json(serde_json::json!({
+                                "accepted": accepted,
+                                "duplicates": 0,
+                                "rejected": 0,
+                            })),
+                        )
                     }
                 }
             }),
@@ -454,6 +489,60 @@ mod tests {
         });
 
         (format!("http://{addr}").parse().unwrap(), rx)
+    }
+
+    async fn mock_ack_server(body: &'static str) -> url::Url {
+        let app = Router::new().route(
+            "/internal/portal/v1/usage",
+            post(move |Json(_batch): Json<serde_json::Value>| async move {
+                (StatusCode::ACCEPTED, body)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://{addr}").parse().unwrap()
+    }
+
+    #[derive(Default)]
+    struct LogCounts {
+        warnings: AtomicUsize,
+        errors: AtomicUsize,
+    }
+
+    struct CountingSubscriber(Arc<LogCounts>);
+
+    impl Subscriber for CountingSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            match *event.metadata().level() {
+                tracing::Level::WARN => {
+                    self.0.warnings.fetch_add(1, Ordering::SeqCst);
+                }
+                tracing::Level::ERROR => {
+                    self.0.errors.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
+
+        fn enter(&self, _span: &span::Id) {}
+
+        fn exit(&self, _span: &span::Id) {}
     }
 
     fn reporter(
@@ -668,6 +757,65 @@ mod tests {
         assert!(reporter.pop_batch().is_none());
         assert!(rx.try_recv().is_err());
         assert!(metrics::COMMERCIAL_USAGE_DROPPED.get() > before);
+    }
+
+    #[tokio::test]
+    async fn success_ack_with_rejections_records_metric_and_drops_batch() {
+        let url = mock_ack_server(r#"{"accepted":1,"duplicates":0,"rejected":2}"#).await;
+        let reporter = reporter(url, Duration::from_secs(60), 1, 10);
+        let before = metrics::COMMERCIAL_USAGE_REJECTED.get();
+        let logs = Arc::new(LogCounts::default());
+        let _subscriber = tracing::subscriber::set_default(CountingSubscriber(logs.clone()));
+
+        reporter.report(event("partially-rejected"));
+        assert!(
+            reporter
+                .flush_one_batch_with_retry(&CancellationToken::new())
+                .await
+        );
+
+        assert!(reporter.pop_batch().is_none());
+        assert_eq!(metrics::COMMERCIAL_USAGE_REJECTED.get(), before + 2);
+        assert_eq!(logs.errors.load(Ordering::SeqCst), 1);
+        assert_eq!(logs.warnings.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn success_ack_without_rejections_is_silent() {
+        let url = mock_ack_server(r#"{"accepted":1,"duplicates":0,"rejected":0}"#).await;
+        let reporter = reporter(url, Duration::from_secs(60), 1, 10);
+        let logs = Arc::new(LogCounts::default());
+        let _subscriber = tracing::subscriber::set_default(CountingSubscriber(logs.clone()));
+
+        reporter.report(event("accepted"));
+        assert!(
+            reporter
+                .flush_one_batch_with_retry(&CancellationToken::new())
+                .await
+        );
+
+        assert!(reporter.pop_batch().is_none());
+        assert_eq!(logs.errors.load(Ordering::SeqCst), 0);
+        assert_eq!(logs.warnings.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_success_ack_warns_and_drops_batch() {
+        let url = mock_ack_server("garbage").await;
+        let reporter = reporter(url, Duration::from_secs(60), 1, 10);
+        let logs = Arc::new(LogCounts::default());
+        let _subscriber = tracing::subscriber::set_default(CountingSubscriber(logs.clone()));
+
+        reporter.report(event("unknown-verdict"));
+        assert!(
+            reporter
+                .flush_one_batch_with_retry(&CancellationToken::new())
+                .await
+        );
+
+        assert!(reporter.pop_batch().is_none());
+        assert_eq!(logs.errors.load(Ordering::SeqCst), 0);
+        assert_eq!(logs.warnings.load(Ordering::SeqCst), 1);
     }
 
     #[test]
