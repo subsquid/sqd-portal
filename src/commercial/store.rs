@@ -9,7 +9,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -686,15 +686,8 @@ impl SnapshotStore {
                     metrics::report_commercial_resolve("stale_generation");
                     return Ok(None);
                 }
-                self.inner.negative_cache.insert(
-                    key_id.to_string(),
-                    NegativeCacheEntry {
-                        expires_at: Instant::now() + self.inner.negative_cache_ttl,
-                        generation,
-                    },
-                );
-                if self.inner.generation.load(Ordering::Acquire) != generation {
-                    self.negative_cached(key_id);
+                let expires_at = Instant::now() + self.inner.negative_cache_ttl;
+                if !self.insert_negative_cache_for_generation(key_id, generation, expires_at) {
                     metrics::report_commercial_resolve("stale_generation");
                     return Ok(None);
                 }
@@ -1127,14 +1120,58 @@ impl SnapshotStore {
         let Some(entry) = self.inner.negative_cache.get(key_id) else {
             return false;
         };
+        let entry_generation = entry.generation;
         if entry.generation == self.inner.generation.load(Ordering::Acquire)
             && entry.expires_at > Instant::now()
         {
             return true;
         }
         drop(entry);
-        self.inner.negative_cache.remove(key_id);
+        self.remove_negative_cache_for_generation(key_id, entry_generation);
         false
+    }
+
+    fn insert_negative_cache_for_generation(
+        &self,
+        key_id: &str,
+        generation: u64,
+        expires_at: Instant,
+    ) -> bool {
+        match self.inner.negative_cache.entry(key_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                if self.inner.generation.load(Ordering::Acquire) != generation
+                    || entry.get().generation != generation
+                {
+                    return false;
+                }
+                entry.insert(NegativeCacheEntry {
+                    expires_at,
+                    generation,
+                });
+            }
+            Entry::Vacant(entry) => {
+                if self.inner.generation.load(Ordering::Acquire) != generation {
+                    return false;
+                }
+                entry.insert(NegativeCacheEntry {
+                    expires_at,
+                    generation,
+                });
+            }
+        }
+        if self.inner.generation.load(Ordering::Acquire) != generation {
+            self.remove_negative_cache_for_generation(key_id, generation);
+            return false;
+        }
+        true
+    }
+
+    fn remove_negative_cache_for_generation(&self, key_id: &str, generation: u64) {
+        if let Entry::Occupied(entry) = self.inner.negative_cache.entry(key_id.to_string()) {
+            if entry.get().generation == generation {
+                entry.remove();
+            }
+        }
     }
 
     fn take_resolve_token(&self) -> bool {
@@ -3461,6 +3498,36 @@ mod tests {
         mock.resolve_with(key_id, Some(resolved));
         assert_eq!(store.get_or_resolve(key_id).await.unwrap().seq, 6);
         assert_eq!(mock.resolve_calls(), vec![key_id.to_string()]);
+    }
+
+    #[test]
+    fn stale_generation_negative_cache_mutations_preserve_fresh_entry_and_ttl() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        store.inner.generation.store(2, Ordering::Release);
+        let fresh_expiry = Instant::now() + Duration::from_secs(60);
+        assert!(store.insert_negative_cache_for_generation("missing", 2, fresh_expiry));
+
+        assert!(!store.insert_negative_cache_for_generation(
+            "missing",
+            1,
+            Instant::now() + Duration::from_secs(5),
+        ));
+        store.remove_negative_cache_for_generation("missing", 1);
+
+        let fresh = store
+            .inner
+            .negative_cache
+            .get("missing")
+            .expect("fresh generation entry must survive stale cleanup");
+        assert_eq!(fresh.generation, 2);
+        assert_eq!(fresh.expires_at, fresh_expiry);
     }
 
     #[test]
