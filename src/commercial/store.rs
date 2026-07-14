@@ -341,13 +341,50 @@ impl SnapshotStore {
         let mut cursor = 0;
         let mut all = Vec::new();
         let mut pages = 0usize;
+        let mut attempt_pages = 0usize;
         let mut epoch = fallback_epoch;
         loop {
+            if pages >= MAX_BOOTSTRAP_PAGES {
+                tracing::warn!(
+                    pages,
+                    cursor,
+                    "aborting commercial snapshot bootstrap after too many pages"
+                );
+                anyhow::bail!("snapshot bootstrap exceeded {MAX_BOOTSTRAP_PAGES} pages");
+            }
             let page = self.fetch_page(cursor).await?;
+            pages += 1;
+
+            let epoch_changed = attempt_pages > 0
+                && page
+                    .epoch
+                    .as_ref()
+                    .zip(epoch.as_ref())
+                    .is_some_and(|(received, expected)| received != expected);
+            let reset_mid_bootstrap = attempt_pages > 0 && page.reset;
+            let head_rolled_back =
+                attempt_pages > 0 && page.head_seq.is_some_and(|head_seq| cursor > head_seq);
+            if epoch_changed || reset_mid_bootstrap || head_rolled_back {
+                tracing::warn!(
+                    cursor,
+                    received_epoch = ?page.epoch,
+                    expected_epoch = ?epoch,
+                    reset = page.reset,
+                    head_seq = ?page.head_seq,
+                    "commercial snapshot bootstrap metadata changed; restarting from cursor zero"
+                );
+                cursor = 0;
+                all.clear();
+                attempt_pages = 0;
+                if page.epoch.is_some() {
+                    epoch = page.epoch;
+                }
+                continue;
+            }
             if let Some(page_epoch) = page.epoch.clone() {
                 epoch = Some(page_epoch);
             }
-            pages += 1;
+            attempt_pages += 1;
             let next_cursor = page.next_cursor;
             let len = page.raw_record_count;
             all.extend(page.records);
@@ -363,15 +400,6 @@ impl SnapshotStore {
                     "aborting commercial snapshot bootstrap after stalled cursor"
                 );
                 anyhow::bail!("snapshot bootstrap cursor did not advance");
-            }
-            if pages >= MAX_BOOTSTRAP_PAGES {
-                tracing::warn!(
-                    pages,
-                    cursor,
-                    next_cursor,
-                    "aborting commercial snapshot bootstrap after too many pages"
-                );
-                anyhow::bail!("snapshot bootstrap exceeded {MAX_BOOTSTRAP_PAGES} pages");
             }
             cursor = next_cursor;
         }
@@ -1605,6 +1633,70 @@ mod tests {
         assert!(err.to_string().contains("cursor did not advance"));
         assert!(!store.is_ready());
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_restarts_when_paginated_epoch_changes() {
+        let mock = MockControlPlane::spawn().await;
+        let mut epoch_a = active_snapshot(10);
+        epoch_a.key_id = "epoch-a-key".to_string();
+        epoch_a.account_id = Some("epoch-a".to_string());
+        mock.push_page(
+            0,
+            feed_page(
+                vec![SnapshotRecord::Key(epoch_a); usize::from(DEFAULT_PAGE_LIMIT)],
+                10,
+                false,
+                Some("epoch-a"),
+                Some(20),
+            ),
+        );
+        let mut mixed_epoch_b = active_snapshot(20);
+        mixed_epoch_b.key_id = "mixed-epoch-b-key".to_string();
+        mock.push_page(
+            10,
+            feed_page(
+                vec![SnapshotRecord::Key(mixed_epoch_b)],
+                20,
+                false,
+                Some("epoch-b"),
+                Some(20),
+            ),
+        );
+        let mut restored = active_snapshot(5);
+        restored.key_id = "epoch-b-key".to_string();
+        restored.account_id = Some("epoch-b".to_string());
+        mock.push_page(
+            0,
+            feed_page(
+                vec![SnapshotRecord::Key(restored)],
+                5,
+                false,
+                Some("epoch-b"),
+                Some(5),
+            ),
+        );
+        let store = SnapshotStore::new(
+            &config(&mock, PathBuf::new(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+
+        store.bootstrap(BootstrapMode::Normal, None).await.unwrap();
+
+        assert_eq!(store.view().cursor, 5);
+        assert_eq!(
+            store.inner.epoch.lock().unwrap().as_deref(),
+            Some("epoch-b")
+        );
+        assert!(store.get("epoch-a-key").is_none());
+        assert!(store.get("mixed-epoch-b-key").is_none());
+        assert_eq!(
+            store.get("epoch-b-key").unwrap().account_id.as_deref(),
+            Some("epoch-b")
+        );
     }
 
     #[tokio::test]
