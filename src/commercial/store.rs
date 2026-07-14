@@ -12,6 +12,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
@@ -62,6 +63,8 @@ struct SnapshotStoreInner {
     hooks: SnapshotHooks,
     #[cfg(test)]
     resolve_application_gate: Mutex<ResolveApplicationGate>,
+    #[cfg(test)]
+    persist_steps: Mutex<Vec<&'static str>>,
 }
 
 #[cfg(test)]
@@ -216,6 +219,8 @@ impl SnapshotStore {
                 hooks,
                 #[cfg(test)]
                 resolve_application_gate: Mutex::new(ResolveApplicationGate::default()),
+                #[cfg(test)]
+                persist_steps: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -250,6 +255,8 @@ impl SnapshotStore {
                 hooks: SnapshotHooks::default(),
                 #[cfg(test)]
                 resolve_application_gate: Mutex::new(ResolveApplicationGate::default()),
+                #[cfg(test)]
+                persist_steps: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -485,6 +492,8 @@ impl SnapshotStore {
                         error = %err,
                         "authoritative commercial snapshot cache persist failed"
                     );
+                    self.remove_stale_cache_after_authoritative_persist_failure()
+                        .await;
                 }
             }
             BootstrapMode::DefaultsRecovery => {}
@@ -1036,9 +1045,41 @@ impl SnapshotStore {
         };
         let bytes = serde_json::to_vec(&cache)?;
         let tmp = tmp_path(path);
-        tokio::fs::write(&tmp, bytes).await?;
+        #[cfg(test)]
+        self.inner.persist_steps.lock().unwrap().push("write");
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+        #[cfg(test)]
+        self.inner.persist_steps.lock().unwrap().push("sync_temp");
+        drop(file);
+        #[cfg(test)]
+        self.inner.persist_steps.lock().unwrap().push("rename");
         tokio::fs::rename(&tmp, path).await?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        tokio::fs::File::open(parent).await?.sync_all().await?;
+        #[cfg(test)]
+        self.inner.persist_steps.lock().unwrap().push("sync_parent");
         Ok(())
+    }
+
+    async fn remove_stale_cache_after_authoritative_persist_failure(&self) {
+        let path = &self.inner.cache_path;
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        if let Err(err) = tokio::fs::remove_file(path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to remove stale commercial snapshot cache after authoritative persist failure"
+                );
+            }
+        }
     }
 
     fn mark_disk_cache_dirty(&self) {
@@ -2608,6 +2649,62 @@ mod tests {
             Some("restored")
         );
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn disk_cache_persist_syncs_temp_before_rename_and_parent_after() {
+        let path = cache_path("persist-fsync-order");
+        let store = SnapshotStore::new(
+            &offline_config(path.clone()),
+            SnapshotHooks::default(),
+            String::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+
+        store.persist_disk_cache().await.unwrap();
+
+        assert_eq!(
+            *store.inner.persist_steps.lock().unwrap(),
+            ["write", "sync_temp", "rename", "sync_parent"]
+        );
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn authoritative_persist_failure_removes_pre_restore_cache() {
+        let mock = MockControlPlane::spawn().await;
+        let path = cache_path("authoritative-persist-failure");
+        tokio::fs::write(&path, b"pre-restore-cache").await.unwrap();
+        let tmp = tmp_path(&path);
+        tokio::fs::create_dir(&tmp).await.unwrap();
+        mock.push_page(
+            0,
+            feed_page(
+                vec![SnapshotRecord::Key(active_snapshot(5))],
+                5,
+                false,
+                Some("restored"),
+                Some(5),
+            ),
+        );
+        let store = SnapshotStore::new(
+            &config(&mock, path.clone(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+
+        store
+            .bootstrap(BootstrapMode::Authoritative, Some("restored".to_string()))
+            .await
+            .unwrap();
+
+        assert!(!path.exists());
+        assert!(store.is_ready());
+        assert_eq!(store.get(KEY_ID).unwrap().seq, 5);
+        let _ = tokio::fs::remove_dir(tmp).await;
     }
 
     #[tokio::test]
