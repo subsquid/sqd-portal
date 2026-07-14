@@ -270,6 +270,9 @@ fn ip_bucket_from_headers(headers: &HeaderMap, client_ip_header: &str) -> String
     match ip {
         IpAddr::V4(ip) => format!("{ip}/32"),
         IpAddr::V6(ip) => {
+            if let Some(ip) = ip.to_ipv4_mapped() {
+                return format!("{ip}/32");
+            }
             let segments = ip.segments();
             format!(
                 "{:x}:{:x}:{:x}:{:x}::/64",
@@ -506,6 +509,28 @@ mod tests {
                 ip_bucket: "198.51.100.7/32".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn mapped_ipv4_uses_embedded_ipv4_bucket_and_native_ipv6_keeps_64() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "::ffff:203.0.113.7".parse().unwrap());
+        assert_eq!(
+            ip_bucket_from_headers(&headers, "x-forwarded-for"),
+            "203.0.113.7/32"
+        );
+
+        headers.insert("x-forwarded-for", "::ffff:198.51.100.9".parse().unwrap());
+        assert_eq!(
+            ip_bucket_from_headers(&headers, "x-forwarded-for"),
+            "198.51.100.9/32"
+        );
+
+        headers.insert("x-forwarded-for", "2001:db8:abcd:12::1".parse().unwrap());
+        let first = ip_bucket_from_headers(&headers, "x-forwarded-for");
+        headers.insert("x-forwarded-for", "2001:db8:abcd:12::ffff".parse().unwrap());
+        assert_eq!(first, ip_bucket_from_headers(&headers, "x-forwarded-for"));
+        assert_eq!(first, "2001:db8:abcd:12::/64");
     }
 
     #[test]
