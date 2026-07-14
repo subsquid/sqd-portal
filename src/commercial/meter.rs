@@ -179,14 +179,16 @@ impl MeterHandle {
             )
         });
         if let (Some(store), Some(key_id)) = (&snapshot_store, principal.api_key_id.as_deref()) {
-            if store
-                .get(key_id)
-                .is_some_and(|snapshot| snapshot.status != KeyStatus::Active)
+            let snapshot = store.get(key_id);
+            if store.is_ready()
+                && snapshot
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.status != KeyStatus::Active)
             {
                 kill.store(true, Ordering::Release);
                 tracing::info!(
                     key_id,
-                    "commercial key became non-active before meter registration completed"
+                    "commercial key became missing or non-active before meter registration completed"
                 );
             }
         }

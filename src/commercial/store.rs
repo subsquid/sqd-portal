@@ -915,6 +915,13 @@ impl SnapshotStore {
                 "commercial quota tallies force-rebased for authoritative snapshot replacement"
             );
         }
+        if let Some(registry) = &self.inner.hooks.registry {
+            let killed = registry.kill_all();
+            tracing::info!(
+                killed,
+                "commercial streams killed for authoritative snapshot replacement"
+            );
+        }
     }
 
     fn apply_removed_key_hook(&self, key_id: &str) {
@@ -1425,6 +1432,46 @@ mod tests {
 
     fn cache_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("sqd-portal-{name}-{}.json", uuid::Uuid::new_v4()))
+    }
+
+    async fn registered_meter_emitted_chunks(
+        store: Arc<SnapshotStore>,
+        key_id: Option<&str>,
+    ) -> usize {
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = MeterHandle::new_enforced(
+            Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: key_id.map(str::to_string),
+                },
+                tally_account_id: None,
+                entitled_chains: None,
+                entitled_traces: None,
+                limits: GrantedLimits::default(),
+                on_exceed: OnExceed::Reject,
+                quota_version: 1,
+                quota_remaining_bytes: Some(1_000),
+                concurrency_permit: None,
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter,
+            Arc::new(TallyStore::default()),
+            Arc::new(ActiveStreamRegistry::default()),
+            Some(store),
+        );
+        tap_plain_stream(
+            stream::iter([
+                Ok::<_, std::io::Error>(Bytes::from_static(b"first")),
+                Ok::<_, std::io::Error>(Bytes::from_static(b"second")),
+            ]),
+            meter,
+        )
+        .collect::<Vec<_>>()
+        .await
+        .len()
     }
 
     #[tokio::test]
@@ -2026,6 +2073,45 @@ mod tests {
         let _ = tokio::fs::remove_file(path).await;
     }
 
+    #[test]
+    fn authoritative_replacement_kills_registered_active_key_stream() {
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let store = SnapshotStore::new(
+            &offline_config(PathBuf::new()),
+            SnapshotHooks {
+                tally: None,
+                registry: Some(registry.clone()),
+            },
+            String::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Key(active_snapshot(100))],
+                100,
+                BootstrapMode::Normal,
+            )
+            .unwrap();
+        let kill = Arc::new(AtomicBool::new(false));
+        let _registration = registry.register(
+            "active-before-restore".to_string(),
+            Some(KEY_ID.to_string()),
+            kill.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Key(active_snapshot(5))],
+                5,
+                BootstrapMode::Authoritative,
+            )
+            .unwrap();
+
+        assert!(kill.load(Ordering::Acquire));
+    }
+
     #[tokio::test]
     async fn head_seq_rollback_authoritatively_rebootstraps() {
         let mock = MockControlPlane::spawn().await;
@@ -2321,6 +2407,58 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         let event = reporter.events.lock().unwrap().pop().unwrap();
         assert_eq!(event.status, UsageStatus::CutSuspended);
+    }
+
+    #[tokio::test]
+    async fn meter_registration_recheck_kills_key_missing_after_authoritative_replace() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        store.install_records_for_test(vec![SnapshotRecord::Key(active_snapshot(100))], 100);
+        store
+            .replace_records_with_mode(vec![], 5, BootstrapMode::Authoritative)
+            .unwrap();
+
+        assert_eq!(
+            registered_meter_emitted_chunks(store, Some(KEY_ID)).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn meter_registration_recheck_leaves_anonymous_stream_alive() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+
+        assert_eq!(registered_meter_emitted_chunks(store, None).await, 2);
+    }
+
+    #[tokio::test]
+    async fn meter_registration_recheck_fails_open_while_store_not_ready() {
+        let store = SnapshotStore::new(
+            &offline_config(PathBuf::new()),
+            SnapshotHooks::default(),
+            String::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        assert!(!store.is_ready());
+
+        assert_eq!(
+            registered_meter_emitted_chunks(store, Some(KEY_ID)).await,
+            2
+        );
     }
 
     #[tokio::test]

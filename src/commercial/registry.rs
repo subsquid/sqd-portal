@@ -55,6 +55,15 @@ impl ActiveStreamRegistry {
         killed
     }
 
+    pub fn kill_all(&self) -> usize {
+        let mut killed = 0;
+        for entry in self.streams.iter() {
+            entry.value().kill.store(true, Ordering::Release);
+            killed += 1;
+        }
+        killed
+    }
+
     pub fn set_floor_for_key(&self, key_id: &str, floor_bytes_per_sec: u64) -> usize {
         let mut changed = 0;
         for entry in self.streams.iter() {
