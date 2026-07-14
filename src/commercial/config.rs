@@ -3,6 +3,9 @@ use std::{path::PathBuf, time::Duration};
 use serde::Deserialize;
 use url::Url;
 
+pub const DEFAULT_USAGE_MAX_RETRY_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const MAX_USAGE_RETRY_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommercialConfig {
     pub control_plane_url: Url,
@@ -11,6 +14,10 @@ pub struct CommercialConfig {
     pub flush_interval_secs: u64,
     pub flush_max_events: usize,
     pub usage_buffer_max_events: usize,
+    // Cross-repo contract: the portal retry cap must not exceed the SaaS
+    // usage-event dedup retention, whose validated lower bound is 30 days.
+    #[serde(default = "default_usage_max_retry_age_secs")]
+    pub usage_max_retry_age_secs: u64,
     pub snapshot_cache_path: PathBuf,
     pub resolve_rate_per_sec: u64,
     pub negative_cache_secs: u64,
@@ -60,6 +67,10 @@ impl CommercialConfig {
             "commercial.flush_interval_secs must be at least 1"
         );
         anyhow::ensure!(
+            (1..=MAX_USAGE_RETRY_AGE_SECS).contains(&self.usage_max_retry_age_secs),
+            "commercial.usage_max_retry_age_secs must be between 1 and {MAX_USAGE_RETRY_AGE_SECS}"
+        );
+        anyhow::ensure!(
             !self.client_ip_header.trim().is_empty(),
             "commercial.client_ip_header must not be empty"
         );
@@ -87,6 +98,10 @@ impl CommercialConfig {
 
 fn default_client_ip_header() -> String {
     "x-forwarded-for".to_string()
+}
+
+fn default_usage_max_retry_age_secs() -> u64 {
+    DEFAULT_USAGE_MAX_RETRY_AGE_SECS
 }
 
 pub fn default_throttle_residual_secs() -> u64 {

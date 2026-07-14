@@ -428,9 +428,23 @@ sqd_network:
         );
         assert_eq!(commercial.pod_count, 4);
         assert_eq!(commercial.public_fallback.concurrency, 2);
+        assert_eq!(commercial.usage_max_retry_age_secs, 7 * 24 * 60 * 60);
         assert_eq!(commercial.throttle_residual_secs, 60);
         assert_eq!(commercial.sweep_horizon_window_multiplier, 2);
         assert_eq!(commercial.sweep_horizon(), Duration::from_secs(172800));
+
+        let override_yaml = yaml.replace(
+            "  usage_buffer_max_events: 100000\n",
+            "  usage_buffer_max_events: 100000\n  usage_max_retry_age_secs: 3600\n",
+        );
+        let override_config: Config = serde_yaml::from_str(&override_yaml).expect("parse override");
+        assert_eq!(
+            override_config
+                .commercial
+                .expect("commercial config")
+                .usage_max_retry_age_secs,
+            3600
+        );
         std::env::remove_var("PORTAL_CP_TOKEN_FOR_PARSE_TEST");
     }
 

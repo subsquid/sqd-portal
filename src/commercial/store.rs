@@ -1798,8 +1798,9 @@ mod tests {
     use futures::{stream, StreamExt};
 
     use crate::commercial::{
-        meter::tap_plain_stream, Authorization, Credential, Endpoint, Granted, GrantedLimits,
-        MeterHandle, Principal, QueryDescriptor, StreamUsageEvent, UsageReporter, UsageStatus,
+        config::DEFAULT_USAGE_MAX_RETRY_AGE_SECS, meter::tap_plain_stream, Authorization,
+        Credential, Endpoint, Granted, GrantedLimits, MeterHandle, Principal, QueryDescriptor,
+        StreamUsageEvent, UsageReporter, UsageStatus,
     };
 
     #[derive(Default)]
@@ -1836,6 +1837,7 @@ mod tests {
             flush_interval_secs: 5,
             flush_max_events: 500,
             usage_buffer_max_events: 1000,
+            usage_max_retry_age_secs: DEFAULT_USAGE_MAX_RETRY_AGE_SECS,
             snapshot_cache_path: cache_path,
             resolve_rate_per_sec,
             negative_cache_secs: 60,
@@ -1862,6 +1864,7 @@ mod tests {
             flush_interval_secs: 5,
             flush_max_events: 500,
             usage_buffer_max_events: 1000,
+            usage_max_retry_age_secs: DEFAULT_USAGE_MAX_RETRY_AGE_SECS,
             snapshot_cache_path: cache_path,
             resolve_rate_per_sec: 0,
             negative_cache_secs: 60,
@@ -3791,7 +3794,8 @@ mod tests {
         drop(guard);
 
         let notified = follower.notify.notified();
-        let result = if let Some(result) = follower.result.lock().unwrap().clone() {
+        let initial_result = { follower.result.lock().unwrap().clone() };
+        let result = if let Some(result) = initial_result {
             result
         } else {
             tokio::time::timeout(Duration::from_millis(50), notified)

@@ -74,6 +74,7 @@ lazy_static::lazy_static! {
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 3.0, 20)));
     pub static ref STREAM_THROTTLED_RATIO: Histogram = Histogram::new(iter::empty());
     pub static ref COMMERCIAL_USAGE_DROPPED: Counter = Default::default();
+    pub static ref COMMERCIAL_USAGE_DROPPED_AGE: Counter = Default::default();
     pub static ref COMMERCIAL_USAGE_REJECTED: Counter = Default::default();
     pub static ref COMMERCIAL_ANON_FALLBACK_BUCKET: Family<Labels, Counter> = Default::default();
     pub static ref COMMERCIAL_SNAPSHOT_AGE_SECONDS: Gauge = Default::default();
@@ -196,6 +197,10 @@ pub fn report_commercial_stream_bytes(
 
 pub fn report_commercial_usage_dropped() {
     COMMERCIAL_USAGE_DROPPED.inc();
+}
+
+pub fn report_commercial_usage_dropped_age(count: u64) {
+    COMMERCIAL_USAGE_DROPPED_AGE.inc_by(count);
 }
 
 pub fn report_commercial_usage_rejected(count: u64) {
@@ -461,6 +466,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "commercial_usage_dropped_total",
         "Commercial usage events dropped by the bounded reporter buffer",
         COMMERCIAL_USAGE_DROPPED.clone(),
+    );
+    registry.register(
+        "commercial_usage_dropped_age_total",
+        "Commercial usage events dropped after exceeding the reporter retry-age cap",
+        COMMERCIAL_USAGE_DROPPED_AGE.clone(),
     );
     registry.register(
         "commercial_usage_rejected_total",

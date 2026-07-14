@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     future::Future,
+    ops::Deref,
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
@@ -40,6 +41,7 @@ struct ReporterOptions {
     flush_interval: Duration,
     flush_max_events: usize,
     capacity: usize,
+    max_retry_age: Duration,
 }
 
 #[derive(Clone)]
@@ -49,14 +51,39 @@ pub struct BufferedUsageReporter {
 
 struct BufferedUsageReporterInner {
     options: ReporterOptions,
-    queue: Mutex<VecDeque<StreamUsageEvent>>,
+    queue: Mutex<VecDeque<QueuedUsageEvent>>,
     notify: Notify,
     client: reqwest::Client,
 }
 
+#[derive(Clone, Serialize)]
+struct QueuedUsageEvent {
+    #[serde(flatten)]
+    event: StreamUsageEvent,
+    #[serde(skip)]
+    enqueued_at: tokio::time::Instant,
+}
+
+impl QueuedUsageEvent {
+    fn new(event: StreamUsageEvent) -> Self {
+        Self {
+            event,
+            enqueued_at: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl Deref for QueuedUsageEvent {
+    type Target = StreamUsageEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
+}
+
 #[derive(Serialize)]
 struct UsageBatch<'a> {
-    events: &'a [StreamUsageEvent],
+    events: &'a [QueuedUsageEvent],
 }
 
 #[derive(Deserialize)]
@@ -78,6 +105,7 @@ impl BufferedUsageReporter {
             flush_interval: Duration::from_secs(config.flush_interval_secs),
             flush_max_events: config.flush_max_events.max(1),
             capacity: config.usage_buffer_max_events.max(1),
+            max_retry_age: Duration::from_secs(config.usage_max_retry_age_secs),
         });
         let task_reporter = reporter.clone();
         let task = tokio::spawn(async move {
@@ -144,7 +172,7 @@ impl BufferedUsageReporter {
 
     async fn flush_remaining_once_using<F>(&self, mut send_once: F)
     where
-        F: for<'a> FnMut(&'a [StreamUsageEvent]) -> SendOnceFuture<'a>,
+        F: for<'a> FnMut(&'a [QueuedUsageEvent]) -> SendOnceFuture<'a>,
     {
         while let Some(batch) = self.pop_batch() {
             if let Err(err) = send_once(&batch).await {
@@ -169,7 +197,7 @@ impl BufferedUsageReporter {
     #[cfg(test)]
     async fn flush_threshold_backlog_using<F>(&self, cancel: &CancellationToken, mut send_once: F)
     where
-        F: for<'a> FnMut(&'a [StreamUsageEvent]) -> SendOnceFuture<'a>,
+        F: for<'a> FnMut(&'a [QueuedUsageEvent]) -> SendOnceFuture<'a>,
     {
         while self.queue_len() >= self.inner.options.flush_max_events {
             let Some(batch) = self.pop_batch() else {
@@ -192,9 +220,9 @@ impl BufferedUsageReporter {
 
     async fn send_with_retry(
         &self,
-        batch: Vec<StreamUsageEvent>,
+        batch: Vec<QueuedUsageEvent>,
         cancel: &CancellationToken,
-    ) -> Option<Vec<StreamUsageEvent>> {
+    ) -> Option<Vec<QueuedUsageEvent>> {
         let reporter = self.clone();
         self.send_with_retry_using(batch, cancel, move |batch| {
             let reporter = reporter.clone();
@@ -208,16 +236,20 @@ impl BufferedUsageReporter {
 
     async fn send_with_retry_using<F>(
         &self,
-        batch: Vec<StreamUsageEvent>,
+        mut batch: Vec<QueuedUsageEvent>,
         cancel: &CancellationToken,
         mut send_once: F,
-    ) -> Option<Vec<StreamUsageEvent>>
+    ) -> Option<Vec<QueuedUsageEvent>>
     where
-        F: for<'a> FnMut(&'a [StreamUsageEvent]) -> SendOnceFuture<'a>,
+        F: for<'a> FnMut(&'a [QueuedUsageEvent]) -> SendOnceFuture<'a>,
     {
         let mut delay = Duration::from_secs(1);
         let mut attempts = 0usize;
         loop {
+            self.drop_aged_batch(&mut batch);
+            if batch.is_empty() {
+                return None;
+            }
             attempts += 1;
             let result = tokio::select! {
                 _ = cancel.cancelled() => return Some(batch),
@@ -265,7 +297,7 @@ impl BufferedUsageReporter {
         }
     }
 
-    async fn send_once(&self, batch: &[StreamUsageEvent]) -> Result<(), SendBatchError> {
+    async fn send_once(&self, batch: &[QueuedUsageEvent]) -> Result<(), SendBatchError> {
         let url = usage_url(&self.inner.options.control_plane_url)?;
         let response = self
             .inner
@@ -307,8 +339,9 @@ impl BufferedUsageReporter {
         self.lock_queue().len()
     }
 
-    fn pop_batch(&self) -> Option<Vec<StreamUsageEvent>> {
+    fn pop_batch(&self) -> Option<Vec<QueuedUsageEvent>> {
         let mut queue = self.lock_queue();
+        self.drop_aged_queue(&mut queue);
         if queue.is_empty() {
             metrics::set_commercial_usage_buffer_len(0);
             return None;
@@ -320,7 +353,8 @@ impl BufferedUsageReporter {
         Some(batch)
     }
 
-    fn push_front_batch(&self, mut batch: Vec<StreamUsageEvent>) {
+    fn push_front_batch(&self, mut batch: Vec<QueuedUsageEvent>) {
+        self.drop_aged_batch(&mut batch);
         let mut queue = self.lock_queue();
         while let Some(event) = batch.pop() {
             queue.push_front(event);
@@ -332,7 +366,37 @@ impl BufferedUsageReporter {
         metrics::set_commercial_usage_buffer_len(queue.len() as i64);
     }
 
-    fn lock_queue(&self) -> MutexGuard<'_, VecDeque<StreamUsageEvent>> {
+    fn drop_aged_queue(&self, queue: &mut VecDeque<QueuedUsageEvent>) {
+        let now = tokio::time::Instant::now();
+        let before = queue.len();
+        queue.retain(|event| {
+            now.saturating_duration_since(event.enqueued_at) <= self.inner.options.max_retry_age
+        });
+        self.report_age_drops(before - queue.len());
+    }
+
+    fn drop_aged_batch(&self, batch: &mut Vec<QueuedUsageEvent>) {
+        let now = tokio::time::Instant::now();
+        let before = batch.len();
+        batch.retain(|event| {
+            now.saturating_duration_since(event.enqueued_at) <= self.inner.options.max_retry_age
+        });
+        self.report_age_drops(before - batch.len());
+    }
+
+    fn report_age_drops(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        metrics::report_commercial_usage_dropped_age(count as u64);
+        tracing::warn!(
+            count,
+            max_retry_age = ?self.inner.options.max_retry_age,
+            "dropping commercial usage events older than the reporter retry-age cap"
+        );
+    }
+
+    fn lock_queue(&self) -> MutexGuard<'_, VecDeque<QueuedUsageEvent>> {
         match self.inner.queue.lock() {
             Ok(queue) => queue,
             Err(poisoned) => {
@@ -353,7 +417,7 @@ impl UsageReporter for BufferedUsageReporter {
             metrics::report_commercial_usage_dropped();
             tracing::warn!("commercial usage buffer full; dropping oldest event");
         }
-        queue.push_back(event);
+        queue.push_back(QueuedUsageEvent::new(event));
         metrics::set_commercial_usage_buffer_len(queue.len() as i64);
         drop(queue);
         self.inner.notify.notify_one();
@@ -551,12 +615,29 @@ mod tests {
         flush_max_events: usize,
         capacity: usize,
     ) -> Arc<BufferedUsageReporter> {
+        reporter_with_max_retry_age(
+            url,
+            flush_interval,
+            flush_max_events,
+            capacity,
+            Duration::from_secs(7 * 24 * 60 * 60),
+        )
+    }
+
+    fn reporter_with_max_retry_age(
+        url: url::Url,
+        flush_interval: Duration,
+        flush_max_events: usize,
+        capacity: usize,
+        max_retry_age: Duration,
+    ) -> Arc<BufferedUsageReporter> {
         BufferedUsageReporter::new(ReporterOptions {
             control_plane_url: url,
             service_token: "service-token".to_string(),
             flush_interval,
             flush_max_events,
             capacity,
+            max_retry_age,
         })
     }
 
@@ -602,7 +683,7 @@ mod tests {
         {
             let mut queue = reporter.lock_queue();
             for index in 0..6 {
-                queue.push_back(event(&format!("burst-{index}")));
+                queue.push_back(QueuedUsageEvent::new(event(&format!("burst-{index}"))));
             }
         }
         metrics::set_commercial_usage_buffer_len(reporter.queue_len() as i64);
@@ -615,7 +696,7 @@ mod tests {
         reporter
             .flush_threshold_backlog_using(&cancel, {
                 let delivered = delivered.clone();
-                move |batch: &[StreamUsageEvent]| -> SendOnceFuture<'_> {
+                move |batch: &[QueuedUsageEvent]| -> SendOnceFuture<'_> {
                     let delivered = delivered.clone();
                     let batch = batch
                         .iter()
@@ -655,7 +736,7 @@ mod tests {
         {
             let mut queue = reporter.lock_queue();
             for index in 0..6 {
-                queue.push_back(event(&format!("outage-{index}")));
+                queue.push_back(QueuedUsageEvent::new(event(&format!("outage-{index}"))));
             }
         }
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -663,7 +744,7 @@ mod tests {
         reporter
             .flush_threshold_backlog_using(&cancel, {
                 let attempts = attempts.clone();
-                move |_: &[StreamUsageEvent]| -> SendOnceFuture<'_> {
+                move |_: &[QueuedUsageEvent]| -> SendOnceFuture<'_> {
                     let attempts = attempts.clone();
                     Box::pin(async move {
                         attempts.fetch_add(1, Ordering::SeqCst);
@@ -721,6 +802,111 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["two", "three"]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn events_older_than_default_retry_age_are_dropped_before_flush() {
+        let dropped_before = metrics::COMMERCIAL_USAGE_DROPPED_AGE.get();
+        let reporter = reporter(
+            "http://127.0.0.1:1".parse().unwrap(),
+            Duration::from_secs(60),
+            10,
+            10,
+        );
+        reporter.report(event("too-old"));
+
+        tokio::time::advance(Duration::from_secs(7 * 24 * 60 * 60 + 1)).await;
+
+        assert!(
+            reporter.pop_batch().is_none(),
+            "events older than the default retry-age cap must not be flushed"
+        );
+        assert!(metrics::COMMERCIAL_USAGE_DROPPED_AGE.get() > dropped_before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn event_within_retry_age_is_still_flushed() {
+        let reporter = reporter_with_max_retry_age(
+            "http://127.0.0.1:1".parse().unwrap(),
+            Duration::from_secs(60),
+            10,
+            10,
+            Duration::from_secs(10),
+        );
+        reporter.report(event("still-fresh"));
+
+        tokio::time::advance(Duration::from_secs(9)).await;
+
+        let batch = reporter.pop_batch().expect("fresh event remains queued");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].event_id, "still-fresh");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_failures_drop_event_after_retry_age_and_increment_metric() {
+        let reporter = reporter_with_max_retry_age(
+            "http://127.0.0.1:1".parse().unwrap(),
+            Duration::from_secs(60),
+            1,
+            10,
+            Duration::from_secs(3),
+        );
+        let cancel = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let dropped_before = metrics::COMMERCIAL_USAGE_DROPPED_AGE.get();
+        reporter.report(event("ages-during-retries"));
+        let batch = reporter.pop_batch().unwrap();
+
+        let requeued = reporter
+            .send_with_retry_using(batch, &cancel, {
+                let attempts = attempts.clone();
+                move |_| {
+                    let attempts = attempts.clone();
+                    Box::pin(async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err(SendBatchError::Retry("outage".to_string()))
+                    })
+                }
+            })
+            .await;
+
+        assert!(requeued.is_none(), "aged event must not be requeued");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(metrics::COMMERCIAL_USAGE_DROPPED_AGE.get() > dropped_before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_succeeds_while_event_is_within_retry_age() {
+        let reporter = reporter_with_max_retry_age(
+            "http://127.0.0.1:1".parse().unwrap(),
+            Duration::from_secs(60),
+            1,
+            10,
+            Duration::from_secs(10),
+        );
+        let cancel = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        reporter.report(event("retried-while-fresh"));
+        let batch = reporter.pop_batch().unwrap();
+
+        let requeued = reporter
+            .send_with_retry_using(batch, &cancel, {
+                let attempts = attempts.clone();
+                move |_| {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        if attempt == 0 {
+                            Err(SendBatchError::Retry("transient".to_string()))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }
+            })
+            .await;
+
+        assert!(requeued.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -843,7 +1029,7 @@ mod tests {
         );
         let cancel = CancellationToken::new();
         let attempts = Arc::new(AtomicUsize::new(0));
-        let batch = vec![event("auth-rotation")];
+        let batch = vec![QueuedUsageEvent::new(event("auth-rotation"))];
 
         let requeued = reporter
             .send_with_retry_using(batch, &cancel, {
@@ -896,7 +1082,7 @@ mod tests {
         );
         let cancel = CancellationToken::new();
         let attempts = Arc::new(AtomicUsize::new(0));
-        let batch = vec![event("survives-outage")];
+        let batch = vec![QueuedUsageEvent::new(event("survives-outage"))];
 
         let requeued = reporter
             .send_with_retry_using(batch, &cancel, {
