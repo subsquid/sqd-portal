@@ -2,6 +2,7 @@ hostname: http://0.0.0.0:8000
 use_gzjoin: true
 sqd_network:
   datasets: https://cdn.subsquid.io/sqd-network/datasets-testnet.yml
+  metadata: https://cdn.subsquid.io/sqd-network/testnet/metadata.yml
   serve: "all"
 datasets:
   solana-mainnet:

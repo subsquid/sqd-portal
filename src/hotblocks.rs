@@ -74,13 +74,16 @@ pub async fn build_client(config: &Config) -> anyhow::Result<HotblocksHandle> {
         }
     }
 
+    // Read (idle) timeout, not a total timeout: this client proxies streams, and a
+    // total deadline would truncate a stream drained slowly by a backpressured client.
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_gzip()
         .no_deflate()
         .no_brotli()
         .no_zstd()
-        .connect_timeout(Duration::from_secs(1));
+        .connect_timeout(Duration::from_secs(1))
+        .read_timeout(Duration::from_secs(30));
 
     if let Some(client_id) = &config.client_id {
         let mut headers = reqwest::header::HeaderMap::new();
