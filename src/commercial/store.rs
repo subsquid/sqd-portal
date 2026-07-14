@@ -32,6 +32,7 @@ const RESOLVE_PATH_SEGMENTS: [&str; 4] = ["internal", "portal", "v1", "authorize
 const DEFAULT_PAGE_LIMIT: u16 = 1000;
 const MAX_BOOTSTRAP_PAGES: usize = 10_000;
 const MAX_RESOLVE_FOLLOWERS: usize = 64;
+const RESOLVE_FOLLOWER_TIMEOUT: Duration = Duration::from_secs(11);
 
 pub struct SnapshotStore {
     inner: Arc<SnapshotStoreInner>,
@@ -184,6 +185,11 @@ impl Drop for ResolveFlightGuard<'_> {
         if self.completed {
             return;
         }
+        let mut result = self.flight.result.lock().unwrap();
+        if result.is_none() {
+            *result = Some(None);
+        }
+        drop(result);
         self.store.remove_resolve_flight(&self.key_id, &self.flight);
         self.flight.notify.notify_waiters();
     }
@@ -376,7 +382,17 @@ impl SnapshotStore {
             if let Some(result) = flight.result.lock().unwrap().clone() {
                 return result;
             }
-            notified.await;
+            if tokio::time::timeout(RESOLVE_FOLLOWER_TIMEOUT, notified)
+                .await
+                .is_err()
+            {
+                tracing::info!(
+                    key_id,
+                    "commercial snapshot resolve follower timed out; failing closed"
+                );
+                metrics::report_commercial_resolve("follower_timeout");
+                return None;
+            }
             if let Some(result) = flight.result.lock().unwrap().clone() {
                 return result;
             };
@@ -3742,6 +3758,53 @@ mod tests {
         assert_eq!(mock.resolve_calls(), vec![key_id.to_string()]);
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_resolve_leader_cannot_strand_late_follower() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        let key_id = "cancelled-leader";
+        let flight = Arc::new(ResolveFlight {
+            result: Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+            follower_permits: Arc::new(tokio::sync::Semaphore::new(MAX_RESOLVE_FOLLOWERS)),
+        });
+        store
+            .inner
+            .inflight_resolves
+            .insert(key_id.to_string(), flight.clone());
+        let guard = ResolveFlightGuard {
+            store: &store,
+            key_id: key_id.to_string(),
+            flight,
+            completed: false,
+        };
+
+        let follower = store.inner.inflight_resolves.get(key_id).unwrap().clone();
+        drop(guard);
+
+        let notified = follower.notify.notified();
+        let result = if let Some(result) = follower.result.lock().unwrap().clone() {
+            result
+        } else {
+            tokio::time::timeout(Duration::from_millis(50), notified)
+                .await
+                .expect("leader cancellation must wake a late-registering follower");
+            follower
+                .result
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("leader cancellation must publish a terminal result")
+        };
+        assert!(result.is_none());
     }
 
     #[tokio::test]
