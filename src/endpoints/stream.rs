@@ -675,7 +675,7 @@ fn restrict_archival_debug_request(
     request: StreamRequest,
     grant: Option<&CommercialGrant>,
 ) -> StreamRequest {
-    let request = if grant.is_some_and(|grant| grant.granted.principal.api_key_id.is_some()) {
+    let request = if grant.is_some_and(|grant| grant.granted.principal.account_id != "oss") {
         restrict_request(config, request)
     } else {
         request
@@ -961,11 +961,13 @@ default_retries: 0
     }
 
     #[test]
-    fn archival_debug_applies_operator_restrictions_for_keyed_callers_only() {
+    fn archival_debug_clamps_keyed_and_anonymous_requests() {
         let config = config_for_restriction_test();
         let keyed = commercial_grant(Some("key"), Some(3));
         let anonymous = commercial_grant(None, Some(3));
-        let request = stream_request(Some(10));
+        let mut request = stream_request(Some(10));
+        request.buffer_size = 1_000_000_000;
+        request.retries = u8::MAX;
 
         let keyed_request = restrict_archival_debug_request(&config, request.clone(), Some(&keyed));
         assert_eq!(keyed_request.buffer_size, 4);
@@ -976,14 +978,11 @@ default_retries: 0
 
         let anonymous_request =
             restrict_archival_debug_request(&config, request.clone(), Some(&anonymous));
-        assert_eq!(anonymous_request.buffer_size, request.buffer_size);
-        assert_eq!(
-            anonymous_request.max_stored_results_per_chunk,
-            request.max_stored_results_per_chunk
-        );
-        assert_eq!(anonymous_request.max_chunks, Some(3));
-        assert_eq!(anonymous_request.timeout_quantile, request.timeout_quantile);
-        assert_eq!(anonymous_request.retries, request.retries);
+        assert_eq!(anonymous_request.buffer_size, 4);
+        assert_eq!(anonymous_request.max_stored_results_per_chunk, 1);
+        assert_eq!(anonymous_request.max_chunks, Some(2));
+        assert_eq!(anonymous_request.timeout_quantile, 0.25);
+        assert_eq!(anonymous_request.retries, 0);
 
         let oss_request = restrict_archival_debug_request(&config, request.clone(), None);
         assert_eq!(oss_request.buffer_size, request.buffer_size);
