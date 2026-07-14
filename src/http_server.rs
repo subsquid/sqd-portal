@@ -86,7 +86,14 @@ fn commercial_route_layer(
     }
 }
 
-fn internal_route_layer(route: MethodRouter, service_token: Option<Arc<str>>) -> MethodRouter {
+fn internal_route_layer(
+    route: MethodRouter,
+    commercial_enabled: bool,
+    service_token: Option<Arc<str>>,
+) -> MethodRouter {
+    if !commercial_enabled {
+        return route;
+    }
     route.route_layer(axum::middleware::from_fn(
         move |mut req: Request, next: axum::middleware::Next| {
             let service_token = service_token.clone();
@@ -374,6 +381,7 @@ pub async fn run_server(
             "/debug/workers",
             internal_route_layer(
                 get(get_all_workers).endpoint("/debug/workers"),
+                commercial_enabled,
                 internal_service_token.clone(),
             ),
         )
@@ -381,6 +389,7 @@ pub async fn run_server(
             "/datasets/:dataset/:block/debug",
             internal_route_layer(
                 get(get_debug_block).endpoint("/block/debug"),
+                commercial_enabled,
                 internal_service_token,
             ),
         )
@@ -1560,6 +1569,7 @@ mod tests {
             "/debug/workers",
             internal_route_layer(
                 get(|| async { "workers" }),
+                true,
                 Some(Arc::<str>::from("internal-secret")),
             ),
         );
@@ -1600,6 +1610,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(internal.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn internal_routes_remain_open_without_commercial_config() {
+        let app = Router::new().route(
+            "/debug/workers",
+            internal_route_layer(get(|| async { "workers" }), false, None),
+        );
+
+        let anonymous = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/workers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::OK);
     }
 
     #[test]
