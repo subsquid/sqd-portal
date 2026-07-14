@@ -121,6 +121,8 @@ struct DiskCache {
     epoch: Option<String>,
     records: Vec<serde_json::Value>,
     defaults: Defaults,
+    #[serde(default)]
+    defaults_pending_authoritative_replace: bool,
     saved_at: u64,
 }
 
@@ -128,6 +130,7 @@ struct DiskCache {
 enum BootstrapMode {
     Normal,
     Authoritative,
+    DefaultsRecovery,
 }
 
 #[derive(Debug)]
@@ -332,10 +335,7 @@ impl SnapshotStore {
     #[cfg(test)]
     fn pause_resolve_application_for_test(
         &self,
-    ) -> (
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::Sender<()>,
-    ) {
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         *self.inner.resolve_application_gate.lock().unwrap() = ResolveApplicationGate {
@@ -370,10 +370,24 @@ impl SnapshotStore {
             } else {
                 Ok(())
             }
-        } else if let Err(err) = self.sync_once().await {
-            Err(err)
         } else {
-            Ok(())
+            let defaults_recovery = if self
+                .inner
+                .defaults_pending_authoritative_replace
+                .load(Ordering::Acquire)
+            {
+                metrics::report_commercial_defaults_recovery_pending_tick();
+                tracing::warn!(
+                    current_seq = self.inner.defaults.load().seq,
+                    "authoritative commercial defaults recovery remains pending; retrying bootstrap"
+                );
+                let epoch = self.inner.epoch.lock().unwrap().clone();
+                self.bootstrap(BootstrapMode::DefaultsRecovery, epoch).await
+            } else {
+                Ok(())
+            };
+            let sync = self.sync_once().await;
+            defaults_recovery.and(sync)
         };
 
         match &result {
@@ -473,6 +487,7 @@ impl SnapshotStore {
                     );
                 }
             }
+            BootstrapMode::DefaultsRecovery => {}
         }
         self.inner.ready.store(true, Ordering::Release);
         tracing::info!(
@@ -695,6 +710,20 @@ impl SnapshotStore {
         cursor: u64,
         mode: BootstrapMode,
     ) -> anyhow::Result<()> {
+        if matches!(mode, BootstrapMode::DefaultsRecovery) {
+            if let Some(defaults) = records
+                .into_iter()
+                .filter_map(|record| match record {
+                    SnapshotRecord::Defaults(record) => Some(Defaults::from(record)),
+                    SnapshotRecord::Key(_) => None,
+                })
+                .last()
+            {
+                self.store_defaults(defaults);
+                self.mark_disk_cache_dirty();
+            }
+            return Ok(());
+        }
         let _authoritative_guard = matches!(mode, BootstrapMode::Authoritative)
             .then(|| self.inner.authoritative_lock.write().unwrap());
         let mut defaults = None;
@@ -803,6 +832,7 @@ impl SnapshotStore {
                     .store(false, Ordering::Release);
                 true
             }
+            BootstrapMode::DefaultsRecovery => unreachable!("handled before defaults storage"),
         };
         let preserve_higher_seq = matches!(mode, BootstrapMode::Normal) && !force_replace;
         loop {
@@ -958,6 +988,10 @@ impl SnapshotStore {
         }
         self.inner.records.store(Arc::new(map));
         self.inner.defaults.store(Arc::new(cache.defaults));
+        self.inner.defaults_pending_authoritative_replace.store(
+            cache.defaults_pending_authoritative_replace,
+            Ordering::Release,
+        );
         self.inner.cursor.store(cache.cursor, Ordering::Release);
         *self.inner.epoch.lock().unwrap() = cache.epoch;
         self.inner.ready.store(true, Ordering::Release);
@@ -994,6 +1028,10 @@ impl SnapshotStore {
             epoch: self.inner.epoch.lock().unwrap().clone(),
             records,
             defaults: (**self.inner.defaults.load()).clone(),
+            defaults_pending_authoritative_replace: self
+                .inner
+                .defaults_pending_authoritative_replace
+                .load(Ordering::Acquire),
             saved_at: now_secs(),
         };
         let bytes = serde_json::to_vec(&cache)?;
@@ -1937,6 +1975,7 @@ mod tests {
                 active_snapshot(2),
             ))],
             defaults: Defaults::from(defaults_record(1)),
+            defaults_pending_authoritative_replace: false,
             saved_at: now_secs(),
         };
         tokio::fs::write(&path, serde_json::to_vec(&cache).unwrap())
@@ -2457,6 +2496,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_authoritative_defaults_survive_disk_cache_restart() {
+        let path = cache_path("pending-defaults-restart");
+        let config = offline_config(path.clone());
+        let store = SnapshotStore::new(
+            &config,
+            SnapshotHooks::default(),
+            String::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store.store_defaults(Defaults::from(defaults_record(100)));
+        store
+            .replace_records_with_mode(vec![], 5, BootstrapMode::Authoritative)
+            .unwrap();
+        store.persist_disk_cache().await.unwrap();
+
+        let restarted = SnapshotStore::new(
+            &config,
+            SnapshotHooks::default(),
+            String::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        restarted.load_disk_cache();
+        restarted
+            .apply_records(vec![SnapshotRecord::Defaults(defaults_record(6))], 6)
+            .unwrap();
+
+        assert_eq!(restarted.view().defaults.seq, 6);
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn pending_authoritative_defaults_retry_bootstrap_and_report_each_tick() {
+        let mock = MockControlPlane::spawn().await;
+        mock.push_page(5, page(vec![], 5, false));
+        mock.push_page(
+            0,
+            page(vec![SnapshotRecord::Defaults(defaults_record(5))], 5, false),
+        );
+        let store = SnapshotStore::new(
+            &config(&mock, PathBuf::new(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store.store_defaults(Defaults::from(defaults_record(100)));
+        store
+            .replace_records_with_mode(vec![], 5, BootstrapMode::Authoritative)
+            .unwrap();
+        store.set_ready_for_test(true);
+        let pending_ticks_before = metrics::COMMERCIAL_DEFAULTS_RECOVERY_PENDING_TICKS.get();
+
+        store.run_sync_tick().await.unwrap();
+
+        assert_eq!(store.view().defaults.seq, 5);
+        assert!(metrics::COMMERCIAL_DEFAULTS_RECOVERY_PENDING_TICKS.get() > pending_ticks_before);
+    }
+
+    #[tokio::test]
     async fn authoritative_bootstrap_persists_restored_cache_before_return() {
         let mock = MockControlPlane::spawn().await;
         let path = cache_path("authoritative-bootstrap-sync-persist");
@@ -2485,10 +2585,7 @@ mod tests {
         );
 
         store
-            .bootstrap(
-                BootstrapMode::Authoritative,
-                Some("epoch-new".to_string()),
-            )
+            .bootstrap(BootstrapMode::Authoritative, Some("epoch-new".to_string()))
             .await
             .unwrap();
 
@@ -3424,8 +3521,7 @@ mod tests {
             TokioInstant::now(),
         );
         store.set_ready_for_test(true);
-        let (application_reached, resume_application) =
-            store.pause_resolve_application_for_test();
+        let (application_reached, resume_application) = store.pause_resolve_application_for_test();
 
         let resolving_store = store.clone();
         let resolve_task =
@@ -3451,7 +3547,10 @@ mod tests {
         resume_application.send(()).unwrap();
 
         let returned = resolve_task.await.unwrap();
-        assert!(returned.is_none(), "stale resolved record escaped: {returned:?}");
+        assert!(
+            returned.is_none(),
+            "stale resolved record escaped: {returned:?}"
+        );
         assert_eq!(tally.version_for("account"), Some(5));
         assert!(!restored_stream_kill.load(Ordering::Acquire));
         assert_eq!(store.get(KEY_ID).unwrap().seq, 5);

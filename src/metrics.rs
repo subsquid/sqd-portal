@@ -80,6 +80,7 @@ lazy_static::lazy_static! {
     pub static ref COMMERCIAL_SYNC_STALENESS_SECONDS: Gauge = Default::default();
     pub static ref COMMERCIAL_SNAPSHOT_RECORDS: Gauge = Default::default();
     pub static ref COMMERCIAL_SNAPSHOT_PERSIST_ERRORS: Counter = Default::default();
+    pub static ref COMMERCIAL_DEFAULTS_RECOVERY_PENDING_TICKS: Counter = Default::default();
     pub static ref COMMERCIAL_SNAPSHOT_PARSE_ERRORS: Counter = Default::default();
     pub static ref COMMERCIAL_AUTHORIZE: Family<Labels, Counter> = Default::default();
     pub static ref COMMERCIAL_RESOLVE: Family<Labels, Counter> = Default::default();
@@ -221,6 +222,10 @@ pub fn set_commercial_snapshot_records(records: i64) {
 
 pub fn report_commercial_snapshot_persist_error() {
     COMMERCIAL_SNAPSHOT_PERSIST_ERRORS.inc();
+}
+
+pub fn report_commercial_defaults_recovery_pending_tick() {
+    COMMERCIAL_DEFAULTS_RECOVERY_PENDING_TICKS.inc();
 }
 
 pub fn report_commercial_snapshot_parse_error() {
@@ -486,6 +491,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "commercial_snapshot_persist_errors_total",
         "Commercial snapshot disk-cache persistence failures",
         COMMERCIAL_SNAPSHOT_PERSIST_ERRORS.clone(),
+    );
+    registry.register(
+        "commercial_defaults_recovery_pending_ticks_total",
+        "Commercial sync ticks that started with authoritative defaults recovery pending",
+        COMMERCIAL_DEFAULTS_RECOVERY_PENDING_TICKS.clone(),
     );
     registry.register(
         "commercial_snapshot_parse_errors_total",
