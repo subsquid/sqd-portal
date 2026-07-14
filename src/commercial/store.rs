@@ -133,7 +133,18 @@ struct DiskCache {
 enum BootstrapMode {
     Normal,
     Authoritative,
+    RecordsOnlyAuthoritative,
     DefaultsRecovery,
+}
+
+impl BootstrapMode {
+    fn is_authoritative(self) -> bool {
+        matches!(self, Self::Authoritative | Self::RecordsOnlyAuthoritative)
+    }
+
+    fn is_full_authoritative(self) -> bool {
+        matches!(self, Self::Authoritative)
+    }
 }
 
 #[derive(Debug)]
@@ -484,7 +495,7 @@ impl SnapshotStore {
         self.replace_records_with_mode(all, cursor, mode)?;
         match mode {
             BootstrapMode::Normal => self.observe_epoch(epoch),
-            BootstrapMode::Authoritative => {
+            BootstrapMode::Authoritative | BootstrapMode::RecordsOnlyAuthoritative => {
                 self.set_epoch(epoch);
                 if let Err(err) = self.persist_disk_cache().await {
                     metrics::report_commercial_snapshot_persist_error();
@@ -501,7 +512,7 @@ impl SnapshotStore {
         self.inner.ready.store(true, Ordering::Release);
         tracing::info!(
             cursor,
-            authoritative = matches!(mode, BootstrapMode::Authoritative),
+            authoritative = mode.is_authoritative(),
             "commercial snapshot bootstrap applied"
         );
         Ok(())
@@ -535,8 +546,20 @@ impl SnapshotStore {
                     );
                 }
             }
-            self.bootstrap(BootstrapMode::Authoritative, page.epoch)
-                .await?;
+            // A reset with no stored epoch is normally a retention reset from a
+            // legacy cache, so versions remain continuous and global tally/stream
+            // hooks would be needless disruption. If a real restore coincides
+            // with such a cache, the runbook epoch bump is what upgrades the next
+            // comparison to a full authoritative reset.
+            let mode = if matches!(
+                reason,
+                AuthoritativeResetReason::ResetWithUnknownEpoch { .. }
+            ) {
+                BootstrapMode::RecordsOnlyAuthoritative
+            } else {
+                BootstrapMode::Authoritative
+            };
+            self.bootstrap(mode, page.epoch).await?;
             return Ok(());
         }
         if page.reset {
@@ -719,14 +742,15 @@ impl SnapshotStore {
                     SnapshotRecord::Defaults(record) => Some(Defaults::from(record)),
                     SnapshotRecord::Key(_) => None,
                 })
-                .last()
+                .next_back()
             {
                 self.store_defaults(defaults);
                 self.mark_disk_cache_dirty();
             }
             return Ok(());
         }
-        let _authoritative_guard = matches!(mode, BootstrapMode::Authoritative)
+        let _authoritative_guard = mode
+            .is_authoritative()
             .then(|| self.inner.authoritative_lock.write().unwrap());
         let mut defaults = None;
         let mut records_map = HashMap::new();
@@ -741,7 +765,7 @@ impl SnapshotStore {
         }
         if let Some(defaults) = defaults {
             self.store_defaults_with_mode(defaults, mode);
-        } else if matches!(mode, BootstrapMode::Authoritative) {
+        } else if mode.is_authoritative() {
             self.inner
                 .defaults_pending_authoritative_replace
                 .store(true, Ordering::Release);
@@ -750,11 +774,11 @@ impl SnapshotStore {
                 "authoritative commercial snapshot contained no defaults; keeping current defaults"
             );
         }
-        if matches!(mode, BootstrapMode::Authoritative) {
+        if mode.is_authoritative() {
             self.inner.generation.fetch_add(1, Ordering::AcqRel);
         }
         let hooks = self.replace_key_records(records_map, cursor, mode);
-        if matches!(mode, BootstrapMode::Authoritative) {
+        if mode.is_full_authoritative() {
             self.apply_authoritative_hooks();
         }
         for record in hooks.changed {
@@ -829,6 +853,12 @@ impl SnapshotStore {
                 .defaults_pending_authoritative_replace
                 .swap(false, Ordering::AcqRel),
             BootstrapMode::Authoritative => {
+                self.inner
+                    .defaults_pending_authoritative_replace
+                    .store(false, Ordering::Release);
+                true
+            }
+            BootstrapMode::RecordsOnlyAuthoritative => {
                 self.inner
                     .defaults_pending_authoritative_replace
                     .store(false, Ordering::Release);
@@ -2452,12 +2482,13 @@ mod tests {
             ),
         );
         let registry = Arc::new(ActiveStreamRegistry::default());
+        let tally = Arc::new(TallyStore::default());
         let path = cache_path("epoch-authoritative-reset");
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let store = SnapshotStore::new(
             &config(&mock, path.clone(), 10),
             SnapshotHooks {
-                tally: None,
+                tally: Some(tally.clone()),
                 registry: Some(registry.clone()),
             },
             SERVICE_TOKEN.to_string(),
@@ -2471,6 +2502,7 @@ mod tests {
             store.inner.epoch.lock().unwrap().as_deref(),
             Some("epoch-old")
         );
+        tally.debit("account", 100, 9_000);
 
         let kill = Arc::new(AtomicBool::new(false));
         let _registration = registry.register(
@@ -2494,6 +2526,9 @@ mod tests {
         );
         assert!(store.get(removed_key).is_none());
         assert!(kill.load(Ordering::Acquire));
+        assert_eq!(tally.version_for("account"), Some(0));
+        assert_eq!(tally.bytes_for("account", 0), 0);
+        assert_eq!(tally.version_for("restored"), Some(5));
 
         let cache: DiskCache =
             serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
@@ -2842,9 +2877,14 @@ mod tests {
                 Some(5),
             ),
         );
+        let tally = Arc::new(TallyStore::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
         let store = SnapshotStore::new(
             &config(&mock, PathBuf::new(), 10),
-            SnapshotHooks::default(),
+            SnapshotHooks {
+                tally: Some(tally.clone()),
+                registry: Some(registry.clone()),
+            },
             SERVICE_TOKEN.to_string(),
             reqwest::Client::builder().no_proxy().build().unwrap(),
             TokioInstant::now(),
@@ -2859,6 +2899,14 @@ mod tests {
             100,
         );
         assert!(store.inner.epoch.lock().unwrap().is_none());
+        tally.debit("account", 100, 9_000);
+        let stream_kill = Arc::new(AtomicBool::new(false));
+        let _registration = registry.register(
+            "legacy-cache-stream".to_string(),
+            Some(KEY_ID.to_string()),
+            stream_kill.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
 
         store.sync_once().await.unwrap();
 
@@ -2869,6 +2917,9 @@ mod tests {
             Some("restored")
         );
         assert!(store.get("pre-restore-leftover").is_none());
+        assert!(!stream_kill.load(Ordering::Acquire));
+        assert_eq!(tally.version_for("account"), Some(100));
+        assert_eq!(tally.bytes_for("account", 100), 9_000);
         assert_eq!(
             store.inner.epoch.lock().unwrap().as_deref(),
             Some("epoch-new")
