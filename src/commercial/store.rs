@@ -1024,6 +1024,8 @@ impl SnapshotStore {
                 "commercial quota tallies force-rebased for authoritative snapshot replacement"
             );
         }
+        self.inner.negative_cache.clear();
+        self.inner.resolve_limiter.lock().unwrap().reset();
         if let Some(registry) = &self.inner.hooks.registry {
             let killed = registry.kill_all();
             tracing::info!(
@@ -1072,6 +1074,11 @@ impl ResolveLimiter {
         } else {
             false
         }
+    }
+
+    fn reset(&mut self) {
+        self.tokens = self.capacity;
+        self.last = Instant::now();
     }
 }
 
@@ -2899,6 +2906,53 @@ mod tests {
 
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn authoritative_reset_clears_negative_cache_before_next_resolve() {
+        let mock = MockControlPlane::spawn().await;
+        let key_id = "restored-resolve-key";
+        let store = SnapshotStore::new(
+            &config(&mock, PathBuf::new(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store.set_ready_for_test(true);
+        store.insert_negative_cache_for_test(key_id, Duration::from_secs(60));
+        assert_eq!(store.negative_cache_len(), 1);
+
+        store
+            .replace_records_with_mode(vec![], 5, BootstrapMode::Authoritative)
+            .unwrap();
+
+        assert_eq!(store.negative_cache_len(), 0);
+        let mut resolved = active_snapshot(6);
+        resolved.key_id = key_id.to_string();
+        mock.resolve_with(key_id, Some(resolved));
+        assert_eq!(store.get_or_resolve(key_id).await.unwrap().seq, 6);
+        assert_eq!(mock.resolve_calls(), vec![key_id.to_string()]);
+    }
+
+    #[test]
+    fn authoritative_reset_refills_exhausted_resolve_limiter() {
+        let store = SnapshotStore::new(
+            &offline_config(PathBuf::new()),
+            SnapshotHooks::default(),
+            String::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        *store.inner.resolve_limiter.lock().unwrap() = ResolveLimiter::new(1);
+        assert!(store.take_resolve_token());
+        assert!(!store.take_resolve_token());
+
+        store
+            .replace_records_with_mode(vec![], 5, BootstrapMode::Authoritative)
+            .unwrap();
+
+        assert!(store.take_resolve_token());
     }
 
     #[tokio::test]
