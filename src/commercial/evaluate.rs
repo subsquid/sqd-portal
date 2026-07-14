@@ -579,7 +579,10 @@ mod tests {
 
     use super::*;
     use crate::commercial::{
-        config::{CommercialConfig, PublicFallbackConfig, DEFAULT_USAGE_MAX_RETRY_AGE_SECS},
+        config::{
+            CommercialConfig, PublicFallbackConfig, DEFAULT_MAX_INFLIGHT_RESOLVES,
+            DEFAULT_USAGE_MAX_RETRY_AGE_SECS,
+        },
         store::test_support::{
             active_snapshot, defaults_record, page, MockControlPlane, KEY_ID, SECRET_SHA256,
             SERVICE_TOKEN,
@@ -630,6 +633,7 @@ mod tests {
             usage_max_retry_age_secs: DEFAULT_USAGE_MAX_RETRY_AGE_SECS,
             snapshot_cache_path: cache_path,
             resolve_rate_per_sec: 10,
+            max_inflight_resolves: DEFAULT_MAX_INFLIGHT_RESOLVES,
             negative_cache_secs: 60,
             pod_count: 1,
             client_ip_header: "x-forwarded-for".to_string(),

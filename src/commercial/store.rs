@@ -13,8 +13,8 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
+use tokio::{sync::OwnedSemaphorePermit, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -59,6 +59,7 @@ struct SnapshotStoreInner {
     negative_cache_ttl: Duration,
     negative_cache: DashMap<String, NegativeCacheEntry>,
     inflight_resolves: DashMap<String, Arc<ResolveFlight>>,
+    inflight_resolve_permits: Arc<tokio::sync::Semaphore>,
     resolve_limiter: Mutex<ResolveLimiter>,
     client: reqwest::Client,
     control_plane_url: url::Url,
@@ -171,6 +172,7 @@ struct ResolveFlight {
     result: Mutex<Option<Option<Arc<KeySnapshot>>>>,
     notify: tokio::sync::Notify,
     follower_permits: Arc<tokio::sync::Semaphore>,
+    _global_permit: OwnedSemaphorePermit,
 }
 
 struct ResolveFlightGuard<'a> {
@@ -255,6 +257,9 @@ impl SnapshotStore {
                 negative_cache_ttl: Duration::from_secs(config.negative_cache_secs.max(1)),
                 negative_cache: DashMap::new(),
                 inflight_resolves: DashMap::new(),
+                inflight_resolve_permits: Arc::new(tokio::sync::Semaphore::new(
+                    config.max_inflight_resolves,
+                )),
                 resolve_limiter: Mutex::new(ResolveLimiter::new(config.resolve_rate_per_sec)),
                 client,
                 control_plane_url: config.control_plane_url.clone(),
@@ -287,6 +292,9 @@ impl SnapshotStore {
                 negative_cache_ttl: Duration::from_secs(15),
                 negative_cache: DashMap::new(),
                 inflight_resolves: DashMap::new(),
+                inflight_resolve_permits: Arc::new(tokio::sync::Semaphore::new(
+                    super::config::DEFAULT_MAX_INFLIGHT_RESOLVES,
+                )),
                 resolve_limiter: Mutex::new(ResolveLimiter::new(0)),
                 client: reqwest::Client::builder()
                     .no_proxy()
@@ -352,12 +360,26 @@ impl SnapshotStore {
                         (flight, false, Some(permit))
                     }
                     Entry::Vacant(entry) => {
+                        let Ok(global_permit) = self
+                            .inner
+                            .inflight_resolve_permits
+                            .clone()
+                            .try_acquire_owned()
+                        else {
+                            tracing::info!(
+                                key_id,
+                                "commercial snapshot resolve fail-closed: global flight limit reached"
+                            );
+                            metrics::report_commercial_resolve("global_flight_limited");
+                            return None;
+                        };
                         let flight = Arc::new(ResolveFlight {
                             result: Mutex::new(None),
                             notify: tokio::sync::Notify::new(),
                             follower_permits: Arc::new(tokio::sync::Semaphore::new(
                                 MAX_RESOLVE_FOLLOWERS,
                             )),
+                            _global_permit: global_permit,
                         });
                         entry.insert(flight.clone());
                         (flight, true, None)
@@ -1798,9 +1820,10 @@ mod tests {
     use futures::{stream, StreamExt};
 
     use crate::commercial::{
-        config::DEFAULT_USAGE_MAX_RETRY_AGE_SECS, meter::tap_plain_stream, Authorization,
-        Credential, Endpoint, Granted, GrantedLimits, MeterHandle, Principal, QueryDescriptor,
-        StreamUsageEvent, UsageReporter, UsageStatus,
+        config::{DEFAULT_MAX_INFLIGHT_RESOLVES, DEFAULT_USAGE_MAX_RETRY_AGE_SECS},
+        meter::tap_plain_stream,
+        Authorization, Credential, Endpoint, Granted, GrantedLimits, MeterHandle, Principal,
+        QueryDescriptor, StreamUsageEvent, UsageReporter, UsageStatus,
     };
 
     #[derive(Default)]
@@ -1840,6 +1863,7 @@ mod tests {
             usage_max_retry_age_secs: DEFAULT_USAGE_MAX_RETRY_AGE_SECS,
             snapshot_cache_path: cache_path,
             resolve_rate_per_sec,
+            max_inflight_resolves: DEFAULT_MAX_INFLIGHT_RESOLVES,
             negative_cache_secs: 60,
             pod_count: 1,
             client_ip_header: "x-forwarded-for".to_string(),
@@ -1867,6 +1891,7 @@ mod tests {
             usage_max_retry_age_secs: DEFAULT_USAGE_MAX_RETRY_AGE_SECS,
             snapshot_cache_path: cache_path,
             resolve_rate_per_sec: 0,
+            max_inflight_resolves: DEFAULT_MAX_INFLIGHT_RESOLVES,
             negative_cache_secs: 60,
             pod_count: 1,
             client_ip_header: "x-forwarded-for".to_string(),
@@ -3724,41 +3749,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn small_concurrent_resolvable_burst_coalesces_and_all_succeed() {
+    async fn concurrent_distinct_resolve_flights_are_globally_bounded() {
+        const MAX_INFLIGHT: usize = 2;
+        const REQUESTS: usize = MAX_INFLIGHT + 2;
+
         std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
         let mock = MockControlPlane::spawn().await;
-        let key_id = "concurrent-resolvable-key";
-        let mut resolved = active_snapshot(42);
-        resolved.key_id = key_id.to_string();
-        mock.resolve_with(key_id, Some(resolved));
-        let gate = mock.pause_resolve(key_id);
-        let path = cache_path("resolve-small-burst");
-        let (store, task) =
-            SnapshotStore::spawn(&config(&mock, path.clone(), 10), CancellationToken::new())
-                .unwrap();
+        let keys = (0..REQUESTS)
+            .map(|index| format!("blocked-distinct-key-{index}"))
+            .collect::<Vec<_>>();
+        let gates = keys
+            .iter()
+            .map(|key_id| mock.pause_resolve(key_id))
+            .collect::<Vec<_>>();
+        let path = cache_path("resolve-bounded-distinct-flights");
+        let mut config = config(&mock, path.clone(), REQUESTS as u64);
+        config.max_inflight_resolves = MAX_INFLIGHT;
+        let (store, task) = SnapshotStore::spawn(&config, CancellationToken::new()).unwrap();
         store.inner.ready.store(true, Ordering::Release);
 
-        let resolves = (0..10)
-            .map(|_| {
+        let resolves = keys
+            .into_iter()
+            .map(|key_id| {
                 let store = store.clone();
-                tokio::spawn(async move { store.get_or_resolve(key_id).await })
+                tokio::spawn(async move { store.get_or_resolve(&key_id).await })
             })
             .collect::<Vec<_>>();
+
         tokio::time::timeout(Duration::from_secs(1), async {
-            while mock.resolve_calls().is_empty() {
+            while mock.resolve_calls().len() < MAX_INFLIGHT
+                || resolves
+                    .iter()
+                    .filter(|resolve| resolve.is_finished())
+                    .count()
+                    < REQUESTS - MAX_INFLIGHT
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("distinct resolves beyond the global flight bound should fail closed promptly");
+        assert_eq!(mock.resolve_calls().len(), MAX_INFLIGHT);
+        assert!(store.inner.inflight_resolves.len() <= MAX_INFLIGHT);
+
+        for gate in gates {
+            gate.notify_waiters();
+        }
+        for resolve in resolves {
+            assert!(resolve.await.unwrap().is_none());
+        }
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn small_concurrent_resolvable_burst_coalesces_and_all_succeed() {
+        const KEYS: [&str; 3] = [
+            "concurrent-resolvable-key-1",
+            "concurrent-resolvable-key-2",
+            "concurrent-resolvable-key-3",
+        ];
+
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let gates = KEYS
+            .iter()
+            .enumerate()
+            .map(|(index, key_id)| {
+                let mut resolved = active_snapshot(42 + index as u64);
+                resolved.key_id = (*key_id).to_string();
+                mock.resolve_with(key_id, Some(resolved));
+                mock.pause_resolve(key_id)
+            })
+            .collect::<Vec<_>>();
+        let path = cache_path("resolve-small-burst");
+        let mut config = config(&mock, path.clone(), 10);
+        config.max_inflight_resolves = KEYS.len();
+        let (store, task) = SnapshotStore::spawn(&config, CancellationToken::new()).unwrap();
+        store.inner.ready.store(true, Ordering::Release);
+
+        let mut resolves = Vec::new();
+        for key_id in KEYS {
+            for _ in 0..3 {
+                let store = store.clone();
+                resolves.push((
+                    key_id,
+                    tokio::spawn(async move { store.get_or_resolve(key_id).await }),
+                ));
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while mock.resolve_calls().len() < KEYS.len() {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(mock.resolve_calls(), vec![key_id.to_string()]);
+        let calls = mock.resolve_calls();
+        for key_id in KEYS {
+            assert_eq!(calls.iter().filter(|called| *called == key_id).count(), 1);
+        }
 
-        gate.notify_one();
-        for resolve in resolves {
+        for gate in gates {
+            gate.notify_one();
+        }
+        for (key_id, resolve) in resolves {
             assert_eq!(resolve.await.unwrap().unwrap().key_id, key_id);
         }
-        assert_eq!(mock.resolve_calls(), vec![key_id.to_string()]);
+        assert_eq!(mock.resolve_calls().len(), KEYS.len());
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -3778,6 +3877,12 @@ mod tests {
             result: Mutex::new(None),
             notify: tokio::sync::Notify::new(),
             follower_permits: Arc::new(tokio::sync::Semaphore::new(MAX_RESOLVE_FOLLOWERS)),
+            _global_permit: store
+                .inner
+                .inflight_resolve_permits
+                .clone()
+                .try_acquire_owned()
+                .unwrap(),
         });
         store
             .inner
