@@ -36,6 +36,10 @@ pub struct SnapshotStore {
 }
 
 struct SnapshotStoreInner {
+    // Lock order: authoritative_lock -> records ArcSwap CAS -> tally reset_lock,
+    // with registry operations last. Code holding a tally or record-local lock
+    // must never acquire authoritative_lock, so replacement and resolve cannot
+    // deadlock while serializing their externally visible side effects.
     records: ArcSwap<HashMap<String, Arc<KeySnapshot>>>,
     defaults: ArcSwap<Defaults>,
     defaults_pending_authoritative_replace: AtomicBool,
@@ -56,6 +60,15 @@ struct SnapshotStoreInner {
     control_plane_url: url::Url,
     service_token: String,
     hooks: SnapshotHooks,
+    #[cfg(test)]
+    resolve_application_gate: Mutex<ResolveApplicationGate>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ResolveApplicationGate {
+    reached: Option<std::sync::mpsc::Sender<()>>,
+    resume: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 #[derive(Clone, Default)]
@@ -198,6 +211,8 @@ impl SnapshotStore {
                 control_plane_url: config.control_plane_url.clone(),
                 service_token,
                 hooks,
+                #[cfg(test)]
+                resolve_application_gate: Mutex::new(ResolveApplicationGate::default()),
             }),
         })
     }
@@ -230,6 +245,8 @@ impl SnapshotStore {
                     .expect("static URL should parse"),
                 service_token: String::new(),
                 hooks: SnapshotHooks::default(),
+                #[cfg(test)]
+                resolve_application_gate: Mutex::new(ResolveApplicationGate::default()),
             }),
         })
     }
@@ -310,6 +327,22 @@ impl SnapshotStore {
         if loaded {
             self.inner.ready.store(true, Ordering::Release);
         }
+    }
+
+    #[cfg(test)]
+    fn pause_resolve_application_for_test(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *self.inner.resolve_application_gate.lock().unwrap() = ResolveApplicationGate {
+            reached: Some(reached_tx),
+            resume: Some(resume_rx),
+        };
+        (reached_rx, resume_tx)
     }
 
     #[cfg(test)]
@@ -614,6 +647,9 @@ impl SnapshotStore {
                     metrics::report_commercial_resolve("parse_error");
                     return Ok(None);
                 };
+                #[cfg(test)]
+                self.wait_at_resolve_application_gate_for_test();
+                let _authoritative_guard = self.inner.authoritative_lock.read().unwrap();
                 let Some(record) = self.upsert_key_for_generation(record, generation)? else {
                     metrics::report_commercial_resolve("stale_generation");
                     return Ok(None);
@@ -842,6 +878,7 @@ impl SnapshotStore {
 
     #[cfg(test)]
     fn upsert_key(&self, record: KeySnapshot) -> anyhow::Result<Arc<KeySnapshot>> {
+        let _authoritative_guard = self.inner.authoritative_lock.read().unwrap();
         let generation = self.inner.generation.load(Ordering::Acquire);
         self.upsert_key_for_generation(record, generation)?
             .ok_or_else(|| anyhow::anyhow!("commercial snapshot generation changed during upsert"))
@@ -886,6 +923,16 @@ impl SnapshotStore {
         metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.mark_disk_cache_dirty();
         Ok(Some(record))
+    }
+
+    #[cfg(test)]
+    fn wait_at_resolve_application_gate_for_test(&self) {
+        let mut gate = self.inner.resolve_application_gate.lock().unwrap();
+        if let (Some(reached), Some(resume)) = (gate.reached.take(), gate.resume.take()) {
+            reached.send(()).unwrap();
+            drop(gate);
+            resume.recv().unwrap();
+        }
     }
 
     fn load_disk_cache(&self) {
@@ -3356,6 +3403,58 @@ mod tests {
 
         assert_eq!(store.get_or_resolve(fresh_key).await.unwrap().seq, 6);
         assert_eq!(store.get(fresh_key).unwrap().seq, 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolved_record_cannot_run_hooks_or_return_after_authoritative_replace() {
+        let mock = MockControlPlane::spawn().await;
+        let mut stale = active_snapshot(100);
+        stale.status = KeyStatus::Suspended;
+        mock.resolve_with(KEY_ID, Some(stale));
+        let tally = Arc::new(TallyStore::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let store = SnapshotStore::new(
+            &config(&mock, PathBuf::new(), 10),
+            SnapshotHooks {
+                tally: Some(tally.clone()),
+                registry: Some(registry.clone()),
+            },
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store.set_ready_for_test(true);
+        let (application_reached, resume_application) =
+            store.pause_resolve_application_for_test();
+
+        let resolving_store = store.clone();
+        let resolve_task =
+            tokio::spawn(async move { resolving_store.get_or_resolve(KEY_ID).await });
+        tokio::task::spawn_blocking(move || application_reached.recv().unwrap())
+            .await
+            .unwrap();
+
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Key(active_snapshot(5))],
+                5,
+                BootstrapMode::Authoritative,
+            )
+            .unwrap();
+        let restored_stream_kill = Arc::new(AtomicBool::new(false));
+        let _restored_registration = registry.register(
+            "restored-stream".to_string(),
+            Some(KEY_ID.to_string()),
+            restored_stream_kill.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        resume_application.send(()).unwrap();
+
+        let returned = resolve_task.await.unwrap();
+        assert!(returned.is_none(), "stale resolved record escaped: {returned:?}");
+        assert_eq!(tally.version_for("account"), Some(5));
+        assert!(!restored_stream_kill.load(Ordering::Acquire));
+        assert_eq!(store.get(KEY_ID).unwrap().seq, 5);
     }
 
     #[tokio::test]
