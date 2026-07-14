@@ -905,10 +905,14 @@ impl SnapshotStore {
 
     fn apply_authoritative_hooks(&self) {
         if let Some(tally) = &self.inner.hooks.tally {
-            let cleared = tally.clear();
+            // Preserve each tally's Arc identity so meters held by active streams
+            // keep debiting the same entry used by new admissions. A concurrent
+            // debit between this reset and the restored snapshot rebase may be
+            // discarded; that is bounded to post-restore over-serving.
+            let rebased = tally.force_rebase_all();
             tracing::info!(
-                cleared,
-                "commercial quota tallies cleared for authoritative snapshot replacement"
+                rebased,
+                "commercial quota tallies force-rebased for authoritative snapshot replacement"
             );
         }
     }
@@ -1872,6 +1876,7 @@ mod tests {
             .unwrap();
         tally.debit("account", 100, 9_000);
         tally.debit("anon:198.51.100.7/32", 100, 500);
+        let active_stream_tally = tally.handle("account", 100);
 
         let mut restored = active_snapshot(5);
         restored.limits.as_mut().unwrap().concurrency = None;
@@ -1885,7 +1890,7 @@ mod tests {
 
         assert_eq!(tally.version_for("account"), Some(5));
         assert_eq!(tally.bytes_for("account", 5), 0);
-        assert_eq!(tally.version_for("anon:198.51.100.7/32"), None);
+        assert_eq!(tally.version_for("anon:198.51.100.7/32"), Some(0));
 
         let admission = crate::commercial::evaluate::evaluate_with_store(
             &store,
@@ -1917,6 +1922,10 @@ mod tests {
                 panic!("restored quota should admit with its full budget: {rejected:?}")
             }
         }
+
+        active_stream_tally.debit(100, 250);
+        let fresh_tally = tally.handle("account", 5);
+        assert_eq!(fresh_tally.bytes_for(5), 250);
     }
 
     #[tokio::test]

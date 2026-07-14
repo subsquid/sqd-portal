@@ -31,10 +31,17 @@ struct Tally {
 }
 
 impl TallyStore {
-    pub(crate) fn clear(&self) -> usize {
-        let cleared = self.entries.len();
-        self.entries.clear();
-        cleared
+    pub(crate) fn force_rebase_all(&self) -> usize {
+        let mut rebased = 0;
+        for entry in &self.entries {
+            let tally = entry.value();
+            let _guard = tally.lock.lock().unwrap();
+            tally.touch();
+            tally.bytes.store(0, Ordering::Release);
+            tally.version.store(0, Ordering::Release);
+            rebased += 1;
+        }
+        rebased
     }
 
     pub fn rebase_account(&self, account_id: &str, version: u64) {
