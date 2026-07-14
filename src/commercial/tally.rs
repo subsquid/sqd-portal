@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -15,11 +15,15 @@ const ANON_TALLY_ENTRY_CAP: usize = 100_000;
 #[derive(Debug, Default)]
 pub struct TallyStore {
     entries: DashMap<String, Arc<Tally>>,
+    generation: Arc<AtomicU64>,
+    reset_lock: RwLock<()>,
 }
 
 #[derive(Debug, Clone)]
 pub struct TallyHandle {
     tally: Arc<Tally>,
+    generation: u64,
+    current_generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -32,6 +36,8 @@ struct Tally {
 
 impl TallyStore {
     pub(crate) fn force_rebase_all(&self) -> usize {
+        let _reset_guard = self.reset_lock.write().unwrap();
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let mut rebased = 0;
         for entry in &self.entries {
             let tally = entry.value();
@@ -69,8 +75,11 @@ impl TallyStore {
     }
 
     pub fn handle(&self, account_id: &str, version: u64) -> TallyHandle {
+        let _reset_guard = self.reset_lock.read().unwrap();
         TallyHandle {
             tally: self.entry(account_id, version),
+            generation: self.generation.load(Ordering::Acquire),
+            current_generation: self.generation.clone(),
         }
     }
 
@@ -148,14 +157,18 @@ impl TallyHandle {
     pub fn debit(&self, grant_version: u64, bytes: u64) -> u64 {
         let _guard = self.tally.lock.lock().unwrap();
         self.tally.touch();
-        self.tally.rebase_if_newer(grant_version);
+        if self.is_current_generation() {
+            self.tally.rebase_if_newer(grant_version);
+        }
         self.tally.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes
     }
 
     pub fn bytes_for(&self, snapshot_version: u64) -> u64 {
         let _guard = self.tally.lock.lock().unwrap();
         self.tally.touch();
-        self.tally.rebase_if_newer(snapshot_version);
+        if self.is_current_generation() {
+            self.tally.rebase_if_newer(snapshot_version);
+        }
         self.tally.bytes.load(Ordering::Acquire)
     }
 
@@ -167,7 +180,9 @@ impl TallyHandle {
     ) -> i64 {
         let _guard = self.tally.lock.lock().unwrap();
         self.tally.touch();
-        self.tally.rebase_if_newer(grant_version);
+        if self.is_current_generation() {
+            self.tally.rebase_if_newer(grant_version);
+        }
         let served = if bytes == 0 {
             self.tally.bytes.load(Ordering::Acquire)
         } else {
@@ -179,7 +194,13 @@ impl TallyHandle {
     fn rebase_to(&self, version: u64) {
         let _guard = self.tally.lock.lock().unwrap();
         self.tally.touch();
-        self.tally.rebase_if_newer(version);
+        if self.is_current_generation() {
+            self.tally.rebase_if_newer(version);
+        }
+    }
+
+    fn is_current_generation(&self) -> bool {
+        self.generation == self.current_generation.load(Ordering::Acquire)
     }
 }
 

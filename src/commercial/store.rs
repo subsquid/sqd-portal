@@ -1925,7 +1925,16 @@ mod tests {
 
         active_stream_tally.debit(100, 250);
         let fresh_tally = tally.handle("account", 5);
+        assert_eq!(tally.version_for("account"), Some(5));
         assert_eq!(fresh_tally.bytes_for(5), 250);
+        assert_eq!(
+            fresh_tally.debit_and_effective_remaining(5, 0, 10_000),
+            9_750
+        );
+
+        tally.rebase_account("account", 6);
+        assert_eq!(tally.version_for("account"), Some(6));
+        assert_eq!(tally.effective_remaining("account", 6, 9_000), 9_000);
     }
 
     #[tokio::test]
