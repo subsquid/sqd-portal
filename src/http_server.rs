@@ -15,7 +15,9 @@ use axum::{
 use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqd_contract_client::PeerId;
+use subtle::ConstantTimeEq;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -44,7 +46,7 @@ use crate::utils::logging::MethodRouterExt;
 use crate::{
     commercial::{
         extractor as commercial_extractor, CommercialGrant, CommercialRuntime, Endpoint,
-        MeterHandle, SnapshotStore, UsageReporter,
+        MeterHandle, Principal, SnapshotStore, UsageReporter,
     },
     config::Config,
     controller::task_manager::TaskManager,
@@ -82,6 +84,52 @@ fn commercial_route_layer(
     } else {
         route
     }
+}
+
+fn internal_route_layer(route: MethodRouter, service_token: Option<Arc<str>>) -> MethodRouter {
+    route.route_layer(axum::middleware::from_fn(
+        move |mut req: Request, next: axum::middleware::Next| {
+            let service_token = service_token.clone();
+            async move {
+                let authorized = service_token.as_deref().is_some_and(|expected| {
+                    internal_service_token_matches(req.headers(), expected)
+                });
+                if !authorized {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                req.extensions_mut().insert(Principal {
+                    account_id: "oss".to_string(),
+                    api_key_id: None,
+                });
+                next.run(req).await
+            }
+        },
+    ))
+}
+
+fn internal_service_token_matches(headers: &HeaderMap, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let Some(presented) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty() && !value.contains(char::is_whitespace))
+    else {
+        return false;
+    };
+    let presented = Sha256::digest(presented.as_bytes());
+    let expected = Sha256::digest(expected.as_bytes());
+    presented.ct_eq(&expected).into()
+}
+
+fn configured_internal_service_token(config: &Config) -> Option<Arc<str>> {
+    let env = &config.commercial.as_ref()?.service_token_env;
+    std::env::var(env)
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .map(Arc::from)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -262,6 +310,7 @@ pub async fn run_server(
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
     let commercial_enabled = config.commercial.is_some();
+    let internal_service_token = configured_internal_service_token(&config);
     let dataset_canonicalizer =
         network_client.clone() as Arc<dyn commercial_extractor::DatasetCanonicalizer>;
     let cors = CorsLayer::new()
@@ -323,11 +372,17 @@ pub async fn run_server(
         // Internal routes
         .route(
             "/debug/workers",
-            get(get_all_workers).endpoint("/debug/workers"),
+            internal_route_layer(
+                get(get_all_workers).endpoint("/debug/workers"),
+                internal_service_token.clone(),
+            ),
         )
         .route(
             "/datasets/:dataset/:block/debug",
-            get(get_debug_block).endpoint("/block/debug"),
+            internal_route_layer(
+                get(get_debug_block).endpoint("/block/debug"),
+                internal_service_token,
+            ),
         )
         .route("/metrics", get(get_metrics))
         .route("/ready", get(get_readiness))
@@ -1498,6 +1553,54 @@ mod tests {
         Granted, GrantedLimits, LocalControlPlane, OnExceed, Principal, PublicFallbackConfig,
         SnapshotRecord, TallyStore,
     };
+
+    #[tokio::test]
+    async fn internal_routes_require_service_token() {
+        let app = Router::new().route(
+            "/debug/workers",
+            internal_route_layer(
+                get(|| async { "workers" }),
+                Some(Arc::<str>::from("internal-secret")),
+            ),
+        );
+
+        let anonymous = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/workers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::NOT_FOUND);
+
+        let ordinary_key = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/workers")
+                    .header(header::AUTHORIZATION, "Bearer sqd_data_key_secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary_key.status(), StatusCode::NOT_FOUND);
+
+        let internal = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/workers")
+                    .header(header::AUTHORIZATION, "Bearer internal-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(internal.status(), StatusCode::OK);
+    }
 
     #[test]
     fn hide_internal_drops_marked_ops_and_empty_tags() {
