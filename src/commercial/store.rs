@@ -31,6 +31,7 @@ const SNAPSHOT_PATH_SEGMENTS: [&str; 4] = ["internal", "portal", "v1", "snapshot
 const RESOLVE_PATH_SEGMENTS: [&str; 4] = ["internal", "portal", "v1", "authorize"];
 const DEFAULT_PAGE_LIMIT: u16 = 1000;
 const MAX_BOOTSTRAP_PAGES: usize = 10_000;
+const MAX_RESOLVE_FOLLOWERS: usize = 64;
 
 pub struct SnapshotStore {
     inner: Arc<SnapshotStoreInner>,
@@ -168,6 +169,7 @@ struct NegativeCacheEntry {
 struct ResolveFlight {
     result: Mutex<Option<Option<Arc<KeySnapshot>>>>,
     notify: tokio::sync::Notify,
+    follower_permits: Arc<tokio::sync::Semaphore>,
 }
 
 struct ResolveFlightGuard<'a> {
@@ -329,17 +331,32 @@ impl SnapshotStore {
             if let Some(record) = self.get(key_id) {
                 return Some(record);
             }
-            let (flight, leader) = match self.inner.inflight_resolves.entry(key_id.to_string()) {
-                Entry::Occupied(entry) => (entry.get().clone(), false),
-                Entry::Vacant(entry) => {
-                    let flight = Arc::new(ResolveFlight {
-                        result: Mutex::new(None),
-                        notify: tokio::sync::Notify::new(),
-                    });
-                    entry.insert(flight.clone());
-                    (flight, true)
-                }
-            };
+            let (flight, leader, follower_permit) =
+                match self.inner.inflight_resolves.entry(key_id.to_string()) {
+                    Entry::Occupied(entry) => {
+                        let flight = entry.get().clone();
+                        let Ok(permit) = flight.follower_permits.clone().try_acquire_owned() else {
+                            tracing::info!(
+                                key_id,
+                                "commercial snapshot resolve fail-closed: follower limit reached"
+                            );
+                            metrics::report_commercial_resolve("rate_limited");
+                            return None;
+                        };
+                        (flight, false, Some(permit))
+                    }
+                    Entry::Vacant(entry) => {
+                        let flight = Arc::new(ResolveFlight {
+                            result: Mutex::new(None),
+                            notify: tokio::sync::Notify::new(),
+                            follower_permits: Arc::new(tokio::sync::Semaphore::new(
+                                MAX_RESOLVE_FOLLOWERS,
+                            )),
+                        });
+                        entry.insert(flight.clone());
+                        (flight, true, None)
+                    }
+                };
             if leader {
                 let mut guard = ResolveFlightGuard {
                     store: self,
@@ -354,6 +371,7 @@ impl SnapshotStore {
                 flight.notify.notify_waiters();
                 return result;
             }
+            let _follower_permit = follower_permit.expect("followers acquire a permit");
             let notified = flight.notify.notified();
             if let Some(result) = flight.result.lock().unwrap().clone() {
                 return result;
@@ -3622,6 +3640,106 @@ mod tests {
         for resolve in resolves {
             assert!(resolve.await.unwrap().is_none());
         }
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolve_followers_are_bounded_while_control_plane_is_blocked() {
+        const REQUESTS: usize = 1_000;
+        const EXPECTED_MAX_FOLLOWERS: usize = 64;
+
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let key_id = "blocked-missing-key";
+        let gate = mock.pause_resolve(key_id);
+        let path = cache_path("resolve-bounded-followers");
+        let (store, task) = SnapshotStore::spawn(
+            &config(&mock, path.clone(), REQUESTS as u64),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        store.inner.ready.store(true, Ordering::Release);
+
+        let resolves = (0..REQUESTS)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move { store.get_or_resolve(key_id).await })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while mock.resolve_calls().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while resolves
+                .iter()
+                .filter(|resolve| resolve.is_finished())
+                .count()
+                < REQUESTS - EXPECTED_MAX_FOLLOWERS - 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("followers beyond the per-flight bound should fail closed promptly");
+        assert_eq!(mock.resolve_calls(), vec![key_id.to_string()]);
+        assert!(
+            resolves
+                .iter()
+                .filter(|resolve| !resolve.is_finished())
+                .count()
+                <= EXPECTED_MAX_FOLLOWERS + 1
+        );
+
+        gate.notify_one();
+        for resolve in resolves {
+            assert!(resolve.await.unwrap().is_none());
+        }
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn small_concurrent_resolvable_burst_coalesces_and_all_succeed() {
+        std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let key_id = "concurrent-resolvable-key";
+        let mut resolved = active_snapshot(42);
+        resolved.key_id = key_id.to_string();
+        mock.resolve_with(key_id, Some(resolved));
+        let gate = mock.pause_resolve(key_id);
+        let path = cache_path("resolve-small-burst");
+        let (store, task) =
+            SnapshotStore::spawn(&config(&mock, path.clone(), 10), CancellationToken::new())
+                .unwrap();
+        store.inner.ready.store(true, Ordering::Release);
+
+        let resolves = (0..10)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move { store.get_or_resolve(key_id).await })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while mock.resolve_calls().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(mock.resolve_calls(), vec![key_id.to_string()]);
+
+        gate.notify_one();
+        for resolve in resolves {
+            assert_eq!(resolve.await.unwrap().unwrap().key_id, key_id);
+        }
+        assert_eq!(mock.resolve_calls(), vec![key_id.to_string()]);
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
     }
