@@ -39,6 +39,7 @@ struct SnapshotStoreInner {
     records: ArcSwap<HashMap<String, Arc<KeySnapshot>>>,
     defaults: ArcSwap<Defaults>,
     defaults_pending_authoritative_replace: AtomicBool,
+    generation: AtomicU64,
     cursor: AtomicU64,
     epoch: Mutex<Option<String>>,
     ready: AtomicBool,
@@ -48,7 +49,7 @@ struct SnapshotStoreInner {
     cache_path: PathBuf,
     sync_interval: Duration,
     negative_cache_ttl: Duration,
-    negative_cache: DashMap<String, Instant>,
+    negative_cache: DashMap<String, NegativeCacheEntry>,
     resolve_limiter: Mutex<ResolveLimiter>,
     client: reqwest::Client,
     control_plane_url: url::Url,
@@ -125,6 +126,11 @@ struct KeyRecordHooks {
     removed_key_ids: Vec<String>,
 }
 
+struct NegativeCacheEntry {
+    expires_at: Instant,
+    generation: u64,
+}
+
 struct ResolveLimiter {
     rate_per_sec: f64,
     capacity: f64,
@@ -172,6 +178,7 @@ impl SnapshotStore {
                 records: ArcSwap::from_pointee(HashMap::new()),
                 defaults: ArcSwap::from_pointee(defaults_from_fallback(&config.public_fallback)),
                 defaults_pending_authoritative_replace: AtomicBool::new(false),
+                generation: AtomicU64::new(0),
                 cursor: AtomicU64::new(0),
                 epoch: Mutex::new(None),
                 ready: AtomicBool::new(false),
@@ -197,6 +204,7 @@ impl SnapshotStore {
                 records: ArcSwap::from_pointee(HashMap::new()),
                 defaults: ArcSwap::from_pointee(defaults_from_fallback(fallback)),
                 defaults_pending_authoritative_replace: AtomicBool::new(false),
+                generation: AtomicU64::new(0),
                 cursor: AtomicU64::new(0),
                 epoch: Mutex::new(None),
                 ready: AtomicBool::new(true),
@@ -251,8 +259,8 @@ impl SnapshotStore {
     pub(crate) fn sweep_negative_cache(&self) -> usize {
         let now = Instant::now();
         let mut removed = 0;
-        self.inner.negative_cache.retain(|_, expires_at| {
-            let expired = *expires_at <= now;
+        self.inner.negative_cache.retain(|_, entry| {
+            let expired = entry.expires_at <= now;
             if expired {
                 removed += 1;
             }
@@ -268,9 +276,13 @@ impl SnapshotStore {
 
     #[cfg(test)]
     pub(crate) fn insert_negative_cache_for_test(&self, key_id: &str, ttl: Duration) {
-        self.inner
-            .negative_cache
-            .insert(key_id.to_string(), Instant::now() + ttl);
+        self.inner.negative_cache.insert(
+            key_id.to_string(),
+            NegativeCacheEntry {
+                expires_at: Instant::now() + ttl,
+                generation: self.inner.generation.load(Ordering::Acquire),
+            },
+        );
     }
 
     #[cfg(test)]
@@ -549,6 +561,7 @@ impl SnapshotStore {
     }
 
     async fn resolve(&self, key_id: &str) -> anyhow::Result<Option<Arc<KeySnapshot>>> {
+        let generation = self.inner.generation.load(Ordering::Acquire);
         if self.negative_cached(key_id) {
             metrics::report_commercial_resolve("negative_cache");
             return Ok(None);
@@ -578,15 +591,30 @@ impl SnapshotStore {
                     metrics::report_commercial_resolve("parse_error");
                     return Ok(None);
                 };
-                let record = self.upsert_key(record)?;
+                let Some(record) = self.upsert_key_for_generation(record, generation)? else {
+                    metrics::report_commercial_resolve("stale_generation");
+                    return Ok(None);
+                };
                 metrics::report_commercial_resolve("hit");
                 Ok(Some(record))
             }
             StatusCode::NOT_FOUND => {
+                if self.inner.generation.load(Ordering::Acquire) != generation {
+                    metrics::report_commercial_resolve("stale_generation");
+                    return Ok(None);
+                }
                 self.inner.negative_cache.insert(
                     key_id.to_string(),
-                    Instant::now() + self.inner.negative_cache_ttl,
+                    NegativeCacheEntry {
+                        expires_at: Instant::now() + self.inner.negative_cache_ttl,
+                        generation,
+                    },
                 );
+                if self.inner.generation.load(Ordering::Acquire) != generation {
+                    self.negative_cached(key_id);
+                    metrics::report_commercial_resolve("stale_generation");
+                    return Ok(None);
+                }
                 metrics::report_commercial_resolve("not_found");
                 Ok(None)
             }
@@ -629,6 +657,9 @@ impl SnapshotStore {
                 current_seq = self.inner.defaults.load().seq,
                 "authoritative commercial snapshot contained no defaults; keeping current defaults"
             );
+        }
+        if matches!(mode, BootstrapMode::Authoritative) {
+            self.inner.generation.fetch_add(1, Ordering::AcqRel);
         }
         let hooks = self.replace_key_records(records_map, cursor, mode);
         if matches!(mode, BootstrapMode::Authoritative) {
@@ -784,13 +815,30 @@ impl SnapshotStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn upsert_key(&self, record: KeySnapshot) -> anyhow::Result<Arc<KeySnapshot>> {
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        self.upsert_key_for_generation(record, generation)?
+            .ok_or_else(|| anyhow::anyhow!("commercial snapshot generation changed during upsert"))
+    }
+
+    fn upsert_key_for_generation(
+        &self,
+        record: KeySnapshot,
+        generation: u64,
+    ) -> anyhow::Result<Option<Arc<KeySnapshot>>> {
         let record = Arc::new(record);
         loop {
+            if self.inner.generation.load(Ordering::Acquire) != generation {
+                return Ok(None);
+            }
             let current = self.inner.records.load();
             if let Some(existing) = current.get(&record.key_id) {
                 if existing.seq >= record.seq {
-                    return Ok(existing.clone());
+                    if self.inner.generation.load(Ordering::Acquire) != generation {
+                        return Ok(None);
+                    }
+                    return Ok(Some(existing.clone()));
                 }
             }
 
@@ -805,10 +853,14 @@ impl SnapshotStore {
             }
         }
 
+        if self.inner.generation.load(Ordering::Acquire) != generation {
+            return Ok(None);
+        }
+
         self.apply_snapshot_hooks(&record);
         metrics::set_commercial_snapshot_records(self.inner.records.load().len() as i64);
         self.mark_disk_cache_dirty();
-        Ok(record)
+        Ok(Some(record))
     }
 
     fn load_disk_cache(&self) {
@@ -924,7 +976,9 @@ impl SnapshotStore {
         let Some(entry) = self.inner.negative_cache.get(key_id) else {
             return false;
         };
-        if *entry.value() > Instant::now() {
+        if entry.generation == self.inner.generation.load(Ordering::Acquire)
+            && entry.expires_at > Instant::now()
+        {
             return true;
         }
         drop(entry);
@@ -1150,6 +1204,7 @@ pub mod test_support {
         pages: Mutex<VecDeque<MockPage>>,
         resolves: Mutex<HashMap<String, Option<KeySnapshot>>>,
         resolve_statuses: Mutex<HashMap<String, StatusCode>>,
+        resolve_gates: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
         resolve_calls: Mutex<Vec<String>>,
         resolve_bodies: Mutex<Vec<serde_json::Value>>,
         usage_batches: Mutex<Vec<Vec<StreamUsageEvent>>>,
@@ -1221,6 +1276,16 @@ pub mod test_support {
                 .lock()
                 .unwrap()
                 .insert(key_id.to_string(), status);
+        }
+
+        pub fn pause_resolve(&self, key_id: &str) -> Arc<tokio::sync::Notify> {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            self.state
+                .resolve_gates
+                .lock()
+                .unwrap()
+                .insert(key_id.to_string(), gate.clone());
+            gate
         }
 
         pub fn resolve_calls(&self) -> Vec<String> {
@@ -1369,6 +1434,10 @@ pub mod test_support {
             .unwrap_or_default()
             .to_string();
         state.resolve_calls.lock().unwrap().push(key_id.clone());
+        let gate = state.resolve_gates.lock().unwrap().get(&key_id).cloned();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         if let Some(status) = state.resolve_statuses.lock().unwrap().get(&key_id) {
             return Err(*status);
         }
@@ -2892,6 +2961,60 @@ mod tests {
 
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_started_before_authoritative_replace_cannot_upsert_after_it() {
+        let mock = MockControlPlane::spawn().await;
+        let mut stale = active_snapshot(100);
+        stale.account_id = Some("pre-restore".to_string());
+        mock.resolve_with(KEY_ID, Some(stale));
+        let gate = mock.pause_resolve(KEY_ID);
+        let store = SnapshotStore::new(
+            &config(&mock, PathBuf::new(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store.set_ready_for_test(true);
+
+        let resolving_store = store.clone();
+        let resolve_task =
+            tokio::spawn(async move { resolving_store.get_or_resolve(KEY_ID).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mock.resolve_calls().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut restored = active_snapshot(5);
+        restored.account_id = Some("restored".to_string());
+        store
+            .replace_records_with_mode(
+                vec![SnapshotRecord::Key(restored)],
+                5,
+                BootstrapMode::Authoritative,
+            )
+            .unwrap();
+        gate.notify_one();
+
+        assert!(resolve_task.await.unwrap().is_none());
+        assert_eq!(store.get(KEY_ID).unwrap().seq, 5);
+        assert_eq!(
+            store.get(KEY_ID).unwrap().account_id.as_deref(),
+            Some("restored")
+        );
+
+        let fresh_key = "fresh-after-reset";
+        let mut fresh = active_snapshot(6);
+        fresh.key_id = fresh_key.to_string();
+        mock.resolve_with(fresh_key, Some(fresh));
+
+        assert_eq!(store.get_or_resolve(fresh_key).await.unwrap().seq, 6);
+        assert_eq!(store.get(fresh_key).unwrap().seq, 6);
     }
 
     #[tokio::test]
