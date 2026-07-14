@@ -12,7 +12,7 @@ use async_stream::stream;
 use bytes::Bytes;
 use flate2::{write::MultiGzDecoder as WriteMultiGzDecoder, Decompress, FlushDecompress, Status};
 use futures::{Stream, StreamExt};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::Instant as TokioInstant;
 use uuid::{NoContext, Timestamp, Uuid};
 
@@ -66,6 +66,7 @@ struct MeterInner {
     quota_remaining_bytes: Option<i64>,
     tally: Option<TallyHandle>,
     kill: Arc<AtomicBool>,
+    kill_notify: Arc<Notify>,
     floor_bytes_per_sec: Arc<AtomicU64>,
     bucket: AsyncMutex<Option<TokenBucket>>,
     _registration: Option<StreamRegistration>,
@@ -171,6 +172,7 @@ impl MeterHandle {
             );
         }
         let kill = Arc::new(AtomicBool::new(false));
+        let kill_notify = Arc::new(Notify::new());
         let floor_bytes_per_sec = Arc::new(AtomicU64::new(0));
         let bucket = AsyncMutex::new(bucket_from_limits(&limits));
         let register = |current_generation: Option<u64>| {
@@ -187,10 +189,11 @@ impl MeterHandle {
                 .as_ref()
                 .map(|tally| tally.handle(&tally_account_id, quota_version));
             let registration = registry.as_ref().map(|registry| {
-                registry.register(
+                registry.register_with_notify(
                     event_id.clone(),
                     principal.api_key_id.clone(),
                     kill.clone(),
+                    kill_notify.clone(),
                     floor_bytes_per_sec.clone(),
                 )
             });
@@ -242,6 +245,7 @@ impl MeterHandle {
                 quota_remaining_bytes,
                 tally,
                 kill,
+                kill_notify,
                 floor_bytes_per_sec,
                 bucket,
                 _registration: registration,
@@ -302,6 +306,24 @@ impl MeterHandle {
         if bytes > 0 {
             self.inner.pace(bytes).await;
         }
+    }
+
+    async fn next_or_killed<S>(&self, mut input: Pin<&mut S>) -> Option<S::Item>
+    where
+        S: Stream + ?Sized,
+    {
+        tokio::select! {
+            biased;
+            _ = self.wait_for_kill() => None,
+            item = input.next() => item,
+        }
+    }
+
+    async fn wait_for_kill(&self) {
+        if !self.inner.kill.load(Ordering::Acquire) {
+            self.inner.kill_notify.notified().await;
+        }
+        self.inner.set_status(UsageStatus::CutSuspended);
     }
 
     pub async fn complete_buffered_response(&self) {
@@ -457,6 +479,10 @@ impl MeterInner {
     async fn pace(&self, bytes: u64) {
         let mut warned = false;
         loop {
+            if self.kill.load(Ordering::Acquire) {
+                self.set_status(UsageStatus::CutSuspended);
+                return;
+            }
             let Some((rate, burst)) = self.current_rate_and_burst() else {
                 return;
             };
@@ -482,11 +508,22 @@ impl MeterInner {
                 );
                 warned = true;
             }
-            tokio::time::sleep(wait).await;
+            tokio::select! {
+                biased;
+                _ = self.kill_notify.notified() => {
+                    self.set_status(UsageStatus::CutSuspended);
+                    return;
+                }
+                _ = tokio::time::sleep(wait) => {}
+            }
         }
     }
 
     async fn pace_buffered(&self, bytes: u64) {
+        if self.kill.load(Ordering::Acquire) {
+            self.set_status(UsageStatus::CutSuspended);
+            return;
+        }
         let Some((rate, burst)) = self.current_rate_and_burst() else {
             return;
         };
@@ -516,7 +553,13 @@ impl MeterInner {
                 "commercial throttle stalled a buffered response for more than 30 seconds"
             );
         }
-        tokio::time::sleep(wait).await;
+        tokio::select! {
+            biased;
+            _ = self.kill_notify.notified() => {
+                self.set_status(UsageStatus::CutSuspended);
+            }
+            _ = tokio::time::sleep(wait) => {}
+        }
     }
 
     fn current_rate_and_burst(&self) -> Option<(f64, f64)> {
@@ -623,7 +666,10 @@ where
         let mut passthrough = false;
         let mut decode_iterations = 0usize;
         futures::pin_mut!(input);
-        'input: while let Some(frame) = input.next().await {
+        'input: loop {
+            let Some(frame) = meter.next_or_killed(input.as_mut()).await else {
+                break;
+            };
             meter.add_chunk();
             if passthrough {
                 yield frame;
@@ -728,7 +774,10 @@ where
                 tracing::warn!(error = %err, "failed to initialize portal usage zstd decoder");
                 meter.mark_error();
                 futures::pin_mut!(input);
-                while let Some(frame) = input.next().await {
+                loop {
+                    let Some(frame) = meter.next_or_killed(input.as_mut()).await else {
+                        break;
+                    };
                     meter.add_chunk();
                     yield frame;
                 }
@@ -740,7 +789,10 @@ where
         let mut stopped_after_cut = false;
         let mut decode_iterations = 0usize;
         futures::pin_mut!(input);
-        'input: while let Some(frame) = input.next().await {
+        'input: loop {
+            let Some(frame) = meter.next_or_killed(input.as_mut()).await else {
+                break;
+            };
             meter.add_chunk();
             if passthrough {
                 yield frame;
@@ -1241,7 +1293,10 @@ where
 {
     stream! {
         futures::pin_mut!(input);
-        while let Some(item) = input.next().await {
+        loop {
+            let Some(item) = meter.next_or_killed(input.as_mut()).await else {
+                break;
+            };
             if let Ok(bytes) = &item {
                 meter.add_logical_bytes(bytes.len() as u64);
                 meter.add_wire_bytes(bytes.len() as u64);
@@ -1265,7 +1320,10 @@ where
 {
     stream! {
         futures::pin_mut!(input);
-        while let Some(item) = input.next().await {
+        loop {
+            let Some(item) = meter.next_or_killed(input.as_mut()).await else {
+                break;
+            };
             if let Ok(bytes) = &item {
                 meter.add_wire_bytes(bytes.len() as u64);
             } else {
@@ -1291,7 +1349,10 @@ where
 {
     stream! {
         futures::pin_mut!(input);
-        while let Some(item) = input.next().await {
+        loop {
+            let Some(item) = meter.next_or_killed(input.as_mut()).await else {
+                break;
+            };
             if let Ok(bytes) = &item {
                 meter.add_wire_bytes(bytes.len() as u64);
             } else {
@@ -1313,7 +1374,10 @@ where
 {
     stream! {
         futures::pin_mut!(input);
-        while let Some(item) = input.next().await {
+        loop {
+            let Some(item) = meter.next_or_killed(input.as_mut()).await else {
+                break;
+            };
             if let Ok(bytes) = &item {
                 meter.add_chunk();
                 meter.add_wire_bytes(bytes.len() as u64);
@@ -1334,7 +1398,10 @@ where
         // concatenated members here, matching the network gzip path.
         let mut decoder = WriteMultiGzDecoder::new(CountingWriter::default());
         futures::pin_mut!(input);
-        while let Some(item) = input.next().await {
+        loop {
+            let Some(item) = meter.next_or_killed(input.as_mut()).await else {
+                break;
+            };
             match &item {
                 Ok(bytes) => {
                     meter.add_wire_bytes(bytes.len() as u64);
@@ -2435,7 +2502,7 @@ mod tests {
         let output = tap_plain_stream(stream::iter(chunks), meter);
         let emitted: Vec<_> = output.collect().await;
 
-        assert_eq!(emitted.len(), 1);
+        assert!(emitted.is_empty());
         let event = reporter.events.lock().unwrap().pop().unwrap();
         assert_eq!(event.status, UsageStatus::CutSuspended);
         assert_eq!(registry.len(), 0);
@@ -2466,6 +2533,93 @@ mod tests {
 
         assert_eq!(emitted.len(), 3);
         assert!(start.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_kill_interrupts_long_pacing_wait_and_releases_permit() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let limiter = ConcurrencyLimiter::new(1);
+        let permit = limiter.try_acquire("account", 1).unwrap();
+        let other = limiter.try_acquire("account", 1).unwrap();
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let meter = MeterHandle::new_enforced(
+            Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: Some("key".to_string()),
+                },
+                tally_account_id: None,
+                entitled_chains: None,
+                entitled_traces: None,
+                limits: GrantedLimits {
+                    throughput_bytes_per_sec: Some(1),
+                    burst_bytes: Some(1),
+                    ..GrantedLimits::default()
+                },
+                on_exceed: OnExceed::Reject,
+                quota_version: 7,
+                quota_remaining_bytes: Some(10_000),
+                snapshot_generation: None,
+                concurrency_permit: Some(permit),
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter,
+            Arc::new(TallyStore::default()),
+            registry.clone(),
+            None,
+        );
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from(vec![0; 1_024])),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"next")),
+        ];
+        let stream_task = tokio::spawn(async move {
+            tap_plain_stream(stream::iter(chunks), meter)
+                .collect::<Vec<_>>()
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!stream_task.is_finished());
+        assert!(limiter.try_acquire("account", 1).is_none());
+
+        assert_eq!(registry.kill_key("key"), 1);
+
+        tokio::time::timeout(Duration::from_secs(1), stream_task)
+            .await
+            .expect("killed pacing wait should terminate promptly")
+            .unwrap();
+        assert!(limiter.try_acquire("account", 1).is_some());
+        drop(other);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_kill_interrupts_wait_for_next_chunk() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let (meter, _, registry) = enforced_meter(
+            reporter,
+            GrantedLimits::default(),
+            OnExceed::Reject,
+            Some(100),
+        );
+        let stream_task = tokio::spawn(async move {
+            tap_plain_stream(
+                futures::stream::pending::<Result<Bytes, std::io::Error>>(),
+                meter,
+            )
+            .collect::<Vec<_>>()
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!stream_task.is_finished());
+
+        assert_eq!(registry.kill_key("key"), 1);
+
+        tokio::time::timeout(Duration::from_secs(1), stream_task)
+            .await
+            .expect("killed upstream wait should terminate promptly")
+            .unwrap();
+        assert!(registry.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

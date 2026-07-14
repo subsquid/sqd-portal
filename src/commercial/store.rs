@@ -2992,7 +2992,7 @@ mod tests {
             .collect()
             .await;
 
-        assert_eq!(emitted.len(), 1);
+        assert!(emitted.is_empty());
         assert!(start.elapsed() <= Duration::from_secs(1));
         let event = reporter.events.lock().unwrap().pop().unwrap();
         assert_eq!(event.status, UsageStatus::CutSuspended);
@@ -3053,7 +3053,7 @@ mod tests {
             .collect()
             .await;
 
-        assert_eq!(emitted.len(), 1);
+        assert!(emitted.is_empty());
         let event = reporter.events.lock().unwrap().pop().unwrap();
         assert_eq!(event.status, UsageStatus::CutSuspended);
     }
@@ -3075,7 +3075,7 @@ mod tests {
 
         assert_eq!(
             registered_meter_emitted_chunks(store, Some(KEY_ID)).await,
-            1
+            0
         );
     }
 
@@ -3368,7 +3368,7 @@ mod tests {
             .collect()
             .await;
 
-        assert_eq!(emitted.len(), 1);
+        assert!(emitted.is_empty());
         let event = reporter.events.lock().unwrap().pop().unwrap();
         assert_eq!(event.status, UsageStatus::CutSuspended);
     }

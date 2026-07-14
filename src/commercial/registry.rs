@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use dashmap::DashMap;
+use tokio::sync::Notify;
 
 #[derive(Debug, Default)]
 pub struct ActiveStreamRegistry {
@@ -14,6 +15,7 @@ pub struct ActiveStreamRegistry {
 struct StreamCtl {
     key_id: Option<String>,
     kill: Arc<AtomicBool>,
+    kill_notify: Arc<Notify>,
     floor_bytes_per_sec: Arc<AtomicU64>,
 }
 
@@ -30,11 +32,29 @@ impl ActiveStreamRegistry {
         kill: Arc<AtomicBool>,
         floor_bytes_per_sec: Arc<AtomicU64>,
     ) -> StreamRegistration {
+        self.register_with_notify(
+            event_id,
+            key_id,
+            kill,
+            Arc::new(Notify::new()),
+            floor_bytes_per_sec,
+        )
+    }
+
+    pub(crate) fn register_with_notify(
+        self: &Arc<Self>,
+        event_id: String,
+        key_id: Option<String>,
+        kill: Arc<AtomicBool>,
+        kill_notify: Arc<Notify>,
+        floor_bytes_per_sec: Arc<AtomicU64>,
+    ) -> StreamRegistration {
         self.streams.insert(
             event_id.clone(),
             StreamCtl {
                 key_id,
                 kill,
+                kill_notify,
                 floor_bytes_per_sec,
             },
         );
@@ -49,6 +69,7 @@ impl ActiveStreamRegistry {
         for entry in self.streams.iter() {
             if entry.value().key_id.as_deref() == Some(key_id) {
                 entry.value().kill.store(true, Ordering::Release);
+                entry.value().kill_notify.notify_one();
                 killed += 1;
             }
         }
@@ -59,6 +80,7 @@ impl ActiveStreamRegistry {
         let mut killed = 0;
         for entry in self.streams.iter() {
             entry.value().kill.store(true, Ordering::Release);
+            entry.value().kill_notify.notify_one();
             killed += 1;
         }
         killed
