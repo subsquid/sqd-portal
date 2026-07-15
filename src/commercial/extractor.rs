@@ -145,7 +145,15 @@ fn credential_from_request(
     query: Option<&str>,
     client_ip_header: &str,
 ) -> Result<Credential, Rejected> {
-    if let Some(value) = bearer_token(headers).or_else(|| query_api_key(query)) {
+    let value = match bearer_token(headers) {
+        Ok(Some(value)) => Some(value),
+        Ok(None) => query_api_key(query),
+        Err(rejected) => {
+            tracing::warn!("malformed authorization header rejected");
+            return Err(rejected);
+        }
+    };
+    if let Some(value) = value {
         if let Some((key_id, secret_sha256)) = parse_api_key_token(&value) {
             return Ok(Credential::Key {
                 key_id,
@@ -153,10 +161,8 @@ fn credential_from_request(
             });
         }
 
-        if value.starts_with(API_KEY_PREFIX) {
-            tracing::warn!("malformed portal API key rejected");
-            return Err(invalid_key());
-        }
+        tracing::warn!("malformed portal API key rejected");
+        return Err(invalid_key());
     }
 
     Ok(Credential::None {
@@ -236,14 +242,20 @@ fn invalid_key() -> Rejected {
     }
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let (scheme, token) = value.split_once(' ')?;
-    if scheme != "Bearer" || token.contains(' ') || token.is_empty() {
-        return None;
+fn bearer_token(headers: &HeaderMap) -> Result<Option<String>, Rejected> {
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| invalid_key())?;
+    let (scheme, token) = value.split_once(' ').ok_or_else(invalid_key)?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.chars().any(char::is_whitespace)
+    {
+        return Err(invalid_key());
     }
 
-    Some(token.to_string())
+    Ok(Some(token.to_string()))
 }
 
 fn query_api_key(query: Option<&str>) -> Option<String> {
@@ -342,7 +354,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::{
         body::{to_bytes, Body},
-        http::Request as HttpRequest,
+        http::{HeaderValue, Request as HttpRequest},
         middleware::from_fn,
         routing::{get, post},
     };
@@ -566,6 +578,138 @@ mod tests {
         metrics::COMMERCIAL_ANON_FALLBACK_BUCKET
             .get_or_create(&labels)
             .get()
+    }
+
+    fn credential_test_app(control_plane: Arc<RecordingControlPlane>) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/datasets/ethereum-mainnet/stream",
+                get(|| async move { "ok" }),
+            )
+            .route_layer(from_fn(|req, next| middleware(req, next, Endpoint::Stream)))
+            .layer(axum::Extension(
+                control_plane as Arc<dyn ControlPlaneClient>,
+            ))
+    }
+
+    #[tokio::test]
+    async fn malformed_authorization_headers_return_401_instead_of_anonymous() {
+        let control_plane = Arc::new(RecordingControlPlane::default());
+        let app = credential_test_app(control_plane.clone());
+        let malformed = [
+            HeaderValue::from_static(""),
+            HeaderValue::from_static("Bearer"),
+            HeaderValue::from_static("Basic xyz"),
+            HeaderValue::from_bytes(b"Bearer \xff").unwrap(),
+            HeaderValue::from_static("Bearer  double-space"),
+        ];
+
+        for value in malformed {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/datasets/ethereum-mainnet/stream")
+                        .header(header::AUTHORIZATION, value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+        let malformed_header_with_valid_query = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/datasets/ethereum-mainnet/stream?api_key={TOKEN}"))
+                    .header(header::AUTHORIZATION, "Bearer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            malformed_header_with_valid_query.status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        assert!(control_plane.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_query_credentials_return_401_instead_of_anonymous() {
+        let control_plane = Arc::new(RecordingControlPlane::default());
+        let app = credential_test_app(control_plane.clone());
+
+        for query in [
+            "api_key=",
+            "api_key=not-a-portal-key",
+            "api_key=sqd_data_key_",
+            "api_key=%00",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(format!("/datasets/ethereum-mainnet/stream?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+        assert!(control_plane.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn absent_and_valid_credentials_keep_anonymous_and_keyed_paths() {
+        let control_plane = Arc::new(RecordingControlPlane::default());
+        let app = credential_test_app(control_plane.clone());
+
+        let anonymous = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/datasets/ethereum-mainnet/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), axum::http::StatusCode::OK);
+
+        let keyed = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/datasets/ethereum-mainnet/stream")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(keyed.status(), axum::http::StatusCode::OK);
+
+        let valid_header_ignores_malformed_query = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/datasets/ethereum-mainnet/stream?api_key=not-a-portal-key")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            valid_header_ignores_malformed_query.status(),
+            axum::http::StatusCode::OK
+        );
+
+        let requests = control_plane.requests.lock().unwrap();
+        assert!(matches!(requests[0].credential, Credential::None { .. }));
+        assert!(matches!(requests[1].credential, Credential::Key { .. }));
+        assert!(matches!(requests[2].credential, Credential::Key { .. }));
     }
 
     #[tokio::test]
