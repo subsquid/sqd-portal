@@ -514,7 +514,7 @@ pub fn register_metrics(registry: &mut Registry) {
     );
     registry.register(
         "commercial_snapshot_parse_errors_total",
-        "Commercial snapshot records skipped after parse failures",
+        "Commercial snapshot cache or record parse failures",
         COMMERCIAL_SNAPSHOT_PARSE_ERRORS.clone(),
     );
     registry.register(

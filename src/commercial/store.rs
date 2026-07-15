@@ -1170,6 +1170,7 @@ impl SnapshotStore {
         let cache = match serde_json::from_slice::<DiskCache>(&bytes) {
             Ok(cache) => cache,
             Err(err) => {
+                metrics::report_commercial_snapshot_parse_error();
                 tracing::warn!(path = %path.display(), error = %err, "failed to load commercial snapshot cache");
                 return;
             }
@@ -2217,6 +2218,7 @@ mod tests {
     async fn corrupt_disk_cache_is_ignored_and_bootstrap_continues() {
         let path = cache_path("corrupt");
         tokio::fs::write(&path, b"{not-json").await.unwrap();
+        let parse_errors_before = metrics::COMMERCIAL_SNAPSHOT_PARSE_ERRORS.get();
 
         std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
         let mock = MockControlPlane::spawn().await;
@@ -2238,6 +2240,7 @@ mod tests {
         .unwrap();
 
         assert!(store.get(KEY_ID).is_some());
+        assert!(metrics::COMMERCIAL_SNAPSHOT_PARSE_ERRORS.get() > parse_errors_before);
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
     }
