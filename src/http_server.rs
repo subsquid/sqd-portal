@@ -1898,6 +1898,29 @@ mod tests {
         store
     }
 
+    fn store_for_account_limit_two_test(second_key_id: &str) -> Arc<SnapshotStore> {
+        let store = SnapshotStore::inactive(&public_fallback_for_concurrency_test());
+        let mut defaults = defaults_record(10);
+        defaults.messages.insert(
+            "concurrency_limit".to_string(),
+            "concurrency_limit".to_string(),
+        );
+        let mut first = active_snapshot(11);
+        first.limits.as_mut().unwrap().concurrency = Some(2);
+        let mut second = active_snapshot(12);
+        second.key_id = second_key_id.to_string();
+        second.limits.as_mut().unwrap().concurrency = Some(2);
+        store.install_records_for_test(
+            vec![
+                SnapshotRecord::Defaults(defaults),
+                SnapshotRecord::Key(first),
+                SnapshotRecord::Key(second),
+            ],
+            12,
+        );
+        store
+    }
+
     fn store_for_anonymous_concurrency_test() -> Arc<SnapshotStore> {
         let store = SnapshotStore::inactive(&public_fallback_for_concurrency_test());
         let mut defaults = defaults_record(10);
@@ -2211,6 +2234,47 @@ mod tests {
         let response_b_retry = app.oneshot(stream_request(&keyed_uri, None)).await.unwrap();
         assert_eq!(response_b_retry.status(), StatusCode::OK);
         assert_eq!(response_b_retry.headers()["x-meter-created"], "true");
+    }
+
+    #[tokio::test]
+    async fn account_limit_two_rejects_third_live_stream_across_keys() {
+        const SECOND_KEY_ID: &str = "SecondKeyId";
+        const SECRET: &str = "0123456789abcdefghijklmnopqrstuv";
+        let app = commercial_concurrency_test_app(store_for_account_limit_two_test(SECOND_KEY_ID));
+        let first_key_uri =
+            format!("/datasets/ethereum-mainnet/stream?api_key=sqd_data_{KEY_ID}_{SECRET}");
+        let second_key_uri =
+            format!("/datasets/ethereum-mainnet/stream?api_key=sqd_data_{SECOND_KEY_ID}_{SECRET}");
+
+        let response_a = app
+            .clone()
+            .oneshot(stream_request(&first_key_uri, None))
+            .await
+            .unwrap();
+        assert_eq!(response_a.status(), StatusCode::OK);
+
+        let response_b = app
+            .clone()
+            .oneshot(stream_request(&second_key_uri, None))
+            .await
+            .unwrap();
+        assert_eq!(response_b.status(), StatusCode::OK);
+
+        let response_c = app
+            .clone()
+            .oneshot(stream_request(&first_key_uri, None))
+            .await
+            .unwrap();
+        assert_concurrency_rejection(response_c).await;
+
+        drop(response_a);
+        let response_c_retry = app
+            .oneshot(stream_request(&first_key_uri, None))
+            .await
+            .unwrap();
+        assert_eq!(response_c_retry.status(), StatusCode::OK);
+        drop(response_b);
+        drop(response_c_retry);
     }
 
     #[tokio::test]

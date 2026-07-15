@@ -323,7 +323,10 @@ fn acquire_key_permit(
     if limit == 0 {
         zero_limits::report(key_id, "concurrency");
     }
-    let permit = concurrency.and_then(|limiter| limiter.try_acquire(account_id, limit));
+    // The limiter adds one per-pod guardrail permit. Keep that permit inside
+    // the keyed plan cap while preserving the zero-limit fail-open guardrail.
+    let permit =
+        concurrency.and_then(|limiter| limiter.try_acquire(account_id, limit.saturating_sub(1)));
     let available = permit.is_some();
     (permit, available)
 }
