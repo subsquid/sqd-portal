@@ -381,12 +381,24 @@ async fn run_stream_internal(
             discard_meter(&meter);
             stream_after_network_head(&network, dataset_id).await
         }
-        None => {
-            unreachable!(
-                "invalid dataset name should have been handled in the ClientRequest parser"
-            )
-        }
+        None => missing_stream_source_response(&dataset, &request, &meter),
     }
+}
+
+fn missing_stream_source_response(
+    dataset: &DatasetConfig,
+    _request: &StreamRequest,
+    meter: &Option<MeterHandle>,
+) -> Response {
+    discard_meter(meter);
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "Dataset {} has no stream source configured",
+            dataset.default_name
+        ),
+    )
+        .into_response()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -892,6 +904,40 @@ mod tests {
             compression: Compression::Gzip,
             skip_parent_hash_validation: false,
         }
+    }
+
+    #[tokio::test]
+    async fn solana_dataset_without_a_source_returns_client_error_instead_of_panicking() {
+        let raw = r#"{"type":"solana","fromBlock":300000000,"toBlock":300000000,"fields":{"block":{"number":true}},"includeAllBlocks":true}"#;
+        let request = StreamRequest {
+            dataset_id: DatasetId::from_url("-"),
+            dataset_name: "solana-mainnet".to_string(),
+            query: ParsedQuery::try_from(raw.to_string()).unwrap(),
+            request_id: "g2-repro".to_string(),
+            buffer_size: 10,
+            max_stored_results_per_chunk: 2,
+            max_chunks: None,
+            timeout_quantile: 0.5,
+            retries: 1,
+            compression: Compression::Gzip,
+            skip_parent_hash_validation: false,
+        };
+        let dataset = DatasetConfig {
+            default_name: "solana-mainnet".to_string(),
+            aliases: vec!["solana-beta".to_string()],
+            network_id: None,
+            hotblocks: None,
+            kind: "solana".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+
+        let response = missing_stream_source_response(&dataset, &request, &None);
+        assert!(response.status().is_client_error());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            &body[..],
+            b"Dataset solana-mainnet has no stream source configured"
+        );
     }
 
     fn config_for_restriction_test() -> Config {
