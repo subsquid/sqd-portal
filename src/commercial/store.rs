@@ -34,6 +34,7 @@ const MAX_BOOTSTRAP_PAGES: usize = 10_000;
 const MAX_RESOLVE_FOLLOWERS: usize = 64;
 const RESOLVE_FOLLOWER_TIMEOUT: Duration = Duration::from_secs(11);
 
+#[derive(Clone)]
 pub struct SnapshotStore {
     inner: Arc<SnapshotStoreInner>,
 }
@@ -58,6 +59,7 @@ struct SnapshotStoreInner {
     sync_interval: Duration,
     negative_cache_ttl: Duration,
     negative_cache: DashMap<String, NegativeCacheEntry>,
+    stale_quota_cooldowns: DashMap<String, Instant>,
     inflight_resolves: DashMap<String, Arc<ResolveFlight>>,
     inflight_resolve_permits: Arc<tokio::sync::Semaphore>,
     resolve_limiter: Mutex<ResolveLimiter>,
@@ -256,6 +258,7 @@ impl SnapshotStore {
                 sync_interval: Duration::from_secs(config.sync_interval_secs.max(1)),
                 negative_cache_ttl: Duration::from_secs(config.negative_cache_secs.max(1)),
                 negative_cache: DashMap::new(),
+                stale_quota_cooldowns: DashMap::new(),
                 inflight_resolves: DashMap::new(),
                 inflight_resolve_permits: Arc::new(tokio::sync::Semaphore::new(
                     config.max_inflight_resolves,
@@ -291,6 +294,7 @@ impl SnapshotStore {
                 sync_interval: Duration::from_secs(10),
                 negative_cache_ttl: Duration::from_secs(15),
                 negative_cache: DashMap::new(),
+                stale_quota_cooldowns: DashMap::new(),
                 inflight_resolves: DashMap::new(),
                 inflight_resolve_permits: Arc::new(tokio::sync::Semaphore::new(
                     super::config::DEFAULT_MAX_INFLIGHT_RESOLVES,
@@ -341,50 +345,85 @@ impl SnapshotStore {
     }
 
     pub async fn get_or_resolve(&self, key_id: &str) -> Option<Arc<KeySnapshot>> {
-        loop {
-            if let Some(record) = self.get(key_id) {
-                return Some(record);
+        self.get_or_resolve_inner(key_id, true).await
+    }
+
+    pub(crate) fn schedule_stale_quota_resolve(&self, key_id: &str) {
+        let now = Instant::now();
+        let next_attempt = now + self.inner.negative_cache_ttl;
+        match self.inner.stale_quota_cooldowns.entry(key_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                if *entry.get() > now {
+                    return;
+                }
+                entry.insert(next_attempt);
             }
-            let (flight, leader, follower_permit) =
-                match self.inner.inflight_resolves.entry(key_id.to_string()) {
-                    Entry::Occupied(entry) => {
-                        let flight = entry.get().clone();
-                        let Ok(permit) = flight.follower_permits.clone().try_acquire_owned() else {
-                            tracing::info!(
-                                key_id,
-                                "commercial snapshot resolve fail-closed: follower limit reached"
-                            );
-                            metrics::report_commercial_resolve("rate_limited");
-                            return None;
-                        };
-                        (flight, false, Some(permit))
-                    }
-                    Entry::Vacant(entry) => {
-                        let Ok(global_permit) = self
-                            .inner
-                            .inflight_resolve_permits
-                            .clone()
-                            .try_acquire_owned()
-                        else {
-                            tracing::info!(
-                                key_id,
-                                "commercial snapshot resolve fail-closed: global flight limit reached"
-                            );
-                            metrics::report_commercial_resolve("global_flight_limited");
-                            return None;
-                        };
-                        let flight = Arc::new(ResolveFlight {
-                            result: Mutex::new(None),
-                            notify: tokio::sync::Notify::new(),
-                            follower_permits: Arc::new(tokio::sync::Semaphore::new(
-                                MAX_RESOLVE_FOLLOWERS,
-                            )),
-                            _global_permit: global_permit,
-                        });
-                        entry.insert(flight.clone());
-                        (flight, true, None)
-                    }
-                };
+            Entry::Vacant(entry) => {
+                entry.insert(next_attempt);
+            }
+        }
+
+        let store = self.clone();
+        let key_id = key_id.to_string();
+        tokio::spawn(async move {
+            let _ = store.get_or_resolve_inner(&key_id, false).await;
+        });
+    }
+
+    async fn get_or_resolve_inner(
+        &self,
+        key_id: &str,
+        return_cached: bool,
+    ) -> Option<Arc<KeySnapshot>> {
+        loop {
+            if return_cached {
+                if let Some(record) = self.get(key_id) {
+                    return Some(record);
+                }
+            }
+            let (flight, leader, follower_permit) = match self
+                .inner
+                .inflight_resolves
+                .entry(key_id.to_string())
+            {
+                Entry::Occupied(entry) => {
+                    let flight = entry.get().clone();
+                    let Ok(permit) = flight.follower_permits.clone().try_acquire_owned() else {
+                        tracing::info!(
+                            key_id,
+                            "commercial snapshot resolve fail-closed: follower limit reached"
+                        );
+                        metrics::report_commercial_resolve("rate_limited");
+                        return None;
+                    };
+                    (flight, false, Some(permit))
+                }
+                Entry::Vacant(entry) => {
+                    let Ok(global_permit) = self
+                        .inner
+                        .inflight_resolve_permits
+                        .clone()
+                        .try_acquire_owned()
+                    else {
+                        tracing::info!(
+                            key_id,
+                            "commercial snapshot resolve fail-closed: global flight limit reached"
+                        );
+                        metrics::report_commercial_resolve("global_flight_limited");
+                        return None;
+                    };
+                    let flight = Arc::new(ResolveFlight {
+                        result: Mutex::new(None),
+                        notify: tokio::sync::Notify::new(),
+                        follower_permits: Arc::new(tokio::sync::Semaphore::new(
+                            MAX_RESOLVE_FOLLOWERS,
+                        )),
+                        _global_permit: global_permit,
+                    });
+                    entry.insert(flight.clone());
+                    (flight, true, None)
+                }
+            };
             if leader {
                 let mut guard = ResolveFlightGuard {
                     store: self,
@@ -1366,6 +1405,7 @@ impl SnapshotStore {
             );
         }
         self.inner.negative_cache.clear();
+        self.inner.stale_quota_cooldowns.clear();
         self.inner.resolve_limiter.lock().unwrap().reset();
         if let Some(registry) = &self.inner.hooks.registry {
             let killed = registry.kill_all();

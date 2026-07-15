@@ -98,6 +98,12 @@ pub async fn evaluate_with_store_and_policy(
                     return Authorization::Rejected(rejected);
                 }
             }
+            if snapshot
+                .as_deref()
+                .is_some_and(|snapshot| stale_quota_grace_applies(snapshot, state))
+            {
+                store.schedule_stale_quota_resolve(key_id);
+            }
             let (permit, concurrency_available) =
                 acquire_key_permit(snapshot.as_deref(), concurrency);
             state.concurrency_available = concurrency_available;
@@ -185,6 +191,17 @@ fn evaluate_key(
         .map(|remaining_bytes| {
             effective_remaining_after_served(remaining_bytes, state.tally_bytes)
         });
+    if stale_quota_grace_applies(snapshot, state) {
+        let mut granted = grant(
+            snapshot,
+            key_id,
+            granted_limits(snapshot.limits.as_ref()),
+            on_exceed,
+        );
+        granted.quota_remaining_bytes = None;
+        crate::metrics::report_commercial_stale_quota_grace_admission();
+        return Authorization::Granted(granted);
+    }
     if effective.is_some_and(|effective| effective <= 0) {
         return match on_exceed {
             OnExceed::Reject => reject(
@@ -221,6 +238,22 @@ fn evaluate_key(
         limits.max_response_bytes = min_optional(limits.max_response_bytes, Some(effective));
     }
     Authorization::Granted(grant(snapshot, key_id, limits, on_exceed))
+}
+
+fn stale_quota_grace_applies(snapshot: &KeySnapshot, state: EvaluationState) -> bool {
+    let Some(quota) = snapshot.quota.as_ref() else {
+        return false;
+    };
+    let Some(period_end) = quota.period_end else {
+        return false;
+    };
+    period_end <= state.now_secs
+        && quota
+            .remaining_bytes
+            .map(|remaining_bytes| {
+                effective_remaining_after_served(remaining_bytes, state.tally_bytes)
+            })
+            .is_some_and(|effective| effective <= 0)
 }
 
 fn evaluate_key_prechecks<'a>(
@@ -883,6 +916,179 @@ mod tests {
             }
             Authorization::Rejected(_) => panic!("expected throttle grant"),
         }
+    }
+
+    #[test]
+    fn expired_exhausted_quota_is_granted_with_unknown_quota() {
+        let mut snapshot = active_snapshot(1);
+        snapshot.quota.as_mut().unwrap().period_end = Some(state().now_secs - 1);
+        let mut quota_state = state();
+        quota_state.tally_bytes = 10_000;
+        let grace_admissions_before = crate::metrics::COMMERCIAL_STALE_QUOTA_GRACE_ADMISSIONS.get();
+
+        match evaluate(
+            &request(SECRET_SHA256),
+            Some(&snapshot),
+            &defaults(),
+            quota_state,
+        ) {
+            Authorization::Granted(grant) => {
+                assert_eq!(grant.quota_remaining_bytes, None);
+                assert_eq!(grant.limits.throughput_bytes_per_sec, Some(1_000_000));
+                assert_eq!(grant.limits.burst_bytes, Some(2_000_000));
+                assert_eq!(grant.limits.max_response_bytes, Some(3_000_000));
+                assert!(
+                    crate::metrics::COMMERCIAL_STALE_QUOTA_GRACE_ADMISSIONS.get()
+                        > grace_admissions_before
+                );
+            }
+            Authorization::Rejected(rejected) => {
+                panic!("expected stale-quota grace, got {rejected:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn unexpired_exhausted_quota_is_rejected_with_retry_after() {
+        let mut snapshot = active_snapshot(1);
+        snapshot.quota.as_mut().unwrap().period_end = Some(state().now_secs + 30);
+        let mut quota_state = state();
+        quota_state.tally_bytes = 10_000;
+
+        match evaluate(
+            &request(SECRET_SHA256),
+            Some(&snapshot),
+            &defaults(),
+            quota_state,
+        ) {
+            Authorization::Rejected(rejected) => {
+                assert_eq!(rejected.reason, "quota_exhausted");
+                assert_eq!(rejected.http_status, 402);
+                assert_eq!(rejected.retry_after_secs, Some(30));
+            }
+            Authorization::Granted(_) => panic!("expected quota rejection"),
+        }
+    }
+
+    #[test]
+    fn expired_exhausted_throttle_quota_uses_normal_limits() {
+        let mut snapshot = active_snapshot(1);
+        let quota = snapshot.quota.as_mut().unwrap();
+        quota.period_end = Some(state().now_secs - 1);
+        quota.on_exceed = OnExceed::Throttle {
+            floor_bytes_per_sec: 7,
+        };
+        let mut quota_state = state();
+        quota_state.tally_bytes = 10_000;
+
+        match evaluate(
+            &request(SECRET_SHA256),
+            Some(&snapshot),
+            &defaults(),
+            quota_state,
+        ) {
+            Authorization::Granted(grant) => {
+                assert_eq!(grant.quota_remaining_bytes, None);
+                assert_eq!(grant.limits.throughput_bytes_per_sec, Some(1_000_000));
+                assert_eq!(grant.limits.burst_bytes, Some(2_000_000));
+                assert_eq!(grant.limits.max_response_bytes, Some(3_000_000));
+            }
+            Authorization::Rejected(rejected) => {
+                panic!("expected stale-quota grace, got {rejected:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn suspended_key_beats_expired_exhausted_quota() {
+        let mut snapshot = active_snapshot(1);
+        snapshot.status = KeyStatus::Suspended;
+        snapshot.quota.as_mut().unwrap().period_end = Some(state().now_secs - 1);
+        let mut quota_state = state();
+        quota_state.tally_bytes = 10_000;
+
+        assert_eq!(
+            rejected_reason(evaluate(
+                &request(SECRET_SHA256),
+                Some(&snapshot),
+                &defaults(),
+                quota_state,
+            )),
+            "suspended"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_stale_quota_grants_dispatch_one_refresh_per_cooldown() {
+        std::env::set_var("PORTAL_EVALUATE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let mut stale = active_snapshot(1);
+        stale.limits.as_mut().unwrap().concurrency = None;
+        stale.quota.as_mut().unwrap().remaining_bytes = Some(0);
+        stale.quota.as_mut().unwrap().period_end = Some(1);
+        mock.push_page(0, page(vec![SnapshotRecord::Key(stale.clone())], 1, false));
+        let mut refreshed = stale;
+        refreshed.seq = 2;
+        refreshed.quota.as_mut().unwrap().remaining_bytes = Some(10_000);
+        refreshed.quota.as_mut().unwrap().period_end = Some(4_102_444_800);
+        refreshed.quota.as_mut().unwrap().version = 2;
+        mock.resolve_with(KEY_ID, Some(refreshed));
+
+        let path = cache_path("stale-quota-refresh");
+        let (store, task) =
+            SnapshotStore::spawn(&store_config(&mock, path.clone()), CancellationToken::new())
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let requests =
+            (0..32).map(|_| evaluate_with_store(&store, None, None, request(SECRET_SHA256)));
+        for result in futures::future::join_all(requests).await {
+            match result {
+                Authorization::Granted(grant) => assert_eq!(grant.quota_remaining_bytes, None),
+                Authorization::Rejected(rejected) => {
+                    panic!("expected stale-quota grace, got {rejected:?}")
+                }
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mock.resolve_calls().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(mock.resolve_calls(), vec![KEY_ID.to_string()]);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.get(KEY_ID).is_none_or(|snapshot| snapshot.seq < 2) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let second_wave =
+            (0..32).map(|_| evaluate_with_store(&store, None, None, request(SECRET_SHA256)));
+        for result in futures::future::join_all(second_wave).await {
+            match result {
+                Authorization::Granted(grant) => {
+                    assert_eq!(grant.quota_remaining_bytes, Some(10_000))
+                }
+                Authorization::Rejected(rejected) => {
+                    panic!("expected refreshed quota grant, got {rejected:?}")
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(mock.resolve_calls(), vec![KEY_ID.to_string()]);
+
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     #[test]

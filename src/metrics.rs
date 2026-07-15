@@ -83,6 +83,7 @@ lazy_static::lazy_static! {
     pub static ref COMMERCIAL_SNAPSHOT_PERSIST_ERRORS: Counter = Default::default();
     pub static ref COMMERCIAL_DEFAULTS_RECOVERY_PENDING_TICKS: Counter = Default::default();
     pub static ref COMMERCIAL_SNAPSHOT_PARSE_ERRORS: Counter = Default::default();
+    pub static ref COMMERCIAL_STALE_QUOTA_GRACE_ADMISSIONS: Counter = Default::default();
     pub static ref COMMERCIAL_AUTHORIZE: Family<Labels, Counter> = Default::default();
     pub static ref COMMERCIAL_RESOLVE: Family<Labels, Counter> = Default::default();
     pub static ref COMMERCIAL_USAGE_BUFFER_LEN: Gauge = Default::default();
@@ -235,6 +236,10 @@ pub fn report_commercial_defaults_recovery_pending_tick() {
 
 pub fn report_commercial_snapshot_parse_error() {
     COMMERCIAL_SNAPSHOT_PARSE_ERRORS.inc();
+}
+
+pub fn report_commercial_stale_quota_grace_admission() {
+    COMMERCIAL_STALE_QUOTA_GRACE_ADMISSIONS.inc();
 }
 
 pub fn report_commercial_authorize(outcome: &str, reason: &str) {
@@ -511,6 +516,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "commercial_snapshot_parse_errors_total",
         "Commercial snapshot records skipped after parse failures",
         COMMERCIAL_SNAPSHOT_PARSE_ERRORS.clone(),
+    );
+    registry.register(
+        "commercial_stale_quota_grace_admissions_total",
+        "Commercial requests admitted while an exhausted quota snapshot is stale",
+        COMMERCIAL_STALE_QUOTA_GRACE_ADMISSIONS.clone(),
     );
     registry.register(
         "commercial_authorize_total",
