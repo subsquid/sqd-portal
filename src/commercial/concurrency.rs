@@ -35,6 +35,12 @@ struct LimitState {
     reclaimer_running: bool,
 }
 
+#[derive(Clone, Copy)]
+enum SweepCandidateKind {
+    Idle,
+    Capacity,
+}
+
 #[derive(Clone)]
 pub struct ConcurrencyPermit {
     _permit: Arc<OwnedSemaphorePermit>,
@@ -80,14 +86,21 @@ impl ConcurrencyLimiter {
 
     fn sweep_idle_with_cap(&self, horizon: Duration, cap: usize) -> usize {
         let now = Instant::now();
-        let mut keys: Vec<String> = self
+        let mut candidates: Vec<(String, Instant, SweepCandidateKind)> = self
             .semaphores
             .iter()
             .filter(|entry| entry.value().is_idle(now, horizon))
-            .map(|entry| entry.key().clone())
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().last_touched(),
+                    SweepCandidateKind::Idle,
+                )
+            })
             .collect();
 
-        let mut selected: HashSet<String> = keys.iter().cloned().collect();
+        let mut selected: HashSet<String> =
+            candidates.iter().map(|(key, _, _)| key.clone()).collect();
         let anon_count = self
             .semaphores
             .iter()
@@ -95,7 +108,7 @@ impl ConcurrencyLimiter {
             .count();
         let remaining_after_idle = anon_count.saturating_sub(selected.len());
         if remaining_after_idle > cap {
-            let mut candidates: Vec<(Instant, String)> = self
+            let mut cap_candidates: Vec<(Instant, String)> = self
                 .semaphores
                 .iter()
                 .filter(|entry| {
@@ -105,17 +118,29 @@ impl ConcurrencyLimiter {
                 })
                 .map(|entry| (entry.value().last_touched(), entry.key().clone()))
                 .collect();
-            candidates
+            cap_candidates
                 .sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-            for (_, key) in candidates.into_iter().take(remaining_after_idle - cap) {
+            for (last_touched, key) in cap_candidates.into_iter().take(remaining_after_idle - cap) {
                 selected.insert(key.clone());
-                keys.push(key);
+                candidates.push((key, last_touched, SweepCandidateKind::Capacity));
             }
         }
 
         let mut removed = 0;
-        for key in keys {
-            if self.semaphores.remove(&key).is_some() {
+        for (key, observed_last_touched, kind) in candidates {
+            if self
+                .semaphores
+                .remove_if(&key, |_, entry| {
+                    sweep_candidate_is_still_removable(
+                        entry,
+                        observed_last_touched,
+                        kind,
+                        now,
+                        horizon,
+                    )
+                })
+                .is_some()
+            {
                 removed += 1;
             }
         }
@@ -126,6 +151,20 @@ impl ConcurrencyLimiter {
     fn len(&self) -> usize {
         self.semaphores.len()
     }
+}
+
+fn sweep_candidate_is_still_removable(
+    entry: &LimitSemaphore,
+    observed_last_touched: Instant,
+    kind: SweepCandidateKind,
+    now: Instant,
+    horizon: Duration,
+) -> bool {
+    entry.last_touched() == observed_last_touched
+        && match kind {
+            SweepCandidateKind::Idle => entry.is_idle(now, horizon),
+            SweepCandidateKind::Capacity => entry.all_permits_available(),
+        }
 }
 
 impl LimitSemaphore {
@@ -246,7 +285,9 @@ impl LimitSemaphore {
 
     fn is_idle(&self, now: Instant, horizon: Duration) -> bool {
         self.all_permits_available()
-            && now.duration_since(*self.last_touched.lock().unwrap()) >= horizon
+            && now
+                .checked_duration_since(*self.last_touched.lock().unwrap())
+                .is_some_and(|idle_for| idle_for >= horizon)
     }
 
     fn last_touched(&self) -> Instant {
@@ -407,6 +448,41 @@ mod tests {
         drop(permit);
         assert_eq!(limiter.sweep_idle(Duration::ZERO), 1);
         assert_eq!(limiter.len(), 0);
+    }
+
+    #[test]
+    fn sweep_revalidation_rejects_touched_and_busy_candidates() {
+        let entry = LimitSemaphore::new(1);
+        let now = Instant::now();
+        *entry.last_touched.lock().unwrap() = now - Duration::from_secs(10);
+        let observed = entry.last_touched();
+        assert!(sweep_candidate_is_still_removable(
+            &entry,
+            observed,
+            SweepCandidateKind::Idle,
+            now,
+            Duration::from_secs(5),
+        ));
+
+        entry.touch();
+        assert!(!sweep_candidate_is_still_removable(
+            &entry,
+            observed,
+            SweepCandidateKind::Idle,
+            now,
+            Duration::from_secs(5),
+        ));
+
+        let observed = entry.last_touched();
+        let permit = entry.semaphore.clone().try_acquire_owned().unwrap();
+        assert!(!sweep_candidate_is_still_removable(
+            &entry,
+            observed,
+            SweepCandidateKind::Capacity,
+            now,
+            Duration::ZERO,
+        ));
+        drop(permit);
     }
 
     #[test]

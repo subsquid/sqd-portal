@@ -501,6 +501,9 @@ impl SnapshotStore {
                 .await
                 .is_err()
             {
+                if let Some(result) = flight.result.lock().unwrap().clone() {
+                    return result;
+                }
                 tracing::info!(
                     key_id,
                     "commercial snapshot resolve follower timed out; failing closed"
@@ -535,6 +538,19 @@ impl SnapshotStore {
         removed
     }
 
+    pub(crate) fn sweep_stale_quota_cooldowns(&self) -> usize {
+        let now = Instant::now();
+        let mut removed = 0;
+        self.inner.stale_quota_cooldowns.retain(|_, next_attempt| {
+            let expired = *next_attempt <= now;
+            if expired {
+                removed += 1;
+            }
+            !expired
+        });
+        removed
+    }
+
     #[cfg(test)]
     pub(crate) fn negative_cache_len(&self) -> usize {
         self.inner.negative_cache.len()
@@ -549,6 +565,18 @@ impl SnapshotStore {
                 generation: self.inner.generation.load(Ordering::Acquire),
             },
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stale_quota_cooldown_len(&self) -> usize {
+        self.inner.stale_quota_cooldowns.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_stale_quota_cooldown_for_test(&self, key_id: &str, ttl: Duration) {
+        self.inner
+            .stale_quota_cooldowns
+            .insert(key_id.to_string(), Instant::now() + ttl);
     }
 
     #[cfg(test)]
@@ -4260,6 +4288,49 @@ mod tests {
                 .expect("leader cancellation must publish a terminal result")
         };
         assert!(result.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_follower_timeout_uses_result_published_while_waiting() {
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        let key_id = "late-completed-flight";
+        let flight = Arc::new(ResolveFlight {
+            result: Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+            follower_permits: Arc::new(tokio::sync::Semaphore::new(MAX_RESOLVE_FOLLOWERS)),
+            _global_permit: store
+                .inner
+                .inflight_resolve_permits
+                .clone()
+                .try_acquire_owned()
+                .unwrap(),
+        });
+        store
+            .inner
+            .inflight_resolves
+            .insert(key_id.to_string(), flight.clone());
+
+        let follower_store = store.clone();
+        let follower =
+            tokio::spawn(async move { follower_store.get_or_resolve_inner(key_id, false).await });
+        while flight.follower_permits.available_permits() == MAX_RESOLVE_FOLLOWERS {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+
+        let completed = Arc::new(active_snapshot(9));
+        *flight.result.lock().unwrap() = Some(Some(completed.clone()));
+        tokio::time::advance(RESOLVE_FOLLOWER_TIMEOUT).await;
+
+        let result = follower.await.unwrap();
+        assert_eq!(result.as_deref(), Some(completed.as_ref()));
     }
 
     #[tokio::test]

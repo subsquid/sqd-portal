@@ -96,20 +96,25 @@ impl TallyStore {
 
     fn sweep_anonymous_with_cap(&self, now_secs: u64, idle_secs: u64, cap: usize) -> usize {
         let cutoff = now_secs.saturating_sub(idle_secs);
-        // A live meter caches its Tally handle, so a stream whose chunk gap
-        // exceeds the sweep horizon can be orphaned from this map. Debits touch
-        // last_seen, making that practically negligible for active streams.
-        let mut keys: Vec<String> = self
+        let mut candidates: Vec<(String, u64, bool)> = self
             .entries
             .iter()
             .filter(|entry| {
                 entry.key().starts_with(ANON_PREFIX)
                     && entry.value().last_seen.load(Ordering::Acquire) <= cutoff
+                    && Arc::strong_count(entry.value()) == 1
             })
-            .map(|entry| entry.key().clone())
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().last_seen.load(Ordering::Acquire),
+                    true,
+                )
+            })
             .collect();
 
-        let mut selected: HashSet<String> = keys.iter().cloned().collect();
+        let mut selected: HashSet<String> =
+            candidates.iter().map(|(key, _, _)| key.clone()).collect();
         let anon_count = self
             .entries
             .iter()
@@ -117,11 +122,13 @@ impl TallyStore {
             .count();
         let remaining_after_idle = anon_count.saturating_sub(selected.len());
         if remaining_after_idle > cap {
-            let mut candidates: Vec<(u64, String)> = self
+            let mut cap_candidates: Vec<(u64, String)> = self
                 .entries
                 .iter()
                 .filter(|entry| {
-                    entry.key().starts_with(ANON_PREFIX) && !selected.contains(entry.key())
+                    entry.key().starts_with(ANON_PREFIX)
+                        && !selected.contains(entry.key())
+                        && Arc::strong_count(entry.value()) == 1
                 })
                 .map(|entry| {
                     (
@@ -130,19 +137,34 @@ impl TallyStore {
                     )
                 })
                 .collect();
-            candidates
+            cap_candidates
                 .sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-            for (_, key) in candidates.into_iter().take(remaining_after_idle - cap) {
+            for (observed_last_seen, key) in
+                cap_candidates.into_iter().take(remaining_after_idle - cap)
+            {
                 selected.insert(key.clone());
-                keys.push(key);
+                candidates.push((key, observed_last_seen, false));
             }
         }
 
-        let count = keys.len();
-        for key in keys {
-            self.entries.remove(&key);
+        let mut removed = 0;
+        for (key, observed_last_seen, requires_idle_cutoff) in candidates {
+            if self
+                .entries
+                .remove_if(&key, |key, tally| {
+                    tally_sweep_candidate_is_still_removable(
+                        key,
+                        tally,
+                        observed_last_seen,
+                        requires_idle_cutoff.then_some(cutoff),
+                    )
+                })
+                .is_some()
+            {
+                removed += 1;
+            }
         }
-        count
+        removed
     }
 
     fn entry(&self, account_id: &str, version: u64) -> Arc<Tally> {
@@ -151,6 +173,18 @@ impl TallyStore {
             .or_insert_with(|| Arc::new(Tally::new(version)))
             .clone()
     }
+}
+
+fn tally_sweep_candidate_is_still_removable(
+    key: &str,
+    tally: &Arc<Tally>,
+    observed_last_seen: u64,
+    cutoff: Option<u64>,
+) -> bool {
+    key.starts_with(ANON_PREFIX)
+        && Arc::strong_count(tally) == 1
+        && tally.last_seen.load(Ordering::Acquire) == observed_last_seen
+        && cutoff.is_none_or(|cutoff| observed_last_seen <= cutoff)
 }
 
 impl TallyHandle {
@@ -302,6 +336,44 @@ mod tests {
         assert_eq!(tally.sweep_anonymous(now + 120, 60), 1);
         assert!(tally.version_for("anon:one").is_none());
         assert_eq!(tally.version_for("account"), Some(10));
+    }
+
+    #[test]
+    fn anonymous_sweep_keeps_an_entry_with_a_live_handle() {
+        let tally = TallyStore::default();
+        let handle = tally.handle("anon:stream", 10);
+        tally
+            .entries
+            .get("anon:stream")
+            .unwrap()
+            .last_seen
+            .store(1, Ordering::Release);
+
+        assert_eq!(tally.sweep_anonymous(100, 10), 0);
+        assert_eq!(tally.version_for("anon:stream"), Some(10));
+
+        drop(handle);
+        assert_eq!(tally.sweep_anonymous(100, 10), 1);
+    }
+
+    #[test]
+    fn anonymous_sweep_revalidation_rejects_a_recently_touched_candidate() {
+        let tally = Arc::new(Tally::new(10));
+        tally.last_seen.store(1, Ordering::Release);
+        assert!(tally_sweep_candidate_is_still_removable(
+            "anon:stream",
+            &tally,
+            1,
+            Some(10),
+        ));
+
+        tally.last_seen.store(11, Ordering::Release);
+        assert!(!tally_sweep_candidate_is_still_removable(
+            "anon:stream",
+            &tally,
+            1,
+            Some(10),
+        ));
     }
 
     #[test]

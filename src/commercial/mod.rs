@@ -131,11 +131,17 @@ fn spawn_maintenance_task(
             let tally_removed = tally.sweep_anonymous(now_secs(), horizon_secs);
             let concurrency_removed = concurrency.sweep_idle(sweep_horizon);
             let negative_cache_removed = store.sweep_negative_cache();
-            if tally_removed > 0 || concurrency_removed > 0 || negative_cache_removed > 0 {
+            let stale_quota_cooldowns_removed = store.sweep_stale_quota_cooldowns();
+            if tally_removed > 0
+                || concurrency_removed > 0
+                || negative_cache_removed > 0
+                || stale_quota_cooldowns_removed > 0
+            {
                 tracing::debug!(
                     tally_removed,
                     concurrency_removed,
                     negative_cache_removed,
+                    stale_quota_cooldowns_removed,
                     "commercial maintenance sweep removed idle entries"
                 );
             }
@@ -233,6 +239,7 @@ mod tests {
             concurrency: 1,
         });
         store.insert_negative_cache_for_test("missing", Duration::ZERO);
+        store.insert_stale_quota_cooldown_for_test("stale", Duration::ZERO);
 
         let cancel = CancellationToken::new();
         let task = spawn_maintenance_task(
@@ -248,6 +255,7 @@ mod tests {
         assert!(tally.version_for("anon:bucket").is_none());
         assert_eq!(concurrency.sweep_idle(Duration::ZERO), 0);
         assert_eq!(store.negative_cache_len(), 0);
+        assert_eq!(store.stale_quota_cooldown_len(), 0);
 
         cancel.cancel();
         task.await.unwrap();

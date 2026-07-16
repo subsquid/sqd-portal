@@ -444,7 +444,10 @@ fn evaluate_anonymous_with_state(
         0
     };
     let volume_bytes = quota.and_then(|quota| quota.volume_bytes);
-    let effective = volume_bytes.map(|volume_bytes| volume_bytes as i64 - served as i64);
+    let quota_remaining_bytes =
+        volume_bytes.map(|volume_bytes| i64::try_from(volume_bytes).unwrap_or(i64::MAX));
+    let effective =
+        quota_remaining_bytes.map(|remaining| effective_remaining_after_served(remaining, served));
     if effective.is_some_and(|effective| effective <= 0) {
         return match public_on_exceed(defaults) {
             OnExceed::Reject => reject(
@@ -468,7 +471,7 @@ fn evaluate_anonymous_with_state(
                     ),
                     max_chunks: None,
                 },
-                volume_bytes.map(|volume_bytes| volume_bytes as i64),
+                quota_remaining_bytes,
                 permit,
                 true,
             )),
@@ -491,7 +494,7 @@ fn evaluate_anonymous_with_state(
         account_key,
         window_start,
         limits,
-        volume_bytes.map(|volume_bytes| volume_bytes as i64),
+        quota_remaining_bytes,
         permit,
         quota.is_some(),
     ))
@@ -675,6 +678,26 @@ mod tests {
 
     fn defaults() -> Defaults {
         Defaults::from(defaults_record(1))
+    }
+
+    #[test]
+    fn anonymous_effective_remaining_saturates_large_volume_limits() {
+        let mut defaults = defaults();
+        defaults.public.quota.as_mut().unwrap().volume_bytes = Some(u64::MAX);
+
+        let result = evaluate_anonymous_with_state(
+            &defaults,
+            EvaluationPolicy::default(),
+            None,
+            None,
+            "large-volume",
+            1_700_000_000,
+        );
+
+        let Authorization::Granted(grant) = result else {
+            panic!("a large anonymous volume limit must not wrap into exhaustion");
+        };
+        assert_eq!(grant.quota_remaining_bytes, Some(i64::MAX));
     }
 
     fn request(secret_sha256: &str) -> AuthorizeRequest {
