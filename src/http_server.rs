@@ -346,6 +346,7 @@ async fn get_finalized_head(
 ) -> Response {
     if dataset.hotblocks.is_some() {
         return forward_hotblocks_response(
+            &dataset.default_name,
             hotblocks
                 .request_finalized_head(&dataset.default_name)
                 .await,
@@ -391,7 +392,10 @@ async fn get_head(
     dataset: DatasetConfig,
 ) -> Response {
     if dataset.hotblocks.is_some() {
-        return forward_hotblocks_response(hotblocks.request_head(&dataset.default_name).await);
+        return forward_hotblocks_response(
+            &dataset.default_name,
+            hotblocks.request_head(&dataset.default_name).await,
+        );
     }
 
     // Fall back to network data source
@@ -1137,24 +1141,64 @@ where
 }
 
 pub(crate) fn forward_hotblocks_response(
+    dataset: &str,
     response: Result<reqwest::Response, HotblocksErr>,
 ) -> Response {
     match response {
-        Ok(response) => forward_response(response),
+        Ok(response) => forward_response(dataset, response),
         Err(HotblocksErr::UnknownDataset) => {
             unreachable!("dataset should be known by the hotblocks service")
         }
-        Err(HotblocksErr::Request(e)) => (
-            StatusCode::BAD_GATEWAY,
-            format!("Hotblocks request error: {e}"),
-        )
-            .into_response(),
+        Err(HotblocksErr::Request(e)) => {
+            // Until this fires, a stalled upstream leaves no trace: the request never
+            // returns, so it carries no status. reqwest's Display already names the URL.
+            tracing::warn!(
+                dataset,
+                timed_out = e.is_timeout(),
+                error = %e,
+                "hotblocks request failed"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Hotblocks request error: {e}"),
+            )
+                .into_response()
+        }
     }
 }
 
-pub(crate) fn forward_response(response: reqwest::Response) -> axum::response::Response {
-    let mut builder = Response::builder().status(response.status());
+/// Marks a header as upstream diagnostics for the portal alone. Matched by prefix so the
+/// guarantee holds for headers added later: these name internal topology and must never
+/// reach a client.
+const INTERNAL_HEADER_PREFIX: &str = "x-internal-";
+
+/// Set by hotblocks to name the replica that answered. The Service load-balances behind a
+/// single ClusterIP, so this is the portal's only way to attribute a response to a pod.
+const HOTBLOCKS_INSTANCE_HEADER: &str = "x-internal-hotblocks-instance";
+
+pub(crate) fn forward_response(
+    dataset: &str,
+    response: reqwest::Response,
+) -> axum::response::Response {
+    let status = response.status();
+    if status.is_server_error() {
+        tracing::warn!(
+            dataset,
+            status = status.as_u16(),
+            instance = response
+                .headers()
+                .get(HOTBLOCKS_INSTANCE_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-"),
+            "hotblocks returned a server error"
+        );
+    }
+
+    let mut builder = Response::builder().status(status);
     for (key, value) in response.headers() {
+        if key.as_str().starts_with(INTERNAL_HEADER_PREFIX) {
+            continue;
+        }
         builder = builder.header(key, value);
     }
     let body = Body::from_stream(response.bytes_stream());
@@ -1192,6 +1236,31 @@ async fn sql_metadata(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn forward_response_strips_internal_headers() {
+        let upstream = axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .header(HOTBLOCKS_INSTANCE_HEADER, "hotblocks-db-0")
+            .header("x-sqd-finalized-head-number", "42")
+            .body(Vec::new())
+            .unwrap();
+
+        let forwarded = forward_response("polygon-mainnet", reqwest::Response::from(upstream));
+
+        let headers = forwarded.headers();
+        assert!(
+            !headers
+                .keys()
+                .any(|k| k.as_str().starts_with(INTERNAL_HEADER_PREFIX)),
+            "internal headers must not reach clients: {headers:?}"
+        );
+        assert_eq!(
+            headers.get("x-sqd-finalized-head-number").unwrap(),
+            "42",
+            "client-facing headers must still be forwarded"
+        );
+    }
 
     #[test]
     fn hide_internal_drops_marked_ops_and_empty_tags() {
