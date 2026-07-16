@@ -486,8 +486,20 @@ where
             drain_timeout
         );
         if let Some(registry) = active_stream_registry {
-            let cut = registry.cut_all_for_shutdown().await;
-            tracing::info!(cut, "commercial streams finalized after drain timeout");
+            // Bounded: a connection parked on a stalled client's socket never re-polls
+            // its body, so its meter can't observe the cut — waiting forever would
+            // block process exit. Losing that stream's event on timeout matches the
+            // pre-SD1 worst case; every responsive stream still flushes.
+            match tokio::time::timeout(drain_timeout, registry.cut_all_for_shutdown()).await {
+                Ok(cut) => {
+                    tracing::info!(cut, "commercial streams finalized after drain timeout")
+                }
+                Err(_) => tracing::warn!(
+                    "commercial stream finalization incomplete after {:?}; \
+                     unfinalized stream usage may be lost at process exit",
+                    drain_timeout
+                ),
+            }
         }
     }
     Ok(())
