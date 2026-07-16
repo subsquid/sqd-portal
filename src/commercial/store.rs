@@ -118,6 +118,11 @@ struct RawSnapshotPage {
     head_seq: Option<u64>,
 }
 
+struct ParsedKeySnapshot {
+    record: KeySnapshot,
+    fail_closed: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ResolveRequest<'a> {
     key_id: &'a str,
@@ -767,7 +772,7 @@ impl SnapshotStore {
         let page: RawSnapshotPage = response.json().await?;
         let raw_record_count = page.records.len();
         Ok(SnapshotPage {
-            records: parse_snapshot_records(page.records, "snapshot_page"),
+            records: parse_snapshot_records(page.records, "snapshot_page")?,
             next_cursor: page.next_cursor,
             reset: page.reset,
             epoch: page.epoch,
@@ -852,10 +857,18 @@ impl SnapshotStore {
         match response.status() {
             StatusCode::OK => {
                 let value: serde_json::Value = response.json().await?;
-                let Some(record) = parse_key_snapshot(value, "resolve_response") else {
-                    metrics::report_commercial_resolve("parse_error");
-                    return Ok(None);
+                let parsed = match parse_key_snapshot(value, "resolve_response", key_id) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        metrics::report_commercial_resolve("parse_error");
+                        return Err(err);
+                    }
                 };
+                let fail_closed = parsed.fail_closed;
+                let record = parsed.record;
+                if fail_closed {
+                    metrics::report_commercial_resolve("parse_error");
+                }
                 #[cfg(test)]
                 self.wait_at_resolve_application_gate_for_test();
                 let _authoritative_guard = self.inner.authoritative_lock.read().unwrap();
@@ -863,7 +876,9 @@ impl SnapshotStore {
                     metrics::report_commercial_resolve("stale_generation");
                     return Ok(None);
                 };
-                metrics::report_commercial_resolve("hit");
+                if !fail_closed {
+                    metrics::report_commercial_resolve("hit");
+                }
                 Ok(Some(record))
             }
             StatusCode::NOT_FOUND => {
@@ -1176,7 +1191,18 @@ impl SnapshotStore {
             }
         };
         let mut map = HashMap::new();
-        for record in parse_snapshot_records(cache.records, "disk_cache") {
+        let records = match parse_snapshot_records(cache.records, "disk_cache") {
+            Ok(records) => records,
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "refusing commercial snapshot cache with unidentified malformed record"
+                );
+                return;
+            }
+        };
+        for record in records {
             if let SnapshotRecord::Key(record) = record {
                 map.insert(record.key_id.clone(), Arc::new(record));
             }
@@ -1513,41 +1539,99 @@ fn now_secs() -> u64 {
 fn parse_snapshot_records(
     records: Vec<serde_json::Value>,
     source: &'static str,
-) -> Vec<SnapshotRecord> {
-    records
-        .into_iter()
-        .enumerate()
-        .filter_map(
-            |(index, value)| match serde_json::from_value::<SnapshotRecord>(value) {
-                Ok(record) => Some(record),
-                Err(err) => {
-                    metrics::report_commercial_snapshot_parse_error();
+) -> anyhow::Result<Vec<SnapshotRecord>> {
+    let mut parsed = Vec::with_capacity(records.len());
+    for (index, value) in records.into_iter().enumerate() {
+        match serde_json::from_value::<SnapshotRecord>(value.clone()) {
+            Ok(record) => parsed.push(record),
+            Err(err) => {
+                metrics::report_commercial_snapshot_parse_error();
+                if let Some(tombstone) = fail_closed_tombstone(&value, None) {
+                    tracing::warn!(
+                        source,
+                        index,
+                        key_id = tombstone.key_id,
+                        seq = tombstone.seq,
+                        error = %err,
+                        "installing fail-closed tombstone for unparseable commercial snapshot record"
+                    );
+                    parsed.push(SnapshotRecord::Key(tombstone));
+                } else {
                     tracing::warn!(
                         source,
                         index,
                         error = %err,
-                        "skipping unparseable commercial snapshot record"
+                        "halting commercial snapshot parsing at unidentified record"
                     );
-                    None
+                    anyhow::bail!(
+                        "unparseable commercial snapshot record at index {index} has no usable key_id and seq"
+                    );
                 }
-            },
-        )
-        .collect()
-}
-
-fn parse_key_snapshot(value: serde_json::Value, source: &'static str) -> Option<KeySnapshot> {
-    match serde_json::from_value::<KeySnapshot>(value) {
-        Ok(record) => Some(record),
-        Err(err) => {
-            metrics::report_commercial_snapshot_parse_error();
-            tracing::warn!(
-                source,
-                error = %err,
-                "skipping unparseable commercial snapshot resolve record"
-            );
-            None
+            }
         }
     }
+    Ok(parsed)
+}
+
+fn parse_key_snapshot(
+    value: serde_json::Value,
+    source: &'static str,
+    expected_key_id: &str,
+) -> anyhow::Result<ParsedKeySnapshot> {
+    match serde_json::from_value::<KeySnapshot>(value.clone()) {
+        Ok(record) => Ok(ParsedKeySnapshot {
+            record,
+            fail_closed: false,
+        }),
+        Err(err) => {
+            metrics::report_commercial_snapshot_parse_error();
+            if let Some(tombstone) = fail_closed_tombstone(&value, Some(expected_key_id)) {
+                tracing::warn!(
+                    source,
+                    key_id = tombstone.key_id,
+                    seq = tombstone.seq,
+                    error = %err,
+                    "installing fail-closed tombstone for unparseable commercial snapshot resolve record"
+                );
+                Ok(ParsedKeySnapshot {
+                    record: tombstone,
+                    fail_closed: true,
+                })
+            } else {
+                tracing::warn!(
+                    source,
+                    key_id = expected_key_id,
+                    error = %err,
+                    "failing closed on unparseable commercial snapshot resolve record without seq"
+                );
+                anyhow::bail!("unparseable commercial snapshot resolve record has no usable seq")
+            }
+        }
+    }
+}
+
+fn fail_closed_tombstone(
+    value: &serde_json::Value,
+    expected_key_id: Option<&str>,
+) -> Option<KeySnapshot> {
+    let key_id = expected_key_id
+        .or_else(|| value.get("key_id")?.as_str())?
+        .to_string();
+    if key_id.trim().is_empty() || key_id == "__defaults__" {
+        return None;
+    }
+    let seq = value.get("seq")?.as_u64()?;
+    Some(KeySnapshot {
+        key_id,
+        secret_sha256: None,
+        account_id: None,
+        status: KeyStatus::Revoked,
+        expires_at: None,
+        limits: None,
+        entitlements: None,
+        quota: None,
+        seq,
+    })
 }
 
 fn snapshot_record_to_value(record: SnapshotRecord) -> serde_json::Value {
@@ -1591,7 +1675,7 @@ pub mod test_support {
     #[derive(Default)]
     struct MockState {
         pages: Mutex<VecDeque<MockPage>>,
-        resolves: Mutex<HashMap<String, Option<KeySnapshot>>>,
+        resolves: Mutex<HashMap<String, Option<serde_json::Value>>>,
         resolve_statuses: Mutex<HashMap<String, StatusCode>>,
         resolve_gates: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
         resolve_calls: Mutex<Vec<String>>,
@@ -1652,11 +1736,20 @@ pub mod test_support {
         }
 
         pub fn resolve_with(&self, key_id: &str, record: Option<KeySnapshot>) {
+            self.state.resolves.lock().unwrap().insert(
+                key_id.to_string(),
+                record.map(|record| {
+                    serde_json::to_value(record).expect("mock resolve record should serialize")
+                }),
+            );
+        }
+
+        pub fn resolve_raw(&self, key_id: &str, record: serde_json::Value) {
             self.state
                 .resolves
                 .lock()
                 .unwrap()
-                .insert(key_id.to_string(), record);
+                .insert(key_id.to_string(), Some(record));
         }
 
         pub fn resolve_status(&self, key_id: &str, status: StatusCode) {
@@ -1812,7 +1905,7 @@ pub mod test_support {
         State(state): State<Arc<MockState>>,
         headers: HeaderMap,
         Json(body): Json<serde_json::Value>,
-    ) -> Result<Json<KeySnapshot>, StatusCode> {
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
         if !authorized(&headers) {
             return Err(StatusCode::UNAUTHORIZED);
         }
@@ -2079,7 +2172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_skips_bad_snapshot_records_and_advances_cursor() {
+    async fn bootstrap_tombstones_identified_bad_snapshot_records_and_advances_cursor() {
         std::env::set_var("PORTAL_STORE_TEST_TOKEN", SERVICE_TOKEN);
         let mock = MockControlPlane::spawn().await;
         let mut next = active_snapshot(2);
@@ -2113,10 +2206,37 @@ mod tests {
         let view = store.view();
         assert_eq!(view.cursor, 7);
         assert!(store.get(KEY_ID).is_some());
+        assert_eq!(store.get("poison").unwrap().status, KeyStatus::Revoked);
+        assert_eq!(store.get("poison").unwrap().seq, 2);
         assert!(store.get("next-key").is_some());
         assert!(metrics::COMMERCIAL_SNAPSHOT_PARSE_ERRORS.get() > before);
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_halts_on_bad_snapshot_record_without_identity() {
+        let mock = MockControlPlane::spawn().await;
+        mock.push_raw_page(
+            0,
+            serde_json::json!({
+                "records": [{"seq": 1, "status": null}],
+                "next_cursor": 1,
+                "reset": false
+            }),
+        );
+        let store = SnapshotStore::new(
+            &config(&mock, PathBuf::new(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+
+        assert!(store.run_sync_tick().await.is_err());
+        assert!(!store.is_ready());
+        assert_eq!(store.view().cursor, 0);
+        assert!(store.view().records.is_empty());
     }
 
     #[tokio::test]
@@ -2309,11 +2429,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delta_skips_bad_snapshot_records_and_advances_cursor() {
+    async fn delta_tombstones_identified_bad_record_and_persists_it() {
         let mock = MockControlPlane::spawn().await;
         mock.push_page(
             0,
-            page(vec![SnapshotRecord::Key(active_snapshot(1))], 10, false),
+            page(vec![SnapshotRecord::Key(active_snapshot(10))], 10, false),
         );
         let path = cache_path("delta-poison-page");
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -2333,7 +2453,7 @@ mod tests {
             10,
             serde_json::json!({
                 "records": [
-                    {"key_id": "poison", "seq": 2, "status": null}
+                    {"key_id": KEY_ID, "seq": 11, "status": null}
                 ],
                 "next_cursor": 11,
                 "reset": false
@@ -2343,8 +2463,51 @@ mod tests {
         store.run_sync_tick().await.unwrap();
 
         assert_eq!(store.view().cursor, 11);
+        assert_eq!(store.get(KEY_ID).unwrap().status, KeyStatus::Revoked);
+        assert_eq!(store.get(KEY_ID).unwrap().seq, 11);
         assert!(metrics::COMMERCIAL_SNAPSHOT_PARSE_ERRORS.get() > before);
+
+        let restarted = SnapshotStore::new(
+            &config(&mock, path.clone(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        restarted.load_disk_cache();
+        assert_eq!(restarted.view().cursor, 11);
+        assert_eq!(restarted.get(KEY_ID).unwrap().status, KeyStatus::Revoked);
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn delta_halts_and_retries_bad_record_without_identity() {
+        let mock = MockControlPlane::spawn().await;
+        mock.push_page(
+            0,
+            page(vec![SnapshotRecord::Key(active_snapshot(10))], 10, false),
+        );
+        let poison_page = serde_json::json!({
+            "records": [{"seq": 11, "status": null}],
+            "next_cursor": 11,
+            "reset": false
+        });
+        mock.push_raw_page(10, poison_page.clone());
+        mock.push_raw_page(10, poison_page);
+        let store = SnapshotStore::new(
+            &config(&mock, PathBuf::new(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+
+        store.run_sync_tick().await.unwrap();
+        assert!(store.run_sync_tick().await.is_err());
+        assert_eq!(store.view().cursor, 10);
+        assert_eq!(store.get(KEY_ID).unwrap().status, KeyStatus::Active);
+        assert!(store.run_sync_tick().await.is_err());
+        assert_eq!(store.view().cursor, 10);
     }
 
     #[test]
@@ -4122,6 +4285,56 @@ mod tests {
 
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_resolve_tombstones_requested_key_without_negative_cache() {
+        let mock = MockControlPlane::spawn().await;
+        mock.resolve_raw(
+            KEY_ID,
+            serde_json::json!({"key_id": KEY_ID, "seq": 11, "status": null}),
+        );
+        let store = SnapshotStore::new(
+            &config(&mock, PathBuf::new(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store.install_records_for_test(vec![SnapshotRecord::Key(active_snapshot(10))], 10);
+
+        let resolved = store.get_or_resolve_inner(KEY_ID, false).await.unwrap();
+
+        assert_eq!(resolved.status, KeyStatus::Revoked);
+        assert_eq!(resolved.seq, 11);
+        assert_eq!(store.get(KEY_ID).unwrap().status, KeyStatus::Revoked);
+        assert!(!store.negative_cached(KEY_ID));
+    }
+
+    #[tokio::test]
+    async fn malformed_resolve_without_sequence_is_not_negative_cached() {
+        let mock = MockControlPlane::spawn().await;
+        mock.resolve_raw(
+            KEY_ID,
+            serde_json::json!({"key_id": KEY_ID, "status": null}),
+        );
+        let store = SnapshotStore::new(
+            &config(&mock, PathBuf::new(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store.set_ready_for_test(true);
+
+        assert!(store.get_or_resolve(KEY_ID).await.is_none());
+        assert!(!store.negative_cached(KEY_ID));
+
+        let mut healthy = active_snapshot(12);
+        healthy.key_id = KEY_ID.to_string();
+        mock.resolve_with(KEY_ID, Some(healthy));
+        assert_eq!(store.get_or_resolve(KEY_ID).await.unwrap().seq, 12);
+        assert_eq!(mock.resolve_calls().len(), 2);
     }
 
     #[tokio::test]
