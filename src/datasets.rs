@@ -210,7 +210,13 @@ async fn load_yaml<T: serde::de::DeserializeOwned>(url: &str) -> anyhow::Result<
             ExponentialBackoff::builder().build_with_max_retries(3),
         ))
         .build();
-        let text = client.get(url).send().await?.error_for_status()?.text().await?;
+        let text = client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
         serde_yaml::from_str(&text).with_context(|| format!("failed to parse {url}"))
     }
 }

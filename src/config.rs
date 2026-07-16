@@ -28,6 +28,13 @@ pub struct Config {
 
     #[serde_as(as = "DurationSeconds")]
     #[serde(
+        rename = "hotblocks_read_timeout_sec",
+        default = "default_hotblocks_read_timeout"
+    )]
+    pub hotblocks_read_timeout: Duration,
+
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(
         rename = "pre_drain_grace_period_sec",
         default = "default_pre_drain_grace_period"
     )]
@@ -202,6 +209,13 @@ fn default_max_parallel_streams() -> usize {
 
 fn default_transport_timeout() -> Duration {
     Duration::from_secs(60)
+}
+
+// Must stay below caller-side request timeouts (SDK default: 30s), so a stalled
+// upstream surfaces as our 502 rather than the caller's own timeout — a request
+// still in flight has no recorded status and is invisible in metrics.
+fn default_hotblocks_read_timeout() -> Duration {
+    Duration::from_secs(20)
 }
 
 // Graceful shutdown defaults. See docs/GRACEFUL_SHUTDOWN.md for the full

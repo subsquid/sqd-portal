@@ -83,7 +83,7 @@ pub async fn build_client(config: &Config) -> anyhow::Result<HotblocksHandle> {
         .no_brotli()
         .no_zstd()
         .connect_timeout(Duration::from_secs(1))
-        .read_timeout(Duration::from_secs(30));
+        .read_timeout(config.hotblocks_read_timeout);
 
     if let Some(client_id) = &config.client_id {
         let mut headers = reqwest::header::HeaderMap::new();

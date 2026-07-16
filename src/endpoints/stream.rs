@@ -355,9 +355,9 @@ async fn stream_from_hotblocks(
                 return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
             }
 
-            forward_response(response)
+            forward_response(&dataset.default_name, response)
         }
-        Err(e) => forward_hotblocks_response(Err(e)),
+        Err(e) => forward_hotblocks_response(&dataset.default_name, Err(e)),
     };
 
     res.headers_mut()
