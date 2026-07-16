@@ -60,6 +60,7 @@ struct SnapshotStoreInner {
     negative_cache_ttl: Duration,
     negative_cache: DashMap<String, NegativeCacheEntry>,
     stale_quota_cooldowns: DashMap<String, Instant>,
+    stale_quota_grace: DashMap<String, StaleQuotaGraceState>,
     inflight_resolves: DashMap<String, Arc<ResolveFlight>>,
     inflight_resolve_permits: Arc<tokio::sync::Semaphore>,
     resolve_limiter: Mutex<ResolveLimiter>,
@@ -175,6 +176,11 @@ struct NegativeCacheEntry {
     generation: u64,
 }
 
+struct StaleQuotaGraceState {
+    snapshot_seq: u64,
+    tally_limit: i64,
+}
+
 struct ResolveFlight {
     result: Mutex<Option<Option<Arc<KeySnapshot>>>>,
     notify: tokio::sync::Notify,
@@ -264,6 +270,7 @@ impl SnapshotStore {
                 negative_cache_ttl: Duration::from_secs(config.negative_cache_secs.max(1)),
                 negative_cache: DashMap::new(),
                 stale_quota_cooldowns: DashMap::new(),
+                stale_quota_grace: DashMap::new(),
                 inflight_resolves: DashMap::new(),
                 inflight_resolve_permits: Arc::new(tokio::sync::Semaphore::new(
                     config.max_inflight_resolves,
@@ -300,6 +307,7 @@ impl SnapshotStore {
                 negative_cache_ttl: Duration::from_secs(15),
                 negative_cache: DashMap::new(),
                 stale_quota_cooldowns: DashMap::new(),
+                stale_quota_grace: DashMap::new(),
                 inflight_resolves: DashMap::new(),
                 inflight_resolve_permits: Arc::new(tokio::sync::Semaphore::new(
                     super::config::DEFAULT_MAX_INFLIGHT_RESOLVES,
@@ -373,6 +381,47 @@ impl SnapshotStore {
         tokio::spawn(async move {
             let _ = store.get_or_resolve_inner(&key_id, false).await;
         });
+    }
+
+    pub(crate) fn stale_quota_grace_limit(
+        &self,
+        key_id: &str,
+        snapshot_seq: u64,
+        tally_bytes: u64,
+        allowance_bytes: u64,
+    ) -> i64 {
+        // One snapshot sequence gets one allowance anchored at the tally seen
+        // by its first grace admission. Every concurrent meter then debits
+        // against the same absolute ceiling until a newer snapshot arrives.
+        let new_limit = || {
+            i64::try_from(tally_bytes)
+                .unwrap_or(i64::MAX)
+                .saturating_add(i64::try_from(allowance_bytes).unwrap_or(i64::MAX))
+        };
+        match self.inner.stale_quota_grace.entry(key_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                if entry.get().snapshot_seq == snapshot_seq {
+                    entry.get().tally_limit
+                } else if entry.get().snapshot_seq < snapshot_seq {
+                    let tally_limit = new_limit();
+                    entry.insert(StaleQuotaGraceState {
+                        snapshot_seq,
+                        tally_limit,
+                    });
+                    tally_limit
+                } else {
+                    0
+                }
+            }
+            Entry::Vacant(entry) => {
+                let tally_limit = new_limit();
+                entry.insert(StaleQuotaGraceState {
+                    snapshot_seq,
+                    tally_limit,
+                });
+                tally_limit
+            }
+        }
     }
 
     async fn get_or_resolve_inner(
@@ -1398,6 +1447,15 @@ impl SnapshotStore {
     }
 
     fn apply_snapshot_hooks(&self, record: &KeySnapshot) {
+        if let Entry::Occupied(entry) = self
+            .inner
+            .stale_quota_grace
+            .entry(record.key_id.clone())
+        {
+            if entry.get().snapshot_seq < record.seq {
+                entry.remove();
+            }
+        }
         if let (Some(tally), Some(account_id), Some(quota)) = (
             &self.inner.hooks.tally,
             record.account_id.as_deref(),
@@ -1433,6 +1491,7 @@ impl SnapshotStore {
         }
         self.inner.negative_cache.clear();
         self.inner.stale_quota_cooldowns.clear();
+        self.inner.stale_quota_grace.clear();
         self.inner.resolve_limiter.lock().unwrap().reset();
         if let Some(registry) = &self.inner.hooks.registry {
             let killed = registry.kill_all();

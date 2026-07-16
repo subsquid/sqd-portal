@@ -25,6 +25,7 @@ pub struct EvaluationState {
     pub now_secs: u64,
     pub tally_bytes: u64,
     pub concurrency_available: bool,
+    pub stale_quota_grace_limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +39,7 @@ impl Default for EvaluationState {
             now_secs: now_secs(),
             tally_bytes: 0,
             concurrency_available: true,
+            stale_quota_grace_limit: None,
         }
     }
 }
@@ -98,11 +100,23 @@ pub async fn evaluate_with_store_and_policy(
                     return Authorization::Rejected(rejected);
                 }
             }
-            if snapshot
-                .as_deref()
-                .is_some_and(|snapshot| stale_quota_grace_applies(snapshot, state))
-            {
-                store.schedule_stale_quota_resolve(key_id);
+            if let Some(snapshot) = snapshot.as_deref() {
+                if stale_quota_refresh_needed(snapshot, state.now_secs) {
+                    store.schedule_stale_quota_resolve(key_id);
+                }
+                if stale_quota_grace_applies(snapshot, state) {
+                    let allowance_bytes = snapshot
+                        .limits
+                        .as_ref()
+                        .and_then(|limits| limits.max_response_bytes)
+                        .unwrap_or(0);
+                    state.stale_quota_grace_limit = Some(store.stale_quota_grace_limit(
+                        key_id,
+                        snapshot.seq,
+                        state.tally_bytes,
+                        allowance_bytes,
+                    ));
+                }
             }
             let (permit, concurrency_available) =
                 acquire_key_permit(snapshot.as_deref(), concurrency);
@@ -192,13 +206,33 @@ fn evaluate_key(
             effective_remaining_after_served(remaining_bytes, state.tally_bytes)
         });
     if stale_quota_grace_applies(snapshot, state) {
+        let allowance_bytes = snapshot
+            .limits
+            .as_ref()
+            .and_then(|limits| limits.max_response_bytes)
+            .unwrap_or(0);
+        let grace_limit = state.stale_quota_grace_limit.unwrap_or_else(|| {
+            i64::try_from(state.tally_bytes)
+                .unwrap_or(i64::MAX)
+                .saturating_add(i64::try_from(allowance_bytes).unwrap_or(i64::MAX))
+        });
+        let grace_remaining = effective_remaining_after_served(grace_limit, state.tally_bytes);
+        let Ok(grace_remaining) = u64::try_from(grace_remaining) else {
+            return reject(defaults, QUOTA_EXHAUSTED, 402, Some(1));
+        };
+        if grace_remaining == 0 {
+            return reject(defaults, QUOTA_EXHAUSTED, 402, Some(1));
+        }
+        let mut limits = granted_limits(snapshot.limits.as_ref());
+        limits.max_response_bytes = min_optional(limits.max_response_bytes, Some(grace_remaining));
         let mut granted = grant(
             snapshot,
             key_id,
-            granted_limits(snapshot.limits.as_ref()),
-            on_exceed,
+            limits,
+            OnExceed::Reject,
         );
         granted.quota_remaining_bytes = None;
+        granted.limits.stale_quota_grace_limit = Some(grace_limit);
         crate::metrics::report_commercial_stale_quota_grace_admission();
         return Authorization::Granted(granted);
     }
@@ -218,6 +252,7 @@ fn evaluate_key(
                 snapshot,
                 key_id,
                 GrantedLimits {
+                    stale_quota_grace_limit: None,
                     throughput_bytes_per_sec: Some(floor_bytes_per_sec),
                     burst_bytes: Some(floor_bytes_per_sec),
                     max_response_bytes: Some(
@@ -254,6 +289,14 @@ fn stale_quota_grace_applies(snapshot: &KeySnapshot, state: EvaluationState) -> 
                 effective_remaining_after_served(remaining_bytes, state.tally_bytes)
             })
             .is_some_and(|effective| effective <= 0)
+}
+
+fn stale_quota_refresh_needed(snapshot: &KeySnapshot, now_secs: u64) -> bool {
+    snapshot
+        .quota
+        .as_ref()
+        .and_then(|quota| quota.period_end)
+        .is_some_and(|period_end| period_end <= now_secs)
 }
 
 fn evaluate_key_prechecks<'a>(
@@ -353,6 +396,7 @@ fn evaluate_anonymous(defaults: &Defaults) -> Authorization {
         entitled_chains: None,
         entitled_traces: None,
         limits: GrantedLimits {
+            stale_quota_grace_limit: None,
             max_response_bytes: defaults.public.limits.max_response_bytes,
             throughput_bytes_per_sec: defaults.public.limits.throughput_bytes_per_sec,
             burst_bytes: defaults.public.limits.burst_bytes,
@@ -416,6 +460,7 @@ fn evaluate_anonymous_with_state(
                 account_key,
                 window_start,
                 GrantedLimits {
+                    stale_quota_grace_limit: None,
                     throughput_bytes_per_sec: Some(floor_bytes_per_sec),
                     burst_bytes: Some(floor_bytes_per_sec),
                     max_response_bytes: Some(
@@ -431,6 +476,7 @@ fn evaluate_anonymous_with_state(
     }
 
     let mut limits = GrantedLimits {
+        stale_quota_grace_limit: None,
         max_response_bytes: defaults.public.limits.max_response_bytes,
         throughput_bytes_per_sec: defaults.public.limits.throughput_bytes_per_sec,
         burst_bytes: defaults.public.limits.burst_bytes,
@@ -482,6 +528,7 @@ fn granted_limits(limits: Option<&SnapshotLimits>) -> GrantedLimits {
         return GrantedLimits::default();
     };
     GrantedLimits {
+        stale_quota_grace_limit: None,
         max_response_bytes: limits.max_response_bytes,
         throughput_bytes_per_sec: limits.throughput_bytes_per_sec,
         burst_bytes: limits.burst_bytes,
@@ -652,6 +699,7 @@ mod tests {
             now_secs: 1_700_000_000,
             tally_bytes: 0,
             concurrency_available: true,
+            stale_quota_grace_limit: None,
         }
     }
 
@@ -937,6 +985,7 @@ mod tests {
                 assert_eq!(grant.limits.throughput_bytes_per_sec, Some(1_000_000));
                 assert_eq!(grant.limits.burst_bytes, Some(2_000_000));
                 assert_eq!(grant.limits.max_response_bytes, Some(3_000_000));
+                assert_eq!(grant.on_exceed, OnExceed::Reject);
                 assert!(
                     crate::metrics::COMMERCIAL_STALE_QUOTA_GRACE_ADMISSIONS.get()
                         > grace_admissions_before
@@ -992,6 +1041,7 @@ mod tests {
                 assert_eq!(grant.limits.throughput_bytes_per_sec, Some(1_000_000));
                 assert_eq!(grant.limits.burst_bytes, Some(2_000_000));
                 assert_eq!(grant.limits.max_response_bytes, Some(3_000_000));
+                assert_eq!(grant.on_exceed, OnExceed::Reject);
             }
             Authorization::Rejected(rejected) => {
                 panic!("expected stale-quota grace, got {rejected:?}")
@@ -1089,6 +1139,126 @@ mod tests {
 
         task.abort();
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn expired_residual_quota_schedules_refresh_without_using_grace() {
+        std::env::set_var("PORTAL_EVALUATE_TEST_TOKEN", SERVICE_TOKEN);
+        let mock = MockControlPlane::spawn().await;
+        let mut stale = active_snapshot(1);
+        stale.limits.as_mut().unwrap().concurrency = None;
+        stale.quota.as_mut().unwrap().remaining_bytes = Some(500);
+        stale.quota.as_mut().unwrap().period_end = Some(1);
+        mock.push_page(0, page(vec![SnapshotRecord::Key(stale)], 1, false));
+        let gate = mock.pause_resolve(KEY_ID);
+        let path = cache_path("stale-residual-refresh");
+        let (store, task) =
+            SnapshotStore::spawn(&store_config(&mock, path.clone()), CancellationToken::new())
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let authorization = evaluate_with_store(&store, None, None, request(SECRET_SHA256)).await;
+
+        let Authorization::Granted(granted) = authorization else {
+            panic!("expired residual quota should remain usable while refresh is in flight");
+        };
+        assert_eq!(granted.quota_remaining_bytes, Some(500));
+        let second = evaluate_with_store(&store, None, None, request(SECRET_SHA256)).await;
+        assert!(matches!(second, Authorization::Granted(_)));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mock.resolve_calls().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expired residual quota should schedule a resolve");
+        assert_eq!(mock.resolve_calls(), vec![KEY_ID.to_string()]);
+
+        gate.notify_one();
+        task.abort();
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn stale_exhausted_grace_is_bounded_until_a_new_snapshot_arrives() {
+        let mut stale = active_snapshot(1);
+        stale.limits.as_mut().unwrap().concurrency = None;
+        stale.limits.as_mut().unwrap().max_response_bytes = Some(100);
+        stale.quota.as_mut().unwrap().remaining_bytes = Some(0);
+        stale.quota.as_mut().unwrap().period_end = Some(1);
+        let store = SnapshotStore::inactive(&PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        });
+        store.install_records_for_test(vec![SnapshotRecord::Key(stale.clone())], 1);
+        let tally = TallyStore::default();
+
+        let first = evaluate_with_store(&store, Some(&tally), None, request(SECRET_SHA256)).await;
+        let Authorization::Granted(first) = first else {
+            panic!("first stale exhausted request should receive bounded grace");
+        };
+        assert_eq!(first.quota_remaining_bytes, None);
+        assert_eq!(first.limits.max_response_bytes, Some(100));
+        assert_eq!(first.limits.stale_quota_grace_limit, Some(100));
+
+        tally.debit("account", 1, 100);
+        let second = evaluate_with_store(&store, Some(&tally), None, request(SECRET_SHA256)).await;
+        let Authorization::Rejected(second) = second else {
+            panic!("exhausted stale-quota grace should reject");
+        };
+        assert_eq!(second.reason, QUOTA_EXHAUSTED);
+        assert_eq!(second.retry_after_secs, Some(1));
+
+        stale.seq = 2;
+        stale.quota.as_mut().unwrap().version = 2;
+        store.install_records_for_test(vec![SnapshotRecord::Key(stale)], 2);
+        let refreshed =
+            evaluate_with_store(&store, Some(&tally), None, request(SECRET_SHA256)).await;
+        let Authorization::Granted(refreshed) = refreshed else {
+            panic!("a newer stale snapshot should start a new bounded allowance");
+        };
+        assert_eq!(refreshed.limits.max_response_bytes, Some(100));
+        assert_eq!(refreshed.limits.stale_quota_grace_limit, Some(100));
+    }
+
+    #[test]
+    fn only_expired_quota_periods_need_refresh() {
+        let mut snapshot = active_snapshot(1);
+        assert!(!stale_quota_refresh_needed(&snapshot, 1_700_000_000));
+        snapshot.quota.as_mut().unwrap().period_end = Some(1_700_000_000);
+        assert!(stale_quota_refresh_needed(&snapshot, 1_700_000_000));
+    }
+
+    #[test]
+    fn stale_exhausted_quota_without_response_cap_has_no_grace() {
+        let mut snapshot = active_snapshot(1);
+        snapshot.limits.as_mut().unwrap().max_response_bytes = None;
+        snapshot.quota.as_mut().unwrap().period_end = Some(state().now_secs - 1);
+        let mut quota_state = state();
+        quota_state.tally_bytes = 10_000;
+
+        let authorization = evaluate(
+            &request(SECRET_SHA256),
+            Some(&snapshot),
+            &defaults(),
+            quota_state,
+        );
+
+        let Authorization::Rejected(rejected) = authorization else {
+            panic!("uncapped stale quota cannot receive bounded grace");
+        };
+        assert_eq!(rejected.reason, QUOTA_EXHAUSTED);
+        assert_eq!(rejected.retry_after_secs, Some(1));
     }
 
     #[test]

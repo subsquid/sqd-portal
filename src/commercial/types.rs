@@ -77,6 +77,9 @@ pub struct Principal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GrantedLimits {
+    /// Internal cumulative account-tally ceiling for bounded stale-quota grace.
+    #[serde(skip)]
+    pub(crate) stale_quota_grace_limit: Option<i64>,
     /// None means no response-size cap; Some(0) is a literal zero-byte cap.
     pub max_response_bytes: Option<u64>,
     /// None means no throughput pacing; Some(0) fails open as no bucket and emits zero-limit telemetry.

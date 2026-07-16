@@ -432,6 +432,7 @@ mod tests {
                     now_secs: 1_700_000_000,
                     tally_bytes: 0,
                     concurrency_available: true,
+                    stale_quota_grace_limit: None,
                 },
             )
         }

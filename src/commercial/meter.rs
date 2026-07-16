@@ -16,7 +16,10 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::Instant as TokioInstant;
 use uuid::{NoContext, Timestamp, Uuid};
 
-use crate::commercial::{concurrency::ConcurrencyPermit, tally::TallyHandle};
+use crate::commercial::{
+    concurrency::ConcurrencyPermit,
+    tally::{effective_remaining_after_served, TallyHandle},
+};
 use crate::{
     commercial::zero_limits,
     commercial::{
@@ -435,10 +438,17 @@ impl MeterInner {
     }
 
     fn flush_pending_tally(&self) -> Option<i64> {
-        let Some(tally) = &self.tally else {
-            return None;
-        };
         let bytes = self.pending_tally_logical.swap(0, Ordering::AcqRel);
+        let Some(tally) = &self.tally else {
+            return self.limits.stale_quota_grace_limit.map(|_| 0);
+        };
+        if let Some(grace_limit) = self.limits.stale_quota_grace_limit {
+            let served = tally.debit(self.quota_version, bytes);
+            if bytes > 0 {
+                metrics::report_commercial_stale_quota_grace_bytes(bytes);
+            }
+            return Some(effective_remaining_after_served(grace_limit, served));
+        }
         match self.quota_remaining_bytes {
             Some(snapshot_remaining) => Some(tally.debit_and_effective_remaining(
                 self.quota_version,
@@ -2629,6 +2639,52 @@ mod tests {
         let event = reporter.events.lock().unwrap().pop().unwrap();
         assert_eq!(event.logical_bytes, 6);
         assert_eq!(event.status, UsageStatus::CutQuota);
+    }
+
+    #[test]
+    fn stale_quota_grace_bytes_are_debited_and_reported() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let tally = Arc::new(TallyStore::default());
+        let before = metrics::COMMERCIAL_STALE_QUOTA_GRACE_BYTES.get();
+        let meter = MeterHandle::new_enforced(
+            Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: Some("key".to_string()),
+                },
+                tally_account_id: None,
+                entitled_chains: None,
+                entitled_traces: None,
+                limits: GrantedLimits {
+                    stale_quota_grace_limit: Some(100),
+                    max_response_bytes: Some(100),
+                    ..GrantedLimits::default()
+                },
+                on_exceed: OnExceed::Reject,
+                quota_version: 7,
+                quota_remaining_bytes: None,
+                snapshot_generation: None,
+                concurrency_permit: None,
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter,
+            tally.clone(),
+            Arc::new(ActiveStreamRegistry::default()),
+            None,
+        );
+
+        meter.add_logical_bytes(40);
+
+        assert!(!meter.should_stop_after_chunk());
+        assert_eq!(tally.bytes_for("account", 7), 40);
+        assert!(metrics::COMMERCIAL_STALE_QUOTA_GRACE_BYTES.get() >= before + 40);
+
+        meter.add_logical_bytes(60);
+        assert!(meter.should_stop_after_chunk());
+        assert_eq!(tally.bytes_for("account", 7), 100);
+        assert!(metrics::COMMERCIAL_STALE_QUOTA_GRACE_BYTES.get() >= before + 100);
     }
 
     #[tokio::test]
