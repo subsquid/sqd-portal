@@ -148,6 +148,7 @@ pub enum UsageStatus {
     CutQuota,
     CutMaxBytes,
     CutSuspended,
+    CutShutdown,
     Error,
 }
 

@@ -403,6 +403,7 @@ pub async fn run_server(
     let app = app.route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
 
     let drain_timeout = config.drain_timeout;
+    let active_stream_registry = commercial.registry.clone();
 
     let mut app = app
         .route_layer(axum::middleware::from_fn(logging::middleware))
@@ -437,7 +438,13 @@ pub async fn run_server(
     let serve = axum::serve(listener, app)
         .with_graceful_shutdown(async move { cancel_for_serve.cancelled().await });
 
-    drive_serve_with_drain(serve.into_future(), shutdown_signal, drain_timeout).await?;
+    drive_serve_with_drain(
+        serve.into_future(),
+        shutdown_signal,
+        drain_timeout,
+        active_stream_registry,
+    )
+    .await?;
 
     tracing::info!("HTTP server stopped");
     Ok(())
@@ -452,6 +459,7 @@ async fn drive_serve_with_drain<F>(
     serve: F,
     shutdown_signal: CancellationToken,
     drain_timeout: std::time::Duration,
+    active_stream_registry: Option<Arc<crate::commercial::ActiveStreamRegistry>>,
 ) -> std::io::Result<()>
 where
     F: std::future::Future<Output = std::io::Result<()>>,
@@ -461,18 +469,25 @@ where
         tokio::time::sleep(drain_timeout).await;
     };
 
-    tokio::select! {
+    let drain_timed_out = tokio::select! {
         res = serve => {
             res?;
             tracing::info!("HTTP server drained cleanly");
+            false
         }
         _ = force_close => {
-            tracing::warn!(
-                "Drain timeout {:?} exceeded; listener will close on serve drop. \
-                 In-flight connections are detached and will be aborted only on \
-                 process exit (runtime drop after main() returns).",
-                drain_timeout
-            );
+            true
+        }
+    };
+    if drain_timed_out {
+        tracing::warn!(
+            "Drain timeout {:?} exceeded; listener will close on serve drop and \
+             in-flight commercial streams will be cut before the final usage flush.",
+            drain_timeout
+        );
+        if let Some(registry) = active_stream_registry {
+            let cut = registry.cut_all_for_shutdown().await;
+            tracing::info!(cut, "commercial streams finalized after drain timeout");
         }
     }
     Ok(())
@@ -1550,9 +1565,11 @@ mod tests {
     use axum::async_trait;
     use std::future;
     use std::io;
+    use std::pin::Pin;
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use futures::StreamExt;
     use tower::ServiceExt;
 
     use crate::commercial::{
@@ -1562,6 +1579,27 @@ mod tests {
         Granted, GrantedLimits, LocalControlPlane, OnExceed, Principal, PublicFallbackConfig,
         SnapshotRecord, TallyStore,
     };
+
+    #[derive(Default)]
+    struct ShutdownRecordingReporter {
+        queued: Mutex<Vec<crate::commercial::StreamUsageEvent>>,
+        flushed: Mutex<Vec<crate::commercial::StreamUsageEvent>>,
+    }
+
+    impl UsageReporter for ShutdownRecordingReporter {
+        fn report(&self, event: crate::commercial::StreamUsageEvent) {
+            self.queued.lock().unwrap().push(event);
+        }
+
+        fn flush_shutdown(&self) -> Pin<Box<dyn future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.flushed
+                    .lock()
+                    .unwrap()
+                    .extend(self.queued.lock().unwrap().drain(..));
+            })
+        }
+    }
 
     #[tokio::test]
     async fn internal_routes_require_service_token() {
@@ -2354,7 +2392,12 @@ mod tests {
             Ok::<(), std::io::Error>(())
         };
 
-        let driver = tokio::spawn(drive_serve_with_drain(serve, cancel.clone(), drain_timeout));
+        let driver = tokio::spawn(drive_serve_with_drain(
+            serve,
+            cancel.clone(),
+            drain_timeout,
+            None,
+        ));
 
         tokio::time::advance(Duration::from_millis(10)).await;
         cancel.cancel();
@@ -2372,7 +2415,12 @@ mod tests {
 
         let serve = std::future::pending::<std::io::Result<()>>();
 
-        let driver = tokio::spawn(drive_serve_with_drain(serve, cancel.clone(), drain_timeout));
+        let driver = tokio::spawn(drive_serve_with_drain(
+            serve,
+            cancel.clone(),
+            drain_timeout,
+            None,
+        ));
 
         // Trigger shutdown immediately; force_close arm starts its drain_timeout countdown.
         cancel.cancel();
@@ -2388,6 +2436,73 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn drain_timeout_survivor_is_finalized_before_reporter_flush() {
+        let cutoff_labels = vec![("status".to_owned(), "cut_shutdown".to_owned())];
+        let cutoffs_before = crate::metrics::COMMERCIAL_CUTOFFS
+            .get_or_create(&cutoff_labels)
+            .get();
+        let reporter = Arc::new(ShutdownRecordingReporter::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let meter = MeterHandle::new_enforced(
+            Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: Some("key".to_string()),
+                },
+                tally_account_id: None,
+                entitled_chains: None,
+                entitled_traces: None,
+                limits: GrantedLimits::default(),
+                on_exceed: OnExceed::Reject,
+                quota_version: 7,
+                quota_remaining_bytes: None,
+                snapshot_generation: None,
+                concurrency_permit: None,
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter.clone(),
+            Arc::new(TallyStore::default()),
+            registry.clone(),
+            None,
+        );
+        let stream = crate::commercial::meter::tap_plain_stream(
+            futures::stream::pending::<Result<bytes::Bytes, io::Error>>(),
+            meter,
+        );
+        let stream_task = tokio::spawn(async move {
+            futures::pin_mut!(stream);
+            while stream.next().await.is_some() {}
+        });
+        tokio::task::yield_now().await;
+
+        let cancel = CancellationToken::new();
+        let driver = tokio::spawn(drive_serve_with_drain(
+            future::pending::<std::io::Result<()>>(),
+            cancel.clone(),
+            Duration::from_millis(100),
+            Some(registry.clone()),
+        ));
+        cancel.cancel();
+        tokio::time::advance(Duration::from_millis(101)).await;
+        driver.await.expect("join").expect("drain timeout");
+
+        reporter.flush_shutdown().await;
+        stream_task.await.expect("metered stream exits");
+
+        let flushed = reporter.flushed.lock().unwrap();
+        assert_eq!(flushed.len(), 1, "surviving stream usage must be flushed");
+        assert_eq!(flushed[0].status, crate::commercial::UsageStatus::CutShutdown);
+        assert_eq!(
+            crate::metrics::COMMERCIAL_CUTOFFS
+                .get_or_create(&cutoff_labels)
+                .get(),
+            cutoffs_before + 1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn drive_serve_propagates_serve_error() {
         let cancel = CancellationToken::new();
         let drain_timeout = Duration::from_secs(10);
@@ -2396,7 +2511,7 @@ mod tests {
             Err::<(), std::io::Error>(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
         };
 
-        let res = drive_serve_with_drain(serve, cancel, drain_timeout).await;
+        let res = drive_serve_with_drain(serve, cancel, drain_timeout, None).await;
         let err = res.expect_err("error from serve propagates");
         assert_eq!(err.to_string(), "boom");
     }

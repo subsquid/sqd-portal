@@ -1,14 +1,21 @@
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
-
-use dashmap::DashMap;
 use tokio::sync::Notify;
 
 #[derive(Debug, Default)]
 pub struct ActiveStreamRegistry {
-    streams: DashMap<String, StreamCtl>,
+    state: Mutex<RegistryState>,
+}
+
+#[derive(Debug, Default)]
+struct RegistryState {
+    streams: HashMap<String, StreamCtl>,
+    shutting_down: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -16,7 +23,15 @@ struct StreamCtl {
     key_id: Option<String>,
     kill: Arc<AtomicBool>,
     kill_notify: Arc<Notify>,
+    shutdown: StreamShutdown,
     floor_bytes_per_sec: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StreamShutdown {
+    pub shutdown_cut: Arc<AtomicBool>,
+    pub finalized: Arc<AtomicBool>,
+    pub finalized_notify: Arc<Notify>,
 }
 
 pub struct StreamRegistration {
@@ -37,8 +52,13 @@ impl ActiveStreamRegistry {
             key_id,
             kill,
             Arc::new(Notify::new()),
+            StreamShutdown {
+                finalized: Arc::new(AtomicBool::new(true)),
+                ..Default::default()
+            },
             floor_bytes_per_sec,
         )
+        .0
     }
 
     pub(crate) fn register_with_notify(
@@ -47,29 +67,42 @@ impl ActiveStreamRegistry {
         key_id: Option<String>,
         kill: Arc<AtomicBool>,
         kill_notify: Arc<Notify>,
+        shutdown: StreamShutdown,
         floor_bytes_per_sec: Arc<AtomicU64>,
-    ) -> StreamRegistration {
-        self.streams.insert(
+    ) -> (StreamRegistration, bool) {
+        let mut state = self.state.lock().unwrap();
+        let shutting_down = state.shutting_down;
+        if shutting_down {
+            shutdown.shutdown_cut.store(true, Ordering::Release);
+            kill.store(true, Ordering::Release);
+            kill_notify.notify_one();
+        }
+        state.streams.insert(
             event_id.clone(),
             StreamCtl {
                 key_id,
                 kill,
                 kill_notify,
+                shutdown,
                 floor_bytes_per_sec,
             },
         );
-        StreamRegistration {
-            registry: self.clone(),
-            event_id,
-        }
+        (
+            StreamRegistration {
+                registry: self.clone(),
+                event_id,
+            },
+            shutting_down,
+        )
     }
 
     pub fn kill_key(&self, key_id: &str) -> usize {
+        let state = self.state.lock().unwrap();
         let mut killed = 0;
-        for entry in self.streams.iter() {
-            if entry.value().key_id.as_deref() == Some(key_id) {
-                entry.value().kill.store(true, Ordering::Release);
-                entry.value().kill_notify.notify_one();
+        for stream in state.streams.values() {
+            if stream.key_id.as_deref() == Some(key_id) {
+                stream.kill.store(true, Ordering::Release);
+                stream.kill_notify.notify_one();
                 killed += 1;
             }
         }
@@ -77,21 +110,48 @@ impl ActiveStreamRegistry {
     }
 
     pub fn kill_all(&self) -> usize {
+        let state = self.state.lock().unwrap();
         let mut killed = 0;
-        for entry in self.streams.iter() {
-            entry.value().kill.store(true, Ordering::Release);
-            entry.value().kill_notify.notify_one();
+        for stream in state.streams.values() {
+            stream.kill.store(true, Ordering::Release);
+            stream.kill_notify.notify_one();
             killed += 1;
         }
         killed
     }
 
+    pub async fn cut_all_for_shutdown(&self) -> usize {
+        let streams = {
+            let mut state = self.state.lock().unwrap();
+            state.shutting_down = true;
+            let streams = state.streams.values().cloned().collect::<Vec<_>>();
+            for stream in &streams {
+                stream.shutdown.shutdown_cut.store(true, Ordering::Release);
+                stream.kill.store(true, Ordering::Release);
+                stream.kill_notify.notify_one();
+            }
+            streams
+        };
+        for stream in &streams {
+            loop {
+                let notified = stream.shutdown.finalized_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if stream.shutdown.finalized.load(Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
+            }
+        }
+        streams.len()
+    }
+
     pub fn set_floor_for_key(&self, key_id: &str, floor_bytes_per_sec: u64) -> usize {
+        let state = self.state.lock().unwrap();
         let mut changed = 0;
-        for entry in self.streams.iter() {
-            if entry.value().key_id.as_deref() == Some(key_id) {
-                entry
-                    .value()
+        for stream in state.streams.values() {
+            if stream.key_id.as_deref() == Some(key_id) {
+                stream
                     .floor_bytes_per_sec
                     .store(floor_bytes_per_sec, Ordering::Release);
                 changed += 1;
@@ -102,18 +162,23 @@ impl ActiveStreamRegistry {
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.streams.len()
+        self.state.lock().unwrap().streams.len()
     }
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.streams.is_empty()
+        self.state.lock().unwrap().streams.is_empty()
     }
 }
 
 impl Drop for StreamRegistration {
     fn drop(&mut self) {
-        self.registry.streams.remove(&self.event_id);
+        self.registry
+            .state
+            .lock()
+            .unwrap()
+            .streams
+            .remove(&self.event_id);
     }
 }
 

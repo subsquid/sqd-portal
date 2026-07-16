@@ -23,9 +23,9 @@ use crate::commercial::{
 use crate::{
     commercial::zero_limits,
     commercial::{
-        registry::StreamRegistration, ActiveStreamRegistry, DataSource, Endpoint, Granted,
-        GrantedLimits, KeyStatus, OnExceed, Principal, SnapshotStore, StreamUsageEvent, TallyStore,
-        UsageReporter, UsageStatus,
+        registry::{StreamRegistration, StreamShutdown}, ActiveStreamRegistry, DataSource, Endpoint,
+        Granted, GrantedLimits, KeyStatus, OnExceed, Principal, SnapshotStore, StreamUsageEvent,
+        TallyStore, UsageReporter, UsageStatus,
     },
     metrics,
     types::Compression,
@@ -61,6 +61,7 @@ struct MeterInner {
     chunks: AtomicU64,
     status: AtomicU8,
     flushed: AtomicBool,
+    shutdown: StreamShutdown,
     reporter: Arc<dyn UsageReporter>,
     pod: String,
     quota_version: u64,
@@ -176,6 +177,7 @@ impl MeterHandle {
         }
         let kill = Arc::new(AtomicBool::new(false));
         let kill_notify = Arc::new(Notify::new());
+        let shutdown = StreamShutdown::default();
         let floor_bytes_per_sec = Arc::new(AtomicU64::new(0));
         let bucket = AsyncMutex::new(bucket_from_limits(&limits));
         let register = |current_generation: Option<u64>| {
@@ -197,6 +199,7 @@ impl MeterHandle {
                     principal.api_key_id.clone(),
                     kill.clone(),
                     kill_notify.clone(),
+                    shutdown.clone(),
                     floor_bytes_per_sec.clone(),
                 )
             });
@@ -222,7 +225,10 @@ impl MeterHandle {
         } else {
             register(None)
         };
-        Self {
+        let shutdown_at_registration = registration
+            .as_ref()
+            .is_some_and(|(_, shutting_down)| *shutting_down);
+        let meter = Self {
             inner: Arc::new(MeterInner {
                 principal,
                 event_id,
@@ -240,6 +246,7 @@ impl MeterHandle {
                 chunks: AtomicU64::new(0),
                 status: AtomicU8::new(status_code(UsageStatus::ClientDisconnect)),
                 flushed: AtomicBool::new(false),
+                shutdown,
                 reporter,
                 pod: pod_hostname().to_string(),
                 quota_version,
@@ -251,10 +258,15 @@ impl MeterHandle {
                 kill_notify,
                 floor_bytes_per_sec,
                 bucket,
-                _registration: registration,
+                _registration: registration.map(|(registration, _)| registration),
                 _concurrency_permit: concurrency_permit,
             }),
+        };
+        if shutdown_at_registration {
+            meter.inner.set_status(UsageStatus::CutShutdown);
+            meter.inner.flush_once();
         }
+        meter
     }
 
     pub fn set_data_source(&self, source: DataSource) {
@@ -286,18 +298,21 @@ impl MeterHandle {
 
     pub fn complete(&self) {
         self.inner.flush_pending_tally();
-        let _ = self.inner.status.compare_exchange(
-            status_code(UsageStatus::ClientDisconnect),
-            status_code(UsageStatus::Completed),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        if self.inner.shutdown.shutdown_cut.load(Ordering::Acquire) {
+            self.inner.set_status(UsageStatus::CutShutdown);
+        } else {
+            let _ = self.inner.status.compare_exchange(
+                status_code(UsageStatus::ClientDisconnect),
+                status_code(UsageStatus::Completed),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
         self.inner.flush_once();
     }
 
     pub fn discard(&self) {
-        self.inner.flush_pending_tally();
-        self.inner.flushed.store(true, Ordering::Release);
+        self.inner.discard();
     }
 
     pub fn should_stop_after_chunk(&self) -> bool {
@@ -326,7 +341,7 @@ impl MeterHandle {
         if !self.inner.kill.load(Ordering::Acquire) {
             self.inner.kill_notify.notified().await;
         }
-        self.inner.set_status(UsageStatus::CutSuspended);
+        self.inner.set_cut_status();
     }
 
     pub async fn complete_buffered_response(&self) {
@@ -366,7 +381,7 @@ impl MeterInner {
     fn should_stop_after_chunk(&self) -> bool {
         let effective_remaining = self.flush_pending_tally();
         if self.kill.load(Ordering::Acquire) {
-            self.set_status(UsageStatus::CutSuspended);
+            self.set_cut_status();
             return true;
         }
 
@@ -409,7 +424,7 @@ impl MeterInner {
     fn observe_buffered_body_after_materialization(&self) {
         let effective_remaining = self.flush_pending_tally();
         if self.kill.load(Ordering::Acquire) {
-            self.set_status(UsageStatus::CutSuspended);
+            self.set_cut_status();
             return;
         }
 
@@ -470,10 +485,21 @@ impl MeterInner {
         if old != code
             && matches!(
                 status,
-                UsageStatus::CutQuota | UsageStatus::CutMaxBytes | UsageStatus::CutSuspended
+                UsageStatus::CutQuota
+                    | UsageStatus::CutMaxBytes
+                    | UsageStatus::CutSuspended
+                    | UsageStatus::CutShutdown
             )
         {
             metrics::report_commercial_cutoff(&status);
+        }
+    }
+
+    fn set_cut_status(&self) {
+        if self.shutdown.shutdown_cut.load(Ordering::Acquire) {
+            self.set_status(UsageStatus::CutShutdown);
+        } else {
+            self.set_status(UsageStatus::CutSuspended);
         }
     }
 
@@ -490,7 +516,7 @@ impl MeterInner {
         let mut warned = false;
         loop {
             if self.kill.load(Ordering::Acquire) {
-                self.set_status(UsageStatus::CutSuspended);
+                self.set_cut_status();
                 return;
             }
             let Some((rate, burst)) = self.current_rate_and_burst() else {
@@ -521,7 +547,7 @@ impl MeterInner {
             tokio::select! {
                 biased;
                 _ = self.kill_notify.notified() => {
-                    self.set_status(UsageStatus::CutSuspended);
+                    self.set_cut_status();
                     return;
                 }
                 _ = tokio::time::sleep(wait) => {}
@@ -531,7 +557,7 @@ impl MeterInner {
 
     async fn pace_buffered(&self, bytes: u64) {
         if self.kill.load(Ordering::Acquire) {
-            self.set_status(UsageStatus::CutSuspended);
+            self.set_cut_status();
             return;
         }
         let Some((rate, burst)) = self.current_rate_and_burst() else {
@@ -566,7 +592,7 @@ impl MeterInner {
         tokio::select! {
             biased;
             _ = self.kill_notify.notified() => {
-                self.set_status(UsageStatus::CutSuspended);
+                self.set_cut_status();
             }
             _ = tokio::time::sleep(wait) => {}
         }
@@ -614,6 +640,20 @@ impl MeterInner {
             pod: self.pod.clone(),
             quota_version: self.quota_version,
         });
+        self.mark_finalized();
+    }
+
+    fn discard(&self) {
+        if self.flushed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.flush_pending_tally();
+        self.mark_finalized();
+    }
+
+    fn mark_finalized(&self) {
+        self.shutdown.finalized.store(true, Ordering::Release);
+        self.shutdown.finalized_notify.notify_waiters();
     }
 }
 
@@ -1617,6 +1657,7 @@ fn status_code(status: UsageStatus) -> u8 {
         UsageStatus::CutMaxBytes => 3,
         UsageStatus::CutSuspended => 4,
         UsageStatus::Error => 5,
+        UsageStatus::CutShutdown => 6,
     }
 }
 
@@ -1627,6 +1668,7 @@ fn status_from_code(code: u8) -> UsageStatus {
         3 => UsageStatus::CutMaxBytes,
         4 => UsageStatus::CutSuspended,
         5 => UsageStatus::Error,
+        6 => UsageStatus::CutShutdown,
         _ => UsageStatus::ClientDisconnect,
     }
 }

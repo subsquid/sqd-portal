@@ -316,6 +316,7 @@ fn usage_status_label(status: &UsageStatus) -> &'static str {
         UsageStatus::CutQuota => "cut_quota",
         UsageStatus::CutMaxBytes => "cut_max_bytes",
         UsageStatus::CutSuspended => "cut_suspended",
+        UsageStatus::CutShutdown => "cut_shutdown",
         UsageStatus::Error => "error",
     }
 }
