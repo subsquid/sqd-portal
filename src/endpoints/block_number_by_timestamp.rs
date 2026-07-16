@@ -6,10 +6,14 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use futures::{pin_mut, StreamExt};
+use futures::StreamExt;
 use tower_http::request_id::RequestId;
 
 use crate::{
+    commercial::{
+        meter::tap_wire_stream_no_complete, CommercialGrant, DataSource, Endpoint, MeterHandle,
+        UsageReporter,
+    },
     config::Config,
     controller::task_manager::TaskManager,
     datasets::DatasetConfig,
@@ -43,6 +47,7 @@ use super::stream::{DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_
     ),
     tag = "Datasets"
 )]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn get_blocknumber_by_timestamp(
     Path((_, timestamp)): Path<(DatasetId, u64)>,
     Extension(req): Extension<RequestId>,
@@ -50,9 +55,18 @@ pub(crate) async fn get_blocknumber_by_timestamp(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
     dataset: DatasetConfig,
 ) -> Response {
-    resolve(
+    let meter = meter_from_extensions(
+        grant,
+        reporter,
+        dataset.default_name.clone(),
+        req.header_value().to_str().unwrap_or("").to_string(),
+    );
+
+    let result = resolve(
         timestamp,
         &req,
         &network,
@@ -60,18 +74,25 @@ pub(crate) async fn get_blocknumber_by_timestamp(
         &config,
         &hotblocks,
         &dataset,
+        meter.clone(),
     )
-    .await
-    .map(|resolved| {
-        (
-            [(DATA_SOURCE_HEADER, resolved.data_source.as_str())],
-            axum::Json(BlockNumberResponse {
-                block_number: resolved.block_number,
-            }),
-        )
-            .into_response()
-    })
-    .unwrap_or_else(BlockNumberLookupError::into_response)
+    .await;
+
+    if result.is_err() {
+        finish_meter_error(&meter);
+    }
+
+    result
+        .map(|resolved| {
+            (
+                [(DATA_SOURCE_HEADER, resolved.data_source.as_str())],
+                axum::Json(BlockNumberResponse {
+                    block_number: resolved.block_number,
+                }),
+            )
+                .into_response()
+        })
+        .unwrap_or_else(BlockNumberLookupError::into_response)
 }
 
 pub struct ResolvedBlockNumber {
@@ -124,6 +145,7 @@ impl BlockNumberLookupError {
 /// Archive data is preferred when the dataset has an SQD Network mapping. If
 /// the archive lookup cannot find a matching chunk, the resolver falls back to
 /// HotblocksDB when the dataset has a real-time data source configured.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve(
     timestamp: u64,
     req: &RequestId,
@@ -132,6 +154,7 @@ pub async fn resolve(
     config: &Config,
     hotblocks: &HotblocksHandle,
     dataset: &DatasetConfig,
+    meter: Option<MeterHandle>,
 ) -> Result<ResolvedBlockNumber, BlockNumberLookupError> {
     get_blocknumber_by_timestamp_inner(
         dataset.network_id.is_some(),
@@ -151,10 +174,14 @@ pub async fn resolve(
                 config,
                 dataset,
                 dataset_id,
+                meter.clone(),
             )
             .await
         },
-        || async { get_hotblocks_blocknumber_by_timestamp(timestamp, hotblocks, dataset).await },
+        || async {
+            get_hotblocks_blocknumber_by_timestamp(timestamp, hotblocks, dataset, meter.clone())
+                .await
+        },
     )
     .await
 }
@@ -209,6 +236,7 @@ where
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn get_archival_blocknumber_by_timestamp(
     timestamp: u64,
     req: &RequestId,
@@ -217,6 +245,7 @@ async fn get_archival_blocknumber_by_timestamp(
     config: &Config,
     dataset: &DatasetConfig,
     dataset_id: &DatasetId,
+    meter: Option<MeterHandle>,
 ) -> Result<u64, BlockNumberLookupError> {
     let ts = timestamp
         .checked_mul(1000) // milliseconds
@@ -254,27 +283,48 @@ async fn get_archival_blocknumber_by_timestamp(
         }
     };
 
-    pin_mut!(stream);
+    if let Some(meter) = &meter {
+        meter.set_data_source(DataSource::Network);
+    }
 
-    let js = collect_to_string(
-        stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result))),
-    )
-    .await
-    .map_err(|e| {
-        tracing::warn!("stream processing error: {:?}", e);
-        BlockNumberLookupError::Internal("stream processing error".to_string())
-    })?;
+    let js = collect_archive_stream(stream, meter.clone())
+        .await
+        .map_err(|e| {
+            tracing::warn!("stream processing error: {:?}", e);
+            BlockNumberLookupError::Internal("stream processing error".to_string())
+        })?;
 
-    find_block_in_chunk(timestamp, &js).map_err(|e| {
+    let block = find_block_in_chunk(timestamp, &js).map_err(|e| {
         tracing::warn!("cannot find blocknumber in chunk: {:?}", e);
         BlockNumberLookupError::NotFound("block not in chunk".to_string())
-    })
+    })?;
+    if let Some(meter) = &meter {
+        meter.complete();
+    }
+    Ok(block)
+}
+
+async fn collect_archive_stream<S>(stream: S, meter: Option<MeterHandle>) -> anyhow::Result<String>
+where
+    S: futures::Stream<Item = Vec<u8>> + Send + 'static,
+{
+    let bytes =
+        stream.map(|result| std::io::Result::Ok(tokio_util::bytes::Bytes::from_owner(result)));
+    if let Some(meter) = meter {
+        let decoded =
+            collect_to_string(Box::pin(tap_wire_stream_no_complete(bytes, meter.clone()))).await?;
+        meter.add_logical_bytes(decoded.len() as u64);
+        Ok(decoded)
+    } else {
+        collect_to_string(Box::pin(bytes)).await
+    }
 }
 
 async fn get_hotblocks_blocknumber_by_timestamp(
     timestamp: u64,
     hotblocks: &HotblocksHandle,
     dataset: &DatasetConfig,
+    meter: Option<MeterHandle>,
 ) -> Result<u64, BlockNumberLookupError> {
     let status = hotblocks
         .get_status(&dataset.default_name)
@@ -306,10 +356,14 @@ async fn get_hotblocks_blocknumber_by_timestamp(
                 )));
             }
 
-            collect_hotblocks_stream(response).await.map_err(|e| {
-                tracing::warn!("hotblocks stream processing error: {:?}", e);
-                BlockNumberLookupError::Internal("hotblocks stream processing error".to_string())
-            })
+            collect_hotblocks_stream(response, meter.clone())
+                .await
+                .map_err(|e| {
+                    tracing::warn!("hotblocks stream processing error: {:?}", e);
+                    BlockNumberLookupError::Internal(
+                        "hotblocks stream processing error".to_string(),
+                    )
+                })
         },
     )
     .await
@@ -357,14 +411,36 @@ where
     })
 }
 
-async fn collect_hotblocks_stream(response: reqwest::Response) -> anyhow::Result<String> {
+async fn collect_hotblocks_stream(
+    response: reqwest::Response,
+    meter: Option<MeterHandle>,
+) -> anyhow::Result<String> {
     let is_gzip = response
         .headers()
         .get(header::CONTENT_ENCODING)
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
+    if let Some(meter) = &meter {
+        meter.set_data_source(DataSource::RealTime);
+    }
     let bytes = response.bytes().await?;
+    if let Some(meter) = &meter {
+        meter.add_chunk();
+        meter.add_wire_bytes(bytes.len() as u64);
+    }
 
-    decode_hotblocks_stream_body(is_gzip, bytes.as_ref())
+    let decoded = decode_hotblocks_stream_body(is_gzip, bytes.as_ref());
+    match (&meter, &decoded) {
+        (Some(meter), Ok(body)) => {
+            meter.add_logical_bytes(body.len() as u64);
+            meter.complete_buffered_response().await;
+        }
+        (Some(meter), Err(_)) => {
+            meter.mark_error();
+            meter.complete();
+        }
+        (None, _) => {}
+    }
+    decoded
 }
 
 fn decode_hotblocks_stream_body(is_gzip: bool, bytes: &[u8]) -> anyhow::Result<String> {
@@ -376,6 +452,44 @@ fn decode_hotblocks_stream_body(is_gzip: bool, bytes: &[u8]) -> anyhow::Result<S
     }
 
     Ok(String::from_utf8(bytes.to_vec())?)
+}
+
+fn meter_from_extensions(
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    dataset: String,
+    request_id: String,
+) -> Option<MeterHandle> {
+    let grant = grant?;
+    let reporter = reporter?;
+    let snapshot_store = grant.0.snapshot_store.clone();
+    match (grant.0.tally.clone(), grant.0.registry.clone()) {
+        (Some(tally), Some(registry)) => Some(MeterHandle::new_enforced(
+            grant.0.granted.clone(),
+            request_id,
+            Endpoint::TsLookup,
+            dataset,
+            reporter.0,
+            tally,
+            registry,
+            snapshot_store,
+        )),
+        _ => Some(MeterHandle::new(
+            grant.0.granted.principal.clone(),
+            request_id,
+            Endpoint::TsLookup,
+            dataset,
+            reporter.0,
+            grant.0.granted.quota_version,
+        )),
+    }
+}
+
+fn finish_meter_error(meter: &Option<MeterHandle>) {
+    if let Some(meter) = meter {
+        meter.mark_error();
+        meter.complete();
+    }
 }
 
 fn build_request(
@@ -405,16 +519,30 @@ fn build_request(
 mod tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
+    use axum::{routing::get, Router};
     use flate2::{write::GzEncoder, Compression};
+    use futures::stream;
     use sqd_primitives::BlockRef;
     use std::io::Write;
 
+    use crate::commercial::{Principal, StreamUsageEvent, UsageStatus};
     use crate::hotblocks::StatusData;
 
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: Mutex<Vec<StreamUsageEvent>>,
+    }
+
+    impl UsageReporter for RecordingReporter {
+        fn report(&self, event: StreamUsageEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     #[tokio::test]
     async fn get_blocknumber_by_timestamp_uses_archive_path_first() {
@@ -446,6 +574,47 @@ mod tests {
         assert_eq!(result.data_source, BlockNumberDataSource::Network);
         assert_eq!(archive_calls.load(Ordering::Relaxed), 1);
         assert_eq!(hotblocks_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn collect_archive_stream_counts_split_gzip_members() {
+        let first = b"{\"header\":{\"number\":100,\"timestamp\":1700000000}}\n";
+        let second = b"{\"header\":{\"number\":101,\"timestamp\":1700000005}}\n";
+        let mut encoded = gzip(first);
+        encoded.extend(gzip(second));
+        let chunks = vec![
+            encoded[..11].to_vec(),
+            encoded[11..encoded.len() - 7].to_vec(),
+            encoded[encoded.len() - 7..].to_vec(),
+        ];
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = MeterHandle::new(
+            Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some("key".to_string()),
+            },
+            "request".to_string(),
+            Endpoint::TsLookup,
+            "ethereum-mainnet".to_string(),
+            reporter.clone(),
+            7,
+        );
+
+        let decoded = collect_archive_stream(stream::iter(chunks), Some(meter.clone()))
+            .await
+            .unwrap();
+        meter.complete();
+
+        let mut expected = first.to_vec();
+        expected.extend(second);
+        assert_eq!(decoded, String::from_utf8(expected).unwrap());
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.endpoint, Endpoint::TsLookup);
+        assert_eq!(event.data_source, DataSource::Network);
+        assert_eq!(event.logical_bytes, (first.len() + second.len()) as u64);
+        assert_eq!(event.wire_bytes, encoded.len() as u64);
+        assert_eq!(event.chunks, 3);
+        assert_eq!(event.status, UsageStatus::Completed);
     }
 
     #[tokio::test]
@@ -595,10 +764,72 @@ mod tests {
         assert!(decode_hotblocks_stream_body(true, b"not gzip").is_err());
     }
 
+    #[tokio::test]
+    async fn collect_hotblocks_stream_counts_ts_lookup_usage() {
+        let body = b"{\"header\":{\"number\":100,\"timestamp\":1700000000}}\n";
+        let encoded = gzip(body);
+        let response = response_with_body(encoded.clone(), true).await;
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = MeterHandle::new(
+            Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some("key".to_string()),
+            },
+            "request".to_string(),
+            Endpoint::TsLookup,
+            "ethereum-mainnet".to_string(),
+            reporter.clone(),
+            7,
+        );
+
+        let decoded = collect_hotblocks_stream(response, Some(meter))
+            .await
+            .unwrap();
+
+        assert_eq!(decoded, String::from_utf8(body.to_vec()).unwrap());
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.endpoint, Endpoint::TsLookup);
+        assert_eq!(event.data_source, DataSource::RealTime);
+        assert_eq!(event.logical_bytes, body.len() as u64);
+        assert_eq!(event.wire_bytes, encoded.len() as u64);
+        assert_eq!(event.chunks, 1);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    async fn response_with_body(body: Vec<u8>, is_gzip: bool) -> reqwest::Response {
+        let app = Router::new().route(
+            "/body",
+            get(move || {
+                let body = body.clone();
+                async move {
+                    let mut builder = Response::builder().status(StatusCode::OK);
+                    if is_gzip {
+                        builder = builder.header(header::CONTENT_ENCODING, "gzip");
+                    }
+                    builder.body(axum::body::Body::from(body)).unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        reqwest::Client::builder()
+            .no_gzip()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/body"))
+            .send()
+            .await
+            .unwrap()
     }
 
     fn fake_status() -> Status {

@@ -9,13 +9,15 @@ use axum::{
     extract::{FromRequest, FromRequestParts, Path, Query, Request},
     http::{header, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, MethodRouter},
     Extension, RequestExt, Router,
 };
 use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqd_contract_client::PeerId;
+use subtle::ConstantTimeEq;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -42,6 +44,10 @@ use crate::types::Compression;
 use crate::utils::conversion::json_lines_to_json;
 use crate::utils::logging::MethodRouterExt;
 use crate::{
+    commercial::{
+        extractor as commercial_extractor, CommercialGrant, CommercialRuntime, Endpoint,
+        MeterHandle, Principal, SnapshotStore, UsageReporter,
+    },
     config::Config,
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
@@ -65,6 +71,194 @@ use axum::body;
 /// They are stripped from the served OpenAPI spec unless `show_internal` is true.
 /// When shown, the marker is stripped from the summary for a clean UI.
 const INTERNAL_MARKER: &str = "[INTERNAL]";
+
+fn commercial_route_layer(
+    route: MethodRouter,
+    commercial_enabled: bool,
+    endpoint: Endpoint,
+) -> MethodRouter {
+    if commercial_enabled {
+        route.route_layer(axum::middleware::from_fn(move |req, next| {
+            commercial_extractor::middleware(req, next, endpoint)
+        }))
+    } else {
+        route
+    }
+}
+
+fn internal_route_layer(
+    route: MethodRouter,
+    commercial_enabled: bool,
+    service_token: Option<Arc<str>>,
+) -> MethodRouter {
+    if !commercial_enabled {
+        return route;
+    }
+    route.route_layer(axum::middleware::from_fn(
+        move |mut req: Request, next: axum::middleware::Next| {
+            let service_token = service_token.clone();
+            async move {
+                let authorized = service_token.as_deref().is_some_and(|expected| {
+                    internal_service_token_matches(req.headers(), expected)
+                });
+                if !authorized {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                req.extensions_mut().insert(Principal {
+                    account_id: "oss".to_string(),
+                    api_key_id: None,
+                });
+                next.run(req).await
+            }
+        },
+    ))
+}
+
+fn internal_service_token_matches(headers: &HeaderMap, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let Some(presented) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty() && !value.contains(char::is_whitespace))
+    else {
+        return false;
+    };
+    let presented = Sha256::digest(presented.as_bytes());
+    let expected = Sha256::digest(expected.as_bytes());
+    presented.ct_eq(&expected).into()
+}
+
+fn configured_internal_service_token(config: &Config) -> Option<Arc<str>> {
+    let env = &config.commercial.as_ref()?.service_token_env;
+    std::env::var(env)
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .map(Arc::from)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CommercialRouteDef {
+    method: CommercialRouteMethod,
+    path: &'static str,
+    endpoint_path: &'static str,
+    endpoint: Endpoint,
+    handler: CommercialRouteHandler,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommercialRouteMethod {
+    Get,
+    Post,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CommercialRouteHandler {
+    ArchivalStreamRestricted,
+    ArchivalStreamDebug,
+    FinalizedStream,
+    Stream,
+    TimestampBlock,
+    LegacyQuery,
+    #[cfg(feature = "sql")]
+    SqlQuery,
+}
+
+const COMMERCIAL_ROUTES: &[CommercialRouteDef] = &[
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/datasets/:dataset/archival-stream",
+        endpoint_path: "/archival-stream",
+        endpoint: Endpoint::ArchivalStream,
+        handler: CommercialRouteHandler::ArchivalStreamRestricted,
+    },
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/datasets/:dataset/archival-stream/debug",
+        endpoint_path: "/archival-stream/debug",
+        endpoint: Endpoint::ArchivalStream,
+        handler: CommercialRouteHandler::ArchivalStreamDebug,
+    },
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/datasets/:dataset/finalized-stream",
+        endpoint_path: "/finalized-stream",
+        endpoint: Endpoint::FinalizedStream,
+        handler: CommercialRouteHandler::FinalizedStream,
+    },
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/datasets/:dataset/stream",
+        endpoint_path: "/stream",
+        endpoint: Endpoint::Stream,
+        handler: CommercialRouteHandler::Stream,
+    },
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Get,
+        path: "/datasets/:dataset/timestamps/:timestamp/block",
+        endpoint_path: "/timestamps/block",
+        endpoint: Endpoint::TsLookup,
+        handler: CommercialRouteHandler::TimestampBlock,
+    },
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/datasets/:dataset_id/query/:worker_id",
+        endpoint_path: "/query",
+        endpoint: Endpoint::LegacyQuery,
+        handler: CommercialRouteHandler::LegacyQuery,
+    },
+    #[cfg(feature = "sql")]
+    CommercialRouteDef {
+        method: CommercialRouteMethod::Post,
+        path: "/sql/query",
+        endpoint_path: "/sql/query",
+        endpoint: Endpoint::SqlQuery,
+        handler: CommercialRouteHandler::SqlQuery,
+    },
+];
+
+fn register_commercial_routes<F>(
+    mut router: Router,
+    commercial_enabled: bool,
+    mut route_for: F,
+) -> Router
+where
+    F: FnMut(CommercialRouteDef) -> MethodRouter,
+{
+    for def in COMMERCIAL_ROUTES {
+        router = router.route(
+            def.path,
+            commercial_route_layer(route_for(*def), commercial_enabled, def.endpoint)
+                .endpoint(def.endpoint_path),
+        );
+    }
+    router
+}
+
+#[allow(deprecated)]
+fn production_commercial_route(def: CommercialRouteDef) -> MethodRouter {
+    match (def.method, def.handler) {
+        (CommercialRouteMethod::Post, CommercialRouteHandler::ArchivalStreamRestricted) => {
+            post(run_archival_stream_restricted)
+        }
+        (CommercialRouteMethod::Post, CommercialRouteHandler::ArchivalStreamDebug) => {
+            post(run_archival_stream)
+        }
+        (CommercialRouteMethod::Post, CommercialRouteHandler::FinalizedStream) => {
+            post(run_finalized_stream)
+        }
+        (CommercialRouteMethod::Post, CommercialRouteHandler::Stream) => post(run_stream),
+        (CommercialRouteMethod::Get, CommercialRouteHandler::TimestampBlock) => {
+            get(get_blocknumber_by_timestamp)
+        }
+        (CommercialRouteMethod::Post, CommercialRouteHandler::LegacyQuery) => post(execute_query),
+        #[cfg(feature = "sql")]
+        (CommercialRouteMethod::Post, CommercialRouteHandler::SqlQuery) => post(sql_query),
+        _ => unreachable!("commercial route method and handler are inconsistent"),
+    }
+}
 
 fn build_openapi_spec(show_internal: bool) -> utoipa::openapi::OpenApi {
     let mut spec = ApiDoc::openapi();
@@ -108,6 +302,7 @@ fn build_openapi_spec(show_internal: bool) -> utoipa::openapi::OpenApi {
 }
 
 #[allow(deprecated)]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     task_manager: Arc<TaskManager>,
     network_client: Arc<NetworkClient>,
@@ -117,9 +312,14 @@ pub async fn run_server(
     hotblocks: Arc<HotblocksHandle>,
     shutting_down: Arc<AtomicBool>,
     shutdown_signal: CancellationToken,
+    commercial: CommercialRuntime,
     show_internal_docs: bool,
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
+    let commercial_enabled = config.commercial.is_some();
+    let internal_service_token = configured_internal_service_token(&config);
+    let dataset_canonicalizer =
+        network_client.clone() as Arc<dyn commercial_extractor::DatasetCanonicalizer>;
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
         .allow_headers(Any)
@@ -134,24 +334,8 @@ pub async fn run_server(
         )
         // Portal status
         .route("/status", get(get_status).endpoint("/status"))
-        .route("/datasets", get(get_datasets).endpoint("/datasets"))
-        // Streaming data
-        .route(
-            "/datasets/:dataset/archival-stream",
-            post(run_archival_stream_restricted).endpoint("/archival-stream"),
-        )
-        .route(
-            "/datasets/:dataset/archival-stream/debug",
-            post(run_archival_stream).endpoint("/archival-stream/debug"),
-        )
-        .route(
-            "/datasets/:dataset/finalized-stream",
-            post(run_finalized_stream).endpoint("/finalized-stream"),
-        )
-        .route(
-            "/datasets/:dataset/stream",
-            post(run_stream).endpoint("/stream"),
-        )
+        .route("/datasets", get(get_datasets).endpoint("/datasets"));
+    let app = register_commercial_routes(app, commercial_enabled, production_commercial_route)
         // Getting head
         .route(
             "/datasets/:dataset/archival-head",
@@ -175,10 +359,6 @@ pub async fn run_server(
             "/datasets/:dataset/metadata",
             get(get_dataset_metadata).endpoint("/metadata"),
         )
-        .route(
-            "/datasets/:dataset/timestamps/:timestamp/block",
-            get(get_blocknumber_by_timestamp).endpoint("/timestamps/block"),
-        )
         // Backward compatibility routes
         .route(
             "/datasets/:dataset/finalized-stream/height",
@@ -187,10 +367,6 @@ pub async fn run_server(
         .route(
             "/datasets/:dataset/archival-stream/height",
             get(get_archival_stream_height).endpoint("/height"),
-        )
-        .route(
-            "/datasets/:dataset_id/query/:worker_id",
-            post(execute_query).endpoint("/query"),
         )
         .route(
             "/datasets/:dataset/height",
@@ -203,11 +379,19 @@ pub async fn run_server(
         // Internal routes
         .route(
             "/debug/workers",
-            get(get_all_workers).endpoint("/debug/workers"),
+            internal_route_layer(
+                get(get_all_workers).endpoint("/debug/workers"),
+                commercial_enabled,
+                internal_service_token.clone(),
+            ),
         )
         .route(
             "/datasets/:dataset/:block/debug",
-            get(get_debug_block).endpoint("/block/debug"),
+            internal_route_layer(
+                get(get_debug_block).endpoint("/block/debug"),
+                commercial_enabled,
+                internal_service_token,
+            ),
         )
         .route("/metrics", get(get_metrics))
         .route("/ready", get(get_readiness))
@@ -216,13 +400,12 @@ pub async fn run_server(
 
     // SQL Query Engine
     #[cfg(feature = "sql")]
-    let app = app
-        .route("/sql/query", post(sql_query).endpoint("/sql/query"))
-        .route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
+    let app = app.route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
 
     let drain_timeout = config.drain_timeout;
+    let active_stream_registry = commercial.registry.clone();
 
-    let app = app
+    let mut app = app
         .route_layer(axum::middleware::from_fn(logging::middleware))
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
@@ -232,10 +415,22 @@ pub async fn run_server(
         )
         .layer(Extension(task_manager))
         .layer(Extension(network_client))
+        .layer(Extension(dataset_canonicalizer))
         .layer(Extension(config))
         .layer(Extension(Arc::new(metrics_registry)))
         .layer(Extension(hotblocks))
+        .layer(Extension(commercial.control_plane))
+        .layer(Extension(commercial.usage_reporter))
         .layer(Extension(shutting_down));
+    if let Some(snapshot_store) = commercial.snapshot_store {
+        app = app.layer(Extension(snapshot_store));
+    }
+    if let Some(tally) = commercial.tally {
+        app = app.layer(Extension(tally));
+    }
+    if let Some(registry) = commercial.registry {
+        app = app.layer(Extension(registry));
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
@@ -243,7 +438,13 @@ pub async fn run_server(
     let serve = axum::serve(listener, app)
         .with_graceful_shutdown(async move { cancel_for_serve.cancelled().await });
 
-    drive_serve_with_drain(serve.into_future(), shutdown_signal, drain_timeout).await?;
+    drive_serve_with_drain(
+        serve.into_future(),
+        shutdown_signal,
+        drain_timeout,
+        active_stream_registry,
+    )
+    .await?;
 
     tracing::info!("HTTP server stopped");
     Ok(())
@@ -258,6 +459,7 @@ async fn drive_serve_with_drain<F>(
     serve: F,
     shutdown_signal: CancellationToken,
     drain_timeout: std::time::Duration,
+    active_stream_registry: Option<Arc<crate::commercial::ActiveStreamRegistry>>,
 ) -> std::io::Result<()>
 where
     F: std::future::Future<Output = std::io::Result<()>>,
@@ -267,18 +469,37 @@ where
         tokio::time::sleep(drain_timeout).await;
     };
 
-    tokio::select! {
+    let drain_timed_out = tokio::select! {
         res = serve => {
             res?;
             tracing::info!("HTTP server drained cleanly");
+            false
         }
         _ = force_close => {
-            tracing::warn!(
-                "Drain timeout {:?} exceeded; listener will close on serve drop. \
-                 In-flight connections are detached and will be aborted only on \
-                 process exit (runtime drop after main() returns).",
-                drain_timeout
-            );
+            true
+        }
+    };
+    if drain_timed_out {
+        tracing::warn!(
+            "Drain timeout {:?} exceeded; listener will close on serve drop and \
+             in-flight commercial streams will be cut before the final usage flush.",
+            drain_timeout
+        );
+        if let Some(registry) = active_stream_registry {
+            // Bounded: a connection parked on a stalled client's socket never re-polls
+            // its body, so its meter can't observe the cut — waiting forever would
+            // block process exit. Losing that stream's event on timeout matches the
+            // pre-SD1 worst case; every responsive stream still flushes.
+            match tokio::time::timeout(drain_timeout, registry.cut_all_for_shutdown()).await {
+                Ok(cut) => {
+                    tracing::info!(cut, "commercial streams finalized after drain timeout")
+                }
+                Err(_) => tracing::warn!(
+                    "commercial stream finalization incomplete after {:?}; \
+                     unfinalized stream usage may be lost at process exit",
+                    drain_timeout
+                ),
+            }
         }
     }
     Ok(())
@@ -649,54 +870,98 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
 async fn get_readiness(
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(shutting_down): Extension<Arc<AtomicBool>>,
+    snapshot_store: Option<Extension<Arc<SnapshotStore>>>,
 ) -> impl IntoResponse {
-    // Stable discriminant per readiness *category*. `/ready` is polled
-    // continuously, so we log only when the category changes — entering a new
-    // state logs once (with live detail), while fluctuating connection counts
-    // within `InsufficientConnections` do not. Starts `READY` so a portal that
-    // never becomes ready still logs the reason on its first probe.
-    const READY: u8 = 0;
-    const SHUTTING_DOWN: u8 = 1;
-    const NO_WORKERS: u8 = 2;
-    const INSUFFICIENT_CONNECTIONS: u8 = 3;
-    static LAST_STATE: AtomicU8 = AtomicU8::new(READY);
+    let decision = readiness_decision(
+        shutting_down.load(Ordering::Relaxed),
+        snapshot_store.as_ref().map(|store| store.is_ready()),
+        || client.readiness(),
+    );
 
-    let (state, code, body, reason): (u8, StatusCode, &str, Option<NotReady>) =
-        if shutting_down.load(Ordering::Relaxed) {
-            (
-                SHUTTING_DOWN,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Shutting down",
-                None,
-            )
-        } else {
-            match client.readiness() {
-                Ok(()) => (READY, StatusCode::OK, "Ready", None),
-                Err(reason) => {
-                    let state = match reason {
-                        NotReady::NoWorkers => NO_WORKERS,
-                        NotReady::InsufficientConnections { .. } => INSUFFICIENT_CONNECTIONS,
-                    };
-                    (
-                        state,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Not ready",
-                        Some(reason),
-                    )
-                }
-            }
+    readiness_response(decision)
+}
+
+// Stable discriminant per readiness *category*. `/ready` is polled
+// continuously, so we log only when the category changes — entering a new
+// state logs once (with live detail), while fluctuating connection counts
+// within `InsufficientConnections` do not. Starts `READY` so a portal that
+// never becomes ready still logs the reason on its first probe.
+const READINESS_READY: u8 = 0;
+const READINESS_SHUTTING_DOWN: u8 = 1;
+const READINESS_NO_WORKERS: u8 = 2;
+const READINESS_INSUFFICIENT_CONNECTIONS: u8 = 3;
+const READINESS_SNAPSHOTS_NOT_READY: u8 = 4;
+
+#[derive(Clone, Copy)]
+struct ReadinessDecision {
+    state: u8,
+    code: StatusCode,
+    body: &'static str,
+    reason: Option<NotReady>,
+}
+
+fn readiness_decision(
+    shutting_down: bool,
+    snapshots_ready: Option<bool>,
+    client_readiness: impl FnOnce() -> Result<(), NotReady>,
+) -> ReadinessDecision {
+    if shutting_down {
+        return ReadinessDecision {
+            state: READINESS_SHUTTING_DOWN,
+            code: StatusCode::SERVICE_UNAVAILABLE,
+            body: "Shutting down",
+            reason: None,
         };
+    }
 
-    if LAST_STATE.swap(state, Ordering::Relaxed) != state {
-        match (state, reason) {
-            (READY, _) => tracing::info!("readiness check now passing: portal is ready"),
-            (SHUTTING_DOWN, _) => tracing::info!("readiness check now failing: shutting down"),
+    if snapshots_ready.is_some_and(|ready| !ready) {
+        return ReadinessDecision {
+            state: READINESS_SNAPSHOTS_NOT_READY,
+            code: StatusCode::SERVICE_UNAVAILABLE,
+            body: "Commercial snapshots not ready",
+            reason: None,
+        };
+    }
+
+    match client_readiness() {
+        Ok(()) => ReadinessDecision {
+            state: READINESS_READY,
+            code: StatusCode::OK,
+            body: "Ready",
+            reason: None,
+        },
+        Err(reason) => {
+            let state = match reason {
+                NotReady::NoWorkers => READINESS_NO_WORKERS,
+                NotReady::InsufficientConnections { .. } => READINESS_INSUFFICIENT_CONNECTIONS,
+            };
+            ReadinessDecision {
+                state,
+                code: StatusCode::SERVICE_UNAVAILABLE,
+                body: "Not ready",
+                reason: Some(reason),
+            }
+        }
+    }
+}
+
+fn readiness_response(decision: ReadinessDecision) -> Response {
+    static LAST_STATE: AtomicU8 = AtomicU8::new(READINESS_READY);
+    if LAST_STATE.swap(decision.state, Ordering::Relaxed) != decision.state {
+        match (decision.state, decision.reason) {
+            (READINESS_READY, _) => tracing::info!("readiness check now passing: portal is ready"),
+            (READINESS_SHUTTING_DOWN, _) => {
+                tracing::info!("readiness check now failing: shutting down")
+            }
+            (READINESS_SNAPSHOTS_NOT_READY, _) => {
+                tracing::warn!("readiness check now failing: commercial snapshots not ready");
+            }
             (_, Some(reason)) => tracing::warn!("readiness check now failing: {reason}"),
             (_, None) => {}
         }
     }
 
-    (code, body).into_response()
+    (decision.code, decision.body).into_response()
 }
 
 /// [INTERNAL] Dataset Height (deprecated)
@@ -864,6 +1129,8 @@ async fn execute_query(
     Path((dataset_id_encoded, worker_id)): Path<(String, PeerId)>,
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(req): Extension<RequestId>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
     query: ParsedQuery, // request body
 ) -> Response {
     let dataset_id = match DatasetId::from_base64(&dataset_id_encoded) {
@@ -876,10 +1143,24 @@ async fn execute_query(
                 .into_response()
         }
     };
+    let dataset_name = client
+        .datasets()
+        .read()
+        .default_name(&dataset_id)
+        .map(str::to_string)
+        .unwrap_or_else(|| dataset_id.to_url().to_string());
 
     let request_id = req.header_value().to_str().unwrap_or("").to_string();
+    let meter = meter_from_extensions(
+        grant,
+        reporter,
+        Endpoint::LegacyQuery,
+        dataset_name,
+        request_id.clone(),
+    );
 
     let Ok(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
+        finish_meter_error(&meter);
         return RequestError::NoData.into_response();
     };
     let range = query
@@ -889,8 +1170,9 @@ async fn execute_query(
     let lease = match client.reserve_worker(worker_id) {
         Some(lease) => lease,
         None => {
+            finish_meter_error(&meter);
             return RequestError::BadRequest(format!("Worker {} does not exist", worker_id))
-                .into_response()
+                .into_response();
         }
     };
     let fut = client.query_worker(
@@ -904,15 +1186,28 @@ async fn execute_query(
     );
     let result = match fut.await {
         Ok(success) => success.ok,
-        Err(err) => return RequestError::from_query_error(err, worker_id).into_response(),
+        Err(err) => {
+            finish_meter_error(&meter);
+            return RequestError::from_query_error(err, worker_id).into_response();
+        }
     };
     match json_lines_to_json(&result.data) {
-        Ok(data) => Response::builder()
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CONTENT_ENCODING, "gzip")
-            .body(Body::from(data))
-            .unwrap(),
+        Ok(data) => {
+            if let Some(meter) = &meter {
+                if let Err(err) = meter.record_gzip_body_and_complete(&data).await {
+                    tracing::warn!(error = %err, "cannot decode legacy query response for usage meter");
+                    meter.mark_error();
+                    meter.complete();
+                }
+            }
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_ENCODING, "gzip")
+                .body(Body::from(data))
+                .unwrap()
+        }
         Err(e) => {
+            finish_meter_error(&meter);
             RequestError::InternalError(format!("Couldn't convert response: {e}")).into_response()
         }
     }
@@ -1164,13 +1459,101 @@ pub(crate) fn forward_response(response: reqwest::Response) -> axum::response::R
 #[cfg(feature = "sql")]
 async fn sql_query(
     Extension(network): Extension<Arc<NetworkClient>>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    request_id: Option<Extension<RequestId>>,
     query: body::Bytes,
-) -> impl axum::response::IntoResponse {
-    match sql::query(query, &network).await {
-        Ok(res) => axum::Json(res).into_response(),
+) -> Response {
+    match sql::query(
+        query,
+        &network,
+        grant.as_ref().map(|grant| &grant.0.granted),
+    )
+    .await
+    {
+        Ok(res) => {
+            let meter = meter_from_extensions(
+                grant,
+                reporter,
+                Endpoint::SqlQuery,
+                "sql".to_string(),
+                request_id
+                    .and_then(|id| id.header_value().to_str().ok().map(str::to_owned))
+                    .unwrap_or_default(),
+            );
+            json_response_with_usage(meter, &res, "sql").await
+        }
         Err(e) => {
             tracing::warn!("cannot query data: {:?}", e);
             e.into_response()
+        }
+    }
+}
+
+fn meter_from_extensions(
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    endpoint: Endpoint,
+    dataset: String,
+    request_id: String,
+) -> Option<MeterHandle> {
+    let grant = grant?;
+    let reporter = reporter?;
+    let snapshot_store = grant.0.snapshot_store.clone();
+    match (grant.0.tally.clone(), grant.0.registry.clone()) {
+        (Some(tally), Some(registry)) => Some(MeterHandle::new_enforced(
+            grant.0.granted.clone(),
+            request_id,
+            endpoint,
+            dataset,
+            reporter.0,
+            tally,
+            registry,
+            snapshot_store,
+        )),
+        _ => Some(MeterHandle::new(
+            grant.0.granted.principal.clone(),
+            request_id,
+            endpoint,
+            dataset,
+            reporter.0,
+            grant.0.granted.quota_version,
+        )),
+    }
+}
+
+fn finish_meter_error(meter: &Option<MeterHandle>) {
+    if let Some(meter) = meter {
+        meter.mark_error();
+        meter.complete();
+    }
+}
+
+#[cfg(feature = "sql")]
+async fn json_response_with_usage<T: serde::Serialize>(
+    meter: Option<MeterHandle>,
+    res: &T,
+    endpoint: &str,
+) -> Response {
+    match serde_json::to_vec(res) {
+        Ok(bytes) => {
+            if let Some(meter) = meter {
+                meter
+                    .record_plain_bytes_and_complete(bytes.len() as u64)
+                    .await;
+            }
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(bytes))
+                .unwrap()
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, endpoint, "cannot serialize response for usage meter");
+            if let Some(meter) = meter {
+                meter.mark_error();
+                meter.complete();
+            }
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
@@ -1191,7 +1574,112 @@ async fn sql_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::async_trait;
+    use std::future;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    use futures::StreamExt;
+    use tower::ServiceExt;
+
+    use crate::commercial::{
+        evaluate::EvaluationPolicy,
+        store::test_support::{active_snapshot, defaults_record, KEY_ID},
+        ActiveStreamRegistry, Authorization, ConcurrencyLimiter, ControlPlaneClient, Credential,
+        Granted, GrantedLimits, LocalControlPlane, OnExceed, Principal, PublicFallbackConfig,
+        SnapshotRecord, TallyStore,
+    };
+
+    #[derive(Default)]
+    struct ShutdownRecordingReporter {
+        queued: Mutex<Vec<crate::commercial::StreamUsageEvent>>,
+        flushed: Mutex<Vec<crate::commercial::StreamUsageEvent>>,
+    }
+
+    impl UsageReporter for ShutdownRecordingReporter {
+        fn report(&self, event: crate::commercial::StreamUsageEvent) {
+            self.queued.lock().unwrap().push(event);
+        }
+
+        fn flush_shutdown(&self) -> Pin<Box<dyn future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.flushed
+                    .lock()
+                    .unwrap()
+                    .extend(self.queued.lock().unwrap().drain(..));
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_routes_require_service_token() {
+        let app = Router::new().route(
+            "/debug/workers",
+            internal_route_layer(
+                get(|| async { "workers" }),
+                true,
+                Some(Arc::<str>::from("internal-secret")),
+            ),
+        );
+
+        let anonymous = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/workers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::NOT_FOUND);
+
+        let ordinary_key = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/workers")
+                    .header(header::AUTHORIZATION, "Bearer sqd_data_key_secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary_key.status(), StatusCode::NOT_FOUND);
+
+        let internal = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/workers")
+                    .header(header::AUTHORIZATION, "Bearer internal-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(internal.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn internal_routes_remain_open_without_commercial_config() {
+        let app = Router::new().route(
+            "/debug/workers",
+            internal_route_layer(get(|| async { "workers" }), false, None),
+        );
+
+        let anonymous = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/workers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::OK);
+    }
 
     #[test]
     fn hide_internal_drops_marked_ops_and_empty_tags() {
@@ -1241,56 +1729,667 @@ mod tests {
         );
     }
 
-    /// End-to-end: real TCP listener + axum router + reqwest client. Verifies that
-    /// flipping the AtomicBool that `watch_shutdown_signal` flips on SIGTERM actually
-    /// changes the response observed by an HTTP client. The handler mirrors
-    /// `get_readiness` with `client.is_ready()` stubbed as `true`, since constructing
-    /// a real `NetworkClient` is heavy. The "Not ready" branch is pre-existing and
-    /// out of scope for this PR.
-    #[tokio::test]
-    async fn ready_endpoint_flips_to_503_when_shutdown_flag_set() {
-        let shutting_down = Arc::new(AtomicBool::new(false));
-        let cancel = CancellationToken::new();
+    fn assert_readiness_decision(
+        decision: ReadinessDecision,
+        state: u8,
+        code: StatusCode,
+        body: &'static str,
+        reason: Option<NotReady>,
+    ) {
+        assert_eq!(decision.state, state);
+        assert_eq!(decision.code, code);
+        assert_eq!(decision.body, body);
+        assert_eq!(decision.reason, reason);
+    }
 
+    #[test]
+    fn ready_endpoint_flips_to_503_when_shutdown_flag_set() {
+        let mut client_readiness_called = false;
+
+        let decision = readiness_decision(true, None, || {
+            client_readiness_called = true;
+            Ok(())
+        });
+
+        assert_readiness_decision(
+            decision,
+            READINESS_SHUTTING_DOWN,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Shutting down",
+            None,
+        );
+        assert!(!client_readiness_called);
+    }
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: Mutex<Vec<crate::commercial::StreamUsageEvent>>,
+    }
+
+    impl UsageReporter for RecordingReporter {
+        fn report(&self, event: crate::commercial::StreamUsageEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    async fn metered_test_handler(
+        endpoint: Option<Extension<Endpoint>>,
+        grant: Option<Extension<CommercialGrant>>,
+        reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    ) -> Response {
+        const BODY: &[u8] = b"{\"ok\":true}\n";
+        let endpoint = endpoint
+            .map(|endpoint| endpoint.0)
+            .unwrap_or(Endpoint::Stream);
+        let meter = meter_from_extensions(
+            grant,
+            reporter,
+            endpoint,
+            "ethereum-mainnet".to_string(),
+            "request".to_string(),
+        );
+        let meter_created = meter.is_some();
+        if let Some(meter) = meter {
+            meter
+                .record_plain_bytes_and_complete(BODY.len() as u64)
+                .await;
+        }
+
+        Response::builder()
+            .header("x-meter-created", meter_created.to_string())
+            .body(Body::from(BODY))
+            .unwrap()
+    }
+
+    async fn request_id_metered_test_handler(
+        Extension(req): Extension<RequestId>,
+        endpoint: Option<Extension<Endpoint>>,
+        grant: Option<Extension<CommercialGrant>>,
+        reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    ) -> Response {
+        const BODY: &[u8] = b"{\"ok\":true}\n";
+        let endpoint = endpoint
+            .map(|endpoint| endpoint.0)
+            .unwrap_or(Endpoint::Stream);
+        let meter = meter_from_extensions(
+            grant,
+            reporter,
+            endpoint,
+            "ethereum-mainnet".to_string(),
+            req.header_value().to_str().unwrap_or("").to_string(),
+        );
+        if let Some(meter) = meter {
+            meter
+                .record_plain_bytes_and_complete(BODY.len() as u64)
+                .await;
+        }
+
+        Response::builder().body(Body::from(BODY)).unwrap()
+    }
+
+    fn test_commercial_route(def: CommercialRouteDef) -> MethodRouter {
+        let route = match def.method {
+            CommercialRouteMethod::Get => get(metered_test_handler),
+            CommercialRouteMethod::Post => post(metered_test_handler),
+        };
+        route.layer(Extension(def.endpoint))
+    }
+
+    fn http_method(method: CommercialRouteMethod) -> Method {
+        match method {
+            CommercialRouteMethod::Get => Method::GET,
+            CommercialRouteMethod::Post => Method::POST,
+        }
+    }
+
+    fn sample_path(def: CommercialRouteDef) -> &'static str {
+        match def.path {
+            "/datasets/:dataset/archival-stream" => "/datasets/ethereum-mainnet/archival-stream",
+            "/datasets/:dataset/archival-stream/debug" => {
+                "/datasets/ethereum-mainnet/archival-stream/debug"
+            }
+            "/datasets/:dataset/finalized-stream" => "/datasets/ethereum-mainnet/finalized-stream",
+            "/datasets/:dataset/stream" => "/datasets/ethereum-mainnet/stream",
+            "/datasets/:dataset/timestamps/:timestamp/block" => {
+                "/datasets/ethereum-mainnet/timestamps/1/block"
+            }
+            "/datasets/:dataset_id/query/:worker_id" => "/datasets/ethereum-mainnet/query/worker",
+            "/sql/query" => "/sql/query",
+            path => unreachable!("missing commercial route test sample for {path}"),
+        }
+    }
+
+    async fn held_meter_stream_handler(
+        endpoint: Option<Extension<Endpoint>>,
+        grant: Option<Extension<CommercialGrant>>,
+        reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    ) -> Response {
+        let endpoint = endpoint
+            .map(|endpoint| endpoint.0)
+            .unwrap_or(Endpoint::Stream);
+        let meter = meter_from_extensions(
+            grant,
+            reporter,
+            endpoint,
+            "ethereum-mainnet".to_string(),
+            "request".to_string(),
+        )
+        .expect("commercial middleware should attach a grant");
+        let stream = futures::stream::once(async move {
+            let _meter = meter;
+            future::pending::<Result<bytes::Bytes, io::Error>>().await
+        });
+
+        Response::builder()
+            .header("x-meter-created", "true")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    }
+
+    fn held_meter_test_route(def: CommercialRouteDef) -> MethodRouter {
+        let route = match def.method {
+            CommercialRouteMethod::Get => get(held_meter_stream_handler),
+            CommercialRouteMethod::Post => post(held_meter_stream_handler),
+        };
+        route.layer(Extension(def.endpoint))
+    }
+
+    fn commercial_concurrency_test_app(store: Arc<SnapshotStore>) -> axum::Router {
+        let tally = Arc::new(TallyStore::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let concurrency = Arc::new(ConcurrencyLimiter::new(1));
+        let control_plane = Arc::new(LocalControlPlane::new(
+            store,
+            tally.clone(),
+            concurrency,
+            EvaluationPolicy {
+                throttle_residual_secs: 60,
+            },
+        )) as Arc<dyn ControlPlaneClient>;
+
+        register_commercial_routes(axum::Router::new(), true, held_meter_test_route)
+            .layer(Extension(control_plane))
+            .layer(Extension(
+                Arc::new(RecordingReporter::default()) as Arc<dyn UsageReporter>
+            ))
+            .layer(Extension(tally))
+            .layer(Extension(registry))
+    }
+
+    fn public_fallback_for_concurrency_test() -> PublicFallbackConfig {
+        PublicFallbackConfig {
+            throughput_bytes_per_sec: 1_000_000,
+            burst_bytes: 1_000_000,
+            max_response_bytes: 1_000_000,
+            volume_bytes: 1_000_000,
+            window_secs: 60,
+            // The runtime limiter adds one guardrail permit to the configured
+            // value, so 0 is the non-invasive way to test one effective permit.
+            concurrency: 0,
+        }
+    }
+
+    fn store_for_keyed_concurrency_test() -> Arc<SnapshotStore> {
+        let store = SnapshotStore::inactive(&public_fallback_for_concurrency_test());
+        let mut defaults = defaults_record(10);
+        defaults.messages.insert(
+            "concurrency_limit".to_string(),
+            "concurrency_limit".to_string(),
+        );
+        let mut snapshot = active_snapshot(11);
+        snapshot.limits.as_mut().unwrap().concurrency = Some(0);
+        store.install_records_for_test(
+            vec![
+                SnapshotRecord::Defaults(defaults),
+                SnapshotRecord::Key(snapshot),
+            ],
+            11,
+        );
+        store
+    }
+
+    fn store_for_account_limit_two_test(second_key_id: &str) -> Arc<SnapshotStore> {
+        let store = SnapshotStore::inactive(&public_fallback_for_concurrency_test());
+        let mut defaults = defaults_record(10);
+        defaults.messages.insert(
+            "concurrency_limit".to_string(),
+            "concurrency_limit".to_string(),
+        );
+        let mut first = active_snapshot(11);
+        first.limits.as_mut().unwrap().concurrency = Some(2);
+        let mut second = active_snapshot(12);
+        second.key_id = second_key_id.to_string();
+        second.limits.as_mut().unwrap().concurrency = Some(2);
+        store.install_records_for_test(
+            vec![
+                SnapshotRecord::Defaults(defaults),
+                SnapshotRecord::Key(first),
+                SnapshotRecord::Key(second),
+            ],
+            12,
+        );
+        store
+    }
+
+    fn store_for_anonymous_concurrency_test() -> Arc<SnapshotStore> {
+        let store = SnapshotStore::inactive(&public_fallback_for_concurrency_test());
+        let mut defaults = defaults_record(10);
+        defaults.public.limits.concurrency = Some(0);
+        defaults.public.quota.as_mut().unwrap().volume_bytes = Some(1_000_000);
+        defaults.messages.insert(
+            "concurrency_limit".to_string(),
+            "concurrency_limit".to_string(),
+        );
+        store.install_records_for_test(vec![SnapshotRecord::Defaults(defaults)], 10);
+        store
+    }
+
+    fn stream_request(uri: &str, forwarded_for: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method(Method::POST).uri(uri);
+        if let Some(forwarded_for) = forwarded_for {
+            builder = builder.header("x-forwarded-for", forwarded_for);
+        }
+        builder
+            .body(Body::from(
+                r#"{"type":"evm","fromBlock":1,"fields":{"block":{"number":true}}}"#,
+            ))
+            .unwrap()
+    }
+
+    async fn assert_concurrency_rejection(response: Response) {
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "1");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"concurrency_limit");
+    }
+
+    #[tokio::test]
+    async fn commercial_disabled_skips_extractor_and_meter_on_metered_route() {
+        let reporter = Arc::new(RecordingReporter::default());
         let app = axum::Router::new()
             .route(
-                "/ready",
-                axum::routing::get(|Extension(sd): Extension<Arc<AtomicBool>>| async move {
-                    if sd.load(Ordering::Relaxed) {
-                        (StatusCode::SERVICE_UNAVAILABLE, "Shutting down").into_response()
-                    } else {
-                        (StatusCode::OK, "Ready").into_response()
-                    }
-                }),
+                "/datasets/ethereum-mainnet/stream",
+                commercial_route_layer(get(metered_test_handler), false, Endpoint::Stream),
             )
-            .layer(Extension(shutting_down.clone()));
+            .layer(Extension(reporter.clone() as Arc<dyn UsageReporter>));
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let cancel_for_serve = cancel.clone();
-        let server = tokio::spawn(
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move { cancel_for_serve.cancelled().await })
-                .into_future(),
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/datasets/ethereum-mainnet/stream?api_key=sqd_data_key_secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-meter-created"], "false");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"{\"ok\":true}\n");
+        assert!(
+            reporter.events.lock().unwrap().is_empty(),
+            "no meter means no usage event or commercial metric side effect"
+        );
+    }
+
+    fn public_fallback_for_ready_test() -> PublicFallbackConfig {
+        PublicFallbackConfig {
+            throughput_bytes_per_sec: 1,
+            burst_bytes: 1,
+            max_response_bytes: 1,
+            volume_bytes: 1,
+            window_secs: 1,
+            concurrency: 1,
+        }
+    }
+
+    #[test]
+    fn ready_endpoint_waits_for_commercial_snapshot_store_before_network_readiness() {
+        let store = SnapshotStore::inactive(&public_fallback_for_ready_test());
+        store.set_ready_for_test(false);
+        let mut client_readiness_called = false;
+
+        let decision = readiness_decision(false, Some(store.is_ready()), || {
+            client_readiness_called = true;
+            Ok(())
+        });
+
+        assert_readiness_decision(
+            decision,
+            READINESS_SNAPSHOTS_NOT_READY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Commercial snapshots not ready",
+            None,
+        );
+        assert!(!client_readiness_called);
+
+        store.set_ready_for_test(true);
+        let decision = readiness_decision(false, Some(store.is_ready()), || Ok(()));
+
+        assert_readiness_decision(decision, READINESS_READY, StatusCode::OK, "Ready", None);
+    }
+
+    #[test]
+    fn ready_endpoint_is_ready_immediately_when_snapshot_store_loaded_from_disk_cache() {
+        let store = SnapshotStore::inactive(&public_fallback_for_ready_test());
+        store.set_loaded_from_cache_for_test(true);
+        assert!(store.loaded_from_cache());
+
+        let decision = readiness_decision(false, Some(store.is_ready()), || Ok(()));
+
+        assert_readiness_decision(decision, READINESS_READY, StatusCode::OK, "Ready", None);
+    }
+
+    #[test]
+    fn ready_endpoint_oss_mode_passthrough_matches_network_readiness() {
+        let ready = readiness_decision(false, None, || Ok(()));
+
+        assert_readiness_decision(ready, READINESS_READY, StatusCode::OK, "Ready", None);
+
+        let not_ready = readiness_decision(false, None, || Err(NotReady::NoWorkers));
+
+        assert_readiness_decision(
+            not_ready,
+            READINESS_NO_WORKERS,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Not ready",
+            Some(NotReady::NoWorkers),
+        );
+    }
+
+    struct GrantingControlPlane;
+
+    #[async_trait]
+    impl ControlPlaneClient for GrantingControlPlane {
+        async fn authorize(&self, req: crate::commercial::AuthorizeRequest) -> Authorization {
+            let api_key_id = match req.credential {
+                Credential::Key { key_id, .. } => Some(key_id),
+                Credential::None { .. } | Credential::Internal { .. } => None,
+            };
+            Authorization::Granted(Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id,
+                },
+                tally_account_id: None,
+                entitled_chains: None,
+                entitled_traces: None,
+                limits: GrantedLimits::default(),
+                on_exceed: OnExceed::Reject,
+                quota_version: 1,
+                quota_remaining_bytes: Some(1_000_000),
+                snapshot_generation: None,
+                concurrency_permit: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn commercial_enabled_meters_all_metered_route_identities() {
+        let query = r#"{"type":"evm","fromBlock":1,"fields":{"block":{"number":true}}}"#;
+        let expected = vec![
+            (
+                CommercialRouteMethod::Post,
+                "/datasets/:dataset/archival-stream",
+                Endpoint::ArchivalStream,
+            ),
+            (
+                CommercialRouteMethod::Post,
+                "/datasets/:dataset/archival-stream/debug",
+                Endpoint::ArchivalStream,
+            ),
+            (
+                CommercialRouteMethod::Post,
+                "/datasets/:dataset/finalized-stream",
+                Endpoint::FinalizedStream,
+            ),
+            (
+                CommercialRouteMethod::Post,
+                "/datasets/:dataset/stream",
+                Endpoint::Stream,
+            ),
+            (
+                CommercialRouteMethod::Get,
+                "/datasets/:dataset/timestamps/:timestamp/block",
+                Endpoint::TsLookup,
+            ),
+            (
+                CommercialRouteMethod::Post,
+                "/datasets/:dataset_id/query/:worker_id",
+                Endpoint::LegacyQuery,
+            ),
+            #[cfg(feature = "sql")]
+            (
+                CommercialRouteMethod::Post,
+                "/sql/query",
+                Endpoint::SqlQuery,
+            ),
+        ];
+        let actual = COMMERCIAL_ROUTES
+            .iter()
+            .map(|def| (def.method, def.path, def.endpoint))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        let reporter = Arc::new(RecordingReporter::default());
+        let app = register_commercial_routes(axum::Router::new(), true, test_commercial_route)
+            .layer(Extension(reporter.clone() as Arc<dyn UsageReporter>))
+            .layer(Extension(
+                Arc::new(GrantingControlPlane) as Arc<dyn ControlPlaneClient>
+            ));
+
+        for def in COMMERCIAL_ROUTES {
+            let body = if matches!(
+                def.endpoint,
+                Endpoint::Stream
+                    | Endpoint::FinalizedStream
+                    | Endpoint::ArchivalStream
+                    | Endpoint::LegacyQuery
+            ) {
+                Some(query)
+            } else {
+                None
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(http_method(def.method))
+                        .uri(format!("{}?api_key=sqd_data_key_secret", sample_path(*def)))
+                        .body(body.map_or_else(Body::empty, Body::from))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{}", def.path);
+            assert_eq!(
+                response.headers()["x-meter-created"],
+                "true",
+                "{}",
+                def.path
+            );
+            let event = reporter.events.lock().unwrap().pop().expect("usage event");
+            assert_eq!(event.endpoint, def.endpoint, "{}", def.path);
+            assert_eq!(event.logical_bytes, 12, "{}", def.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_x_request_id_is_regenerated_before_usage_event() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let app = axum::Router::new()
+            .route(
+                "/datasets/ethereum-mainnet/stream",
+                commercial_route_layer(
+                    post(request_id_metered_test_handler),
+                    true,
+                    Endpoint::Stream,
+                ),
+            )
+            .layer(Extension(reporter.clone() as Arc<dyn UsageReporter>))
+            .layer(Extension(
+                Arc::new(GrantingControlPlane) as Arc<dyn ControlPlaneClient>
+            ))
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/datasets/ethereum-mainnet/stream?api_key=sqd_data_key_secret")
+                    .header("x-request-id", "")
+                    .body(Body::from(
+                        r#"{"type":"evm","fromBlock":1,"fields":{"block":{"number":true}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let event = reporter.events.lock().unwrap().pop().expect("usage event");
+        assert!(!event.request_id.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn keyed_live_stream_concurrency_rejects_until_meter_drops() {
+        let app = commercial_concurrency_test_app(store_for_keyed_concurrency_test());
+        let keyed_uri = format!(
+            "/datasets/ethereum-mainnet/stream?api_key=sqd_data_{KEY_ID}_0123456789abcdefghijklmnopqrstuv"
         );
 
-        let client = reqwest::Client::new();
-        let url = format!("http://{addr}/ready");
-
-        let resp = client.get(&url).send().await.expect("GET /ready");
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-
-        // Equivalent to what `run_shutdown_sequence` does on SIGTERM.
-        shutting_down.store(true, Ordering::Relaxed);
-
-        let resp = client.get(&url).send().await.expect("GET /ready");
-        assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-
-        cancel.cancel();
-        server
+        let response_a = app
+            .clone()
+            .oneshot(stream_request(&keyed_uri, None))
             .await
-            .expect("server join")
-            .expect("server drains cleanly");
+            .unwrap();
+        assert_eq!(response_a.status(), StatusCode::OK);
+        assert_eq!(response_a.headers()["x-meter-created"], "true");
+
+        let response_b = app
+            .clone()
+            .oneshot(stream_request(&keyed_uri, None))
+            .await
+            .unwrap();
+        assert_concurrency_rejection(response_b).await;
+
+        drop(response_a);
+
+        let response_b_retry = app.oneshot(stream_request(&keyed_uri, None)).await.unwrap();
+        assert_eq!(response_b_retry.status(), StatusCode::OK);
+        assert_eq!(response_b_retry.headers()["x-meter-created"], "true");
+    }
+
+    #[tokio::test]
+    async fn account_limit_two_rejects_third_live_stream_across_keys() {
+        const SECOND_KEY_ID: &str = "SecondKeyId";
+        const SECRET: &str = "0123456789abcdefghijklmnopqrstuv";
+        let app = commercial_concurrency_test_app(store_for_account_limit_two_test(SECOND_KEY_ID));
+        let first_key_uri =
+            format!("/datasets/ethereum-mainnet/stream?api_key=sqd_data_{KEY_ID}_{SECRET}");
+        let second_key_uri =
+            format!("/datasets/ethereum-mainnet/stream?api_key=sqd_data_{SECOND_KEY_ID}_{SECRET}");
+
+        let response_a = app
+            .clone()
+            .oneshot(stream_request(&first_key_uri, None))
+            .await
+            .unwrap();
+        assert_eq!(response_a.status(), StatusCode::OK);
+
+        let response_b = app
+            .clone()
+            .oneshot(stream_request(&second_key_uri, None))
+            .await
+            .unwrap();
+        assert_eq!(response_b.status(), StatusCode::OK);
+
+        let response_c = app
+            .clone()
+            .oneshot(stream_request(&first_key_uri, None))
+            .await
+            .unwrap();
+        assert_concurrency_rejection(response_c).await;
+
+        drop(response_a);
+        let response_c_retry = app
+            .oneshot(stream_request(&first_key_uri, None))
+            .await
+            .unwrap();
+        assert_eq!(response_c_retry.status(), StatusCode::OK);
+        drop(response_b);
+        drop(response_c_retry);
+    }
+
+    #[tokio::test]
+    async fn anonymous_live_stream_concurrency_rejects_until_meter_drops() {
+        let app = commercial_concurrency_test_app(store_for_anonymous_concurrency_test());
+        let anon_uri = "/datasets/ethereum-mainnet/stream";
+
+        let response_a = app
+            .clone()
+            .oneshot(stream_request(anon_uri, Some("203.0.113.7")))
+            .await
+            .unwrap();
+        assert_eq!(response_a.status(), StatusCode::OK);
+        assert_eq!(response_a.headers()["x-meter-created"], "true");
+
+        let response_b = app
+            .clone()
+            .oneshot(stream_request(anon_uri, Some("203.0.113.7")))
+            .await
+            .unwrap();
+        assert_concurrency_rejection(response_b).await;
+
+        drop(response_a);
+
+        let response_b_retry = app
+            .oneshot(stream_request(anon_uri, Some("203.0.113.7")))
+            .await
+            .unwrap();
+        assert_eq!(response_b_retry.status(), StatusCode::OK);
+        assert_eq!(response_b_retry.headers()["x-meter-created"], "true");
+    }
+
+    #[tokio::test]
+    async fn hotblocks_head_status_forwards_stay_unmetered() {
+        for body in [
+            b"{\"number\":42}".as_slice(),
+            b"{\"status\":\"ok\"}".as_slice(),
+        ] {
+            let response = reqwest_response(body.to_vec()).await;
+            let forwarded = forward_hotblocks_response(Ok(response));
+            let forwarded_body = axum::body::to_bytes(forwarded.into_body(), usize::MAX)
+                .await
+                .unwrap();
+
+            assert_eq!(&forwarded_body[..], body);
+        }
+    }
+
+    async fn reqwest_response(body: Vec<u8>) -> reqwest::Response {
+        let app = axum::Router::new().route(
+            "/hotblocks",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { Body::from(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        reqwest::get(format!("http://{addr}/hotblocks"))
+            .await
+            .unwrap()
     }
 
     #[tokio::test(start_paused = true)]
@@ -1305,7 +2404,12 @@ mod tests {
             Ok::<(), std::io::Error>(())
         };
 
-        let driver = tokio::spawn(drive_serve_with_drain(serve, cancel.clone(), drain_timeout));
+        let driver = tokio::spawn(drive_serve_with_drain(
+            serve,
+            cancel.clone(),
+            drain_timeout,
+            None,
+        ));
 
         tokio::time::advance(Duration::from_millis(10)).await;
         cancel.cancel();
@@ -1323,7 +2427,12 @@ mod tests {
 
         let serve = std::future::pending::<std::io::Result<()>>();
 
-        let driver = tokio::spawn(drive_serve_with_drain(serve, cancel.clone(), drain_timeout));
+        let driver = tokio::spawn(drive_serve_with_drain(
+            serve,
+            cancel.clone(),
+            drain_timeout,
+            None,
+        ));
 
         // Trigger shutdown immediately; force_close arm starts its drain_timeout countdown.
         cancel.cancel();
@@ -1339,6 +2448,73 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn drain_timeout_survivor_is_finalized_before_reporter_flush() {
+        let cutoff_labels = vec![("status".to_owned(), "cut_shutdown".to_owned())];
+        let cutoffs_before = crate::metrics::COMMERCIAL_CUTOFFS
+            .get_or_create(&cutoff_labels)
+            .get();
+        let reporter = Arc::new(ShutdownRecordingReporter::default());
+        let registry = Arc::new(ActiveStreamRegistry::default());
+        let meter = MeterHandle::new_enforced(
+            Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: Some("key".to_string()),
+                },
+                tally_account_id: None,
+                entitled_chains: None,
+                entitled_traces: None,
+                limits: GrantedLimits::default(),
+                on_exceed: OnExceed::Reject,
+                quota_version: 7,
+                quota_remaining_bytes: None,
+                snapshot_generation: None,
+                concurrency_permit: None,
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter.clone(),
+            Arc::new(TallyStore::default()),
+            registry.clone(),
+            None,
+        );
+        let stream = crate::commercial::meter::tap_plain_stream(
+            futures::stream::pending::<Result<bytes::Bytes, io::Error>>(),
+            meter,
+        );
+        let stream_task = tokio::spawn(async move {
+            futures::pin_mut!(stream);
+            while stream.next().await.is_some() {}
+        });
+        tokio::task::yield_now().await;
+
+        let cancel = CancellationToken::new();
+        let driver = tokio::spawn(drive_serve_with_drain(
+            future::pending::<std::io::Result<()>>(),
+            cancel.clone(),
+            Duration::from_millis(100),
+            Some(registry.clone()),
+        ));
+        cancel.cancel();
+        tokio::time::advance(Duration::from_millis(101)).await;
+        driver.await.expect("join").expect("drain timeout");
+
+        reporter.flush_shutdown().await;
+        stream_task.await.expect("metered stream exits");
+
+        let flushed = reporter.flushed.lock().unwrap();
+        assert_eq!(flushed.len(), 1, "surviving stream usage must be flushed");
+        assert_eq!(flushed[0].status, crate::commercial::UsageStatus::CutShutdown);
+        assert_eq!(
+            crate::metrics::COMMERCIAL_CUTOFFS
+                .get_or_create(&cutoff_labels)
+                .get(),
+            cutoffs_before + 1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn drive_serve_propagates_serve_error() {
         let cancel = CancellationToken::new();
         let drain_timeout = Duration::from_secs(10);
@@ -1347,8 +2523,58 @@ mod tests {
             Err::<(), std::io::Error>(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
         };
 
-        let res = drive_serve_with_drain(serve, cancel, drain_timeout).await;
+        let res = drive_serve_with_drain(serve, cancel, drain_timeout, None).await;
         let err = res.expect_err("error from serve propagates");
         assert_eq!(err.to_string(), "boom");
+    }
+
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn sql_response_usage_records_serialized_body() {
+        use std::sync::Mutex;
+
+        use crate::commercial::{Principal, StreamUsageEvent, UsageReporter, UsageStatus};
+        use crate::sql::query::TableItem;
+
+        #[derive(Default)]
+        struct RecordingReporter {
+            events: Mutex<Vec<StreamUsageEvent>>,
+        }
+
+        impl UsageReporter for RecordingReporter {
+            fn report(&self, event: StreamUsageEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = MeterHandle::new(
+            Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some("key".to_string()),
+            },
+            "request".to_string(),
+            Endpoint::SqlQuery,
+            "sql".to_string(),
+            reporter.clone(),
+            3,
+        );
+        let response = crate::sql::query::SqlQueryResponse {
+            query_id: "sql-test".to_string(),
+            tables: Vec::<TableItem>::new(),
+        };
+        let expected = serde_json::to_vec(&response).unwrap();
+
+        let response = json_response_with_usage(Some(meter), &response, "sql").await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), expected.as_slice());
+
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.endpoint, Endpoint::SqlQuery);
+        assert_eq!(event.logical_bytes, expected.len() as u64);
+        assert_eq!(event.wire_bytes, expected.len() as u64);
+        assert_eq!(event.status, UsageStatus::Completed);
     }
 }

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{pin::Pin, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -10,11 +10,18 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
 use crate::{
+    commercial::{
+        meter::{
+            tap_gzip_stream, tap_input_chunks, tap_input_frames, tap_plain_stream,
+            tap_wire_stream_without_cut,
+        },
+        CommercialGrant, DataSource, Endpoint, GrantedLimits, MeterHandle, UsageReporter,
+    },
     config::Config,
     controller::task_manager::TaskManager,
     datasets::DatasetConfig,
     hotblocks::{traceless_key, HotblocksHandle, StreamMode},
-    http_server::{forward_hotblocks_response, forward_response},
+    http_server::forward_hotblocks_response,
     network::NetworkClient,
     types::{Compression, DatasetId, RequestError, StreamRequest},
     utils::conversion::{join_gzip_default, recompress_gzip},
@@ -50,11 +57,32 @@ pub(crate) async fn run_archival_stream_restricted(
     task_manager: Extension<Arc<TaskManager>>,
     network: Extension<Arc<NetworkClient>>,
     config: Extension<Arc<Config>>,
-    dataset_id: DatasetId,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    dataset: DatasetConfig,
     raw_request: StreamRequest,
 ) -> Response {
+    let Some(dataset_id) = dataset.network_id.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "Dataset {} doesn't have archival data",
+                dataset.default_name
+            ),
+        )
+            .into_response();
+    };
     let request = restrict_request(&config, raw_request);
-    run_archival_stream(task_manager, network, config, dataset_id, request).await
+    let request =
+        restrict_request_to_grant(request, grant.as_ref().map(|grant| &grant.0.granted.limits));
+    let meter = meter_from_extensions(
+        grant,
+        reporter,
+        Endpoint::ArchivalStream,
+        dataset.default_name,
+        request.request_id.clone(),
+    );
+    run_archival_stream_inner(task_manager, network, config, dataset_id, request, meter).await
 }
 
 /// [INTERNAL] Archival stream (debug)
@@ -87,8 +115,47 @@ pub(crate) async fn run_archival_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(config): Extension<Arc<Config>>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    dataset: DatasetConfig,
+    request: StreamRequest,
+) -> Response {
+    let Some(dataset_id) = dataset.network_id.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "Dataset {} doesn't have archival data",
+                dataset.default_name
+            ),
+        )
+            .into_response();
+    };
+    let request = restrict_archival_debug_request(&config, request, grant.as_ref().map(|g| &g.0));
+    let meter = meter_from_extensions(
+        grant,
+        reporter,
+        Endpoint::ArchivalStream,
+        dataset.default_name,
+        request.request_id.clone(),
+    );
+    run_archival_stream_inner(
+        Extension(task_manager),
+        Extension(network),
+        Extension(config),
+        dataset_id,
+        request,
+        meter,
+    )
+    .await
+}
+
+async fn run_archival_stream_inner(
+    Extension(task_manager): Extension<Arc<TaskManager>>,
+    Extension(network): Extension<Arc<NetworkClient>>,
+    Extension(config): Extension<Arc<Config>>,
     dataset_id: DatasetId,
     mut request: StreamRequest,
+    meter: Option<MeterHandle>,
 ) -> Response {
     let mut res = Response::builder();
     res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
@@ -105,18 +172,25 @@ pub(crate) async fn run_archival_stream(
 
     match task_manager.spawn_stream(request).await {
         Ok(stream) => {
-            let body = response_body(stream, compression, config.use_gzjoin);
+            if let Some(meter) = &meter {
+                meter.set_data_source(DataSource::Network);
+            }
+            let body = response_body(stream, compression, config.use_gzjoin, meter);
             res.header(header::CONTENT_TYPE, "application/jsonl")
                 .header(header::CONTENT_ENCODING, compression.content_encoding())
                 .body(body)
                 .unwrap()
         }
         Err(RequestError::NoData) => {
+            discard_meter(&meter);
             // Delay request from this client for 5 seconds to avoid unnecessary retries.
             tokio::time::sleep(Duration::from_secs(5)).await;
             res.status(StatusCode::NO_CONTENT).body(().into()).unwrap()
         }
-        Err(e) => e.into_response(),
+        Err(e) => {
+            discard_meter(&meter);
+            e.into_response()
+        }
     }
 }
 
@@ -155,11 +229,14 @@ found, request earlier blocks until one is."),
     ),
     tag = "Stream"
 )]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
     dataset: DatasetConfig,
     request: StreamRequest,
 ) -> Response {
@@ -171,6 +248,8 @@ pub(crate) async fn run_stream(
         dataset,
         request,
         StreamMode::RealTime,
+        grant,
+        reporter,
     )
     .await
 }
@@ -202,11 +281,14 @@ pub(crate) async fn run_stream(
     ),
     tag = "Stream"
 )]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_finalized_stream(
     Extension(task_manager): Extension<Arc<TaskManager>>,
     Extension(config): Extension<Arc<Config>>,
     Extension(network): Extension<Arc<NetworkClient>>,
     Extension(hotblocks): Extension<Arc<HotblocksHandle>>,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
     dataset: DatasetConfig,
     request: StreamRequest,
 ) -> Response {
@@ -218,10 +300,13 @@ pub(crate) async fn run_finalized_stream(
         dataset,
         request,
         StreamMode::Finalized,
+        grant,
+        reporter,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_stream_internal(
     task_manager: Arc<TaskManager>,
     config: Arc<Config>,
@@ -230,8 +315,23 @@ async fn run_stream_internal(
     dataset: DatasetConfig,
     request: StreamRequest,
     mode: StreamMode,
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
 ) -> Response {
     let request = restrict_request(&config, request);
+    let request =
+        restrict_request_to_grant(request, grant.as_ref().map(|grant| &grant.0.granted.limits));
+    let endpoint = match mode {
+        StreamMode::RealTime => Endpoint::Stream,
+        StreamMode::Finalized => Endpoint::FinalizedStream,
+    };
+    let meter = meter_from_extensions(
+        grant,
+        reporter,
+        endpoint,
+        dataset.default_name.clone(),
+        request.request_id.clone(),
+    );
 
     // Use the traceless hotblocks variant when the query doesn't need traces/statediffs
     let hotblocks_name = if dataset
@@ -261,21 +361,47 @@ async fn run_stream_internal(
                 mode,
                 dataset_id,
                 hotblocks_name,
+                meter,
             )
             .await
         }
         _ if dataset.hotblocks.is_some() => {
-            stream_from_hotblocks(network, hotblocks, dataset, request, mode, hotblocks_name).await
-        }
-        Some(dataset_id) => stream_after_network_head(&network, dataset_id).await,
-        None => {
-            unreachable!(
-                "invalid dataset name should have been handled in the ClientRequest parser"
+            stream_from_hotblocks(
+                network,
+                hotblocks,
+                dataset,
+                request,
+                mode,
+                hotblocks_name,
+                meter,
             )
+            .await
         }
+        Some(dataset_id) => {
+            discard_meter(&meter);
+            stream_after_network_head(&network, dataset_id).await
+        }
+        None => missing_stream_source_response(&dataset, &request, &meter),
     }
 }
 
+fn missing_stream_source_response(
+    dataset: &DatasetConfig,
+    _request: &StreamRequest,
+    meter: &Option<MeterHandle>,
+) -> Response {
+    discard_meter(meter);
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "Dataset {} has no stream source configured",
+            dataset.default_name
+        ),
+    )
+        .into_response()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn stream_from_network(
     task_manager: Arc<TaskManager>,
     config: Arc<Config>,
@@ -285,6 +411,7 @@ async fn stream_from_network(
     mode: StreamMode,
     dataset_id: DatasetId,
     hotblocks_name: String,
+    meter: Option<MeterHandle>,
 ) -> Response {
     let archival_head = network.head(&dataset_id);
     let head_task = tokio::spawn({
@@ -304,6 +431,7 @@ async fn stream_from_network(
     let stream = match task_manager.spawn_stream(request).await {
         Ok(stream) => stream,
         Err(e) => {
+            discard_meter(&meter);
             let mut response = e.into_response();
             response
                 .headers_mut()
@@ -320,7 +448,10 @@ async fn stream_from_network(
     if let Some(head) = head_task.await.unwrap() {
         res = res.header(HEAD_NUMBER_HEADER, head);
     }
-    let body = response_body(stream, compression, config.use_gzjoin);
+    if let Some(meter) = &meter {
+        meter.set_data_source(DataSource::Network);
+    }
+    let body = response_body(stream, compression, config.use_gzjoin, meter);
     res.header(header::CONTENT_TYPE, "application/jsonl")
         .header(header::CONTENT_ENCODING, compression.content_encoding())
         .body(body)
@@ -334,6 +465,7 @@ async fn stream_from_hotblocks(
     request: StreamRequest,
     mode: StreamMode,
     hotblocks_name: String,
+    meter: Option<MeterHandle>,
 ) -> Response {
     let first_block = request.query.first_block();
     let hotblocks_response = hotblocks
@@ -352,17 +484,79 @@ async fn stream_from_hotblocks(
                 )
                 .await
             {
+                discard_meter(&meter);
                 return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
             }
 
-            forward_response(response)
+            if response.status().is_success() {
+                if let Some(meter) = &meter {
+                    meter.set_data_source(DataSource::RealTime);
+                }
+                forward_response_metered(response, meter)
+            } else {
+                forward_hotblocks_error_response(response, meter)
+            }
         }
-        Err(e) => forward_hotblocks_response(Err(e)),
+        Err(e) => {
+            discard_meter(&meter);
+            forward_hotblocks_response(Err(e))
+        }
     };
 
     res.headers_mut()
         .insert(DATA_SOURCE_HEADER, DATA_SOURCE_REALTIME);
     res
+}
+
+fn forward_response_metered(
+    response: reqwest::Response,
+    meter: Option<MeterHandle>,
+) -> axum::response::Response {
+    let is_gzip = response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"gzip"));
+    let mut builder = Response::builder().status(response.status());
+    for (key, value) in response.headers() {
+        builder = builder.header(key, value);
+    }
+    let body = match meter {
+        Some(meter) if is_gzip => {
+            // Hotblocks arrive as an opaque proxied gzip byte stream, so there is
+            // no safe input-frame boundary where we can stop and flush a trailer.
+            // A cutoff here is an abrupt compressed-body termination; clients see
+            // it as a disconnect and receive the reject on their next poll.
+            Body::from_stream(tap_gzip_stream(response.bytes_stream(), meter))
+        }
+        Some(meter) => Body::from_stream(tap_plain_stream(response.bytes_stream(), meter)),
+        None => Body::from_stream(response.bytes_stream()),
+    };
+    builder.body(body).unwrap()
+}
+
+fn forward_hotblocks_error_response(
+    response: reqwest::Response,
+    meter: Option<MeterHandle>,
+) -> axum::response::Response {
+    if let Some(meter) = &meter {
+        meter.set_data_source(DataSource::RealTime);
+        meter.mark_error();
+    }
+
+    let mut builder = Response::builder().status(response.status());
+    for (key, value) in response.headers() {
+        if meter.is_some() && key == header::CONTENT_LENGTH {
+            continue;
+        }
+        builder = builder.header(key, value);
+    }
+    let body = match meter {
+        Some(meter) => {
+            Body::from_stream(tap_wire_stream_without_cut(response.bytes_stream(), meter))
+        }
+        None => Body::from_stream(response.bytes_stream()),
+    };
+    builder.body(body).unwrap()
 }
 
 async fn stream_after_network_head(network: &NetworkClient, dataset_id: DatasetId) -> Response {
@@ -380,13 +574,73 @@ fn response_body(
     stream: impl Stream<Item = Vec<u8>> + Send + 'static,
     compression: Compression,
     use_gzjoin: bool,
+    meter: Option<MeterHandle>,
 ) -> Body {
+    let stream: Pin<Box<dyn Stream<Item = Vec<u8>> + Send>> = match (meter.clone(), compression) {
+        (Some(meter), Compression::Gzip) => tap_input_chunks(stream, meter),
+        (Some(meter), Compression::Zstd) => tap_input_frames(stream, compression, meter),
+        (None, _) => Box::pin(stream),
+    };
+
     match compression {
-        Compression::Gzip if use_gzjoin => Body::from_stream(join_gzip_default(stream)),
-        Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
+        Compression::Gzip if use_gzjoin => match meter {
+            Some(meter) => Body::from_stream(tap_wire_stream_without_cut(
+                join_gzip_default(stream),
+                meter,
+            )),
+            None => Body::from_stream(join_gzip_default(stream)),
+        },
+        Compression::Gzip => match meter {
+            Some(meter) => {
+                Body::from_stream(tap_wire_stream_without_cut(recompress_gzip(stream), meter))
+            }
+            None => Body::from_stream(recompress_gzip(stream)),
+        },
         Compression::Zstd => {
-            Body::from_stream(stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))))
+            let output = stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result)));
+            match meter {
+                Some(meter) => Body::from_stream(tap_wire_stream_without_cut(output, meter)),
+                None => Body::from_stream(output),
+            }
         }
+    }
+}
+
+fn meter_from_extensions(
+    grant: Option<Extension<CommercialGrant>>,
+    reporter: Option<Extension<Arc<dyn UsageReporter>>>,
+    endpoint: Endpoint,
+    dataset: String,
+    request_id: String,
+) -> Option<MeterHandle> {
+    let grant = grant?;
+    let reporter = reporter?;
+    let snapshot_store = grant.0.snapshot_store.clone();
+    match (grant.0.tally.clone(), grant.0.registry.clone()) {
+        (Some(tally), Some(registry)) => Some(MeterHandle::new_enforced(
+            grant.0.granted.clone(),
+            request_id,
+            endpoint,
+            dataset,
+            reporter.0,
+            tally,
+            registry,
+            snapshot_store,
+        )),
+        _ => Some(MeterHandle::new(
+            grant.0.granted.principal.clone(),
+            request_id,
+            endpoint,
+            dataset,
+            reporter.0,
+            grant.0.granted.quota_version,
+        )),
+    }
+}
+
+fn discard_meter(meter: &Option<MeterHandle>) {
+    if let Some(meter) = meter {
+        meter.discard();
     }
 }
 
@@ -406,6 +660,39 @@ pub(crate) fn restrict_request(config: &Config, request: StreamRequest) -> Strea
         retries: config.default_retries,
         ..request
     }
+}
+
+fn restrict_request_to_grant(
+    request: StreamRequest,
+    limits: Option<&GrantedLimits>,
+) -> StreamRequest {
+    let grant_max_chunks = limits
+        .and_then(|limits| limits.max_chunks)
+        .and_then(|max_chunks| usize::try_from(max_chunks).ok());
+    let Some(grant_max_chunks) = grant_max_chunks else {
+        return request;
+    };
+    let max_chunks = match request.max_chunks {
+        Some(requested) => Some(requested.min(grant_max_chunks)),
+        None => Some(grant_max_chunks),
+    };
+    StreamRequest {
+        max_chunks,
+        ..request
+    }
+}
+
+fn restrict_archival_debug_request(
+    config: &Config,
+    request: StreamRequest,
+    grant: Option<&CommercialGrant>,
+) -> StreamRequest {
+    let request = if grant.is_some_and(|grant| grant.granted.principal.account_id != "oss") {
+        restrict_request(config, request)
+    } else {
+        request
+    };
+    restrict_request_to_grant(request, grant.map(|grant| &grant.granted.limits))
 }
 
 async fn should_treat_as_hotblocks_gap(
@@ -471,7 +758,282 @@ const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static(DATA_SOURCE_R
 
 #[cfg(test)]
 mod tests {
-    use super::is_hotblocks_gap;
+    use std::{
+        io::{Read, Write},
+        sync::{Arc, Mutex},
+    };
+
+    use axum::body::to_bytes;
+    use flate2::{read::MultiGzDecoder, write::GzEncoder, Compression as GzipCompression};
+    use futures::stream;
+
+    use super::*;
+    use crate::{
+        commercial::{
+            ActiveStreamRegistry, Granted, OnExceed, Principal, StreamUsageEvent, TallyStore,
+            UsageReporter, UsageStatus,
+        },
+        types::ParsedQuery,
+    };
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: Mutex<Vec<StreamUsageEvent>>,
+    }
+
+    impl UsageReporter for RecordingReporter {
+        fn report(&self, event: StreamUsageEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn meter(reporter: Arc<RecordingReporter>) -> MeterHandle {
+        MeterHandle::new(
+            Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some("key".to_string()),
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter,
+            0,
+        )
+    }
+
+    fn enforced_meter(reporter: Arc<RecordingReporter>, quota_remaining: i64) -> MeterHandle {
+        MeterHandle::new_enforced(
+            Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: Some("key".to_string()),
+                },
+                tally_account_id: None,
+                entitled_chains: None,
+                entitled_traces: None,
+                limits: GrantedLimits::default(),
+                on_exceed: OnExceed::Reject,
+                quota_version: 7,
+                quota_remaining_bytes: Some(quota_remaining),
+                snapshot_generation: None,
+                concurrency_permit: None,
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter,
+            Arc::new(TallyStore::default()),
+            Arc::new(ActiveStreamRegistry::default()),
+            None,
+        )
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), GzipCompression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn gunzip_all(bytes: &[u8]) -> Vec<u8> {
+        let mut decoded = Vec::new();
+        MultiGzDecoder::new(bytes)
+            .read_to_end(&mut decoded)
+            .unwrap();
+        decoded
+    }
+
+    async fn collect_response_body(
+        frames: Vec<Vec<u8>>,
+        compression: Compression,
+        use_gzjoin: bool,
+        meter: Option<MeterHandle>,
+    ) -> Vec<u8> {
+        to_bytes(
+            response_body(stream::iter(frames), compression, use_gzjoin, meter),
+            usize::MAX,
+        )
+        .await
+        .unwrap()
+        .to_vec()
+    }
+
+    fn split_frame(frame: Vec<u8>) -> Vec<Vec<u8>> {
+        let split = frame.len() / 2;
+        vec![frame[..split].to_vec(), frame[split..].to_vec()]
+    }
+
+    async fn reqwest_response(status: StatusCode, body: Vec<u8>) -> reqwest::Response {
+        let app = axum::Router::new().route(
+            "/hotblocks",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move {
+                    (
+                        status,
+                        [(header::CONTENT_LENGTH, body.len().to_string())],
+                        Body::from(body),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        reqwest::get(format!("http://{addr}/hotblocks"))
+            .await
+            .unwrap()
+    }
+
+    fn stream_request(max_chunks: Option<usize>) -> StreamRequest {
+        StreamRequest {
+            dataset_id: DatasetId::from_url("test-dataset"),
+            dataset_name: "test-dataset".to_string(),
+            query: ParsedQuery::try_from(
+                r#"{"type":"evm","fromBlock":1,"fields":{"block":{"number":true}}}"#.to_string(),
+            )
+            .unwrap(),
+            request_id: "request".to_string(),
+            buffer_size: 10,
+            max_stored_results_per_chunk: 2,
+            max_chunks,
+            timeout_quantile: 0.5,
+            retries: 1,
+            compression: Compression::Gzip,
+            skip_parent_hash_validation: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn solana_dataset_without_a_source_returns_client_error_instead_of_panicking() {
+        let raw = r#"{"type":"solana","fromBlock":300000000,"toBlock":300000000,"fields":{"block":{"number":true}},"includeAllBlocks":true}"#;
+        let request = StreamRequest {
+            dataset_id: DatasetId::from_url("-"),
+            dataset_name: "solana-mainnet".to_string(),
+            query: ParsedQuery::try_from(raw.to_string()).unwrap(),
+            request_id: "g2-repro".to_string(),
+            buffer_size: 10,
+            max_stored_results_per_chunk: 2,
+            max_chunks: None,
+            timeout_quantile: 0.5,
+            retries: 1,
+            compression: Compression::Gzip,
+            skip_parent_hash_validation: false,
+        };
+        let dataset = DatasetConfig {
+            default_name: "solana-mainnet".to_string(),
+            aliases: vec!["solana-beta".to_string()],
+            network_id: None,
+            hotblocks: None,
+            kind: "solana".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+
+        let response = missing_stream_source_response(&dataset, &request, &None);
+        assert!(response.status().is_client_error());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            &body[..],
+            b"Dataset solana-mainnet has no stream source configured"
+        );
+    }
+
+    fn config_for_restriction_test() -> Config {
+        serde_yaml::from_str(
+            r#"
+hostname: portal.example
+sqd_network:
+  datasets: https://example.invalid/datasets.yaml
+max_buffer_size: 4
+max_stored_results_per_chunk: 1
+max_chunks_per_stream: 2
+default_timeout_quantile: 0.25
+default_retries: 0
+"#,
+        )
+        .expect("test config should parse")
+    }
+
+    fn commercial_grant(
+        api_key_id: Option<&str>,
+        grant_max_chunks: Option<u64>,
+    ) -> CommercialGrant {
+        CommercialGrant {
+            granted: Granted {
+                principal: Principal {
+                    account_id: "account".to_string(),
+                    api_key_id: api_key_id.map(str::to_string),
+                },
+                tally_account_id: None,
+                entitled_chains: None,
+                entitled_traces: None,
+                limits: GrantedLimits {
+                    max_chunks: grant_max_chunks,
+                    ..GrantedLimits::default()
+                },
+                on_exceed: OnExceed::Reject,
+                quota_version: 7,
+                quota_remaining_bytes: Some(100),
+                snapshot_generation: None,
+                concurrency_permit: None,
+            },
+            tally: None,
+            registry: None,
+            snapshot_store: None,
+        }
+    }
+
+    #[test]
+    fn grant_caps_max_chunks_after_operator_restriction() {
+        let capped = restrict_request_to_grant(
+            stream_request(Some(10)),
+            Some(&GrantedLimits {
+                max_chunks: Some(3),
+                ..GrantedLimits::default()
+            }),
+        );
+        assert_eq!(capped.max_chunks, Some(3));
+
+        let capped = restrict_request_to_grant(
+            stream_request(None),
+            Some(&GrantedLimits {
+                max_chunks: Some(4),
+                ..GrantedLimits::default()
+            }),
+        );
+        assert_eq!(capped.max_chunks, Some(4));
+    }
+
+    #[test]
+    fn archival_debug_clamps_keyed_and_anonymous_requests() {
+        let config = config_for_restriction_test();
+        let keyed = commercial_grant(Some("key"), Some(3));
+        let anonymous = commercial_grant(None, Some(3));
+        let mut request = stream_request(Some(10));
+        request.buffer_size = 1_000_000_000;
+        request.retries = u8::MAX;
+
+        let keyed_request = restrict_archival_debug_request(&config, request.clone(), Some(&keyed));
+        assert_eq!(keyed_request.buffer_size, 4);
+        assert_eq!(keyed_request.max_stored_results_per_chunk, 1);
+        assert_eq!(keyed_request.max_chunks, Some(2));
+        assert_eq!(keyed_request.timeout_quantile, 0.25);
+        assert_eq!(keyed_request.retries, 0);
+
+        let anonymous_request =
+            restrict_archival_debug_request(&config, request.clone(), Some(&anonymous));
+        assert_eq!(anonymous_request.buffer_size, 4);
+        assert_eq!(anonymous_request.max_stored_results_per_chunk, 1);
+        assert_eq!(anonymous_request.max_chunks, Some(2));
+        assert_eq!(anonymous_request.timeout_quantile, 0.25);
+        assert_eq!(anonymous_request.retries, 0);
+
+        let oss_request = restrict_archival_debug_request(&config, request.clone(), None);
+        assert_eq!(oss_request.buffer_size, request.buffer_size);
+        assert_eq!(oss_request.max_chunks, request.max_chunks);
+    }
 
     #[test]
     fn hotblocks_gap_detects_missing_blocks_after_archival_height() {
@@ -501,5 +1063,183 @@ mod tests {
     #[test]
     fn hotblocks_gap_requires_actual_gap_between_sources() {
         assert!(!is_hotblocks_gap(101, 100, 101));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_no_content_discards_meter_without_usage_event() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let meter = Some(MeterHandle::new(
+            Principal {
+                account_id: "account".to_string(),
+                api_key_id: Some("key".to_string()),
+            },
+            "request".to_string(),
+            Endpoint::Stream,
+            "ethereum-mainnet".to_string(),
+            reporter.clone(),
+            0,
+        ));
+        discard_meter(&meter);
+
+        let task = tokio::spawn(delayed_no_content_response(DATA_SOURCE_REALTIME));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let response = task.await.unwrap();
+        drop(meter);
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(reporter.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hotblocks_error_response_marks_meter_error_without_cutting_body() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let body = b"hotblocks failed with detail".to_vec();
+        let response = reqwest_response(StatusCode::BAD_GATEWAY, body.clone()).await;
+        let forwarded =
+            forward_hotblocks_error_response(response, Some(enforced_meter(reporter.clone(), 1)));
+
+        assert_eq!(forwarded.status(), StatusCode::BAD_GATEWAY);
+        assert!(!forwarded.headers().contains_key(header::CONTENT_LENGTH));
+        let forwarded_body = to_bytes(forwarded.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&forwarded_body[..], &body);
+
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.status, UsageStatus::Error);
+        assert_eq!(event.data_source, DataSource::RealTime);
+        assert_eq!(event.logical_bytes, 0);
+        assert_eq!(event.wire_bytes, body.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn response_body_gzjoin_taps_chunks_without_changing_wire_output() {
+        let plain = b"{\"gzjoin\":true}\n";
+        let frames = split_frame(gzip(plain));
+        let expected = collect_response_body(frames.clone(), Compression::Gzip, true, None).await;
+        let reporter = Arc::new(RecordingReporter::default());
+        let metered = collect_response_body(
+            frames,
+            Compression::Gzip,
+            true,
+            Some(meter(reporter.clone())),
+        )
+        .await;
+
+        assert_eq!(metered, expected);
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, plain.len() as u64);
+        assert_eq!(event.wire_bytes, expected.len() as u64);
+        assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn response_body_recompress_taps_chunks_without_changing_wire_output() {
+        let plain = b"{\"recompress\":true}\n";
+        let frames = split_frame(gzip(plain));
+        let expected = collect_response_body(frames.clone(), Compression::Gzip, false, None).await;
+        let reporter = Arc::new(RecordingReporter::default());
+        let metered = collect_response_body(
+            frames,
+            Compression::Gzip,
+            false,
+            Some(meter(reporter.clone())),
+        )
+        .await;
+
+        assert_eq!(metered, expected);
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, plain.len() as u64);
+        assert_eq!(event.wire_bytes, expected.len() as u64);
+        assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn response_body_zstd_taps_frames_without_changing_wire_output() {
+        let plain = b"{\"zstd\":true}\n";
+        let frames = split_frame(zstd::stream::encode_all(&plain[..], 0).unwrap());
+        let expected = collect_response_body(frames.clone(), Compression::Zstd, false, None).await;
+        let reporter = Arc::new(RecordingReporter::default());
+        let metered = collect_response_body(
+            frames,
+            Compression::Zstd,
+            false,
+            Some(meter(reporter.clone())),
+        )
+        .await;
+
+        assert_eq!(metered, expected);
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, plain.len() as u64);
+        assert_eq!(event.wire_bytes, expected.len() as u64);
+        assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::Completed);
+    }
+
+    async fn assert_gzip_cut_by_quota_decodes(use_gzjoin: bool) {
+        let first = b"{\"block\":1}\n";
+        let second = b"{\"block\":2}\n";
+        let third = b"{\"block\":3}\n";
+        let frames = vec![gzip(first), gzip(second), gzip(third)];
+        let reporter = Arc::new(RecordingReporter::default());
+        let metered = collect_response_body(
+            frames,
+            Compression::Gzip,
+            use_gzjoin,
+            Some(enforced_meter(
+                reporter.clone(),
+                first.len().saturating_add(1) as i64,
+            )),
+        )
+        .await;
+
+        assert_eq!(
+            gunzip_all(&metered),
+            [first.as_slice(), second.as_slice()].concat()
+        );
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, (first.len() + second.len()) as u64);
+        assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::CutQuota);
+    }
+
+    #[tokio::test]
+    async fn response_body_gzjoin_cut_by_quota_finishes_decodable_gzip() {
+        assert_gzip_cut_by_quota_decodes(true).await;
+    }
+
+    #[tokio::test]
+    async fn response_body_recompress_cut_by_quota_finishes_decodable_gzip() {
+        assert_gzip_cut_by_quota_decodes(false).await;
+    }
+
+    #[tokio::test]
+    async fn response_body_zstd_cut_by_quota_keeps_decodable_frames() {
+        let first = b"{\"zstd\":1}\n";
+        let second = b"{\"zstd\":2}\n";
+        let third = b"{\"zstd\":3}\n";
+        let frames = vec![
+            zstd::stream::encode_all(&first[..], 0).unwrap(),
+            zstd::stream::encode_all(&second[..], 0).unwrap(),
+            zstd::stream::encode_all(&third[..], 0).unwrap(),
+        ];
+        let reporter = Arc::new(RecordingReporter::default());
+        let metered = collect_response_body(
+            frames,
+            Compression::Zstd,
+            false,
+            Some(enforced_meter(
+                reporter.clone(),
+                first.len().saturating_add(1) as i64,
+            )),
+        )
+        .await;
+
+        let decoded = zstd::stream::decode_all(&metered[..]).unwrap();
+        assert_eq!(decoded, [first.as_slice(), second.as_slice()].concat());
+        let event = reporter.events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.logical_bytes, (first.len() + second.len()) as u64);
+        assert_eq!(event.chunks, 2);
+        assert_eq!(event.status, UsageStatus::CutQuota);
     }
 }

@@ -32,7 +32,7 @@ pub fn json_lines_to_json(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 pub fn recompress_gzip<S>(stream: S) -> impl futures::Stream<Item = std::io::Result<Bytes>>
 where
-    S: futures::Stream<Item = Vec<u8>>,
+    S: futures::Stream<Item = Vec<u8>> + Unpin,
 {
     let reader =
         StreamReader::new(stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))));
@@ -52,10 +52,13 @@ pub fn join_gzip_default<S: Stream<Item = Vec<u8>>>(
     join_gzip(data, JOIN_GZIP_CHUNK_SIZE)
 }
 
-pub fn join_gzip<S: Stream<Item = Vec<u8>>>(
+pub fn join_gzip<S>(
     data: S,
     gzip_chunk_size: usize,
-) -> impl Stream<Item = Result<Bytes, anyhow::Error>> {
+) -> impl Stream<Item = Result<Bytes, anyhow::Error>>
+where
+    S: Stream<Item = Vec<u8>>,
+{
     stream! {
         let mut crc = unsafe { libz_ng_sys::crc32(0, std::ptr::null(), 0) };
         let mut tot = 0u32;

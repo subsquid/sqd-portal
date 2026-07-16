@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use url::Url;
 
+use crate::commercial::CommercialConfig;
 use crate::network::PrioritiesConfig;
 use crate::types::DatasetRef;
 
@@ -126,6 +127,9 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub sentry_is_enabled: bool,
 
+    #[serde(default)]
+    pub commercial: Option<CommercialConfig>,
+
     pub client_id: Option<String>,
 }
 
@@ -188,6 +192,9 @@ impl Config {
 
     fn validate(&self) -> anyhow::Result<()> {
         self.congestion.validate()?;
+        if let Some(commercial) = &self.commercial {
+            commercial.validate()?;
+        }
         Ok(())
     }
 }
@@ -396,6 +403,95 @@ sqd_network:
     fn max_stored_results_per_chunk_defaults_to_two() {
         let config: Config = serde_yaml::from_str(MINIMAL_YAML).expect("parse");
         assert_eq!(config.max_stored_results_per_chunk, 2);
+    }
+
+    #[test]
+    fn commercial_config_defaults_to_absent() {
+        let config: Config = serde_yaml::from_str(MINIMAL_YAML).expect("parse");
+        assert!(config.commercial.is_none());
+    }
+
+    #[test]
+    fn commercial_config_parses_when_present() {
+        std::env::set_var("PORTAL_CP_TOKEN_FOR_PARSE_TEST", "secret");
+        let yaml = format!(
+            "{MINIMAL_YAML}commercial:\n  control_plane_url: http://portal-api.internal:3005\n  service_token_env: PORTAL_CP_TOKEN_FOR_PARSE_TEST\n  sync_interval_secs: 10\n  flush_interval_secs: 5\n  flush_max_events: 500\n  usage_buffer_max_events: 100000\n  snapshot_cache_path: /tmp/snapshots.json\n  resolve_rate_per_sec: 20\n  negative_cache_secs: 15\n  pod_count: 4\n  public_fallback:\n    throughput_bytes_per_sec: 100000\n    burst_bytes: 300000\n    max_response_bytes: 52428800\n    volume_bytes: 52428800\n    window_secs: 86400\n    concurrency: 2\n"
+        );
+
+        let config: Config = serde_yaml::from_str(&yaml).expect("parse");
+        config.validate().expect("validate");
+        let commercial = config.commercial.expect("commercial config");
+
+        assert_eq!(
+            commercial.service_token_env,
+            "PORTAL_CP_TOKEN_FOR_PARSE_TEST"
+        );
+        assert_eq!(commercial.pod_count, 4);
+        assert_eq!(commercial.public_fallback.concurrency, 2);
+        assert_eq!(commercial.usage_max_retry_age_secs, 7 * 24 * 60 * 60);
+        assert_eq!(commercial.throttle_residual_secs, 60);
+        assert_eq!(commercial.sweep_horizon_window_multiplier, 2);
+        assert_eq!(commercial.sweep_horizon(), Duration::from_secs(172800));
+
+        let override_yaml = yaml.replace(
+            "  usage_buffer_max_events: 100000\n",
+            "  usage_buffer_max_events: 100000\n  usage_max_retry_age_secs: 3600\n",
+        );
+        let override_config: Config = serde_yaml::from_str(&override_yaml).expect("parse override");
+        assert_eq!(
+            override_config
+                .commercial
+                .expect("commercial config")
+                .usage_max_retry_age_secs,
+            3600
+        );
+        std::env::remove_var("PORTAL_CP_TOKEN_FOR_PARSE_TEST");
+    }
+
+    #[test]
+    fn commercial_config_requires_service_token_env() {
+        std::env::remove_var("PORTAL_CP_TOKEN_FOR_MISSING_TEST");
+        let yaml = format!(
+            "{MINIMAL_YAML}commercial:\n  control_plane_url: http://portal-api.internal:3005\n  service_token_env: PORTAL_CP_TOKEN_FOR_MISSING_TEST\n  sync_interval_secs: 10\n  flush_interval_secs: 5\n  flush_max_events: 500\n  usage_buffer_max_events: 100000\n  snapshot_cache_path: /tmp/snapshots.json\n  resolve_rate_per_sec: 20\n  negative_cache_secs: 15\n  pod_count: 4\n  public_fallback:\n    throughput_bytes_per_sec: 100000\n    burst_bytes: 300000\n    max_response_bytes: 52428800\n    volume_bytes: 52428800\n    window_secs: 86400\n    concurrency: 2\n"
+        );
+
+        let config: Config = serde_yaml::from_str(&yaml).expect("parse");
+        let err = config.validate().expect_err("missing env rejects");
+        assert!(err.to_string().contains("PORTAL_CP_TOKEN_FOR_MISSING_TEST"));
+    }
+
+    #[test]
+    fn commercial_config_rejects_flush_batches_above_ingest_cap() {
+        std::env::set_var("PORTAL_CP_TOKEN_FOR_FLUSH_CAP_TEST", "secret");
+        let yaml = format!(
+            "{MINIMAL_YAML}commercial:\n  control_plane_url: http://portal-api.internal:3005\n  service_token_env: PORTAL_CP_TOKEN_FOR_FLUSH_CAP_TEST\n  sync_interval_secs: 10\n  flush_interval_secs: 5\n  flush_max_events: 10001\n  usage_buffer_max_events: 100000\n  snapshot_cache_path: /tmp/snapshots.json\n  resolve_rate_per_sec: 20\n  negative_cache_secs: 15\n  pod_count: 4\n  public_fallback:\n    throughput_bytes_per_sec: 100000\n    burst_bytes: 300000\n    max_response_bytes: 52428800\n    volume_bytes: 52428800\n    window_secs: 86400\n    concurrency: 2\n"
+        );
+
+        let config: Config = serde_yaml::from_str(&yaml).expect("parse");
+        let err = config
+            .validate()
+            .expect_err("oversized flush batch rejects");
+        assert!(
+            err.to_string().contains("flush_max_events"),
+            "unexpected error: {err}"
+        );
+        std::env::remove_var("PORTAL_CP_TOKEN_FOR_FLUSH_CAP_TEST");
+    }
+
+    #[test]
+    fn commercial_config_rejects_zero_flush_interval() {
+        std::env::set_var("PORTAL_CP_TOKEN_FOR_FLUSH_INTERVAL_TEST", "secret");
+        let yaml = format!(
+            "{MINIMAL_YAML}commercial:\n  control_plane_url: http://portal-api.internal:3005\n  service_token_env: PORTAL_CP_TOKEN_FOR_FLUSH_INTERVAL_TEST\n  sync_interval_secs: 10\n  flush_interval_secs: 0\n  flush_max_events: 500\n  usage_buffer_max_events: 100000\n  snapshot_cache_path: /tmp/snapshots.json\n  resolve_rate_per_sec: 20\n  negative_cache_secs: 15\n  pod_count: 4\n  public_fallback:\n    throughput_bytes_per_sec: 100000\n    burst_bytes: 300000\n    max_response_bytes: 52428800\n    volume_bytes: 52428800\n    window_secs: 86400\n    concurrency: 2\n"
+        );
+
+        let config: Config = serde_yaml::from_str(&yaml).expect("parse");
+        let err = config.validate().expect_err("zero flush interval rejects");
+        assert!(
+            err.to_string().contains("flush_interval_secs"),
+            "unexpected error: {err}"
+        );
+        std::env::remove_var("PORTAL_CP_TOKEN_FOR_FLUSH_INTERVAL_TEST");
     }
 
     #[test]
