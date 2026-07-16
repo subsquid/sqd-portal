@@ -46,7 +46,10 @@ use crate::{
     controller::task_manager::TaskManager,
     hotblocks::HotblocksHandle,
     network::{NetworkClient, NoWorker, NotReady},
-    types::{ChunkId, DatasetId, ParsedQuery, RequestError, StreamRequest},
+    types::{
+        error_response, with_error_code, ChunkId, DatasetId, ErrorCode, ParsedQuery, RequestError,
+        StreamRequest,
+    },
     utils::logging,
 };
 
@@ -295,7 +298,7 @@ where
     ),
     responses(
         (status = 200, description = "Archival head block retrieved", body = Option<BlockHead>),
-        (status = 404, description = "Dataset has no archival data source"),
+        (status = 404, description = "Dataset has no archival data source", body = ErrorResponse),
     ),
     tag = "Archival stream"
 )]
@@ -314,14 +317,14 @@ async fn get_archival_head(
         return axum::Json(head).into_response();
     }
 
-    (
+    error_response(
         StatusCode::NOT_FOUND,
+        ErrorCode::UnknownDataset,
         format!(
             "Dataset {} has no archival data source",
             dataset.default_name
         ),
     )
-        .into_response()
 }
 
 /// Latest finalized head
@@ -335,7 +338,7 @@ async fn get_archival_head(
     ),
     responses(
         (status = 200, description = "Finalized head block retrieved", body = Option<BlockHead>),
-        (status = 404, description = "Dataset has no data sources"),
+        (status = 404, description = "Dataset has no data sources", body = ErrorResponse),
     ),
     tag = "Stream"
 )]
@@ -349,7 +352,8 @@ async fn get_finalized_head(
             hotblocks
                 .request_finalized_head(&dataset.default_name)
                 .await,
-        );
+        )
+        .await;
     }
 
     // Fall back to network data source
@@ -363,11 +367,11 @@ async fn get_finalized_head(
         return axum::Json(head).into_response();
     }
 
-    (
+    error_response(
         StatusCode::NOT_FOUND,
+        ErrorCode::UnknownDataset,
         format!("Dataset {} has no data sources", dataset.default_name),
     )
-        .into_response()
 }
 
 /// Latest head
@@ -381,7 +385,7 @@ async fn get_finalized_head(
     ),
     responses(
         (status = 200, description = "Head block retrieved", body = Option<BlockHead>),
-        (status = 404, description = "Dataset has no data sources"),
+        (status = 404, description = "Dataset has no data sources", body = ErrorResponse),
     ),
     tag = "Stream"
 )]
@@ -391,7 +395,8 @@ async fn get_head(
     dataset: DatasetConfig,
 ) -> Response {
     if dataset.hotblocks.is_some() {
-        return forward_hotblocks_response(hotblocks.request_head(&dataset.default_name).await);
+        return forward_hotblocks_response(hotblocks.request_head(&dataset.default_name).await)
+            .await;
     }
 
     // Fall back to network data source
@@ -405,11 +410,11 @@ async fn get_head(
         return axum::Json(head).into_response();
     }
 
-    (
+    error_response(
         StatusCode::NOT_FOUND,
+        ErrorCode::UnknownDataset,
         format!("Dataset {} has no data sources", dataset.default_name),
     )
-        .into_response()
 }
 
 /// [INTERNAL] Portal Status
@@ -510,7 +515,7 @@ async fn get_datasets(
     ),
     responses(
         (status = 200, description = "Dataset state retrieved successfully", body = serde_json::Value),
-        (status = 404, description = "Dataset not found"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
     ),
     tag = "Datasets"
 )]
@@ -533,7 +538,7 @@ async fn get_dataset_state(
     ),
     responses(
         (status = 200, description = "Dataset metadata retrieved successfully", body = AvailableDatasetApiResponse),
-        (status = 404, description = "Dataset not found"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
     ),
     tag = "Datasets"
 )]
@@ -570,7 +575,7 @@ async fn get_dataset_metadata(
     ),
     responses(
         (status = 200, description = "Debug information retrieved", body = serde_json::Value),
-        (status = 404, description = "Dataset or block not found"),
+        (status = 404, description = "Dataset or block not found", body = ErrorResponse),
     ),
     tag = "Debug"
 )]
@@ -642,7 +647,7 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
     path = "/ready",
     responses(
         (status = 200, description = "Portal is ready"),
-        (status = 503, description = "Portal is not ready"),
+        (status = 503, description = "Portal is not ready", body = ErrorResponse),
     ),
     tag = "Status"
 )]
@@ -696,7 +701,12 @@ async fn get_readiness(
         }
     }
 
-    (code, body).into_response()
+    // Plain text for probe consumers. Classified so draining isn't counted as a fault.
+    let response = (code, body).into_response();
+    match code {
+        StatusCode::OK => response,
+        _ => with_error_code(response, ErrorCode::NotReady),
+    }
 }
 
 /// [INTERNAL] Dataset Height (deprecated)
@@ -710,7 +720,7 @@ async fn get_readiness(
     ),
     responses(
         (status = 200, description = "Height retrieved successfully", body = String),
-        (status = 404, description = "Dataset not found"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
     ),
     tag = "Stream",
 )]
@@ -734,7 +744,7 @@ async fn get_height(
     ),
     responses(
         (status = 200, description = "Height retrieved successfully", body = String),
-        (status = 404, description = "Dataset not found"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
     ),
     tag = "Stream",
 )]
@@ -758,7 +768,7 @@ async fn get_finalized_stream_height(
     ),
     responses(
         (status = 200, description = "Height retrieved successfully", body = String),
-        (status = 404, description = "Dataset not found"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
     ),
     tag = "Archival stream",
 )]
@@ -771,15 +781,13 @@ async fn get_archival_stream_height(
     height_response(&network, &dataset, &dataset_id)
 }
 
-fn height_response(
-    network: &NetworkClient,
-    dataset: &str,
-    dataset_id: &DatasetId,
-) -> (StatusCode, String) {
+fn height_response(network: &NetworkClient, dataset: &str, dataset_id: &DatasetId) -> Response {
     match network.get_height(dataset_id) {
-        Some(height) => (StatusCode::OK, height.to_string()),
-        None => (
+        // Bare number, not JSON: the deprecated height endpoints' response contract.
+        Some(height) => (StatusCode::OK, height.to_string()).into_response(),
+        None => error_response(
             StatusCode::NOT_FOUND,
+            ErrorCode::UnknownDataset,
             format!("No data for dataset {dataset}"),
         ),
     }
@@ -797,9 +805,9 @@ fn height_response(
     ),
     responses(
         (status = 200, description = "Worker URL retrieved", body = String),
-        (status = 404, description = "Dataset not found"),
-        (status = 429, description = "Rate limit exceeded"),
-        (status = 503, description = "No available workers"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 503, description = "No available workers", body = ErrorResponse),
     ),
     tag = "Debug",
 )]
@@ -813,19 +821,23 @@ async fn get_worker(
     let worker_id = match client.find_worker(&dataset_id, start_block) {
         Ok(worker_id) => worker_id.worker(),
         Err(NoWorker::AllUnavailable) => {
-            return (
+            return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::NoWorkers,
                 format!("No available worker for dataset {dataset} block {start_block}"),
-            )
-                .into_response();
+            );
         }
         Err(NoWorker::Backoff(retry_at)) => {
             let seconds = retry_at.duration_since(Instant::now()).as_secs() + 1; // +1 for rounding up
-            return Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header(header::RETRY_AFTER, seconds)
-                .body(Body::from("Too many requests"))
-                .unwrap();
+            let mut response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::Overloaded,
+                "Too many requests",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, seconds.into());
+            return response;
         }
     };
 
@@ -853,9 +865,9 @@ async fn get_worker(
     request_body = serde_json::Value,
     responses(
         (status = 200, description = "Query executed successfully", body = String),
-        (status = 400, description = "Invalid query"),
-        (status = 404, description = "Dataset or worker not found"),
-        (status = 503, description = "Service unavailable"),
+        (status = 400, description = "Invalid query", body = ErrorResponse),
+        (status = 404, description = "Dataset or worker not found", body = ErrorResponse),
+        (status = 503, description = "Service unavailable", body = ErrorResponse),
     ),
     tag = "Stream",
 )]
@@ -869,11 +881,11 @@ async fn execute_query(
     let dataset_id = match DatasetId::from_base64(&dataset_id_encoded) {
         Ok(dataset_id) => dataset_id,
         Err(e) => {
-            return (
+            return error_response(
                 StatusCode::NOT_FOUND,
+                ErrorCode::UnknownDataset,
                 format!("Couldn't parse dataset id: {e}"),
             )
-                .into_response()
         }
     };
 
@@ -912,9 +924,7 @@ async fn execute_query(
             .header(header::CONTENT_ENCODING, "gzip")
             .body(Body::from(data))
             .unwrap(),
-        Err(e) => {
-            RequestError::InternalError(format!("Couldn't convert response: {e}")).into_response()
-        }
+        Err(e) => RequestError::Internal(format!("Couldn't convert response: {e}")).into_response(),
     }
 }
 
@@ -932,9 +942,13 @@ where
             .extract::<Path<Vec<(String, String)>>>()
             .await
             .map_err(IntoResponse::into_response)?;
-        let (_, alias) = args
-            .first()
-            .ok_or((StatusCode::NOT_FOUND, "not enough arguments").into_response())?;
+        let (_, alias) = args.first().ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                ErrorCode::UnknownDataset,
+                "not enough arguments",
+            )
+        })?;
         let Extension(network) = parts
             .extract::<Extension<Arc<NetworkClient>>>()
             .await
@@ -942,9 +956,11 @@ where
 
         match network.dataset(alias) {
             Some(config) => Ok(config.clone()),
-            None => {
-                Err((StatusCode::NOT_FOUND, format!("Unknown dataset: {alias}")).into_response())
-            }
+            None => Err(error_response(
+                StatusCode::NOT_FOUND,
+                ErrorCode::UnknownDataset,
+                format!("Unknown dataset: {alias}"),
+            )),
         }
     }
 }
@@ -984,17 +1000,19 @@ where
 
         let buffer_size = match params.get("buffer_size").map(|v| v.parse()) {
             Some(Ok(0)) => {
-                return Err(RequestError::BadRequest(
-                    "buffer_size must be greater than 0".to_string(),
-                )
+                return Err(RequestError::InvalidParam {
+                    param: "buffer_size",
+                    message: "buffer_size must be greater than 0".to_string(),
+                }
                 .into_response())
             }
             Some(Ok(value)) => value,
             Some(Err(e)) => {
-                return Err(
-                    RequestError::BadRequest(format!("Couldn't parse buffer_size: {e}"))
-                        .into_response(),
-                )
+                return Err(RequestError::InvalidParam {
+                    param: "buffer_size",
+                    message: format!("Couldn't parse buffer_size: {e}"),
+                }
+                .into_response())
             }
             None => config.default_buffer_size,
         };
@@ -1002,9 +1020,10 @@ where
             Some(value) => match value.parse() {
                 Ok(quantile) => quantile,
                 Err(e) => {
-                    return Err(RequestError::BadRequest(format!(
-                        "Couldn't parse timeout_quantile: {e}"
-                    ))
+                    return Err(RequestError::InvalidParam {
+                        param: "timeout_quantile",
+                        message: format!("Couldn't parse timeout_quantile: {e}"),
+                    }
                     .into_response())
                 }
             },
@@ -1014,10 +1033,11 @@ where
             Some(value) => match value.parse() {
                 Ok(value) => value,
                 Err(e) => {
-                    return Err(
-                        RequestError::BadRequest(format!("Couldn't parse retries: {e}"))
-                            .into_response(),
-                    )
+                    return Err(RequestError::InvalidParam {
+                        param: "retries",
+                        message: format!("Couldn't parse retries: {e}"),
+                    }
+                    .into_response())
                 }
             },
             None => config.default_retries,
@@ -1025,17 +1045,19 @@ where
         let max_chunks = match params.get("max_chunks") {
             Some(value) => match value.parse() {
                 Ok(0) => {
-                    return Err(RequestError::BadRequest(
-                        "max_chunks must be greater than 0".to_string(),
-                    )
+                    return Err(RequestError::InvalidParam {
+                        param: "max_chunks",
+                        message: "max_chunks must be greater than 0".to_string(),
+                    }
                     .into_response())
                 }
                 Ok(value) => Some(value),
                 Err(e) => {
-                    return Err(
-                        RequestError::BadRequest(format!("Couldn't parse max_chunks: {e}"))
-                            .into_response(),
-                    )
+                    return Err(RequestError::InvalidParam {
+                        param: "max_chunks",
+                        message: format!("Couldn't parse max_chunks: {e}"),
+                    }
+                    .into_response())
                 }
             },
             None => None,
@@ -1124,41 +1146,94 @@ where
 
         match dataset.network_id {
             Some(dataset_id) => Ok(dataset_id),
-            None => Err((
+            None => Err(error_response(
                 StatusCode::NOT_FOUND,
+                ErrorCode::UnknownDataset,
                 format!(
                     "Dataset {} doesn't have archival data",
                     dataset.default_name
                 ),
-            )
-                .into_response()),
+            )),
         }
     }
 }
 
-pub(crate) fn forward_hotblocks_response(
+pub(crate) async fn forward_hotblocks_response(
     response: Result<reqwest::Response, HotblocksErr>,
 ) -> Response {
     match response {
-        Ok(response) => forward_response(response),
+        Ok(response) => forward_response(response).await,
+        // Unreachable by construction; a panic here would kill the connection task.
         Err(HotblocksErr::UnknownDataset) => {
-            unreachable!("dataset should be known by the hotblocks service")
+            RequestError::Internal("dataset should be known by the hotblocks service".to_owned())
+                .into_response()
         }
-        Err(HotblocksErr::Request(e)) => (
+        Err(HotblocksErr::Request(e)) => error_response(
             StatusCode::BAD_GATEWAY,
+            ErrorCode::UpstreamUnavailable,
             format!("Hotblocks request error: {e}"),
-        )
-            .into_response(),
+        ),
     }
 }
 
-pub(crate) fn forward_response(response: reqwest::Response) -> axum::response::Response {
+/// Proxy a hotblocks response, rewriting error bodies into the portal's envelope: one
+/// stream endpoint is served by either data source and must not emit two body shapes.
+pub(crate) async fn forward_response(response: reqwest::Response) -> axum::response::Response {
+    let status = response.status();
+
+    if status == StatusCode::NO_CONTENT {
+        // Carries x-sqd-finalized-head-*, which clients need; stream it untouched.
+        return with_error_code(stream_response(response), ErrorCode::NoData);
+    }
+    if status.is_success() || status.is_redirection() {
+        return stream_response(response);
+    }
+
+    let class = ErrorCode::from_upstream_status(status);
+    let headers = response.headers().clone();
+    let body = response.bytes().await.unwrap_or_default();
+
+    let mut rewritten = if status == StatusCode::CONFLICT {
+        // Add `code` beside hotblocks' previousBlocks so both stream paths agree;
+        // pass through unchanged if it doesn't parse.
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(mut value) if value.is_object() => {
+                let object = value.as_object_mut().expect("checked is_object");
+                object.insert("code".to_owned(), class.as_str().into());
+                object
+                    .entry("message")
+                    .or_insert_with(|| "Base block mismatch".into());
+                (status, axum::Json(value)).into_response()
+            }
+            _ => (status, body).into_response(),
+        }
+    } else {
+        error_response(status, class, String::from_utf8_lossy(&body))
+    };
+
+    // Keep upstream headers (retry-after, x-sqd-*), but not the replaced body's own.
+    let out = rewritten.headers_mut();
+    for (key, value) in headers.iter() {
+        if key == header::CONTENT_TYPE
+            || key == header::CONTENT_LENGTH
+            || key == header::CONTENT_ENCODING
+        {
+            continue;
+        }
+        out.insert(key, value.clone());
+    }
+
+    with_error_code(rewritten, class)
+}
+
+fn stream_response(response: reqwest::Response) -> axum::response::Response {
     let mut builder = Response::builder().status(response.status());
     for (key, value) in response.headers() {
         builder = builder.header(key, value);
     }
-    let body = Body::from_stream(response.bytes_stream());
-    builder.body(body).unwrap()
+    builder
+        .body(Body::from_stream(response.bytes_stream()))
+        .unwrap()
 }
 
 #[cfg(feature = "sql")]

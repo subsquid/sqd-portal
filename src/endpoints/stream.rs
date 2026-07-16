@@ -16,7 +16,7 @@ use crate::{
     hotblocks::{traceless_key, HotblocksHandle, StreamMode},
     http_server::{forward_hotblocks_response, forward_response},
     network::NetworkClient,
-    types::{Compression, DatasetId, RequestError, StreamRequest},
+    types::{with_error_code, Compression, DatasetId, ErrorCode, RequestError, StreamRequest},
     utils::conversion::{join_gzip_default, recompress_gzip},
 };
 
@@ -38,11 +38,11 @@ use crate::{
                 ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
             )),
         (status = 204, description = "No new blocks available in the requested range"),
-        (status = 400, description = "Invalid request parameters or query"),
-        (status = 404, description = "Dataset not found"),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later"),
-        (status = 500, description = "Internal server error"),
-        (status = 503, description = "Service temporarily unavailable"),
+        (status = 400, description = "Invalid request parameters or query", body = ErrorResponse),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
+        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 503, description = "Service temporarily unavailable", body = ErrorResponse),
     ),
     tag = "Archival stream"
 )]
@@ -75,11 +75,11 @@ pub(crate) async fn run_archival_stream_restricted(
                 ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
             )),
         (status = 204, description = "No new blocks available in the requested range"),
-        (status = 400, description = "Invalid request parameters or query"),
-        (status = 404, description = "Dataset not found"),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later"),
-        (status = 500, description = "Internal server error"),
-        (status = 503, description = "Service temporarily unavailable"),
+        (status = 400, description = "Invalid request parameters or query", body = ErrorResponse),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
+        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 503, description = "Service temporarily unavailable", body = ErrorResponse),
     ),
     tag = "Archival stream"
 )]
@@ -114,7 +114,10 @@ pub(crate) async fn run_archival_stream(
         Err(RequestError::NoData) => {
             // Delay request from this client for 5 seconds to avoid unnecessary retries.
             tokio::time::sleep(Duration::from_secs(5)).await;
-            res.status(StatusCode::NO_CONTENT).body(().into()).unwrap()
+            with_error_code(
+                res.status(StatusCode::NO_CONTENT).body(().into()).unwrap(),
+                ErrorCode::NoData,
+            )
         }
         Err(e) => e.into_response(),
     }
@@ -138,8 +141,8 @@ pub(crate) async fn run_archival_stream(
                 ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
             )),
         (status = 204, description = "No new blocks available in the requested range"),
-        (status = 400, description = "Invalid request parameters or query"),
-        (status = 404, description = "Dataset not found"),
+        (status = 400, description = "Invalid request parameters or query", body = ErrorResponse),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
         (status = 409, description = "\
 Parent block hash mismatch — the `parentHash` of the first requested block does not match \
 `query.parentBlockHash`. This typically indicates a chain reorganization relative to the \
@@ -148,10 +151,10 @@ The response body is a JSON object with a single `previousBlocks` array of `{num
 pairs from the current canonical chain. The array may have arbitrary length but is \
 guaranteed to contain at least the parent of the first requested block. Clients should \
 find the last known shared ancestor and re-request from there; if no shared block is \
-found, request earlier blocks until one is."),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later"),
-        (status = 500, description = "Internal server error"),
-        (status = 503, description = "Service temporarily unavailable"),
+found, request earlier blocks until one is.", body = BaseBlockConflictResponse),
+        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 503, description = "Service temporarily unavailable", body = ErrorResponse),
     ),
     tag = "Stream"
 )]
@@ -194,11 +197,11 @@ pub(crate) async fn run_stream(
                 ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
             )),
         (status = 204, description = "No new blocks available in the requested range"),
-        (status = 400, description = "Invalid request parameters or query"),
-        (status = 404, description = "Dataset not found"),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later"),
-        (status = 500, description = "Internal server error"),
-        (status = 503, description = "Service temporarily unavailable"),
+        (status = 400, description = "Invalid request parameters or query", body = ErrorResponse),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
+        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 503, description = "Service temporarily unavailable", body = ErrorResponse),
     ),
     tag = "Stream"
 )]
@@ -355,9 +358,9 @@ async fn stream_from_hotblocks(
                 return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
             }
 
-            forward_response(response)
+            forward_response(response).await
         }
-        Err(e) => forward_hotblocks_response(Err(e)),
+        Err(e) => forward_hotblocks_response(Err(e)).await,
     };
 
     res.headers_mut()
@@ -454,10 +457,13 @@ async fn delayed_no_content_response_with_builder(
 ) -> Response {
     // Delay request from this client for 5 seconds to avoid unnecessary retries.
     tokio::time::sleep(Duration::from_secs(5)).await;
-    builder
-        .status(StatusCode::NO_CONTENT)
-        .body(().into())
-        .unwrap()
+    with_error_code(
+        builder
+            .status(StatusCode::NO_CONTENT)
+            .body(().into())
+            .unwrap(),
+        ErrorCode::NoData,
+    )
 }
 
 const FINALIZED_NUMBER_HEADER: &str = "x-sqd-finalized-head-number";

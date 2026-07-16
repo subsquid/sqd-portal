@@ -15,7 +15,7 @@ use thiserror;
 
 use crate::network::{ChunkNotFound, NetworkClient};
 use crate::sql::rewrite_target;
-use crate::types::{BlockNumber, DatasetId, GenericError};
+use crate::types::{error_response, BlockNumber, DatasetId, ErrorCode};
 
 use sql_query_plan::plan::{self, Source, TargetPlan};
 
@@ -35,22 +35,28 @@ pub enum QueryErr {
     InternalError(String),
 }
 
+impl QueryErr {
+    pub fn class(&self) -> ErrorCode {
+        match self {
+            Self::InternalError(_) => ErrorCode::Internal,
+            // No worker holds the chunk: nothing the client can rewrite.
+            Self::NoWorker(_) => ErrorCode::NoWorkers,
+            Self::DecodePlan(_) | Self::Planning(_) | Self::RewriteTarget(_) | Self::NoChunk(_) => {
+                ErrorCode::MalformedRequest
+            }
+        }
+    }
+}
+
 impl IntoResponse for QueryErr {
     fn into_response(self) -> Response {
-        match self {
-            QueryErr::InternalError(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(GenericError { message: msg }),
-            )
-                .into_response(),
-            err => (
-                StatusCode::BAD_REQUEST,
-                axum::Json(GenericError {
-                    message: err.to_string(),
-                }),
-            )
-                .into_response(),
-        }
+        let class = self.class();
+        let status = match class {
+            ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::NoWorkers => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        error_response(status, class, self.to_string())
     }
 }
 

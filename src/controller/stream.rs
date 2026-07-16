@@ -193,7 +193,7 @@ impl<N: StreamingNetwork> StreamController<N> {
             }
             Err(e) => {
                 // Should not be the case under normal operation
-                return Err(RequestError::InternalError(format!(
+                return Err(RequestError::Internal(format!(
                     "block {} could not be found in dataset {} ({e}), please report this to the developers",
                     first_block, request.dataset_id
                 )));
@@ -387,9 +387,9 @@ impl<N: StreamingNetwork> StreamController<N> {
                             running.worker,
                             join_err,
                         );
-                        return Err(RequestState::Done(Err(RequestError::InternalError(
-                            format!("worker query task failed: {join_err}"),
-                        ))));
+                        return Err(RequestState::Done(Err(RequestError::Internal(format!(
+                            "worker query task failed: {join_err}"
+                        )))));
                     }
                 };
 
@@ -458,8 +458,7 @@ impl<N: StreamingNetwork> StreamController<N> {
             let error = format!("worker {}: {}", f.worker, f.result.unwrap_err());
             errors.push(error);
         }
-        let message = format!("All query attempts failed: {}", errors.join("; "));
-        RequestState::Done(Err(RequestError::InternalError(message)))
+        RequestState::Done(Err(RequestError::RetriesExhausted(errors.join("; "))))
     }
 
     fn start_next_attempt(
@@ -1046,11 +1045,11 @@ fn parse_response(
             range.end(),
             worker,
         );
-        RequestState::Done(Err(RequestError::InternalError(format!(
-            "the last returned block is {} which is below the first queried block {} from {}",
+        RequestState::Done(Err(RequestError::Failure(format!(
+            "worker {} returned block {} which is below the first queried block {}",
+            worker,
             last_block,
             range.start(),
-            worker,
         ))))
     } else {
         RequestState::Partial(PartialResult {
@@ -1087,7 +1086,7 @@ fn retriable(result: &QueryResult) -> bool {
 fn short_code(result: &RequestState) -> &'static str {
     match result {
         RequestState::Done(Ok(_)) => "ok",
-        RequestState::Done(Err(e)) => e.short_code(),
+        RequestState::Done(Err(e)) => e.code().as_str(),
         RequestState::Partial(_) => "partial",
         RequestState::Pending(_) | RequestState::Paused(_) | RequestState::NoWorkers => "-",
     }
