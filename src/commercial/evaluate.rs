@@ -323,10 +323,7 @@ fn acquire_key_permit(
     if limit == 0 {
         zero_limits::report(key_id, "concurrency");
     }
-    // The limiter adds one per-pod guardrail permit. Keep that permit inside
-    // the keyed plan cap while preserving the zero-limit fail-open guardrail.
-    let permit =
-        concurrency.and_then(|limiter| limiter.try_acquire(account_id, limit.saturating_sub(1)));
+    let permit = concurrency.and_then(|limiter| limiter.try_acquire(account_id, limit));
     let available = permit.is_some();
     (permit, available)
 }
@@ -1440,7 +1437,7 @@ mod tests {
         let defaults = defaults();
         let limiter = ConcurrencyLimiter::new(1);
         let mut held = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             match evaluate_anonymous_with_state(
                 &defaults,
                 EvaluationPolicy::default(),
@@ -1468,6 +1465,29 @@ mod tests {
             }
             Authorization::Granted(_) => panic!("expected concurrency rejection"),
         }
+    }
+
+    #[test]
+    fn keyed_concurrency_uses_the_configured_per_pod_share() {
+        let mut snapshot = active_snapshot(1);
+        snapshot.limits.as_mut().unwrap().concurrency = Some(4);
+        let multi_pod = ConcurrencyLimiter::new(4);
+
+        let (first, available) = acquire_key_permit(Some(&snapshot), Some(&multi_pod));
+        assert!(available);
+        assert!(first.is_some());
+        let (second, available) = acquire_key_permit(Some(&snapshot), Some(&multi_pod));
+        assert!(!available);
+        assert!(second.is_none());
+
+        snapshot.limits.as_mut().unwrap().concurrency = Some(2);
+        let single_pod = ConcurrencyLimiter::new(1);
+        let (first, first_available) = acquire_key_permit(Some(&snapshot), Some(&single_pod));
+        let (second, second_available) = acquire_key_permit(Some(&snapshot), Some(&single_pod));
+        let (third, third_available) = acquire_key_permit(Some(&snapshot), Some(&single_pod));
+        assert!(first_available && first.is_some());
+        assert!(second_available && second.is_some());
+        assert!(!third_available && third.is_none());
     }
 
     #[tokio::test]

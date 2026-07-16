@@ -1738,18 +1738,18 @@ mod tests {
         let reporter = Arc::new(RecordingReporter::default());
         let limiter = ConcurrencyLimiter::new(1);
         let mut granted = granted;
-        granted.concurrency_permit = limiter.try_acquire(account_key, 1);
+        granted.concurrency_permit = limiter.try_acquire(account_key, 2);
 
         let meter = enforced_meter_with_grant(reporter, granted);
-        let other = limiter.try_acquire(account_key, 1).unwrap();
-        assert!(limiter.try_acquire(account_key, 1).is_none());
+        let other = limiter.try_acquire(account_key, 2).unwrap();
+        assert!(limiter.try_acquire(account_key, 2).is_none());
 
         let cloned = meter.clone();
         drop(meter);
-        assert!(limiter.try_acquire(account_key, 1).is_none());
+        assert!(limiter.try_acquire(account_key, 2).is_none());
 
         drop(cloned);
-        assert!(limiter.try_acquire(account_key, 1).is_some());
+        assert!(limiter.try_acquire(account_key, 2).is_some());
         drop(other);
     }
 
@@ -2686,8 +2686,8 @@ mod tests {
     async fn registry_kill_interrupts_long_pacing_wait_and_releases_permit() {
         let reporter = Arc::new(RecordingReporter::default());
         let limiter = ConcurrencyLimiter::new(1);
-        let permit = limiter.try_acquire("account", 1).unwrap();
-        let other = limiter.try_acquire("account", 1).unwrap();
+        let permit = limiter.try_acquire("account", 2).unwrap();
+        let other = limiter.try_acquire("account", 2).unwrap();
         let registry = Arc::new(ActiveStreamRegistry::default());
         let meter = MeterHandle::new_enforced(
             Granted {
@@ -2728,7 +2728,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert!(!stream_task.is_finished());
-        assert!(limiter.try_acquire("account", 1).is_none());
+        assert!(limiter.try_acquire("account", 2).is_none());
 
         assert_eq!(registry.kill_key("key"), 1);
 
@@ -2736,7 +2736,7 @@ mod tests {
             .await
             .expect("killed pacing wait should terminate promptly")
             .unwrap();
-        assert!(limiter.try_acquire("account", 1).is_some());
+        assert!(limiter.try_acquire("account", 2).is_some());
         drop(other);
     }
 

@@ -264,7 +264,10 @@ fn forget_available_surplus(semaphore: &Semaphore, state: &mut LimitState) {
 }
 
 fn per_pod_permits(global_limit: u64, pod_count: usize) -> u64 {
-    global_limit.div_ceil(pod_count as u64).saturating_add(1)
+    // Every caller uses the same fleet-share formula. Rounding can admit one
+    // permit per pod when the fleet limit is below pod_count; max(1) is also
+    // the intentional fail-open guardrail for a configured zero limit.
+    global_limit.div_ceil(pod_count.max(1) as u64).max(1)
 }
 
 impl fmt::Debug for ConcurrencyPermit {
@@ -287,20 +290,22 @@ mod tests {
     use std::{sync::Barrier, thread};
 
     #[test]
-    fn per_pod_limit_rounds_up_and_adds_guardrail() {
-        assert_eq!(per_pod_permits(4, 4), 2);
-        assert_eq!(per_pod_permits(5, 4), 3);
+    fn per_pod_limit_rounds_up_with_one_as_the_zero_limit_guardrail() {
+        assert_eq!(per_pod_permits(4, 4), 1);
+        assert_eq!(per_pod_permits(5, 4), 2);
+        assert_eq!(per_pod_permits(1, 4), 1);
+        assert_eq!(per_pod_permits(0, 4), 1);
     }
 
     #[test]
     fn permit_exhaustion_and_release() {
-        let limiter = ConcurrencyLimiter::new(4);
-        let first = limiter.try_acquire("account", 4).unwrap();
-        let second = limiter.try_acquire("account", 4).unwrap();
-        assert!(limiter.try_acquire("account", 4).is_none());
+        let limiter = ConcurrencyLimiter::new(1);
+        let first = limiter.try_acquire("account", 2).unwrap();
+        let second = limiter.try_acquire("account", 2).unwrap();
+        assert!(limiter.try_acquire("account", 2).is_none());
 
         drop(first);
-        assert!(limiter.try_acquire("account", 4).is_some());
+        assert!(limiter.try_acquire("account", 2).is_some());
         drop(second);
     }
 
@@ -336,23 +341,21 @@ mod tests {
     fn limit_increase_adds_capacity_while_permits_are_held() {
         let limiter = ConcurrencyLimiter::new(1);
         let first = limiter.try_acquire("account", 1).unwrap();
-        let second = limiter.try_acquire("account", 1).unwrap();
         assert!(limiter.try_acquire("account", 1).is_none());
 
+        let second = limiter.try_acquire("account", 3).unwrap();
         let third = limiter.try_acquire("account", 3).unwrap();
-        let fourth = limiter.try_acquire("account", 3).unwrap();
         assert!(limiter.try_acquire("account", 3).is_none());
 
         drop(first);
         drop(second);
         drop(third);
-        drop(fourth);
     }
 
     #[tokio::test]
     async fn limit_decrease_reclaims_surplus_as_permits_finish() {
         let limiter = ConcurrencyLimiter::new(1);
-        let mut permits = (0..4)
+        let mut permits = (0..3)
             .map(|_| limiter.try_acquire("account", 3).unwrap())
             .collect::<Vec<_>>();
         assert!(limiter.try_acquire("account", 3).is_none());
@@ -376,10 +379,8 @@ mod tests {
         drop(permits);
         yield_reclaimer().await;
         let first = limiter.try_acquire("account", 1).unwrap();
-        let second = limiter.try_acquire("account", 1).unwrap();
         assert!(limiter.try_acquire("account", 1).is_none());
         drop(first);
-        drop(second);
     }
 
     #[test]
