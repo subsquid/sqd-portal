@@ -16,7 +16,7 @@ use crate::{
     hotblocks::{HotblocksHandle, Status, StreamMode},
     network::NetworkClient,
     openapi::BlockNumberResponse,
-    types::{Compression, DatasetId, GenericError, ParsedQuery, StreamRequest},
+    types::{error_response, Compression, DatasetId, ErrorCode, ParsedQuery, StreamRequest},
     utils::{
         conversion::collect_to_string,
         internal_query::{build_blocknumber_query, find_block_in_chunk},
@@ -37,9 +37,9 @@ use super::stream::{DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_
     ),
     responses(
         (status = 200, description = "Block number resolved", body = BlockNumberResponse),
-        (status = 404, description = "No block found for timestamp"),
-        (status = 500, description = "Internal server error"),
-        (status = 503, description = "Upstream data source unavailable"),
+        (status = 404, description = "No block found for timestamp", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 503, description = "Upstream data source unavailable", body = ErrorResponse),
     ),
     tag = "Datasets"
 )]
@@ -107,15 +107,24 @@ pub enum BlockNumberLookupError {
 }
 
 impl BlockNumberLookupError {
+    pub fn class(&self) -> ErrorCode {
+        match self {
+            Self::NotFound(_) => ErrorCode::NotFound,
+            Self::Internal(_) => ErrorCode::Internal,
+            Self::Unavailable(_) => ErrorCode::UpstreamUnavailable,
+        }
+    }
+
     /// Convert a resolver error into the timestamp endpoint's HTTP response.
     pub fn into_response(self) -> Response {
+        let class = self.class();
         let (status, message) = match self {
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
             Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
             Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
         };
 
-        (status, axum::Json(GenericError { message })).into_response()
+        error_response(status, class, message)
     }
 }
 
@@ -301,9 +310,17 @@ async fn get_hotblocks_blocknumber_by_timestamp(
             let status = response.status();
             if !status.is_success() {
                 tracing::warn!("hotblocks stream failed with status {}", status);
-                return Err(BlockNumberLookupError::Unavailable(format!(
-                    "Hotblocks stream failed with status {status}"
-                )));
+                // The query is built by the portal, so a 4xx means we generated a bad
+                // one — retrying it forever would not help.
+                return Err(if status.is_client_error() {
+                    BlockNumberLookupError::Internal(format!(
+                        "hotblocks rejected a portal-generated query with status {status}"
+                    ))
+                } else {
+                    BlockNumberLookupError::Unavailable(format!(
+                        "Hotblocks stream failed with status {status}"
+                    ))
+                });
             }
 
             collect_hotblocks_stream(response).await.map_err(|e| {

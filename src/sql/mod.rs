@@ -15,7 +15,7 @@ use query::{QueryErr, SqlQueryResponse, TableItem};
 
 use crate::datasets;
 use crate::network::NetworkClient;
-use crate::types::GenericError;
+use crate::types::{error_response, ErrorCode};
 
 use axum::body;
 
@@ -33,13 +33,18 @@ impl IntoResponse for SqlErr {
     fn into_response(self) -> Response {
         match self {
             SqlErr::QueryErr(err) => err.into_response(),
-            SqlErr::Metadata(err) => (
+            // Only a missing schema is the caller's problem; a failed read or parse
+            // of our own schema files is ours.
+            SqlErr::Metadata(err @ SchemaErr::SchemaNotFound(_)) => error_response(
                 StatusCode::BAD_REQUEST,
-                axum::Json(GenericError {
-                    message: err.to_string(),
-                }),
-            )
-                .into_response(),
+                ErrorCode::MalformedRequest,
+                err.to_string(),
+            ),
+            SqlErr::Metadata(err) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                err.to_string(),
+            ),
         }
     }
 }

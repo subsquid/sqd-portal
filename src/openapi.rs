@@ -5,6 +5,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::network::{CurrentEpoch, NetworkClientStatus, Status, Workers};
 use crate::types::api_types::AvailableDatasetApiResponse;
+use crate::types::{ErrorDetail, ErrorResponse};
 
 /// Status response for the portal
 #[derive(Serialize, Clone, Debug, ToSchema)]
@@ -28,10 +29,14 @@ pub struct BlockNumberResponse {
     pub block_number: u64,
 }
 
-/// Generic error response
-#[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
-pub struct ErrorResponse {
-    pub message: String,
+/// 409 body: the standard error envelope, plus `previousBlocks` at the top level.
+// Documentation-only; ErrorDetail borrows 'static strs and cannot Deserialize.
+#[derive(Serialize, Clone, Debug, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BaseBlockConflictResponse {
+    pub error: ErrorDetail,
+    /// Canonical-chain blocks to walk back through when looking for a shared ancestor.
+    pub previous_blocks: Vec<BlockHead>,
 }
 
 /// Metadata query parameters
@@ -117,6 +122,8 @@ pub struct DatasetStateResponse {
             BlockHead,
             BlockNumberResponse,
             ErrorResponse,
+            ErrorDetail,
+            BaseBlockConflictResponse,
             MetadataQueryParams,
             StreamRequestBody,
             QueryRequest,

@@ -12,7 +12,10 @@ use prometheus_client::{
 use reqwest::StatusCode;
 use sqd_contract_client::PeerId;
 
-use crate::{types::DatasetId, utils::logging::StreamStats};
+use crate::{
+    types::{DatasetId, ErrorCode, ErrorType},
+    utils::logging::StreamStats,
+};
 
 pub enum MutexLockMode {
     Read,
@@ -108,17 +111,46 @@ pub fn report_backoff(worker: &PeerId) {
         .inc();
 }
 
+/// Carries the wire's `code`/`type`, prefixed — a bare `type` label says nothing on a
+/// metric. Errors only, so success series keep their label set. An unclassified error is
+/// still counted rather than dropped.
+pub fn http_labels(
+    endpoint: String,
+    status: StatusCode,
+    data_source: String,
+    error_code: Option<ErrorCode>,
+) -> Labels {
+    let mut labels = vec![
+        ("endpoint".to_owned(), endpoint),
+        ("status".to_owned(), status.as_str().to_owned()),
+        ("data_source".to_owned(), data_source),
+    ];
+
+    let code = error_code.or_else(|| {
+        (status.is_client_error() || status.is_server_error()).then_some(ErrorCode::Unclassified)
+    });
+    if let Some(code) = code {
+        // An unclassified 4xx is a client hitting a bad route or verb; only a 5xx
+        // implicates us.
+        let error_type = match code {
+            ErrorCode::Unclassified if status.is_client_error() => ErrorType::InvalidRequest,
+            code => code.error_type(),
+        };
+        labels.push(("error_code".to_owned(), code.as_str().to_owned()));
+        labels.push(("error_type".to_owned(), error_type.as_str().to_owned()));
+    }
+
+    labels
+}
+
 pub fn report_http_response(
     endpoint: String,
     status: StatusCode,
     data_source: String,
+    error_code: Option<ErrorCode>,
     seconds_to_first_byte: f64,
 ) {
-    let labels = vec![
-        ("endpoint".to_owned(), endpoint.clone()),
-        ("status".to_owned(), status.as_str().to_owned()),
-        ("data_source".to_owned(), data_source),
-    ];
+    let labels = http_labels(endpoint, status, data_source, error_code);
     HTTP_STATUS.get_or_create(&labels).inc();
     HTTP_TTFB
         .get_or_create(&labels)
@@ -333,4 +365,63 @@ pub fn register_metrics(registry: &mut Registry) {
         "Number of existing mutexes",
         MUTEXES_EXISTING.clone(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labels_for(status: u16, code: Option<ErrorCode>) -> Labels {
+        http_labels(
+            "/stream".to_owned(),
+            StatusCode::from_u16(status).unwrap(),
+            "network".to_owned(),
+            code,
+        )
+    }
+
+    fn get<'a>(labels: &'a Labels, key: &str) -> Option<&'a str> {
+        labels
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn success_keeps_the_original_label_set() {
+        let labels = labels_for(200, None);
+        assert_eq!(get(&labels, "error_code"), None);
+        assert_eq!(get(&labels, "error_type"), None);
+    }
+
+    #[test]
+    fn classified_errors_carry_code_and_type() {
+        let labels = labels_for(529, Some(ErrorCode::Overloaded));
+        assert_eq!(get(&labels, "error_code"), Some("overloaded"));
+        assert_eq!(get(&labels, "error_type"), Some("rate_limit_error"));
+    }
+
+    /// The point of the catch-all: an unclassified 5xx is our bug, not nothing.
+    #[test]
+    fn unclassified_5xx_is_counted_as_an_api_error() {
+        let labels = labels_for(500, None);
+        assert_eq!(get(&labels, "error_code"), Some("unclassified"));
+        assert_eq!(get(&labels, "error_type"), Some("api_error"));
+    }
+
+    /// A client hitting a bad route must not page anyone.
+    #[test]
+    fn unclassified_4xx_is_the_clients_fault() {
+        let labels = labels_for(404, None);
+        assert_eq!(get(&labels, "error_code"), Some("unclassified"));
+        assert_eq!(get(&labels, "error_type"), Some("invalid_request_error"));
+    }
+
+    /// A rolling deploy fails /ready on every pod; that must not read as an api_error.
+    #[test]
+    fn draining_readiness_is_an_availability_error() {
+        let labels = labels_for(503, Some(ErrorCode::NotReady));
+        assert_eq!(get(&labels, "error_code"), Some("not_ready"));
+        assert_eq!(get(&labels, "error_type"), Some("availability_error"));
+    }
 }
