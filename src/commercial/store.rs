@@ -1543,6 +1543,20 @@ fn parse_snapshot_records(
     let mut parsed = Vec::with_capacity(records.len());
     for (index, value) in records.into_iter().enumerate() {
         match serde_json::from_value::<SnapshotRecord>(value.clone()) {
+            Ok(SnapshotRecord::Key(record)) if missing_servable_account_id(&record) => {
+                metrics::report_commercial_snapshot_parse_error();
+                tracing::warn!(
+                    source,
+                    index,
+                    key_id = record.key_id,
+                    seq = record.seq,
+                    "installing fail-closed tombstone for active commercial snapshot without account_id"
+                );
+                parsed.push(SnapshotRecord::Key(revoked_tombstone(
+                    record.key_id,
+                    record.seq,
+                )));
+            }
             Ok(record) => parsed.push(record),
             Err(err) => {
                 metrics::report_commercial_snapshot_parse_error();
@@ -1579,6 +1593,19 @@ fn parse_key_snapshot(
     expected_key_id: &str,
 ) -> anyhow::Result<ParsedKeySnapshot> {
     match serde_json::from_value::<KeySnapshot>(value.clone()) {
+        Ok(record) if missing_servable_account_id(&record) => {
+            metrics::report_commercial_snapshot_parse_error();
+            tracing::warn!(
+                source,
+                key_id = record.key_id,
+                seq = record.seq,
+                "installing fail-closed tombstone for active commercial resolve without account_id"
+            );
+            Ok(ParsedKeySnapshot {
+                record: revoked_tombstone(record.key_id, record.seq),
+                fail_closed: true,
+            })
+        }
         Ok(record) => Ok(ParsedKeySnapshot {
             record,
             fail_closed: false,
@@ -1621,7 +1648,19 @@ fn fail_closed_tombstone(
         return None;
     }
     let seq = value.get("seq")?.as_u64()?;
-    Some(KeySnapshot {
+    Some(revoked_tombstone(key_id, seq))
+}
+
+fn missing_servable_account_id(record: &KeySnapshot) -> bool {
+    record.status == KeyStatus::Active
+        && record
+            .account_id
+            .as_deref()
+            .is_none_or(|account_id| account_id.trim().is_empty())
+}
+
+fn revoked_tombstone(key_id: String, seq: u64) -> KeySnapshot {
+    KeySnapshot {
         key_id,
         secret_sha256: None,
         account_id: None,
@@ -1631,7 +1670,7 @@ fn fail_closed_tombstone(
         entitlements: None,
         quota: None,
         seq,
-    })
+    }
 }
 
 fn snapshot_record_to_value(record: SnapshotRecord) -> serde_json::Value {
@@ -2237,6 +2276,48 @@ mod tests {
         assert!(!store.is_ready());
         assert_eq!(store.view().cursor, 0);
         assert!(store.view().records.is_empty());
+    }
+
+    #[test]
+    fn active_snapshot_without_account_id_is_fail_closed_during_parsing() {
+        let parse_errors_before = metrics::COMMERCIAL_SNAPSHOT_PARSE_ERRORS.get();
+        for account_id in [serde_json::Value::Null, serde_json::json!("   ")] {
+            let mut value = serde_json::to_value(active_snapshot(11)).unwrap();
+            value["account_id"] = account_id;
+
+            let parsed = parse_snapshot_records(vec![value], "test").unwrap();
+
+            let SnapshotRecord::Key(record) = &parsed[0] else {
+                panic!("expected key tombstone");
+            };
+            assert_eq!(record.key_id, KEY_ID);
+            assert_eq!(record.seq, 11);
+            assert_eq!(record.status, KeyStatus::Revoked);
+            assert_eq!(record.account_id, None);
+        }
+        assert!(metrics::COMMERCIAL_SNAPSHOT_PARSE_ERRORS.get() >= parse_errors_before + 2);
+
+        let mut revoked = active_snapshot(12);
+        revoked.status = KeyStatus::Revoked;
+        revoked.account_id = None;
+        let parsed = parse_snapshot_records(
+            vec![snapshot_record_to_value(SnapshotRecord::Key(revoked))],
+            "test",
+        )
+        .unwrap();
+        let SnapshotRecord::Key(record) = &parsed[0] else {
+            panic!("expected revoked key record");
+        };
+        assert_eq!(record.status, KeyStatus::Revoked);
+        assert_eq!(record.seq, 12);
+
+        let healthy = active_snapshot(13);
+        let parsed = parse_snapshot_records(
+            vec![snapshot_record_to_value(SnapshotRecord::Key(healthy.clone()))],
+            "test",
+        )
+        .unwrap();
+        assert_eq!(parsed, vec![SnapshotRecord::Key(healthy)]);
     }
 
     #[tokio::test]
@@ -4335,6 +4416,29 @@ mod tests {
         mock.resolve_with(KEY_ID, Some(healthy));
         assert_eq!(store.get_or_resolve(KEY_ID).await.unwrap().seq, 12);
         assert_eq!(mock.resolve_calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn active_resolve_without_account_id_is_tombstoned() {
+        let mock = MockControlPlane::spawn().await;
+        let mut invalid = active_snapshot(11);
+        invalid.account_id = None;
+        mock.resolve_with(KEY_ID, Some(invalid));
+        let store = SnapshotStore::new(
+            &config(&mock, PathBuf::new(), 10),
+            SnapshotHooks::default(),
+            SERVICE_TOKEN.to_string(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            TokioInstant::now(),
+        );
+        store.set_ready_for_test(true);
+
+        let resolved = store.get_or_resolve(KEY_ID).await.unwrap();
+
+        assert_eq!(resolved.status, KeyStatus::Revoked);
+        assert_eq!(resolved.seq, 11);
+        assert_eq!(store.get(KEY_ID).unwrap().status, KeyStatus::Revoked);
+        assert!(!store.negative_cached(KEY_ID));
     }
 
     #[tokio::test]
