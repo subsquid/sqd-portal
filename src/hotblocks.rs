@@ -16,7 +16,7 @@ pub fn traceless_key(default_name: &str) -> String {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamMode {
+pub enum HeadMode {
     Finalized,
     RealTime,
 }
@@ -100,66 +100,33 @@ pub async fn build_client(config: &Config) -> anyhow::Result<HotblocksHandle> {
 }
 
 impl HotblocksHandle {
-    pub async fn request_head(&self, dataset: &str) -> Result<reqwest::Response, HotblocksErr> {
-        let Some(url) = self.urls.get(dataset) else {
-            return Err(HotblocksErr::UnknownDataset);
-        };
-
-        let response = self.client.get(format!("{url}/head")).send().await?;
-
-        Ok(response)
-    }
-
-    pub async fn get_head(&self, dataset: &str) -> Result<sqd_primitives::BlockRef, HotblocksErr> {
-        let result = self
-            .request_head(dataset)
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        Ok(result)
-    }
-
-    pub async fn request_finalized_head(
+    pub async fn request_head(
         &self,
         dataset: &str,
+        mode: HeadMode,
     ) -> Result<reqwest::Response, HotblocksErr> {
         let Some(url) = self.urls.get(dataset) else {
             return Err(HotblocksErr::UnknownDataset);
         };
 
-        let response = self
-            .client
-            .get(format!("{url}/finalized-head"))
-            .send()
-            .await?;
+        let endpoint = match mode {
+            HeadMode::Finalized => "finalized-head",
+            HeadMode::RealTime => "head",
+        };
+
+        let response = self.client.get(format!("{url}/{endpoint}")).send().await?;
 
         Ok(response)
     }
 
-    pub async fn get_finalized_head(
+    /// `None` means the dataset has no matching blocks yet.
+    pub async fn get_head(
         &self,
         dataset: &str,
-    ) -> Result<sqd_primitives::BlockRef, HotblocksErr> {
-        let result = self
-            .request_finalized_head(dataset)
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        Ok(result)
-    }
-
-    /// Like [`Self::get_finalized_head`], but treats a `null` body (no finalized
-    /// block yet) as `Ok(None)` instead of a deserialization error.
-    pub async fn get_finalized_head_opt(
-        &self,
-        dataset: &str,
+        mode: HeadMode,
     ) -> Result<Option<sqd_primitives::BlockRef>, HotblocksErr> {
         let result = self
-            .request_finalized_head(dataset)
+            .request_head(dataset, mode)
             .await?
             .error_for_status()?
             .json()
@@ -194,15 +161,15 @@ impl HotblocksHandle {
         &self,
         dataset: &str,
         query: &str,
-        mode: StreamMode,
+        mode: HeadMode,
     ) -> Result<reqwest::Response, HotblocksErr> {
         let Some(url) = self.urls.get(dataset) else {
             return Err(HotblocksErr::UnknownDataset);
         };
 
         let endpoint = match mode {
-            StreamMode::Finalized => "finalized-stream",
-            StreamMode::RealTime => "stream",
+            HeadMode::Finalized => "finalized-stream",
+            HeadMode::RealTime => "stream",
         };
 
         let response = self
