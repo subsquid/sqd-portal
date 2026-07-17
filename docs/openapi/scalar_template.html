@@ -1,0 +1,152 @@
+<!doctype html>
+<html>
+<head>
+    <title>SQD Portal API</title>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <style>
+        /* Hide the right column (Server selector + Client Libraries) on the
+           Introduction section — the guides there are pure prose, the
+           testing UI has nothing to do with them. Operation pages keep
+           their right column. */
+        [id^="api-1/description"] .section-columns > .section-column:last-child {
+            display: none !important;
+        }
+
+        [id^="api-1/description"] .section-columns > .section-column:first-child {
+            flex: 1 1 auto !important;
+            max-width: 820px !important;
+            width: 100% !important;
+        }
+
+        /* ASCII diagrams and code samples are noticeably wider than prose;
+           let them overflow the reading column up to a comfortable cap. */
+        [id^="api-1/description"] pre {
+            max-width: 1100px !important;
+            overflow-x: auto !important;
+            /* Force a font with full box-drawing coverage so Unicode chars
+               like │ ┌ ─ ┘ ▲ ▼ stay on the same cell width as letters.
+               Without this Scalar's default mono falls back to a different
+               font for box-drawing glyphs, which shifts vertical lines. */
+            font-family: ui-monospace, "SF Mono", Menlo, Monaco,
+            "Cascadia Mono", "DejaVu Sans Mono",
+            "Liberation Mono", "Courier New", monospace !important;
+            font-variant-ligatures: none !important;
+            letter-spacing: 0 !important;
+        }
+
+        [id^="api-1/description"] pre code {
+            font-family: inherit !important;
+        }
+
+        /* Tables: let them be as wide as code blocks, and stop Scalar
+           breaking words mid-letter in narrow columns. If a row's content
+           is wider than the column, scroll horizontally rather than
+           overflow the page. */
+        [id^="api-1/description"] table {
+            /*display: block !important;*/
+            /*max-width: 1100px !important;*/
+            width: 100% !important;
+        }
+
+        [id^="api-1/description"] table th,
+        [id^="api-1/description"] table td {
+            word-break: normal !important;
+            overflow-wrap: normal !important;
+        }
+
+        /* Make the last column greedy: with table-layout:auto the browser
+           sizes columns by content; setting the last column to width:100%
+           pushes all the slack into it, so leading columns shrink to fit. */
+        [id^="api-1/description"] table {
+            table-layout: auto !important;
+        }
+
+        [id^="api-1/description"] table th:last-child,
+        [id^="api-1/description"] table td:last-child {
+            width: 50% !important;
+        }
+
+        /* Anchors inside table cells shouldn't wrap on `/`, `-` — long
+           Docker/GitHub paths read better on one line. */
+        [id^="api-1/description"] table a {
+            white-space: nowrap !important;
+            text-decoration: none !important;
+        }
+
+        /* Underline only the text label, not the icon — Scalar's default
+           link styling otherwise draws a continuous line across both. */
+        [id^="api-1/description"] table a span {
+            text-decoration: underline !important;
+            text-underline-offset: 2px !important;
+        }
+
+        /* Heading hierarchy — Scalar renders every level with the same
+           weight/size, which kills any sense of structure on long markdown.
+           Restore distinct levels globally. */
+        h2 {
+            font-size: 1.75em !important;
+            font-weight: 700 !important;
+            margin-top: 2.4em !important;
+            margin-bottom: 0.6em !important;
+            padding-top: 0.4em !important;
+            border-top: 1px solid var(--scalar-border-color, rgba(255, 255, 255, 0.12)) !important;
+        }
+
+        h3 {
+            font-size: 1.35em !important;
+            font-weight: 600 !important;
+            margin-top: 1.8em !important;
+            margin-bottom: 0.4em !important;
+            opacity: 0.95 !important;
+        }
+
+        h4 {
+            font-size: 1.1em !important;
+            font-weight: 600 !important;
+            margin-top: 1.3em !important;
+            margin-bottom: 0.3em !important;
+            opacity: 0.85 !important;
+        }
+
+        code {
+            font-size: 14px !important;
+        }
+    </style>
+</head>
+<body>
+<script
+        id="api-reference"
+        type="application/json"
+        data-configuration='{"theme": "fastify","hiddenClients": true, "hideModels": true, "defaultOpenAllTags": true, "showDeveloperTools": "never"}'>
+    $spec
+</script>
+<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+<script>
+    // Scalar has no native option to expand the Introduction sidebar group
+    // (defaultOpenAllTags only applies to API tag groups). Poll for the
+    // sidebar to render, then expand "Introduction" if it's collapsed.
+    (function expandIntroduction() {
+        let attempts = 0;
+        const id = setInterval(() => {
+            attempts++;
+            const candidates = document.querySelectorAll(
+                'button, a, [role="button"], summary'
+            );
+            for (const el of candidates) {
+                if ((el.textContent || '').trim() !== 'Introduction') continue;
+                const ariaExpanded = el.getAttribute('aria-expanded');
+                if (ariaExpanded === 'true' || el.matches('details[open] > summary')) {
+                    clearInterval(id);
+                    return;
+                }
+                el.click();
+                clearInterval(id);
+                return;
+            }
+            if (attempts > 25) clearInterval(id);
+        }, 200);
+    })();
+</script>
+</body>
+</html>
