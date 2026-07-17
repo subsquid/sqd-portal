@@ -16,7 +16,10 @@ use crate::{
     hotblocks::{HeadMode, HotblocksHandle, Status},
     network::NetworkClient,
     openapi::BlockNumberResponse,
-    types::{Compression, DatasetId, GenericError, ParsedQuery, StreamRequest},
+    types::{
+        server_overloaded, Compression, DatasetId, GenericError, ParsedQuery, RequestError,
+        StreamRequest,
+    },
     utils::{
         conversion::collect_to_string,
         internal_query::{build_blocknumber_query, find_block_in_chunk},
@@ -40,6 +43,7 @@ use super::stream::{DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_
         (status = 404, description = "No block found for timestamp"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Upstream data source unavailable"),
+        (status = 529, description = "Overloaded; retry after the Retry-After header"),
     ),
     tag = "Datasets"
 )]
@@ -104,18 +108,44 @@ pub enum BlockNumberLookupError {
     NotFound(String),
     Internal(String),
     Unavailable(String),
+    Overloaded {
+        message: String,
+        retry_after_secs: u64,
+    },
+}
+
+impl From<RequestError> for BlockNumberLookupError {
+    fn from(error: RequestError) -> Self {
+        match error.retry_after_secs() {
+            Some(retry_after_secs) => Self::Overloaded {
+                message: error.to_string(),
+                retry_after_secs,
+            },
+            None => Self::Unavailable(error.to_string()),
+        }
+    }
 }
 
 impl BlockNumberLookupError {
     /// Convert a resolver error into the timestamp endpoint's HTTP response.
     pub fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
-            Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
-            Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
+        let (status, retry_after_secs, message) = match self {
+            Self::NotFound(message) => (StatusCode::NOT_FOUND, None, message),
+            Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, None, message),
+            Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, None, message),
+            Self::Overloaded {
+                message,
+                retry_after_secs,
+            } => (server_overloaded(), Some(retry_after_secs), message),
         };
 
-        (status, axum::Json(GenericError { message })).into_response()
+        let mut response = (status, axum::Json(GenericError { message })).into_response();
+        if let Some(secs) = retry_after_secs {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
+        response
     }
 }
 
@@ -248,9 +278,7 @@ async fn get_archival_blocknumber_by_timestamp(
         Ok(stream) => stream,
         Err(e) => {
             tracing::warn!("spawn stream error: {:?}", e);
-            return Err(BlockNumberLookupError::Unavailable(
-                "SQD Network error".to_string(),
-            ));
+            return Err(e.into());
         }
     };
 
@@ -415,6 +443,39 @@ mod tests {
     use crate::hotblocks::StatusData;
 
     use super::*;
+
+    /// This endpoint used to flatten every spawn_stream error into a bare 503
+    /// "SQD Network error", losing the backoff hint along with the cause.
+    #[test]
+    fn overload_keeps_the_backoff_hint() {
+        let response = BlockNumberLookupError::from(RequestError::TooManyStreams).into_response();
+
+        assert_eq!(response.status(), server_overloaded());
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&header::HeaderValue::from_static("1")),
+        );
+    }
+
+    #[test]
+    fn busy_for_carries_its_own_duration() {
+        let error = RequestError::BusyFor(std::time::Duration::from_secs(7));
+        let response = BlockNumberLookupError::from(error).into_response();
+
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&header::HeaderValue::from_static("8")),
+        );
+    }
+
+    #[test]
+    fn non_overload_errors_stay_503() {
+        let response =
+            BlockNumberLookupError::from(RequestError::NoAvailableWorkers).into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+    }
 
     #[tokio::test]
     async fn get_blocknumber_by_timestamp_uses_archive_path_first() {

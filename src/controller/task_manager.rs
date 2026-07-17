@@ -50,7 +50,7 @@ impl TaskManager {
         let running_tasks = self.running_tasks.fetch_add(1, Ordering::Relaxed);
         if running_tasks >= self.max_tasks {
             self.running_tasks.fetch_sub(1, Ordering::Relaxed);
-            return Err(RequestError::Unavailable);
+            return Err(RequestError::TooManyStreams);
         }
 
         if let Some(util) = self.network_client.download_utilization() {

@@ -517,7 +517,7 @@ impl<N: StreamingNetwork> StreamController<N> {
             RequestState::Done(result) => (Poll::Ready(Some(result)), slot.data_range.range, None),
             RequestState::NoWorkers => {
                 // We don't know how long we'll have to wait, so give up immediately
-                return Poll::Ready(Some(Err(RequestError::Unavailable)));
+                return Poll::Ready(Some(Err(RequestError::NoAvailableWorkers)));
             }
             RequestState::Paused(ref s) => {
                 // All workers are rate-limited, try to pause and continue streaming
