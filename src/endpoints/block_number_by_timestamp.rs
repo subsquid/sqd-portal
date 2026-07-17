@@ -13,7 +13,7 @@ use crate::{
     config::Config,
     controller::task_manager::TaskManager,
     datasets::DatasetConfig,
-    hotblocks::{HotblocksHandle, Status, StreamMode},
+    hotblocks::{HeadMode, HotblocksHandle, Status},
     network::NetworkClient,
     openapi::BlockNumberResponse,
     types::{Compression, DatasetId, GenericError, ParsedQuery, StreamRequest},
@@ -291,7 +291,7 @@ async fn get_hotblocks_blocknumber_by_timestamp(
         status,
         |query| async move {
             let response = hotblocks
-                .stream(&dataset.default_name, &query, StreamMode::RealTime)
+                .stream(&dataset.default_name, &query, HeadMode::RealTime)
                 .await
                 .map_err(|e| {
                     tracing::warn!("hotblocks stream error: {:?}", e);

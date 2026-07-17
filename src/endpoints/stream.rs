@@ -13,7 +13,7 @@ use crate::{
     config::Config,
     controller::task_manager::TaskManager,
     datasets::DatasetConfig,
-    hotblocks::{traceless_key, HotblocksHandle, StreamMode},
+    hotblocks::{traceless_key, HeadMode, HotblocksHandle},
     http_server::{forward_hotblocks_response, forward_response},
     network::NetworkClient,
     types::{Compression, DatasetId, RequestError, StreamRequest},
@@ -170,7 +170,7 @@ pub(crate) async fn run_stream(
         hotblocks,
         dataset,
         request,
-        StreamMode::RealTime,
+        HeadMode::RealTime,
     )
     .await
 }
@@ -217,7 +217,7 @@ pub(crate) async fn run_finalized_stream(
         hotblocks,
         dataset,
         request,
-        StreamMode::Finalized,
+        HeadMode::Finalized,
     )
     .await
 }
@@ -229,7 +229,7 @@ async fn run_stream_internal(
     hotblocks: Arc<HotblocksHandle>,
     dataset: DatasetConfig,
     request: StreamRequest,
-    mode: StreamMode,
+    mode: HeadMode,
 ) -> Response {
     let request = restrict_request(&config, request);
 
@@ -282,7 +282,7 @@ async fn stream_from_network(
     network: Arc<NetworkClient>,
     hotblocks: Arc<HotblocksHandle>,
     mut request: StreamRequest,
-    mode: StreamMode,
+    mode: HeadMode,
     dataset_id: DatasetId,
     hotblocks_name: String,
 ) -> Response {
@@ -290,11 +290,13 @@ async fn stream_from_network(
     let head_task = tokio::spawn({
         let archival_head = archival_head.clone();
         async move {
-            let head = match mode {
-                StreamMode::RealTime => hotblocks.get_head(&hotblocks_name).await,
-                StreamMode::Finalized => hotblocks.get_finalized_head(&hotblocks_name).await,
-            };
-            head.ok().or(archival_head.clone()).map(|b| b.number)
+            hotblocks
+                .get_head(&hotblocks_name, mode)
+                .await
+                .ok()
+                .flatten()
+                .or(archival_head.clone())
+                .map(|b| b.number)
         }
     });
 
@@ -332,7 +334,7 @@ async fn stream_from_hotblocks(
     hotblocks: Arc<HotblocksHandle>,
     dataset: DatasetConfig,
     request: StreamRequest,
-    mode: StreamMode,
+    mode: HeadMode,
     hotblocks_name: String,
 ) -> Response {
     let first_block = request.query.first_block();

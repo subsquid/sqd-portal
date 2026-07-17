@@ -45,7 +45,7 @@ use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
     controller::task_manager::TaskManager,
-    hotblocks::{traceless_key, HotblocksHandle},
+    hotblocks::{traceless_key, HeadMode, HotblocksHandle},
     network::{NetworkClient, NoWorker, NotReady},
     types::{ChunkId, DatasetId, ParsedQuery, RequestError, StreamRequest},
     utils::logging,
@@ -306,13 +306,7 @@ async fn get_archival_head(
 ) -> Response {
     // Prefer network data source to correspond to the /archival-stream behaviour
     if let Some(dataset_id) = dataset.network_id {
-        let head = network.head(&dataset_id).map(|head| {
-            json!({
-                "number": head.number,
-                "hash": head.hash,
-            })
-        });
-        return axum::Json(head).into_response();
+        return axum::Json(network.head(&dataset_id)).into_response();
     }
 
     (
@@ -325,52 +319,105 @@ async fn get_archival_head(
         .into_response()
 }
 
-// Prefer the real-time head; fall back to archival on any error.
-//
-// `realtime` is `Err` whenever hotblocks is unreachable *or* when it returns
-// HTTP 200 with a JSON `null` body (the case described in issue #83): the
-// `get_head` / `get_finalized_head` helpers call `.json::<BlockRef>()`, which
-// fails to deserialize `null` into a struct, producing a `reqwest` decode
-// error wrapped in `HotblocksErr::Request`. Both failure modes are intentionally
-// treated the same way — fall back to archival — mirroring the behaviour of the
-// `x-sqd-head-number` header in `stream_from_network` (see endpoints/stream.rs).
-fn coalesce_head(
-    realtime: Result<BlockRef, HotblocksErr>,
-    archival: Option<BlockRef>,
-) -> Option<BlockRef> {
-    realtime.ok().or(archival)
+/// Whether the head must be reported as the minimum of the traced and traceless variants.
+///
+/// They finalize independently and a stream may use either, so advertising the higher head
+/// could name a block the other variant can't serve yet. Only finalized heads are affected:
+/// the real-time head is served from the traced variant a `/stream` would use.
+fn reports_min_finalized_head(dataset: &DatasetConfig, mode: HeadMode) -> bool {
+    mode == HeadMode::Finalized
+        && dataset
+            .hotblocks
+            .as_ref()
+            .is_some_and(|cfg| cfg.dataset_traceless.is_some())
 }
 
-fn block_head_json_response(head: Option<BlockRef>) -> Response {
-    axum::Json(head.map(|h| {
-        json!({
-            "number": h.number,
-            "hash": h.hash,
-        })
-    }))
-    .into_response()
+/// Returns the head reported by hotblocks, or `None` if there's no such block yet.
+///
+/// If either variant of a traceless dataset has no finalized block, neither has the dataset
+/// as a whole.
+async fn real_time_head(
+    hotblocks: &HotblocksHandle,
+    dataset: &DatasetConfig,
+    mode: HeadMode,
+) -> Result<Option<BlockRef>, HotblocksErr> {
+    if !reports_min_finalized_head(dataset, mode) {
+        return hotblocks.get_head(&dataset.default_name, mode).await;
+    }
+
+    let traceless_name = traceless_key(&dataset.default_name);
+    let (traced, traceless) = tokio::join!(
+        hotblocks.get_head(&dataset.default_name, mode),
+        hotblocks.get_head(&traceless_name, mode),
+    );
+    Ok(match (traced?, traceless?) {
+        (Some(traced), Some(traceless)) => Some(if traced.number <= traceless.number {
+            traced
+        } else {
+            traceless
+        }),
+        _ => None,
+    })
 }
 
-async fn hybrid_head_response(
+/// Returns the real-time head of the dataset, falling back to the archival head when
+/// the hotblocks database has no blocks yet or can't be reached. This mirrors the
+/// `x-sqd-head-number` header of the corresponding streaming endpoints
+/// (see `stream_from_network` in endpoints/stream.rs).
+async fn head_response(
     hotblocks: &HotblocksHandle,
     network: &NetworkClient,
     dataset: &DatasetConfig,
-    finalized: bool,
+    mode: HeadMode,
 ) -> Response {
-    let archival = dataset.network_id.as_ref().and_then(|id| network.head(id));
-    let realtime = if finalized {
-        hotblocks.get_finalized_head(&dataset.default_name).await
-    } else {
-        hotblocks.get_head(&dataset.default_name).await
-    };
-    block_head_json_response(coalesce_head(realtime, archival))
+    if dataset.hotblocks.is_some() {
+        let Some(dataset_id) = &dataset.network_id else {
+            // Without an archival data source there is nothing to fall back to.
+            if reports_min_finalized_head(dataset, mode) {
+                return match real_time_head(hotblocks, dataset, mode).await {
+                    Ok(head) => axum::Json(head).into_response(),
+                    Err(e) => forward_hotblocks_response(&dataset.default_name, Err(e)),
+                };
+            }
+            // Pass the hotblocks response through unchanged.
+            return forward_hotblocks_response(
+                &dataset.default_name,
+                hotblocks.request_head(&dataset.default_name, mode).await,
+            );
+        };
+
+        match real_time_head(hotblocks, dataset, mode).await {
+            Ok(Some(head)) => return axum::Json(head).into_response(),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                "Couldn't get the real-time head of dataset {}: {e}",
+                dataset.default_name
+            ),
+        }
+
+        // Computing the archival head is not free, so it's only done once the real-time
+        // head is known to be unavailable. It never exceeds either real-time head, so
+        // it's safe to advertise for traceless datasets too.
+        return axum::Json(network.head(dataset_id)).into_response();
+    }
+
+    if let Some(dataset_id) = &dataset.network_id {
+        return axum::Json(network.head(dataset_id)).into_response();
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        format!("Dataset {} has no data sources", dataset.default_name),
+    )
+        .into_response()
 }
 
 /// Latest finalized head
 ///
 /// Returns the block number and hash of the highest finalized block.
-/// For hybrid datasets, returns the real-time finalized head when available;
-/// otherwise falls back to the archival head. Matches `/finalized-stream` head behavior.
+/// If the dataset has both real-time and archival data sources, the real-time finalized head
+/// is returned when available, and the archival one otherwise.
+/// Matches `/finalized-stream` head behavior.
 #[utoipa::path(
     get,
     path = "/datasets/{dataset}/finalized-head",
@@ -388,45 +435,15 @@ async fn get_finalized_head(
     Extension(network): Extension<Arc<NetworkClient>>,
     dataset: DatasetConfig,
 ) -> Response {
-    if let Some(hotblocks_cfg) = &dataset.hotblocks {
-        // Traced and traceless variants finalize independently, and a stream may use
-        // either. Report the minimum of their heads so we never advertise a head one
-        // variant can't yet serve.
-        if hotblocks_cfg.dataset_traceless.is_some() {
-            let traceless_name = traceless_key(&dataset.default_name);
-            let (traced, traceless) = tokio::join!(
-                hotblocks.get_finalized_head_opt(&dataset.default_name),
-                hotblocks.get_finalized_head_opt(&traceless_name),
-            );
-            return min_finalized_head_response(&dataset.default_name, traced, traceless);
-        }
-        if dataset.network_id.is_some() {
-            return hybrid_head_response(&hotblocks, &network, &dataset, true).await;
-        }
-        return forward_hotblocks_response(
-            &dataset.default_name,
-            hotblocks
-                .request_finalized_head(&dataset.default_name)
-                .await,
-        );
-    }
-
-    if let Some(dataset_id) = dataset.network_id {
-        return block_head_json_response(network.head(&dataset_id));
-    }
-
-    (
-        StatusCode::NOT_FOUND,
-        format!("Dataset {} has no data sources", dataset.default_name),
-    )
-        .into_response()
+    head_response(&hotblocks, &network, &dataset, HeadMode::Finalized).await
 }
 
 /// Latest head
 ///
 /// Returns the block number and hash of the highest block, including real-time data.
-/// For hybrid datasets, returns the real-time head when available; otherwise falls back
-/// to the archival head. Matches `/stream` head header behavior.
+/// If the dataset has both real-time and archival data sources, the real-time head is
+/// returned when available, and the archival one otherwise.
+/// Matches `/stream` head header behavior.
 #[utoipa::path(
     get,
     path = "/datasets/{dataset}/head",
@@ -444,25 +461,7 @@ async fn get_head(
     Extension(network): Extension<Arc<NetworkClient>>,
     dataset: DatasetConfig,
 ) -> Response {
-    if dataset.hotblocks.is_some() {
-        if dataset.network_id.is_some() {
-            return hybrid_head_response(&hotblocks, &network, &dataset, false).await;
-        }
-        return forward_hotblocks_response(
-            &dataset.default_name,
-            hotblocks.request_head(&dataset.default_name).await,
-        );
-    }
-
-    if let Some(dataset_id) = dataset.network_id {
-        return block_head_json_response(network.head(&dataset_id));
-    }
-
-    (
-        StatusCode::NOT_FOUND,
-        format!("Dataset {} has no data sources", dataset.default_name),
-    )
-        .into_response()
+    head_response(&hotblocks, &network, &dataset, HeadMode::RealTime).await
 }
 
 /// [INTERNAL] Portal Status
@@ -1189,29 +1188,6 @@ where
     }
 }
 
-/// Build a `/finalized-head` response with the lower of the traced and traceless heads,
-/// so it's streamable by whichever variant a later stream uses.
-///
-/// If either variant has no finalized block yet (`None`), the head is `None`: advertising
-/// `null` is safer than a head one variant can't serve. An error from either variant is
-/// surfaced as-is rather than degrading to the other's (possibly too-high) head.
-fn min_finalized_head_response(
-    dataset: &str,
-    traced: Result<Option<sqd_primitives::BlockRef>, HotblocksErr>,
-    traceless: Result<Option<sqd_primitives::BlockRef>, HotblocksErr>,
-) -> Response {
-    match (traced, traceless) {
-        (Ok(traced), Ok(traceless)) => {
-            let head = match (traced, traceless) {
-                (Some(a), Some(b)) => Some(if a.number <= b.number { a } else { b }),
-                _ => None,
-            };
-            axum::Json(head).into_response()
-        }
-        (Err(e), _) | (_, Err(e)) => forward_hotblocks_response(dataset, Err(e)),
-    }
-}
-
 pub(crate) fn forward_hotblocks_response(
     dataset: &str,
     response: Result<reqwest::Response, HotblocksErr>,
@@ -1308,37 +1284,6 @@ async fn sql_metadata(
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    fn block_ref(number: u64) -> BlockRef {
-        BlockRef {
-            number,
-            hash: format!("0x{number}"),
-        }
-    }
-
-    #[test]
-    fn coalesce_head_prefers_realtime_over_archival() {
-        let realtime = block_ref(200);
-        let archival = block_ref(100);
-        assert_eq!(
-            coalesce_head(Ok(realtime.clone()), Some(archival)),
-            Some(realtime)
-        );
-    }
-
-    #[test]
-    fn coalesce_head_falls_back_to_archival_when_realtime_unavailable() {
-        let archival = block_ref(100);
-        assert_eq!(
-            coalesce_head(Err(HotblocksErr::UnknownDataset), Some(archival.clone())),
-            Some(archival)
-        );
-    }
-
-    #[test]
-    fn coalesce_head_returns_none_when_both_unavailable() {
-        assert_eq!(coalesce_head(Err(HotblocksErr::UnknownDataset), None), None);
-    }
 
     #[test]
     fn forward_response_strips_internal_headers() {
