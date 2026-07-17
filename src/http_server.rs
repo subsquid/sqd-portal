@@ -354,7 +354,7 @@ async fn get_finalized_head(
                 hotblocks.get_finalized_head_opt(&dataset.default_name),
                 hotblocks.get_finalized_head_opt(&traceless_name),
             );
-            return min_finalized_head_response(traced, traceless);
+            return min_finalized_head_response(&dataset.default_name, traced, traceless);
         }
         return forward_hotblocks_response(
             &dataset.default_name,
@@ -1158,6 +1158,7 @@ where
 /// `null` is safer than a head one variant can't serve. An error from either variant is
 /// surfaced as-is rather than degrading to the other's (possibly too-high) head.
 fn min_finalized_head_response(
+    dataset: &str,
     traced: Result<Option<sqd_primitives::BlockRef>, HotblocksErr>,
     traceless: Result<Option<sqd_primitives::BlockRef>, HotblocksErr>,
 ) -> Response {
@@ -1169,7 +1170,7 @@ fn min_finalized_head_response(
             };
             axum::Json(head).into_response()
         }
-        (Err(e), _) | (_, Err(e)) => forward_hotblocks_response(Err(e)),
+        (Err(e), _) | (_, Err(e)) => forward_hotblocks_response(dataset, Err(e)),
     }
 }
 
