@@ -274,7 +274,8 @@ async fn get_archival_blocknumber_by_timestamp(
         Some(1),
     );
 
-    let stream = match task_manager.clone().spawn_stream(request).await {
+    let permit = task_manager.try_reserve()?;
+    let stream = match task_manager.clone().spawn_stream(permit, request).await {
         Ok(stream) => stream,
         Err(e) => {
             tracing::warn!("spawn stream error: {:?}", e);
