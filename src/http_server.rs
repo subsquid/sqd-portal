@@ -74,11 +74,6 @@ pub async fn run_server(
 
     tracing::info!("Starting HTTP server listening on {addr}");
     let app = Router::new()
-        .layer(sentry_tower::NewSentryLayer::new_from_top())
-        .layer(
-            // This layer should be called before the response reaches trace layers
-            PropagateRequestIdLayer::x_request_id(),
-        )
         // Portal status
         .route("/status", get(get_status).endpoint("/status"))
         .route("/datasets", get(get_datasets).endpoint("/datasets"))
@@ -175,8 +170,16 @@ pub async fn run_server(
 
     let app = app
         .route_layer(axum::middleware::from_fn(logging::middleware))
+        .layer(sentry_tower::NewSentryLayer::new_from_top())
         .layer(RequestDecompressionLayer::new())
         .layer(cors)
+        .layer(
+            // Copies the request id onto every response (REQ-9). Must be added
+            // before (= sit inside) SetRequestIdLayer to see the id it sets.
+            // Layers attached to the empty Router::new() wrap zero routes, so
+            // this must live here, after the routes.
+            PropagateRequestIdLayer::x_request_id(),
+        )
         .layer(
             // This layer is added here to be applied before the request reaches trace layers
             SetRequestIdLayer::x_request_id(MakeRequestUuid),
@@ -202,9 +205,9 @@ pub async fn run_server(
 
 /// Races axum's graceful drain against a hard `drain_timeout` deadline.
 ///
-/// See [`docs/decisions/graceful_shutdown.md`](../docs/decisions/graceful_shutdown.md) for the
-/// drain semantics — including what "force-close" actually does (and does
-/// not) to in-flight per-connection tasks.
+/// See [ADR-005](../spec/decisions/ADR-005-two-phase-shutdown.md) for the two-phase
+/// shutdown decision and drain semantics — whatever remains in flight after the
+/// timeout is detached, not awaited.
 async fn drive_serve_with_drain<F>(
     serve: F,
     shutdown_signal: CancellationToken,

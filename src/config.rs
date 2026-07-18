@@ -218,8 +218,8 @@ fn default_hotblocks_read_timeout() -> Duration {
     Duration::from_secs(20)
 }
 
-// Graceful shutdown defaults. See docs/decisions/graceful_shutdown.md for the full
-// lifecycle and timing rationale.
+// Graceful shutdown defaults. See spec/decisions/ADR-005-two-phase-shutdown.md for the
+// two-phase shutdown decision, lifecycle, and timing rationale.
 //
 // pre_drain_grace_period: window during which /ready returns 503 before we
 // start refusing connections — lets upstream load balancers stop routing new

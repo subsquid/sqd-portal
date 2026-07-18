@@ -185,8 +185,8 @@ async fn main() -> anyhow::Result<()> {
 
 /// Awaits SIGTERM and runs the two-phase shutdown sequence.
 ///
-/// See [`docs/decisions/graceful_shutdown.md`](../docs/decisions/graceful_shutdown.md) for the
-/// full lifecycle, timing rationale, and non-goals.
+/// See [ADR-005](../spec/decisions/ADR-005-two-phase-shutdown.md) for the two-phase
+/// shutdown decision — lifecycle, timing rationale, and non-goals.
 async fn watch_shutdown_signal(
     mut sigterm: tokio::signal::unix::Signal,
     shutting_down: Arc<AtomicBool>,
