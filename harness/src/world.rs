@@ -103,6 +103,8 @@ impl ToyWorld {
         })
     }
 
+    /// All blocks in `[from, to]` (the `includeAllBlocks=true` shape).
+    /// Selective filtering, when added, must still emit coverage's first+last per INV-29.
     pub fn records(&self, ds: &str, from: u64, to: u64) -> Vec<Value> {
         (from..=to).map(|n| self.record(ds, n)).collect()
     }

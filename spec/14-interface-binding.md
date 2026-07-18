@@ -54,9 +54,10 @@ undocumented in the served description — GAP-11). The head-marker headers appe
 every successful response including 204 EMPTY (INV-24, INV-27). The source header
 appears on routed responses — successful, 204 served after source selection, or failed
 after source selection — and not on validation/admission/alias failures or a no-source
-EMPTY (DEF-6). Body: one JSON block record per line, per INV-20/21/22/25. The target binding
-also exposes DEF-8's coverage cursor; its field name is unresolved (OQ-8), and the
-current wire lacks it (GAP-15). Successful and 204 real-time responses stream through
+EMPTY (DEF-6). Body: one JSON block record per line, per INV-20/21/22/25/29. The last line is always
+the coverage boundary (INV-29) — as is each served chunk's boundary, so a multi-chunk
+selective body carries interior header-only lines (FV-6) — hence DEF-8's coverage cursor is
+the last record; there is no dedicated cursor field or header, by design (DEF-8). Successful and 204 real-time responses stream through
 with all `x-internal-*` headers stripped; proxied error bodies are normalized under
 ADR-011. Completion vs truncation is not distinguished in-band (ADR-001, OQ-2).
 

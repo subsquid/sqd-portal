@@ -151,6 +151,24 @@ concurrent load, prior traffic, or process age.
 *Why:* the whole conformance method rests on it — it is what makes an oracle possible.
 *Check:* CT-3 — same request replayed cold/hot/under-load; diff record content.
 
+**INV-29 — Boundary-block emission.** [response]
+A successful response that evaluates at least one block delivers a record for at least the
+first and the last block of its coverage — header-only when the block matches no item
+filter — regardless of `includeAllBlocks`. The engine pins this boundary per *served
+chunk* (`sqd-query` runs `Plan::execute` once per chunk), so a multi-chunk response also
+carries header-only records at interior chunk boundaries; coverage's global first and last
+are the guaranteed minimum. Hence the last delivered record's reference equals the coverage
+cursor (DEF-8), and a client resumes from it gap-free even when a selective query matched
+nothing at the tail. A range that evaluates no block at all is the EMPTY outcome (INV-27),
+not a recordless success.
+*Why:* this is what makes REQ-2 resumable progress hold on the current wire with no
+dedicated cursor field; the query engine pins the coverage boundary at weight 0 (a
+non-matching block otherwise carries a null weight and falls out of the size budget), so
+it must not silently regress.
+*Check:* CT-1 — selective, multi-chunk world whose tail block matches nothing; assert the
+last record is the coverage boundary, that interior chunk boundaries may add header-only
+records (FV-6), and that a continuation from the last record is gap-free and overlap-free.
+
 ## Reporting (30–34)
 
 **INV-30 — Metrics honesty.** [state]

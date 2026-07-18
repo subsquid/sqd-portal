@@ -26,15 +26,17 @@ The client must always be able to continue from wherever a stream ended. Every
 successful stream response carries the dataset's current head and finalized head
 (number and, for the finalized head, hash) as response metadata, so the client knows the
 frontier and how far behind it is. If the response evaluated any block, it also exposes
-a coverage cursor `(number, hash)` for the last one. A follow-up from cursor number + 1,
+a coverage cursor `(number, hash)` for the last one — carried as the last delivered
+record, which the source always emits (INV-29). A follow-up from cursor number + 1,
 carrying the cursor hash as its parent, continues gap-free and overlap-free even when a
-selective query emitted no record at the end of coverage.
+selective query emitted no *matching* record at the end of coverage.
 *Acceptance:* stream headers expose head and finalized-head markers plus the coverage
 cursor; issuing a follow-up from that cursor yields the immediately following matching
 blocks; head metadata reflects the real head (never an artificially lowered value
-— ADR-009; under head-lag policy the *served* frontier may sit below it). The current
-HTTP binding lacks the coverage cursor (GAP-15/OQ-8), so this requirement is not fully
-conformant for selective queries.
+— ADR-009; under head-lag policy the *served* frontier may sit below it). The coverage
+cursor is delivered as the last record on every response that evaluates a block (INV-29,
+DEF-8), so selective resume is gap-free; there is no dedicated cursor field, by design
+(DEF-8).
 *Trace:* ADR-009, ADR-001.
 
 **REQ-3 — Fork detection and recovery.** [MUST]
@@ -365,7 +367,6 @@ Deliberately left open — tests and clients must not pin these:
 | OQ-4 | Ratify P-MEMORY-BUDGET and the assignment-size planning figure (docs disagree: ~300 MB vs ~0.5 GB). | REQ-27, GAP-3 | portal team |
 | OQ-5 | ADR-009 (head-lag) is accepted but the Portal-side header injection is not implemented — schedule or re-scope? | GAP-13 | portal team |
 | OQ-7 | A stream body without a first block silently defaults to block 0, while the API description marks it required — reject instead? | REQ-7 | portal team |
-| OQ-8 | Ratify the HTTP field/header carrying DEF-8's coverage cursor so selective zero-record responses can make resumable progress. | REQ-2, GAP-15 | portal + SDK teams |
 | OQ-9 | Ratify a global P-BUFFERED-BYTES-BUDGET and its accounting/admission semantics. | REQ-27, GAP-17 | portal team |
 | OQ-10 | Ratify the draft SLO target parameters and their benchmark gating policy. | 11 SLO table | portal team |
 

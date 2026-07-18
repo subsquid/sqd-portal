@@ -59,9 +59,10 @@ model(req, cfg, world) -> Response | ErrorClass:
   coverage = FV_coverage_extent(scanned)             # contiguous evaluated prefix; FV-4
   records = [ record(b, req.query, world.data[ds])   # provenance = stub ledger  # INV-22
               for b in coverage
-              if matches(b, req.query) or req.includeAllBlocks ]
-  return Response(records = records,                 # INV-20/21/25 checked by validators
-                  coverage_cursor = ref(last(coverage)), # absent only when coverage is empty; GAP-15 on current wire
+              if matches(b, req.query) or req.includeAllBlocks
+                 or b in (first(coverage), last(coverage)) ]  # response-level boundary; source may emit more per chunk — INV-29, FV-6
+  return Response(records = records,                 # INV-20/21/25/29 checked by validators
+                  coverage_cursor = ref(last(coverage)), # == ref(last record); delivered as that record, no dedicated field by design (DEF-8)
                   headers = heads(ds, world),        # within staleness bounds   # INV-24
                   source  = src)                     # exact match required
 ```
@@ -77,18 +78,20 @@ transient exhaustion before the first record ⇒ RETRIES-EXHAUSTED, integrity ex
 | FV-1 | which assigned worker serves an attempt | must hold the chunk; cooldowns respected while alternatives exist |
 | FV-2 | speculative attempt count/timing | ≤ 1 + retries per chunk |
 | FV-3 | truncation point | any record boundary after the first record |
-| FV-4 | coverage extent | contiguous evaluated prefix from `fromBlock`; records may be empty because filtering is independent |
+| FV-4 | coverage extent | contiguous evaluated prefix from `fromBlock`; *matching* records may be empty, but the coverage boundary is always emitted (INV-29), so ≥1 record whenever ≥1 block is evaluated |
 | FV-5 | compression choice/framing | must decode; gzip default, zstd when offered |
+| FV-6 | boundary-record granularity | the source emits a header-only coverage boundary per *served chunk* (`Plan::execute` runs per chunk), not only at the response's global first/last; these interior header-only records are licensed. Conformance checks the last record (= coverage cursor, INV-29) and the matched-record set, not exact record-set equality |
 
-Everything else — record content and order within coverage, error type/code, hint
-presence, source marker when routing occurred, coverage cursor, and header honesty — is
-deterministic against the model.
+Everything else — the content and order of the records that are present, error type/code,
+hint presence, source marker when routing occurred, coverage cursor, and header honesty —
+is deterministic against the model; record *presence* is exact up to the extra header-only
+chunk-boundary records FV-6 licenses.
 
 ## Test-class taxonomy
 
 | CT | Class | Primary properties |
 |---|---|---|
-| CT-1 | Response property tests: randomized queries/worlds vs oracle + validators | INV-10/11/20/21/22/27/28, LIV-1, LIV-4 |
+| CT-1 | Response property tests: randomized queries/worlds vs oracle + validators | INV-10/11/20/21/22/27/28/29, LIV-1, LIV-4 |
 | CT-2 | Dependency-fault matrix: every DC × every fault row of 09; incl. kill/restart | INV-1/2/23/25/31/37/40, LIV-2/5/6/7/11/12, FM tables, REQ-25/26 |
 | CT-3 | Concurrency swarms: admit/finish/disconnect storms, artifact swaps mid-flight | INV-1/3/4/5/12/28/30/35, LIV-9/10 |
 | CT-4 | Input-fault corpus: hostile headers/params/bodies, boundary values | INV-10/36, REQ-7/21 |
@@ -105,8 +108,8 @@ deterministic against the model.
 3. Every record within [fromBlock, min(toBlock, frontier)] (INV-21).
 4. Records belong to the requested dataset and match the field-selection shape.
 5. Successful routed responses have coherent headers: finalized ≤ head; source marker
-   ∈ {network, real_time}; coverage cursor agrees with the ledger (INV-24, INV-13,
-   DEF-8). 204 EMPTY carries head markers, and a source marker iff a source was
+   ∈ {network, real_time}; the coverage cursor — the last delivered record — agrees with
+   the ledger (INV-24, INV-13, DEF-8, INV-29). 204 EMPTY carries head markers, and a source marker iff a source was
    selected (retention-gap case). Pre-routing failures have no source marker.
 6. Errors: type/code ∈ DEF-10; hint iff OVERLOADED — present on proxied overloads too,
    preserved or injected at the floor (ADR-014); no data alongside errors (INV-26).
@@ -154,7 +157,7 @@ deterministic against the model.
 | REQ | Status | Note |
 |---|---|---|
 | REQ-1 | P | Exactly-once regression + slot-ordering units; smoke oracle diff over both sources (INV-20) |
-| REQ-2 | P | **Known-violated** for selective zero-record progress: no coverage cursor (GAP-15); no resume-across-requests test |
+| REQ-2 | P | Coverage cursor delivered as the last record (INV-29) → selective resume holds; no dedicated cursor field, by design (DEF-8). Resume-across-requests still untested; no CT-1 selective-tail case yet |
 | REQ-3 | P | Mismatch parsing tested; flow untested; richer-ancestor SHOULD shortfall GAP-7 (INV-23 minimum holds); head-precedence GAP-19 |
 | REQ-4 | P | Routing + source marker asserted by the CT-1 smoke (INV-13) |
 | REQ-5 | P | Gap detection tested; delay/204 untested (INV-27) |
@@ -204,7 +207,6 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-11 | Served API description drift: undocumented route/header, stale examples, size-doc conflict | REQ-32, IB-2/4 | P3 | CT-5 description-vs-router sweep |
 | GAP-12 | Download-priority key wraps at ~43 M streams (HZ-4) | REQ-42 fairness | P3 | widen key; wrap-boundary unit test |
 | GAP-13 | ADR-009 accepted but portal-side injection unimplemented — decision drift | OQ-5 | P3 | schedule or supersede |
-| GAP-15 | The HTTP response does not expose DEF-8's coverage cursor. Selective responses with no trailing matching record cannot make durable resumable progress | REQ-2, DEF-8/9, IB-4 | P1 | CT-1 selective-query world with zero records → assert cursor and resume |
 | GAP-16 | Current master exposes legacy/mixed error bodies and passes real-time error bodies through. ADR-011's closed type/code envelope is not integrated; its 409 and readiness exceptions also need CT-5 proof against IB-5 when the taxonomy change lands, together with ADR-014's amendments (proxied-hint injection, unmatched-4xx normalization, EMPTY head metadata, integrity-exhaustion WORKER-FAILURE) | DEF-10, INV-26, IB-5, REQ-7/13/20 | P1 | CT-5 table-driven local + proxied error-shape/status tests |
 | GAP-17 | Count caps imply a multi-terabyte theoretical buffer ceiling and no global byte budget or accounting exists | REQ-27, PF-1, OQ-9 | P1 | add byte meter/admission test; set P-BUFFERED-BYTES-BUDGET |
 | GAP-18 | Chain-RPC calls have no explicit deadline despite accepted ADR-010 | REQ-22, DC-5, HZ-8 | P2 | stalled-RPC stub → assert bounded call and loop recovery |
@@ -225,7 +227,7 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 
 ## Build order
 
-- **Phase 1 — P1 gaps, failing tests first:** GAP-1/2/4/15/16/17 tests red → fixes;
+- **Phase 1 — P1 gaps, failing tests first:** GAP-1/2/4/16/17 tests red → fixes;
   GAP-3 probe + heap profile → refresh-copy fix.
 - **Phase 2 — correctness core:** full CT-1 oracle diffing; CT-2 fault matrix; CT-4
   corpus; burn down P2 gaps.

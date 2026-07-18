@@ -2,9 +2,9 @@
 //! response via `validate_stream`; validator 6 (`validate_error`) covers error
 //! envelopes and is not yet exercised by the Phase-0 smoke (no error-path request).
 //! `errors` are hard conformance failures; `warnings` cover surfaces the gap
-//! register already knows are not integrated on current master (GAP-15 cursor,
-//! GAP-16 error envelope, ADR-014's 204 metadata) — reported, not fatal, so
-//! the Phase-0 smoke stays green while the gaps stay visible.
+//! register already knows are not integrated on current master (GAP-16 error
+//! envelope, ADR-014's 204 metadata) — reported, not fatal, so the Phase-0
+//! smoke stays green while the gaps stay visible.
 
 use crate::driver::Decoded;
 use crate::model::{Expect, StreamReq};
@@ -108,9 +108,6 @@ pub fn validate_stream(
                     v.err(format!("validator5: source {s}, expected {source}"))
                 }
                 _ => {}
-            }
-            if d.header("x-sqd-coverage-cursor").is_none() {
-                v.warn("GAP-15: coverage cursor absent on the wire".to_string());
             }
             if d.header("x-internal-hotblocks-instance").is_some() {
                 v.err("validator5: x-internal-* header leaked to the client".to_string());
