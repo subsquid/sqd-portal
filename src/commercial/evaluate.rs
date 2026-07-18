@@ -590,6 +590,12 @@ fn reject(
     Authorization::Rejected(rejected(defaults, reason, http_status, retry_after_secs))
 }
 
+/// Ceiling for the Retry-After header on any rejection. Period-reset horizons
+/// (monthly quota: up to ~31 days) overflow 32-bit setTimeout in squid-sdk
+/// clients — the pause clamps to 1ms and the client hot-loops at full speed
+/// (observed 343 req/s, R5 Phase 1 finding P1). Clients re-check hourly instead.
+pub const MAX_RETRY_AFTER_SECS: u64 = 3600;
+
 fn rejected(
     defaults: &Defaults,
     reason: &str,
@@ -604,7 +610,7 @@ fn rejected(
             .get(reason)
             .cloned()
             .unwrap_or_else(|| fallback_message(reason)),
-        retry_after_secs,
+        retry_after_secs: retry_after_secs.map(|secs| secs.min(MAX_RETRY_AFTER_SECS)),
     }
 }
 
@@ -1017,6 +1023,30 @@ mod tests {
             Authorization::Rejected(rejected) => {
                 panic!("expected stale-quota grace, got {rejected:?}")
             }
+        }
+    }
+
+    #[test]
+    fn quota_retry_after_is_capped_for_distant_period_end() {
+        // R5 P1: a month-scale Retry-After (period reset) overflows 32-bit
+        // setTimeout in squid-sdk clients and degenerates into a 1ms hot retry
+        // loop. The header must never exceed MAX_RETRY_AFTER_SECS.
+        let mut snapshot = active_snapshot(1);
+        snapshot.quota.as_mut().unwrap().period_end = Some(state().now_secs + 31 * 24 * 3600);
+        let mut quota_state = state();
+        quota_state.tally_bytes = 10_000;
+
+        match evaluate(
+            &request(SECRET_SHA256),
+            Some(&snapshot),
+            &defaults(),
+            quota_state,
+        ) {
+            Authorization::Rejected(rejected) => {
+                assert_eq!(rejected.reason, "quota_exhausted");
+                assert_eq!(rejected.retry_after_secs, Some(MAX_RETRY_AFTER_SECS));
+            }
+            Authorization::Granted(_) => panic!("expected quota rejection"),
         }
     }
 
