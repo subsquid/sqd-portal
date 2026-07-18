@@ -41,7 +41,10 @@ use crate::{
         (status = 204, description = "No new blocks available in the requested range"),
         (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later"),
+        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later",
+            headers(
+                ("Retry-After" = String, description = "Delay in seconds before retrying (at least 1)"),
+            )),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),
@@ -79,7 +82,10 @@ pub(crate) async fn run_archival_stream_restricted(
         (status = 204, description = "No new blocks available in the requested range"),
         (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later"),
+        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later",
+            headers(
+                ("Retry-After" = String, description = "Delay in seconds before retrying (at least 1)"),
+            )),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),
@@ -149,7 +155,10 @@ Parent block hash mismatch — the `parentHash` of the first requested block doe
 The body (see schema below) lists recent canonical-chain blocks so the client can find a \
 shared ancestor and resume. See [How parentBlockHash works](#description/how-parentblockhash-works) \
 for the recovery procedure and a worked example.", body = ConflictResponse),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later"),
+        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later",
+            headers(
+                ("Retry-After" = String, description = "Delay in seconds before retrying (at least 1)"),
+            )),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),
@@ -196,7 +205,10 @@ pub(crate) async fn run_stream(
         (status = 204, description = "No new blocks available in the requested range"),
         (status = 400, description = "Invalid request parameters or query"),
         (status = 404, description = "Dataset not found"),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later"),
+        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later",
+            headers(
+                ("Retry-After" = String, description = "Delay in seconds before retrying (at least 1)"),
+            )),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Service temporarily unavailable"),
     ),

@@ -152,7 +152,7 @@ pub struct DatasetStateResponse {
             "\n\n",
             include_str!("../docs/openapi/03-getting-started.md"),
         ),
-        version = "0.10.0",
+        version = env!("CARGO_PKG_VERSION"),
     ),
     servers(
         (url = "http://localhost:8000", description = "Local development server"),
