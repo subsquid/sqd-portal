@@ -100,6 +100,18 @@ pub fn validate_stream(
                 ));
             }
 
+            // INV-29 — last delivered record is the coverage cursor a client resumes
+            // from (DEF-8/9). Isolates the resume anchor the full oracle diff subsumes.
+            match (records.last(), d.lines.last()) {
+                (Some(want), Some(got)) if got == want => {}
+                (Some(want), Some(got)) => v.err(format!(
+                    "INV-29: last record {} is not the coverage cursor {}",
+                    got["header"]["number"], want["header"]["number"]
+                )),
+                (Some(_), None) => v.err("INV-29: a covered range delivered no record".to_string()),
+                (None, _) => {}
+            }
+
             // 5 — coherent headers (INV-24, INV-13, DEF-8).
             check_head_headers(&mut v, d, *head, finalized_head, false);
             match d.header("x-sqd-data-source") {

@@ -38,6 +38,34 @@ fn stream_query(from: u64, to: u64) -> serde_json::Value {
     })
 }
 
+/// Selective query (`includeAllBlocks=false`); its filter matches nothing in the
+/// header-only world, so the response is just the coverage boundary (INV-29).
+fn selective_query(from: u64, to: u64, parent_hash: Option<&str>) -> serde_json::Value {
+    let mut q = json!({
+        "type": "evm",
+        "fromBlock": from,
+        "toBlock": to,
+        "includeAllBlocks": false,
+        "logs": [{ "address": ["0x00000000000000000000000000000000deadbeef"] }],
+        "fields": { "block": { "number": true, "hash": true } },
+    });
+    if let Some(h) = parent_hash {
+        q["parentBlockHash"] = json!(h);
+    }
+    q
+}
+
+/// INV-29 resume: the continuation begins exactly one block past the cursor.
+fn assert_resumes(prev: &Decoded, next: &Decoded) -> anyhow::Result<()> {
+    let cursor = *prev.block_numbers().last().context("prev stream empty")?;
+    let next_first = *next.block_numbers().first().context("next stream empty")?;
+    ensure!(
+        next_first == cursor + 1,
+        "resume not gap-free/overlap-free: cursor {cursor}, continuation starts {next_first}"
+    );
+    Ok(())
+}
+
 struct Ctx {
     world: ToyWorld,
     base: String,
@@ -175,7 +203,7 @@ async fn run_smoke(ctx: &Ctx, portal_proc: &mut PortalProcess) -> anyhow::Result
     wait_archival_serving(ctx, portal_proc, Duration::from_secs(30)).await?;
 
     // CT-1 core: archival stream within one chunk.
-    let req = StreamReq { dataset: "toy".into(), from: 0, to: Some(25), finalized: true };
+    let req = StreamReq { dataset: "toy".into(), from: 0, to: Some(25), finalized: true, include_all_blocks: true };
     let expect = model(world, &req);
     let resp =
         driver::stream(http, base, "toy", "finalized-stream", &stream_query(0, 25), "ct1-a")
@@ -183,7 +211,7 @@ async fn run_smoke(ctx: &Ctx, portal_proc: &mut PortalProcess) -> anyhow::Result
     check_clean("archival single-chunk stream", &validate_stream(world, &req, &expect, &resp), &resp)?;
 
     // Archival stream crossing chunk boundaries (ordering across fan-out).
-    let req = StreamReq { dataset: "toy".into(), from: 30, to: Some(85), finalized: true };
+    let req = StreamReq { dataset: "toy".into(), from: 30, to: Some(85), finalized: true, include_all_blocks: true };
     let expect = model(world, &req);
     let resp =
         driver::stream(http, base, "toy", "finalized-stream", &stream_query(30, 85), "ct1-b")
@@ -191,7 +219,7 @@ async fn run_smoke(ctx: &Ctx, portal_proc: &mut PortalProcess) -> anyhow::Result
     check_clean("archival cross-chunk stream", &validate_stream(world, &req, &expect, &resp), &resp)?;
 
     // Alias resolution serves the same dataset (DEF-1).
-    let req = StreamReq { dataset: "toy-alias".into(), from: 90, to: Some(99), finalized: true };
+    let req = StreamReq { dataset: "toy-alias".into(), from: 90, to: Some(99), finalized: true, include_all_blocks: true };
     let expect = model(world, &req);
     let resp =
         driver::stream(http, base, "toy-alias", "finalized-stream", &stream_query(90, 99), "ct1-c")
@@ -199,13 +227,45 @@ async fn run_smoke(ctx: &Ctx, portal_proc: &mut PortalProcess) -> anyhow::Result
     check_clean("archival stream via alias", &validate_stream(world, &req, &expect, &resp), &resp)?;
 
     // Real-time proxied stream (ADR-003 pass-through, internal headers stripped).
-    let req = StreamReq { dataset: "toy-rt".into(), from: 10, to: Some(20), finalized: false };
+    let req = StreamReq { dataset: "toy-rt".into(), from: 10, to: Some(20), finalized: false, include_all_blocks: true };
     let expect = model(world, &req);
     let resp = driver::stream(http, base, "toy-rt", "stream", &stream_query(10, 20), "ct1-d").await?;
     check_clean("real-time stream", &validate_stream(world, &req, &expect, &resp), &resp)?;
 
+    // Selective-tail over the network (INV-29 + FV-6): nothing matches, so the
+    // stream is the coverage boundary, one first/last per served chunk. Interior
+    // chunk boundaries (39, 40) ride along beyond the global {10, 50}; the last
+    // record is the cursor and a continuation from it resumes gap-free.
+    let req = StreamReq { dataset: "toy".into(), from: 10, to: Some(50), finalized: true, include_all_blocks: false };
+    let expect = model(world, &req);
+    let sel = driver::stream(http, base, "toy", "finalized-stream", &selective_query(10, 50, None), "ct1-sel-net").await?;
+    check_clean("selective network multi-chunk tail", &validate_stream(world, &req, &expect, &sel), &sel)?;
+    ensure!(
+        sel.block_numbers() == vec![10, 39, 40, 50],
+        "selective network boundary shape: {:?}",
+        sel.block_numbers()
+    );
+    let req = StreamReq { dataset: "toy".into(), from: 51, to: Some(79), finalized: true, include_all_blocks: false };
+    let expect = model(world, &req);
+    let cont = driver::stream(http, base, "toy", "finalized-stream", &selective_query(51, 79, None), "ct1-sel-net-cont").await?;
+    check_clean("selective network continuation", &validate_stream(world, &req, &expect, &cont), &cont)?;
+    assert_resumes(&sel, &cont)?;
+
+    // Same on the real-time source: single response, boundary {from, last}; the
+    // continuation carries the cursor hash as parent (DEF-9).
+    let req = StreamReq { dataset: "toy-rt".into(), from: 12, to: Some(22), finalized: false, include_all_blocks: false };
+    let expect = model(world, &req);
+    let sel_rt = driver::stream(http, base, "toy-rt", "stream", &selective_query(12, 22, None), "ct1-sel-rt").await?;
+    check_clean("selective real-time tail", &validate_stream(world, &req, &expect, &sel_rt), &sel_rt)?;
+    ensure!(sel_rt.block_numbers() == vec![12, 22], "selective rt boundary: {:?}", sel_rt.block_numbers());
+    let req = StreamReq { dataset: "toy-rt".into(), from: 23, to: Some(33), finalized: false, include_all_blocks: false };
+    let expect = model(world, &req);
+    let cont_rt = driver::stream(http, base, "toy-rt", "stream", &selective_query(23, 33, Some(&world.hash("toy-rt", 22))), "ct1-sel-rt-cont").await?;
+    check_clean("selective real-time continuation", &validate_stream(world, &req, &expect, &cont_rt), &cont_rt)?;
+    assert_resumes(&sel_rt, &cont_rt)?;
+
     // Beyond-frontier poll → EMPTY (REQ-5; proxied 204 passes through).
-    let req = StreamReq { dataset: "toy-rt".into(), from: 1000, to: None, finalized: false };
+    let req = StreamReq { dataset: "toy-rt".into(), from: 1000, to: None, finalized: false, include_all_blocks: true };
     let expect = model(world, &req);
     let resp = driver::stream(
         http,

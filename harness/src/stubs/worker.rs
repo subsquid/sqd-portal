@@ -109,7 +109,17 @@ fn answer(
         return error_result(query, keypair, "unknown dataset");
     };
 
-    let jsonl = world.jsonl(&ds.name, range.begin, range.end);
+    // The real engine emits every block for `includeAllBlocks`, else only this
+    // chunk's coverage boundary, header-only when nothing matches (INV-29).
+    let include_all = serde_json::from_str::<serde_json::Value>(&query.query)
+        .ok()
+        .and_then(|q| q["includeAllBlocks"].as_bool())
+        .unwrap_or(false);
+    let jsonl = if include_all {
+        world.jsonl(&ds.name, range.begin, range.end)
+    } else {
+        world.boundary_jsonl(&ds.name, range.begin, range.end)
+    };
     let data = match sqd_messages::Compression::try_from(query.compression) {
         Ok(sqd_messages::Compression::Gzip) => {
             let mut enc = GzEncoder::new(Vec::new(), Compression::default());
