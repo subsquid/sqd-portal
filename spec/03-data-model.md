@@ -62,23 +62,29 @@ first ≥ dataset start, tuning values non-zero.
 
 **DEF-8 — Stream response and coverage.** A successful stream response is (metadata,
 record sequence). Metadata: current head, finalized head (number and hash), serving
-source, request identifier, and a **coverage cursor** when the response evaluated any
-block. The record sequence obeys INV-20/21/22. The response's **coverage** is the
-contiguous range from the requested first block through the highest block the response
-evaluated, whether or not those blocks matched a selective query. Its cursor is the
-reference `(number, hash)` of that final evaluated block.
+source, and request identifier. The record sequence obeys INV-20/21/22. The response's
+**coverage** is the contiguous range from the requested first block through the highest
+block the response evaluated, whether or not those blocks matched a selective query. Its
+**coverage cursor** is the reference `(number, hash)` of that final evaluated block.
 
-Coverage and delivery are distinct: with `includeAllBlocks=false`, a response may
-cover blocks after its last record, or cover a non-empty range while returning zero
-records. Records alone therefore cannot reveal coverage. Until the HTTP binding exposes
-the cursor (GAP-15/OQ-8), a client can safely checkpoint only the last delivered block;
-with no record it makes no durable progress and MUST NOT infer that unmatched blocks
-were skipped.
+Coverage is recoverable from delivery: the serving source always emits at least the first
+and last block of coverage as records — and the boundary of every served chunk — header-only
+when they match no filter (INV-29). So
+with `includeAllBlocks=false` a response may carry blocks after its last *matching*
+record, and the **last delivered record is always the coverage cursor**. A response that
+evaluated at least one block therefore delivers at least one record; a truly empty body
+is the EMPTY outcome (INV-27, 204), never a covered-but-recordless 200. A client
+checkpoints the last delivered record and continues gap-free, selective queries
+included. There is deliberately no dedicated cursor field or header: the final covered
+block is known only once the stream ends (size-truncation is data-dependent), so it
+could ride only in a fragile HTTP trailer — whereas the last record carries it in-band
+and already includes the hash for fork-safe continuation (DEF-9).
 
 **DEF-9 — Continuation and conflict.** A *continuation* from checkpoint `(N, hash(N))`
-is a new request with first block N+1 and parent hash = hash(N). Prefer the response's
-coverage cursor; if the binding did not expose one, the last delivered record is the
-only safe checkpoint. A **conflict** arises when a real-time-mode request's parent hash
+is a new request with first block N+1 and parent hash = hash(N). The checkpoint is the
+coverage cursor; because the source always emits the last block of coverage (INV-29,
+DEF-8), the last delivered record *is* that cursor and is always a safe checkpoint,
+selective queries included. A **conflict** arises when a real-time-mode request's parent hash
 disagrees with canonical data, regardless of whether routing selected `network` or
 `real_time`; its payload is a non-empty list of canonical block references, ordered by
 ascending height and ending at the parent's height (recovery algorithm: binding, IB-5).
