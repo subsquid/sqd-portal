@@ -238,14 +238,13 @@ fn evaluate_key(
     }
     if effective.is_some_and(|effective| effective <= 0) {
         return match on_exceed {
-            OnExceed::Reject => reject(
+            // Period-end 402: NO Retry-After (month-scale waits read as
+            // "retryable soon" to retry middlewares — R5 P1); the reset moment
+            // ships as the absolute X-SQD-Quota-Reset header instead.
+            OnExceed::Reject => Authorization::Rejected(rejected_quota_exhausted(
                 defaults,
-                QUOTA_EXHAUSTED,
-                402,
-                quota
-                    .and_then(|quota| quota.period_end)
-                    .map(|period_end| period_end.saturating_sub(state.now_secs)),
-            ),
+                quota.and_then(|quota| quota.period_end),
+            )),
             OnExceed::Throttle {
                 floor_bytes_per_sec,
             } => Authorization::Granted(grant(
@@ -611,6 +610,15 @@ fn rejected(
             .cloned()
             .unwrap_or_else(|| fallback_message(reason)),
         retry_after_secs: retry_after_secs.map(|secs| secs.min(MAX_RETRY_AFTER_SECS)),
+        quota_reset_unix_secs: None,
+    }
+}
+
+/// Quota-exhausted (period-end) 402: no Retry-After, absolute reset time only.
+fn rejected_quota_exhausted(defaults: &Defaults, period_end_unix_secs: Option<u64>) -> Rejected {
+    Rejected {
+        quota_reset_unix_secs: period_end_unix_secs,
+        ..rejected(defaults, QUOTA_EXHAUSTED, 402, None)
     }
 }
 
@@ -972,7 +980,8 @@ mod tests {
             Authorization::Rejected(rejected) => {
                 assert_eq!(rejected.reason, "quota_exhausted");
                 assert_eq!(rejected.http_status, 402);
-                assert!(rejected.retry_after_secs.is_some());
+                assert!(rejected.retry_after_secs.is_none());
+                assert!(rejected.quota_reset_unix_secs.is_some());
             }
             Authorization::Granted(_) => panic!("expected rejection"),
         }
@@ -1027,33 +1036,15 @@ mod tests {
     }
 
     #[test]
-    fn quota_retry_after_is_capped_for_distant_period_end() {
-        // R5 P1: a month-scale Retry-After (period reset) overflows 32-bit
-        // setTimeout in squid-sdk clients and degenerates into a 1ms hot retry
-        // loop. The header must never exceed MAX_RETRY_AFTER_SECS.
+    fn quota_exhausted_sends_reset_time_and_no_retry_after() {
+        // R5 P1 (revised): period-end 402s must NOT carry Retry-After at all —
+        // month-scale values overflow 32-bit setTimeout in squid-sdk clients
+        // (1ms hot loop), and ANY Retry-After makes retry middlewares treat the
+        // rejection as "retryable soon". The absolute reset moment ships in
+        // quota_reset_unix_secs (X-SQD-Quota-Reset) instead.
+        let period_end = state().now_secs + 31 * 24 * 3600;
         let mut snapshot = active_snapshot(1);
-        snapshot.quota.as_mut().unwrap().period_end = Some(state().now_secs + 31 * 24 * 3600);
-        let mut quota_state = state();
-        quota_state.tally_bytes = 10_000;
-
-        match evaluate(
-            &request(SECRET_SHA256),
-            Some(&snapshot),
-            &defaults(),
-            quota_state,
-        ) {
-            Authorization::Rejected(rejected) => {
-                assert_eq!(rejected.reason, "quota_exhausted");
-                assert_eq!(rejected.retry_after_secs, Some(MAX_RETRY_AFTER_SECS));
-            }
-            Authorization::Granted(_) => panic!("expected quota rejection"),
-        }
-    }
-
-    #[test]
-    fn unexpired_exhausted_quota_is_rejected_with_retry_after() {
-        let mut snapshot = active_snapshot(1);
-        snapshot.quota.as_mut().unwrap().period_end = Some(state().now_secs + 30);
+        snapshot.quota.as_mut().unwrap().period_end = Some(period_end);
         let mut quota_state = state();
         quota_state.tally_bytes = 10_000;
 
@@ -1066,7 +1057,8 @@ mod tests {
             Authorization::Rejected(rejected) => {
                 assert_eq!(rejected.reason, "quota_exhausted");
                 assert_eq!(rejected.http_status, 402);
-                assert_eq!(rejected.retry_after_secs, Some(30));
+                assert_eq!(rejected.retry_after_secs, None);
+                assert_eq!(rejected.quota_reset_unix_secs, Some(period_end));
             }
             Authorization::Granted(_) => panic!("expected quota rejection"),
         }

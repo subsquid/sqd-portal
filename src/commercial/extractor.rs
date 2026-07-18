@@ -239,6 +239,7 @@ fn invalid_key() -> Rejected {
         // record is available to supply the control-plane message.
         message: "Invalid API key".to_string(),
         retry_after_secs: None,
+        quota_reset_unix_secs: None,
     }
 }
 
@@ -404,7 +405,8 @@ mod tests {
                 reason: "quota_exhausted".to_string(),
                 http_status: 402,
                 message: "quota exhausted".to_string(),
-                retry_after_secs: Some(7),
+                retry_after_secs: None,
+                quota_reset_unix_secs: Some(1_790_000_000),
             })
         }
     }
@@ -792,7 +794,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
-        assert_eq!(response.headers()["retry-after"], "7");
+        assert!(
+            response.headers().get("retry-after").is_none(),
+            "quota 402 must not advertise Retry-After (R5 P1)"
+        );
+        assert_eq!(response.headers()["x-sqd-quota-reset"], "1790000000");
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"quota exhausted");
     }

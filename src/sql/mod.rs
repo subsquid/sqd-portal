@@ -190,6 +190,7 @@ fn sql_entitlement_rejection() -> SqlErr {
         http_status: 403,
         message: "Dataset is not enabled for this key".to_string(),
         retry_after_secs: None,
+        quota_reset_unix_secs: None,
     })
 }
 
@@ -199,6 +200,7 @@ fn sql_trace_entitlement_rejection() -> SqlErr {
         http_status: 403,
         message: "Traces are not enabled for this key".to_string(),
         retry_after_secs: None,
+        quota_reset_unix_secs: None,
     })
 }
 

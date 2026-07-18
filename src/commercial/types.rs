@@ -122,6 +122,12 @@ pub struct Rejected {
     pub http_status: u16,
     pub message: String,
     pub retry_after_secs: Option<u64>,
+    /// Absolute unix time (seconds) when an exhausted quota resets. Rendered as
+    /// the `X-SQD-Quota-Reset` header on quota 402s, which deliberately carry
+    /// NO Retry-After: period resets are month-scale, and retry middlewares
+    /// treat any Retry-After as "retryable soon" (R5 Phase 1 finding P1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_reset_unix_secs: Option<u64>,
 }
 
 // Granted carries the entitlement sets inline; the enum is built once per

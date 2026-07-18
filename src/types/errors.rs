@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use serde::Serialize;
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
@@ -31,6 +31,7 @@ pub enum RequestError {
     PaymentRequired {
         message: String,
         retry_after: Option<u64>,
+        quota_reset: Option<u64>,
     },
     #[error("{0}")]
     Forbidden(String),
@@ -130,12 +131,19 @@ impl axum::response::IntoResponse for RequestError {
             Self::PaymentRequired {
                 message,
                 retry_after,
+                quota_reset,
             } => {
                 let mut response = (StatusCode::PAYMENT_REQUIRED, message).into_response();
                 if let Some(retry_after) = retry_after {
                     response.headers_mut().insert(
                         header::RETRY_AFTER,
                         HeaderValue::from_str(&retry_after.to_string()).unwrap(),
+                    );
+                }
+                if let Some(quota_reset) = quota_reset {
+                    response.headers_mut().insert(
+                        HeaderName::from_static("x-sqd-quota-reset"),
+                        HeaderValue::from_str(&quota_reset.to_string()).unwrap(),
                     );
                 }
                 response
@@ -189,6 +197,7 @@ impl From<Rejected> for RequestError {
             402 => Self::PaymentRequired {
                 message: rejected.message,
                 retry_after: rejected.retry_after_secs,
+                quota_reset: rejected.quota_reset_unix_secs,
             },
             403 => Self::Forbidden(rejected.message),
             429 => Self::TooManyRequests {
