@@ -121,7 +121,13 @@ fn serve_stream(s: HotblocksState, ds: String, body: String, finalized: bool) ->
     }
 
     let last = to.map_or(frontier, |t| t.min(frontier));
-    let jsonl = s.world.jsonl(&ds, from, last);
+    // Selective queries match nothing here, so only the coverage boundary ships (INV-29).
+    let include_all = query["includeAllBlocks"].as_bool().unwrap_or(false);
+    let jsonl = if include_all {
+        s.world.jsonl(&ds, from, last)
+    } else {
+        s.world.boundary_jsonl(&ds, from, last)
+    };
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(&jsonl).unwrap();
     let gz = enc.finish().unwrap();

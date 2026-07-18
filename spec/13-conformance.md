@@ -157,7 +157,7 @@ chunk-boundary records FV-6 licenses.
 | REQ | Status | Note |
 |---|---|---|
 | REQ-1 | P | Exactly-once regression + slot-ordering units; smoke oracle diff over both sources (INV-20) |
-| REQ-2 | P | Coverage cursor delivered as the last record (INV-29) → selective resume holds; no dedicated cursor field, by design (DEF-8). Resume-across-requests still untested; no CT-1 selective-tail case yet |
+| REQ-2 | P | Coverage cursor delivered as the last record (INV-29) → selective resume holds; no dedicated cursor field, by design (DEF-8). CT-1 covers selective-tail resume across requests on both sources; the network multi-chunk case exercises FV-6 |
 | REQ-3 | P | Mismatch parsing tested; flow untested; richer-ancestor SHOULD shortfall GAP-7 (INV-23 minimum holds); head-precedence GAP-19 |
 | REQ-4 | P | Routing + source marker asserted by the CT-1 smoke (INV-13) |
 | REQ-5 | P | Gap detection tested; delay/204 untested (INV-27) |

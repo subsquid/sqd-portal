@@ -104,19 +104,46 @@ impl ToyWorld {
     }
 
     /// All blocks in `[from, to]` (the `includeAllBlocks=true` shape).
-    /// Selective filtering, when added, must still emit coverage's first+last per INV-29.
     pub fn records(&self, ds: &str, from: u64, to: u64) -> Vec<Value> {
         (from..=to).map(|n| self.record(ds, n)).collect()
     }
 
-    pub fn jsonl(&self, ds: &str, from: u64, to: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        for r in self.records(ds, from, to) {
-            out.extend_from_slice(serde_json::to_string(&r).unwrap().as_bytes());
-            out.push(b'\n');
-        }
-        out
+    /// Coverage boundary of `[from, to]` — first and last block only. The header-only
+    /// world matches nothing selectively, so this is a chunk's whole selective response
+    /// (INV-29); the oracle unions per-chunk boundaries for FV-6.
+    pub fn boundary_records(&self, ds: &str, from: u64, to: u64) -> Vec<Value> {
+        boundary_numbers(from, to)
+            .into_iter()
+            .map(|n| self.record(ds, n))
+            .collect()
     }
+
+    pub fn jsonl(&self, ds: &str, from: u64, to: u64) -> Vec<u8> {
+        to_jsonl(&self.records(ds, from, to))
+    }
+
+    /// JSONL of the coverage boundary (the selective, `includeAllBlocks=false` shape).
+    pub fn boundary_jsonl(&self, ds: &str, from: u64, to: u64) -> Vec<u8> {
+        to_jsonl(&self.boundary_records(ds, from, to))
+    }
+}
+
+/// First and last of `[from, to]`, collapsed to a single entry when they coincide.
+pub fn boundary_numbers(from: u64, to: u64) -> Vec<u64> {
+    if from >= to {
+        vec![from]
+    } else {
+        vec![from, to]
+    }
+}
+
+fn to_jsonl(records: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for r in records {
+        out.extend_from_slice(serde_json::to_string(r).unwrap().as_bytes());
+        out.push(b'\n');
+    }
+    out
 }
 
 /// Deterministic 64-hex block hash (FNV-1a over dataset + number, stretched).
