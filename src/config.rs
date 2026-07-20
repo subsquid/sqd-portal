@@ -87,6 +87,15 @@ pub struct Config {
     )]
     pub assignments_update_interval: Duration,
 
+    /// P-ASSIGNMENT-MAX-AGE (ADR-013). Signalling only: past this the artifact
+    /// is reported stale, but the portal keeps serving from it.
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(
+        rename = "assignment_max_age_sec",
+        default = "default_assignment_max_age"
+    )]
+    pub assignment_max_age: Duration,
+
     #[serde_as(as = "DurationSeconds")]
     #[serde(
         rename = "datasets_update_interval_sec",
@@ -274,6 +283,10 @@ fn default_assignments_update_interval() -> Duration {
 
 fn default_datasets_update_interval() -> Duration {
     Duration::from_secs(10 * 60)
+}
+
+fn default_assignment_max_age() -> Duration {
+    Duration::from_secs(15 * 60)
 }
 
 fn default_query_size_limit() -> u64 {

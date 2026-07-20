@@ -1,10 +1,19 @@
-use std::iter;
+use std::{
+    iter,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        LazyLock,
+    },
+    time::{Duration, Instant},
+};
 
 use prometheus_client::{
+    collector::Collector,
+    encoding::{DescriptorEncoder, EncodeMetric},
     metrics::{
         counter::Counter,
         family::Family,
-        gauge::Gauge,
+        gauge::{ConstGauge, Gauge},
         histogram::{exponential_buckets, Histogram},
     },
     registry::Registry,
@@ -36,7 +45,17 @@ fn buckets(start: f64, count: usize) -> impl Iterator<Item = f64> {
         .take(count)
 }
 
+/// Monotonic: a wall-clock step must not make a stale artifact look fresh.
+static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Seconds after [`ORIGIN`] at which the applied assignment was installed (OB-6).
+static ASSIGNMENT_APPLIED_AT: AtomicI64 = AtomicI64::new(NEVER_APPLIED);
+
+const NEVER_APPLIED: i64 = i64::MIN;
+
 lazy_static::lazy_static! {
+    pub static ref ASSIGNMENT_REFRESHES: Family<Labels, Counter> = Default::default();
+
     pub static ref KNOWN_WORKERS: Gauge = Default::default();
     pub static ref AVAILABLE_COMPUTE_UNITS: Gauge = Default::default();
 
@@ -195,7 +214,93 @@ pub fn report_mutex_held_duration(
         .inc_by(duration.as_nanos() as u64);
 }
 
-pub fn register_metrics(registry: &mut Registry) {
+/// The outcome of one assignment refresh cycle (OB-6 counts, OB-9 alarms).
+#[derive(Debug)]
+pub enum AssignmentRefresh {
+    Applied,
+    Unchanged,
+    /// Effective-from earlier than the applied artifact's (DEF-4, INV-2).
+    Regressive,
+    FetchFailed,
+    /// Structurally invalid — never applied (REQ-26, FM-2).
+    Invalid,
+}
+
+impl AssignmentRefresh {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Unchanged => "unchanged",
+            Self::Regressive => "regressive",
+            Self::FetchFailed => "fetch_failed",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+pub fn report_assignment_refresh(outcome: AssignmentRefresh) {
+    if matches!(outcome, AssignmentRefresh::Applied) {
+        ASSIGNMENT_APPLIED_AT.store(ORIGIN.elapsed().as_secs() as i64, Ordering::Relaxed);
+    }
+    ASSIGNMENT_REFRESHES
+        .get_or_create(&vec![("outcome".to_owned(), outcome.as_str().to_owned())])
+        .inc();
+}
+
+fn assignment_age() -> Option<Duration> {
+    let applied_at = ASSIGNMENT_APPLIED_AT.load(Ordering::Relaxed);
+    if applied_at == NEVER_APPLIED {
+        return None;
+    }
+    let now = ORIGIN.elapsed().as_secs() as i64;
+    Some(Duration::from_secs(
+        now.saturating_sub(applied_at).max(0) as u64
+    ))
+}
+
+/// Read at scrape time: a gauge the refresh loop writes would freeze at its last
+/// value, which is the failure this exists to expose (ADR-013, OB-6, GAP-2).
+#[derive(Debug)]
+struct AssignmentAge {
+    max_age: Duration,
+}
+
+impl Collector for AssignmentAge {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        // No artifact yet: readiness already fails with no workers known.
+        let Some(age) = assignment_age() else {
+            return Ok(());
+        };
+
+        let seconds = ConstGauge::new(age.as_secs() as i64);
+        seconds.encode(encoder.encode_descriptor(
+            "assignment_age_seconds",
+            "Time since the applied assignment artifact was installed",
+            None,
+            seconds.metric_type(),
+        )?)?;
+
+        let stale = ConstGauge::new(i64::from(age > self.max_age));
+        stale.encode(encoder.encode_descriptor(
+            "assignment_stale",
+            "1 while the applied assignment is older than assignment_max_age_sec",
+            None,
+            stale.metric_type(),
+        )?)?;
+
+        Ok(())
+    }
+}
+
+pub fn register_metrics(registry: &mut Registry, assignment_max_age: Duration) {
+    registry.register(
+        "assignment_refreshes",
+        "Assignment refresh cycles by outcome",
+        ASSIGNMENT_REFRESHES.clone(),
+    );
+    registry.register_collector(Box::new(AssignmentAge {
+        max_age: assignment_max_age,
+    }));
     registry.register(
         "http_status",
         "Number of sent HTTP responses",
@@ -333,4 +438,64 @@ pub fn register_metrics(registry: &mut Registry) {
         "Number of existing mutexes",
         MUTEXES_EXISTING.clone(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialised: these write `ASSIGNMENT_APPLIED_AT` directly.
+    fn scrape_with_age(applied_secs_ago: Option<i64>, max_age: Duration) -> String {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        ASSIGNMENT_APPLIED_AT.store(
+            match applied_secs_ago {
+                Some(ago) => ORIGIN.elapsed().as_secs() as i64 - ago,
+                None => NEVER_APPLIED,
+            },
+            Ordering::Relaxed,
+        );
+
+        let mut registry = Registry::default();
+        registry
+            .sub_registry_with_prefix("portal")
+            .register_collector(Box::new(AssignmentAge { max_age }));
+
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry).unwrap();
+        buffer
+    }
+
+    #[test]
+    fn age_is_reported_and_not_yet_stale() {
+        let scrape = scrape_with_age(Some(60), Duration::from_secs(900));
+
+        assert!(
+            scrape.contains("portal_assignment_age_seconds 60\n"),
+            "{scrape}"
+        );
+        assert!(scrape.contains("portal_assignment_stale 0\n"), "{scrape}");
+    }
+
+    /// The degraded signal of ADR-013: `/ready` stays green, this flips.
+    #[test]
+    fn stale_flips_past_max_age() {
+        let scrape = scrape_with_age(Some(1000), Duration::from_secs(900));
+
+        assert!(
+            scrape.contains("portal_assignment_age_seconds 1000\n"),
+            "{scrape}"
+        );
+        assert!(scrape.contains("portal_assignment_stale 1\n"), "{scrape}");
+    }
+
+    /// An age of zero here would read as freshness.
+    #[test]
+    fn nothing_is_reported_before_the_first_artifact() {
+        let scrape = scrape_with_age(None, Duration::from_secs(900));
+
+        assert!(!scrape.contains("assignment_age_seconds"), "{scrape}");
+        assert!(!scrape.contains("assignment_stale"), "{scrape}");
+    }
 }

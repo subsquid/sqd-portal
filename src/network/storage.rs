@@ -8,7 +8,7 @@ use tracing::instrument;
 
 use crate::{
     datasets::Datasets,
-    metrics,
+    metrics::{self, AssignmentRefresh},
     types::{api_types::DatasetState, BlockNumber, DataChunk, DatasetId},
     utils::RwLock,
 };
@@ -16,10 +16,29 @@ use crate::{
 pub struct StorageClient {
     assignment: RwLock<Option<Assignment>>,
     datasets_config: Arc<RwLock<Datasets>>,
-    latest_assignment_id: RwLock<Option<String>>,
+    applied: RwLock<Option<Applied>>,
     network_state_url: String,
     reqwest_client: reqwest::Client,
     ignore_deprecated_workers: bool,
+}
+
+/// Applied-artifact provenance: `effective_from` orders, the id only
+/// deduplicates (DEF-4, OB-6).
+#[derive(Clone)]
+struct Applied {
+    id: String,
+    effective_from: u64,
+}
+
+/// Why a refresh cycle produced no new applied artifact.
+#[derive(thiserror::Error, Debug)]
+enum RefreshError {
+    #[error("{0:#}")]
+    Fetch(#[from] anyhow::Error),
+    /// Distinct from a fetch failure: a publisher serving garbage is a different
+    /// alarm from an unreachable one (REQ-26, FM-2).
+    #[error("assignment \"{id}\" failed verification: {reason}")]
+    Invalid { id: String, reason: String },
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -48,7 +67,7 @@ impl StorageClient {
         Self {
             assignment: RwLock::new(None, "StorageClient::assignment"),
             datasets_config,
-            latest_assignment_id: RwLock::new(None, "StorageClient::latest_assignment"),
+            applied: RwLock::new(None, "StorageClient::applied"),
             network_state_url,
             reqwest_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
@@ -72,16 +91,24 @@ impl StorageClient {
     }
 
     pub async fn try_update_assignment(&self) {
-        match self.update_assignment().await {
-            Ok(_) => {}
-            Err(err) => {
-                tracing::error!(error = ?err, "Failed to update assignment, waiting for the next one");
+        let outcome = match self.update_assignment().await {
+            Ok(outcome) => outcome,
+            Err(err @ RefreshError::Invalid { .. }) => {
+                // Not "waiting for the next one": the publisher answered, with
+                // something unusable.
+                tracing::error!(error = %err, "Rejected assignment, keeping the applied one");
+                AssignmentRefresh::Invalid
             }
-        }
+            Err(err) => {
+                tracing::error!(error = %err, "Failed to update assignment, waiting for the next one");
+                AssignmentRefresh::FetchFailed
+            }
+        };
+        metrics::report_assignment_refresh(outcome);
     }
 
     #[instrument(skip_all)]
-    async fn update_assignment(&self) -> anyhow::Result<()> {
+    async fn update_assignment(&self) -> Result<AssignmentRefresh, RefreshError> {
         tracing::debug!("Checking for new assignment");
         let network_state = self.fetch_network_state().await?;
         let visible_assignment = visible_assignment(&network_state);
@@ -91,22 +118,39 @@ impl StorageClient {
             .clone()
             .ok_or(anyhow!("Missing assignment URL"))?;
         let effective_from = visible_assignment.effective_from;
-        let latest_id = self.latest_assignment_id.read().clone();
-        if latest_id.as_ref() == Some(&assignment_id) {
-            tracing::debug!("Assignment has not been changed");
-            return Ok(());
+
+        let applied = self.applied.read().clone();
+        if let Some(applied) = &applied {
+            if applied.id == assignment_id {
+                tracing::debug!("Assignment has not been changed");
+                return Ok(AssignmentRefresh::Unchanged);
+            }
+            // Before the download: no reason to pay for a rejected blob.
+            // Ordering is effective-from, not arrival (DEF-4, INV-2).
+            if effective_from < applied.effective_from {
+                tracing::warn!(
+                    "Skipping assignment \"{}\": effective from {}, older than the applied \"{}\" at {}",
+                    assignment_id,
+                    effective_from,
+                    applied.id,
+                    applied.effective_from,
+                );
+                return Ok(AssignmentRefresh::Regressive);
+            }
         }
 
-        let assignment = self.fetch_assignment(&assignment_url).await?;
+        let assignment = self
+            .fetch_assignment(&assignment_url, &assignment_id)
+            .await?;
 
-        if latest_id.is_some() {
+        if applied.is_some() {
             sleep_until(effective_from).await;
         }
 
-        self.set_assignment(assignment, &assignment_id);
+        self.set_assignment(assignment, &assignment_id, effective_from);
 
         tracing::info!("Applied assignment \"{}\"", assignment_id);
-        Ok(())
+        Ok(AssignmentRefresh::Applied)
     }
 
     async fn fetch_network_state(&self) -> anyhow::Result<sqd_assignments::NetworkState> {
@@ -121,7 +165,18 @@ impl StorageClient {
     }
 
     #[instrument(skip_all)]
-    async fn fetch_assignment(&self, url: &str) -> anyhow::Result<Assignment> {
+    async fn fetch_assignment(&self, url: &str, id: &str) -> Result<Assignment, RefreshError> {
+        let buf = self.download_assignment(url).await?;
+
+        // Not `from_owned_unchecked`: this is remote input, and an unchecked read
+        // of a corrupt buffer panics here (REQ-26, INV-36, GAP-1).
+        Assignment::from_owned(buf).map_err(|e| RefreshError::Invalid {
+            id: id.to_owned(),
+            reason: e.to_string(),
+        })
+    }
+
+    async fn download_assignment(&self, url: &str) -> anyhow::Result<Vec<u8>> {
         use async_compression::tokio::bufread::GzipDecoder;
         use futures::TryStreamExt;
         use tokio::io::AsyncReadExt;
@@ -144,12 +199,15 @@ impl StorageClient {
 
         tracing::debug!("Downloaded assignment from {}", url);
 
-        Ok(Assignment::from_owned_unchecked(buf))
+        Ok(buf)
     }
 
     #[instrument(skip_all)]
-    fn set_assignment(&self, assignment: Assignment, id: &str) {
-        *self.latest_assignment_id.write() = Some(id.to_owned());
+    fn set_assignment(&self, assignment: Assignment, id: &str, effective_from: u64) {
+        *self.applied.write() = Some(Applied {
+            id: id.to_owned(),
+            effective_from,
+        });
 
         let prev = self.assignment.read();
         for dataset in assignment.datasets().iter() {
@@ -374,6 +432,265 @@ mod tests {
         state.portal_assignment = Some(assignment("portal"));
 
         assert_eq!(visible_assignment(&state).id, "portal");
+    }
+}
+
+/// The CT-2 injectors of GAP-1/GAP-20, in-crate. These drive `update_assignment`
+/// rather than `try_update_assignment`, to assert the typed outcome and leave the
+/// process-global refresh metrics alone.
+#[cfg(test)]
+mod refresh_tests {
+    use std::{
+        io::Write,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+    };
+
+    use axum::{extract::State, routing::get, Router};
+    use flate2::{write::GzEncoder, Compression};
+
+    use super::*;
+
+    const DATASET: &str = "s3://ethereum-mainnet";
+    /// Any well-formed peer id.
+    const WORKER: &str = "12D3KooWQZQm7z8vTeUZmCkFwsPPKKzHUDDPnzLPPCEBqrnDZDRs";
+    /// Must stay in the past, or `sleep_until` stalls the tests.
+    const EFFECTIVE_FROM: u64 = 1_700_000_000;
+
+    struct Publisher {
+        state: Arc<Mutex<Served>>,
+        artifact_hits: Arc<AtomicUsize>,
+        url: String,
+    }
+
+    struct Served {
+        id: String,
+        effective_from: u64,
+        artifact_gz: Vec<u8>,
+    }
+
+    #[derive(Clone)]
+    struct AppState {
+        served: Arc<Mutex<Served>>,
+        artifact_hits: Arc<AtomicUsize>,
+        port: u16,
+    }
+
+    impl Publisher {
+        async fn start(id: &str, artifact_gz: Vec<u8>) -> Self {
+            let served = Arc::new(Mutex::new(Served {
+                id: id.to_owned(),
+                effective_from: EFFECTIVE_FROM,
+                artifact_gz,
+            }));
+            let artifact_hits = Arc::new(AtomicUsize::new(0));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+
+            let app = Router::new()
+                .route(
+                    "/network-state-tethys.json",
+                    get(|State(s): State<AppState>| async move {
+                        let served = s.served.lock().unwrap();
+                        axum::Json(serde_json::json!({
+                            "network": "tethys",
+                            "assignment": {
+                                "id": served.id,
+                                "effective_from": served.effective_from,
+                                "fb_url_v1": format!("http://127.0.0.1:{}/assignment.fb.gz", s.port),
+                            }
+                        }))
+                    }),
+                )
+                .route(
+                    "/assignment.fb.gz",
+                    get(|State(s): State<AppState>| async move {
+                        s.artifact_hits.fetch_add(1, Ordering::SeqCst);
+                        s.served.lock().unwrap().artifact_gz.clone()
+                    }),
+                )
+                .with_state(AppState {
+                    served: served.clone(),
+                    artifact_hits: artifact_hits.clone(),
+                    port,
+                });
+
+            tokio::spawn(async move { axum::serve(listener, app).await });
+
+            Self {
+                state: served,
+                artifact_hits,
+                url: format!("http://127.0.0.1:{port}"),
+            }
+        }
+
+        fn publish(&self, id: &str, effective_from: u64, artifact_gz: Vec<u8>) {
+            let mut served = self.state.lock().unwrap();
+            served.id = id.to_owned();
+            served.effective_from = effective_from;
+            served.artifact_gz = artifact_gz;
+        }
+
+        fn artifact_hits(&self) -> usize {
+            self.artifact_hits.load(Ordering::SeqCst)
+        }
+
+        fn client(&self) -> StorageClient {
+            StorageClient::new(
+                Arc::new(RwLock::new(Datasets::empty(), "datasets")),
+                Network::Tethys,
+                &self.url,
+            )
+        }
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// The smallest artifact the reader accepts.
+    fn valid_artifact() -> Vec<u8> {
+        let mut b = sqd_assignments::AssignmentBuilder::new("test-secret");
+        b.new_chunk()
+            .id("0000000000/0000000000-0000000999-abcdef12")
+            .dataset_id(DATASET)
+            .dataset_base_url("https://ethereum.example.invalid")
+            .block_range(0..=999)
+            .size(1_000)
+            .worker_indexes(&[0])
+            .last_block_hash("0xabc")
+            .last_block_timestamp(EFFECTIVE_FROM)
+            .files(&["blocks.parquet".to_string()])
+            .finish()
+            .unwrap();
+        b.finish_dataset();
+        b.add_worker_with_timestamp(
+            WORKER.parse().unwrap(),
+            sqd_assignments::WorkerStatus::Ok,
+            &[0],
+            EFFECTIVE_FROM as usize,
+        );
+        gzip(&b.finish())
+    }
+
+    /// Valid gzip, garbage inside: the transport succeeds, so only verification
+    /// stands between the portal and an unchecked FlatBuffer read.
+    fn corrupt_artifact() -> Vec<u8> {
+        gzip(&[0xff; 512])
+    }
+
+    fn dataset_id() -> DatasetId {
+        DatasetId::from_url(DATASET)
+    }
+
+    #[tokio::test]
+    async fn corrupt_artifact_is_rejected_rather_than_adopted() {
+        let publisher = Publisher::start("corrupt", corrupt_artifact()).await;
+        let client = publisher.client();
+
+        let err = client.update_assignment().await.unwrap_err();
+
+        assert!(
+            matches!(err, RefreshError::Invalid { .. }),
+            "expected a verification failure, got {err:?}",
+        );
+        assert!(client.applied.read().is_none(), "corrupt artifact applied");
+        assert_eq!(client.num_workers(), 0);
+    }
+
+    #[tokio::test]
+    async fn corrupt_artifact_keeps_the_applied_one() {
+        let publisher = Publisher::start("good", valid_artifact()).await;
+        let client = publisher.client();
+        client.update_assignment().await.unwrap();
+
+        publisher.publish("corrupt", EFFECTIVE_FROM + 100, corrupt_artifact());
+        let err = client.update_assignment().await.unwrap_err();
+
+        assert!(matches!(err, RefreshError::Invalid { .. }));
+        assert_eq!(
+            client.applied.read().as_ref().map(|a| a.id.clone()),
+            Some("good".to_owned()),
+            "a rejected artifact must not become the applied one",
+        );
+        assert_eq!(client.num_workers(), 1);
+        assert!(
+            client.find_chunk(&dataset_id(), 0).is_ok(),
+            "routing must keep working off the previous artifact",
+        );
+    }
+
+    #[tokio::test]
+    async fn regressive_assignment_is_not_applied() {
+        let publisher = Publisher::start("current", valid_artifact()).await;
+        let client = publisher.client();
+        client.update_assignment().await.unwrap();
+        let downloads = publisher.artifact_hits();
+
+        // Different identifier, earlier effective-from.
+        publisher.publish("stale-republish", EFFECTIVE_FROM - 100, valid_artifact());
+        let outcome = client.update_assignment().await.unwrap();
+
+        assert!(matches!(outcome, AssignmentRefresh::Regressive));
+        assert_eq!(
+            client.applied.read().as_ref().map(|a| a.id.clone()),
+            Some("current".to_owned()),
+        );
+        assert_eq!(
+            publisher.artifact_hits(),
+            downloads,
+            "the guard should reject before paying for the download",
+        );
+    }
+
+    #[tokio::test]
+    async fn equal_effective_from_is_still_applied() {
+        // Only strictly-earlier is a regression.
+        let publisher = Publisher::start("first", valid_artifact()).await;
+        let client = publisher.client();
+        client.update_assignment().await.unwrap();
+
+        publisher.publish("correction", EFFECTIVE_FROM, valid_artifact());
+        let outcome = client.update_assignment().await.unwrap();
+
+        assert!(matches!(outcome, AssignmentRefresh::Applied));
+        assert_eq!(
+            client.applied.read().as_ref().map(|a| a.id.clone()),
+            Some("correction".to_owned()),
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_assignment_is_applied() {
+        let publisher = Publisher::start("first", valid_artifact()).await;
+        let client = publisher.client();
+        client.update_assignment().await.unwrap();
+
+        publisher.publish("second", EFFECTIVE_FROM + 100, valid_artifact());
+        let outcome = client.update_assignment().await.unwrap();
+
+        assert!(matches!(outcome, AssignmentRefresh::Applied));
+        assert_eq!(
+            client.applied.read().as_ref().map(|a| a.id.clone()),
+            Some("second".to_owned()),
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_assignment_is_not_refetched() {
+        let publisher = Publisher::start("only", valid_artifact()).await;
+        let client = publisher.client();
+        client.update_assignment().await.unwrap();
+        let downloads = publisher.artifact_hits();
+
+        let outcome = client.update_assignment().await.unwrap();
+
+        assert!(matches!(outcome, AssignmentRefresh::Unchanged));
+        assert_eq!(publisher.artifact_hits(), downloads);
     }
 }
 

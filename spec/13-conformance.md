@@ -1,6 +1,6 @@
 # 13 — Conformance & TDD plan
 
-**Mutable doc.** Statuses as of **2026-07-17** (0.11.8,
+**Mutable doc.** Statuses as of **2026-07-20** (0.11.8,
 `master@531e713f8ccb933ffc52fd50b3056db637e4f5fa` + working tree). Statuses: **C** covered · **P** partial · **U**
 unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
 The **Phase-0 harness exists** (`harness/` crate: IB-7 stubs with ledgers — including
@@ -114,11 +114,11 @@ chunk-boundary records FV-6 licenses.
 6. Errors: type/code ∈ DEF-10; hint iff OVERLOADED — present on proxied overloads too,
    preserved or injected at the floor (ADR-014); no data alongside errors (INV-26).
 
-## Traceability matrix — properties (2026-07-17)
+## Traceability matrix — properties (2026-07-20)
 
 | Property | CT | Status | Note |
 |---|---|---|---|
-| INV-1, INV-2 | CT-3/2 | U | artifact-variant selection unit-tested only |
+| INV-1, INV-2 | CT-3/2 | P | INV-2's monotonicity is covered by the refresh tests (regressive artifact skipped, equal effective-from still applied); atomic application (INV-1) still unit-tested only |
 | INV-3 | CT-3 | U | lease underflow guarded in debug builds only |
 | INV-4 | CT-1/3 | P | window grow/shrink/priority unit tests |
 | INV-5 | CT-3 | U | transient overshoot untested |
@@ -136,7 +136,7 @@ chunk-boundary records FV-6 licenses.
 | INV-27 | CT-1 | P | gap detection tested; proxied 204 smoke-tested; delay untested |
 | INV-28 | CT-3 | U | — |
 | INV-30 | CT-3/7 | U | gauge accounting was a past defect class |
-| INV-31 | CT-2 | P | shutdown flip e2e-tested; other conjuncts not; *known-violated* on staleness intent (GAP-2) |
+| INV-31 | CT-2 | P | shutdown flip e2e-tested; other conjuncts not; staleness bounded and observable, readiness independent of age by decision (ADR-013) |
 | INV-35 | CT-8 | U | — |
 | INV-36 | CT-4/9 | P | two crash regressions covered; latent panic (GAP-5) |
 | INV-37 | CT-2 | U | — |
@@ -148,11 +148,11 @@ chunk-boundary records FV-6 licenses.
 | LIV-9 | CT-6 | U | — |
 | LIV-10 | CT-3 | U | cancellation-on-drop unit-approximated only |
 | LIV-11 | CT-2 | P | drain race + signal sequencing tested |
-| LIV-12 | CT-2 | U | *known-violated* for the artifact loop (log-only — GAP-2) |
+| LIV-12 | CT-2 | P | artifact-loop failures are reason-coded counters, no longer log-only; other loops unchecked |
 | FM-1 | CT-9 | P | see INV-36 |
 | SLI-1..SLI-6 | CT-6 | U | no benchmarks; baselines from incidents only |
 
-## Acceptance matrix — requirements (2026-07-17)
+## Acceptance matrix — requirements (2026-07-20)
 
 | REQ | Status | Note |
 |---|---|---|
@@ -173,30 +173,28 @@ chunk-boundary records FV-6 licenses.
 | REQ-20 | P | **Known-violated** — cap exhaustion is not exercised and current master misclassifies it (GAP-4); taxonomy target is GAP-16 |
 | REQ-21 | P | Two crash regressions; latent panic (GAP-5, INV-36) |
 | REQ-22 | P | Real-time deadline units exist; **known-violated** because chain-RPC calls lack explicit deadlines (GAP-18) |
-| REQ-23 | P | Shutdown flip tested; other conjuncts not; staleness unimplemented (GAP-2, INV-31) |
+| REQ-23 | P | Shutdown flip tested; other conjuncts not; staleness bounded and observable per ADR-013, which fixes readiness as independent of artifact age (INV-31) |
 | REQ-24 | P | Drain race tested; in-flight behavior during drain untested (LIV-11) |
 | REQ-25 | U | No outage tests |
-| REQ-26 | U | **Known-violated** (GAP-1, ADR-002) |
+| REQ-26 | P | Artifact verified before adoption; refresh tests assert reject + alarm + prior artifact kept. Rejection of a *validly-structured but wrong* artifact remains out of scope (ADR-002) |
 | REQ-27 | U | **Known-violated** — OOM incident plus no global byte budget (GAP-3, GAP-17, PF-1) |
 | REQ-30 | P | Label mapping tested; gauge accounting untested (INV-30) |
 | REQ-31 | P | Middleware units only |
 | REQ-32 | P | Internal hiding tested; drift (GAP-11) |
 | REQ-33 | C | Config warn/reject/defaults tested |
-| REQ-40 | P | Variant selection tested; effective-time & outage untested (INV-2, LIV-6); regression guard unimplemented (GAP-20) |
+| REQ-40 | P | Variant selection tested; regression guard implemented and tested (INV-2); effective-time & outage untested (LIV-6) |
 | REQ-41 | U | Selection/penalties untested (LIV-7); FV-2 attempt bound ledger-checked by the smoke |
 | REQ-42 | P | Scheduler units; headroom refusal untested (INV-4, LIV-8) |
 | REQ-43 | P | Positive path exercised by the smoke (signed stub responses verified and delivered); rejection path untested |
 | REQ-44 | U | — |
 
-## Gap register — 2026-07-17
+## Gap register — 2026-07-20
 
 Priorities: P0 blocks the program · P1 active production risk · P2 correctness hole
 with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 
 | GAP | Statement | Violates | Priority | Next |
 |---|---|---|---|---|
-| GAP-1 | Assignment artifact adopted with no structural validation; a corrupt blob can panic the refresh path or leave the Portal ready on garbage routing | REQ-26, INV-36, FM-2 (ADR-002) | P1 | CT-2: truncated-artifact stub → assert reject + alarm + prior artifact kept |
-| GAP-2 | Artifact staleness unbounded and invisible: fetch failures log-only; readiness ignores age | REQ-23/40, INV-31 ⚠, LIV-12, OB-6/9 (ADR-013, OQ-3) | P1 | age gauge; readiness-degradation test past P-ASSIGNMENT-MAX-AGE |
 | GAP-3 | Refresh holds old + new artifacts resident and first-byte waits are unmetered. Baseline: 2026-07-17 OOM-kill restart storm on 0.11.8 | REQ-27, PF-1, SLI-5 (OQ-4) | P1 | RSS-during-refresh probe under S4; heap profile to pin the dominant term |
 | GAP-4 | Current master does not implement the stream-cap refusal contract: cap exhaustion yields a 503/no mandatory hint, timestamp handling does not preserve the overload outcome, and a beyond-frontier timestamp still returns 404 where ADR-014 fixes it as the 204 EMPTY outcome | REQ-20, REQ-13, INV-12, PF-6 | P1 | CT-3: occupy P-MAX-STREAMS; assert 529 + hint and admitted-stream integrity |
 | GAP-5 | Latent panic on an empty stream ("first chunk missing") — known trigger fenced only | REQ-21, INV-36 | P2 | replace panic with error; empty-yield test |
@@ -211,11 +209,26 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-17 | Count caps imply a multi-terabyte theoretical buffer ceiling and no global byte budget or accounting exists | REQ-27, PF-1, OQ-9 | P1 | add byte meter/admission test; set P-BUFFERED-BYTES-BUDGET |
 | GAP-18 | Chain-RPC calls have no explicit deadline despite accepted ADR-010 | REQ-22, DC-5, HZ-8 | P2 | stalled-RPC stub → assert bounded call and loop recovery |
 | GAP-19 | Conflict detection is not known to precede the beyond-frontier EMPTY: a real-time continuation at the head with a stale parent may poll empty instead of getting 409 (the pre-ADR-014 oracle ordered EMPTY first; master unverified) | REQ-3, INV-23, INV-27 (ADR-014) | P2 | CT-2: reorg-at-head stub world → assert 409 precedence |
-| GAP-20 | No regression guard on artifact application: a republished older artifact (different identifier) would be re-applied | REQ-40, INV-2, DEF-4 (ADR-014) | P2 | CT-2: regressive publisher stub → assert not applied |
 | GAP-21 | Debug stream variant bypasses clamps without an operator gate | INV-11, REQ-8 (ADR-014; closed OQ-6) | P2 | config test: route absent unless the operator flag enables it |
 
 ### Closed findings
 
+- **GAP-1** (closed 2026-07-20): the artifact is verified before adoption
+  (`Assignment::from_owned`), a rejected one leaves the applied artifact and its
+  routing untouched, and the outcome is counted as `assignment_refreshes{outcome="invalid"}`
+  rather than logged only. The in-crate publisher stub confirmed the failure mode
+  first: under the unchecked read a corrupt blob panicked inside `flatbuffers`
+  on the refresh path, exactly as the gap claimed.
+- **GAP-20** (closed 2026-07-20): artifact application is monotone in
+  effective-from (DEF-4, INV-2). A republished older artifact is skipped before
+  the download and counted as `outcome="regressive"`; a re-publish at the *same*
+  effective-from still applies, since only strictly-earlier is a regression.
+- **GAP-2** (closed 2026-07-20): artifact age is bounded by P-ASSIGNMENT-MAX-AGE and
+  exposed as `assignment_age_seconds` / `assignment_stale`, computed at scrape time so a
+  dead refresh loop cannot pin them; refresh failures are reason-coded counters rather
+  than log-only. ADR-013 is ratified: readiness deliberately does *not* degrade on age —
+  a `/ready` that fails on staleness would empty the fleet during publisher maintenance
+  while every replica could still serve correctly. OQ-3 closed.
 - **GAP-9** (closed 2026-07-17): EMPTY delay occurs after the stream census permit is
   released. It can occupy an HTTP connection/task (HZ-3), but does not consume the
   stream cap.
@@ -233,6 +246,6 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
   corpus; burn down P2 gaps.
 - **Phase 3 — robustness:** CT-3 swarms; CT-8 isolation; CT-9 fuzz; INV-30 audits.
 - **Phase 4 — performance regime:** CT-6 benchmarks S1–S6; ratify ⚠ SLO targets
-  (OQ-3/OQ-4/OQ-9/OQ-10); commit baselines; CT-7 soak on a CI cadence.
+  (OQ-4/OQ-9/OQ-10); commit baselines; CT-7 soak on a CI cadence.
 
 Each phase ends by updating this file's matrices and register in the same change.
