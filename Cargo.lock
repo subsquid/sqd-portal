@@ -7736,14 +7736,18 @@ version = "0.1.0"
 source = "git+https://github.com/subsquid/sqd-network.git?rev=e9a3434#e9a34341035ac7745b71eb87dabc8501aa434376"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "crypto_box",
+ "curve25519-dalek",
  "flatbuffers",
+ "hmac",
  "libp2p-identity",
  "ouroboros",
  "serde",
  "serde_json",
  "sha2",
  "tracing",
+ "url",
 ]
 
 [[package]]

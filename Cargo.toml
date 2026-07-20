@@ -65,6 +65,8 @@ proptest = "1.4.0"
 tower = { version = "0.5", features = ["util"] }
 proptest_async = { version = "0.2.1", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "test-util"] }
+# Tests build the artifacts they serve, with the crate/rev the portal reads them with.
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", features = ["builder"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }

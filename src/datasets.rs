@@ -33,6 +33,15 @@ pub struct DatasetConfig {
 type DatasetsMapping = BTreeMap<String, DatasetId>;
 
 impl Datasets {
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            datasets: Vec::new(),
+            alias_to_index: BTreeMap::new(),
+            id_to_default_name: BTreeMap::new(),
+        }
+    }
+
     pub async fn load(config: &Config) -> anyhow::Result<Self> {
         let (mapping, metadata) = tokio::join!(
             load_mapping(&config.sqd_network.datasets_url),
