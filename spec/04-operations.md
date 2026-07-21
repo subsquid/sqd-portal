@@ -54,7 +54,8 @@ chunk in order, query a worker per DC-1 (choice and speculative retries are free
 variables, FV-1/FV-2, bounded by 1 + retries); concurrently fetch head markers from
 DC-4 (falling back to the archival head) for response metadata. Records from chunk
 results are emitted strictly in chunk order as the client drains.
-— Real-time path: a single proxied request to DC-4; records, conflict payloads, and
+— Real-time path: a proxied request to DC-4, replayed at most once on a connection-class
+fault before the response head (ADR-015); records, conflict payloads, and
 head metadata are streamed with internal upstream headers stripped. Non-success
 upstream responses are classified and rewritten into the Portal error envelope
 (ADR-003 as amended by ADR-011; IB-4/IB-5).

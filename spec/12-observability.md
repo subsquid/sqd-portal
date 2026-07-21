@@ -23,8 +23,17 @@ misdiagnosed for lack of this split.
 
 **OB-4 — Dependency health.** Per dependency (DC-1..DC-6): call outcomes by class,
 latency, and for workers: selections by priority group, penalties applied, backoff
-hints received. A wedged dependency must be visible from the Portal's own metrics
-alone (REQ-22).
+hints received. Every logical real-time-source request is counted exactly once in
+`hotblocks_requests`, with a closed `outcome`: `response`, `replay_response`,
+`replay_failed`, `canceled`, `replay_canceled`, `timeout`, or `transport_failed`
+(ADR-015). The first two mean that a response head was obtained, on the first attempt and
+on the replay respectively; every value states what the transport observed, never what the
+client ended up seeing — that axis lives in `http_status`. The replay outcomes keep an
+absorbed connection fault visible, and the two cancellation outcomes distinguish which
+attempt the caller abandoned without claiming an upstream result that was never observed.
+`timeout` is the expected non-replay decision; growth in `transport_failed` can expose a
+connection fault whose shape the replay classifier stopped recognising. A wedged
+dependency must be visible from the Portal's own metrics alone (REQ-22).
 
 **OB-5 — Readiness reason.** The readiness state as a gauge with a reason code
 (loading / insufficient-connectivity / shutting-down / ⚠ stale-artifact), and logged

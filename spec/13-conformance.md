@@ -172,9 +172,9 @@ chunk-boundary records FV-6 licenses.
 | REQ-15 | P | Plan extraction/rewrite units; no e2e |
 | REQ-20 | P | **Known-violated** — cap exhaustion is not exercised and current master misclassifies it (GAP-4); taxonomy target is GAP-16 |
 | REQ-21 | P | Two crash regressions; latent panic (GAP-5, INV-36) |
-| REQ-22 | P | Real-time deadline units exist; **known-violated** because chain-RPC calls lack explicit deadlines (GAP-18) |
+| REQ-22 | P | Real-time deadline units exist, including ADR-015's exclusion of read stalls from replay; **known-violated** because chain-RPC calls lack explicit deadlines (GAP-18), and because a replayed request can spend the read budget twice (ADR-015). The per-call bound is tested; a client request's total upstream spend is neither bounded nor tested |
 | REQ-23 | P | Shutdown flip tested; other conjuncts not; staleness unimplemented (GAP-2, INV-31) |
-| REQ-24 | P | Drain race tested; in-flight behavior during drain untested (LIV-11) |
+| REQ-24 | P | Drain race tested; in-flight behavior during drain untested (LIV-11); the P-KILL-GRACE conjunct is environmental — no in-process test can assert it |
 | REQ-25 | U | No outage tests |
 | REQ-26 | U | **Known-violated** (GAP-1, ADR-002) |
 | REQ-27 | U | **Known-violated** — OOM incident plus no global byte budget (GAP-3, GAP-17, PF-1) |
@@ -188,7 +188,7 @@ chunk-boundary records FV-6 licenses.
 | REQ-43 | P | Positive path exercised by the smoke (signed stub responses verified and delivered); rejection path untested |
 | REQ-44 | U | — |
 
-## Gap register — 2026-07-17
+## Gap register — 2026-07-21
 
 Priorities: P0 blocks the program · P1 active production risk · P2 correctness hole
 with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
@@ -213,9 +213,18 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-19 | Conflict detection is not known to precede the beyond-frontier EMPTY: a real-time continuation at the head with a stale parent may poll empty instead of getting 409 (the pre-ADR-014 oracle ordered EMPTY first; master unverified) | REQ-3, INV-23, INV-27 (ADR-014) | P2 | CT-2: reorg-at-head stub world → assert 409 precedence |
 | GAP-20 | No regression guard on artifact application: a republished older artifact (different identifier) would be re-applied | REQ-40, INV-2, DEF-4 (ADR-014) | P2 | CT-2: regressive publisher stub → assert not applied |
 | GAP-21 | Debug stream variant bypasses clamps without an operator gate | INV-11, REQ-8 (ADR-014; closed OQ-6) | P2 | config test: route absent unless the operator flag enables it |
+| GAP-22 | Pre-first-byte outcomes of the real-time source now have one denominator in `hotblocks_requests`, but no objective. `response` and `replay_response` obtained a response head; `replay_failed`, `timeout`, and `transport_failed` did not; cancellation remains visible without inventing an upstream result. SLI-4 is readiness availability and excludes deploys, SLI-6 counts truncated streams, and neither turns this counter into a request-success SLI | SLI set, OB-4 (ADR-015) | P2 | define a DC-4 response-head SLI over `hotblocks_requests`, with cancellations explicitly included or excluded by policy |
 
 ### Closed findings
 
+- **GAP-22, original claim** (closed 2026-07-21): the ADR-015 replay landed in the DC-4
+  transport, with unit coverage for the clean close, the reset, the at-most-once bound,
+  and the two non-replay exclusions (mid-body, read stall). Writing the reset case found
+  a real defect in the first implementation: the classifier returned on the first
+  `hyper::Error` in the source chain, so a peer that resets rather than closing cleanly —
+  the common shape when a replica dies with the request still unread — was never
+  replayed, and the fix would have missed most of the incident it was written for.
+  GAP-22 now tracks only the indicator residual.
 - **GAP-9** (closed 2026-07-17): EMPTY delay occurs after the stream census permit is
   released. It can occupy an HTTP connection/task (HZ-3), but does not consume the
   stream cap.

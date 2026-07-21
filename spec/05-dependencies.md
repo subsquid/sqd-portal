@@ -64,15 +64,20 @@ permanent failure is fatal (the Portal cannot know what it serves).
 *Role.* Recent blocks near the head; the real-time path of OP-1, head reads (OP-2),
 timestamp fallback (OP-5).
 *Call contract.* Per-request proxy: connect deadline P-HOTBLOCKS-CONNECT-TIMEOUT;
-per-read idle deadline P-HOTBLOCKS-READ-TIMEOUT, strictly below P-CLIENT-SDK-TIMEOUT
-(ADR-010); no retries; no redirects. Success and 204 responses stream through with
-internal headers stripped; error responses are status-classified and rewritten into the
-Portal envelope (ADR-003, amended by ADR-011; IB-4/IB-5).
+per-read idle deadline P-HOTBLOCKS-READ-TIMEOUT, strictly below P-CLIENT-TIMEOUT
+(ADR-010); at most one replay, and only for a connection-class fault before the response
+head (ADR-015) — a replayed request gets a fresh read budget, so its worst case is twice
+the deadline and is not bounded by P-CLIENT-TIMEOUT; HTTP/1.1 only, since the replay's
+fault classification reads HTTP/1 error shapes (ADR-015); no redirects. Success and 204
+responses stream through with internal headers stripped; error responses are
+status-classified and rewritten into the Portal envelope (ADR-003, amended by ADR-011;
+IB-4/IB-5).
 *Error mapping.*
 
 | Fault | Own class |
 |---|---|
-| connect/transport failure, read stall past deadline | UPSTREAM-FAILURE (recorded — a stalled upstream must never be invisible, REQ-22) |
+| connect/transport failure before the response head | one replay (ADR-015); still failing ⇒ UPSTREAM-FAILURE (recorded) |
+| read stall past deadline | UPSTREAM-FAILURE, never replayed (recorded — a stalled upstream must never be invisible, REQ-22) |
 | upstream 429 / 503 / 529 | OVERLOADED / `overloaded`; preserve public retry/header semantics, injecting `Retry-After` = P-RETRY-AFTER-MIN when the upstream omitted it (INV-26, ADR-014) |
 | other upstream 5xx | UPSTREAM-FAILURE / `upstream_unavailable`; preserve public headers, never the upstream body |
 | other upstream 4xx (unmatched) | BAD-REQUEST / `malformed_request` (ADR-011 unmatched-4xx rule); status normalized to 400, upstream body never leaked |
@@ -80,7 +85,8 @@ Portal envelope (ADR-003, amended by ADR-011; IB-4/IB-5).
 | requested range below upstream retention (gap) | EMPTY after P-NO-DATA-DELAY |
 | upstream reports unknown dataset (404) | NOT-FOUND / `unknown_dataset`; log the possible configuration incoherence, never leak the upstream body |
 
-*Degradation.* Fail-fast per request; no caching, no health state. An outage affects
+*Degradation.* Fail-fast per request after at most one replay; no caching, no health
+state. An outage affects
 only real-time traffic (REQ-25); readiness ignores this dependency by design.
 
 ## DC-5 — Chain RPC & contracts
