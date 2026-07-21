@@ -199,9 +199,16 @@ counterexample tracked as GAP-5.
 **REQ-22 — Bounded upstream interactions.** [MUST]
 Every outbound call carries a deadline. Deadlines on the request path are strictly below
 the deadlines of clients waiting on them (P-HOTBLOCKS-READ-TIMEOUT <
-P-CLIENT-SDK-TIMEOUT), so a stalled upstream surfaces as a Portal-attributed gateway
+P-CLIENT-TIMEOUT), so a stalled upstream surfaces as a Portal-attributed gateway
 error and a recorded metric — never as a silent client-side timeout the Portal did not
-observe.
+observe. The bound is per upstream call: a connection that dies late in the read budget
+is replayed with a fresh one (ADR-015), so a single call's worst case is
+2 × P-HOTBLOCKS-READ-TIMEOUT and can exceed P-CLIENT-TIMEOUT. The ordering still holds
+where it earns its keep — a stall is never replayed — and the tail costs one upstream
+attempt for a caller that has already disconnected, not a silent failure. No requirement
+bounds what one *client request* spends upstream: a handler that makes real-time calls in
+sequence multiplies the per-call worst case, and already exceeded P-CLIENT-TIMEOUT before
+ADR-015 doubled each call.
 *Acceptance:* stalling the real-time source makes the Portal answer 502 within
 P-HOTBLOCKS-READ-TIMEOUT and record the failure; no outbound call in the codebase is
 deadline-free. The chain-RPC status loop currently violates the latter clause (GAP-18).
@@ -221,11 +228,14 @@ to not-ready at SIGTERM before the listener closes.
 Shutdown is two-phase: on SIGTERM the Portal immediately advertises not-ready while
 continuing to serve for P-PRE-DRAIN-GRACE (letting load balancers drain it), then stops
 accepting work and drains in-flight streams for at most P-DRAIN-TIMEOUT. Total shutdown
-never exceeds P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT plus a constant; the orchestrator's
-kill grace must exceed that sum.
+never exceeds P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT plus a constant, and the deployment
+must give the process that long: P-KILL-GRACE exceeds that sum. The Portal cannot enforce
+its own grace — below it the process is killed mid-drain and this requirement is void,
+which is an environment defect rather than a Portal one.
 *Acceptance:* under load, SIGTERM → readiness 503 at once; new connections keep being
 served during the grace window; process exits within the budget; in-flight streams
-either complete or truncate per REQ-6.
+either complete or truncate per REQ-6; the deployment manifest sets P-KILL-GRACE above
+the budget.
 *Trace:* ADR-005.
 
 **REQ-25 — Fault isolation across upstreams.** [MUST]

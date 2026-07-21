@@ -28,8 +28,8 @@ assumes, not knobs it owns.
 |---|---|---|---|
 | P-TRANSPORT-TIMEOUT | Worker query request deadline (REQ-41) | 60 s | 60 s |
 | P-HOTBLOCKS-CONNECT-TIMEOUT | Real-time source connect deadline (REQ-22) | 1 s | 1 s |
-| P-HOTBLOCKS-READ-TIMEOUT | Real-time source per-read deadline; must stay < P-CLIENT-SDK-TIMEOUT (REQ-22, ADR-010) | 20 s | 20 s |
-| P-CLIENT-SDK-TIMEOUT | *Environmental:* default request deadline of the dominant client SDK (ADR-010) | 30 s | ≥ 30 s assumed |
+| P-HOTBLOCKS-READ-TIMEOUT | Real-time source per-read deadline; must stay < P-CLIENT-TIMEOUT (REQ-22, ADR-010). A replayed request spends it twice (ADR-015) | 20 s | 20 s |
+| P-CLIENT-TIMEOUT | *Environmental:* the request deadline callers default to (ADR-010) | 30 s | ≥ 30 s assumed |
 | P-ASSIGNMENT-REFRESH | Assignment poll interval (REQ-40, REQ-11) | 60 s | 60 s |
 | P-ASSIGNMENT-FETCH-TIMEOUT | Assignment fetch connect/read deadlines (REQ-22) | 5 s / 5 s | 5 s / 5 s |
 | P-ASSIGNMENT-MAX-AGE | ⚠ Max tolerated assignment age before readiness degrades (REQ-23, ADR-013) | **unbounded — violated in intent** | ⚠ 15 min (draft; ratify via ADR-013) |
@@ -66,6 +66,7 @@ assumes, not knobs it owns.
 |---|---|---|---|
 | P-PRE-DRAIN-GRACE | Serve-while-not-ready window after SIGTERM (REQ-24, ADR-005) | 25 s | 25 s |
 | P-DRAIN-TIMEOUT | In-flight drain budget after intake stops (REQ-24, ADR-005) | 25 s | 25 s |
+| P-KILL-GRACE | *Environmental:* the orchestrator's grace between SIGTERM and SIGKILL — Kubernetes `terminationGracePeriodSeconds` (REQ-24, LIV-11, ADR-005) | deployment-set, unverified; the Kubernetes default of 30 s is **below** the 50 s budget | ≥ P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT + slack (≥ 60 s) |
 | P-READY-CONNECTION-RATIO | Min fraction of known workers connected for readiness (REQ-23) | 3/4 *(fixed)* | 3/4 |
 | P-STARTUP-BOUND | ⚠ Start → ready bound, dominated by artifact fetch (LIV-5, S5) | unmeasured | ⚠ 10 min (proposed) |
 | P-STALL-BUDGET | ⚠ Max zero-progress interval on a healthy stream; also the first-record bound (LIV-1, LIV-2, OB-2) | unmeasured | ⚠ 2 × P-TRANSPORT-TIMEOUT (proposed) |

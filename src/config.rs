@@ -211,7 +211,7 @@ fn default_transport_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
-// Must stay below caller-side request timeouts (SDK default: 30s), so a stalled
+// Must stay below caller-side request timeouts (callers default to 30s), so a stalled
 // upstream surfaces as our 502 rather than the caller's own timeout — a request
 // still in flight has no recorded status and is invisible in metrics.
 fn default_hotblocks_read_timeout() -> Duration {

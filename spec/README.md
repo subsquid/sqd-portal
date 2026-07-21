@@ -45,7 +45,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 |---|---|---|---|
 | ADR-001 | 2024-08-28 | [Mid-stream failure truncates the response; continuation is the recovery path](decisions/ADR-001-truncation-over-error.md) | Accepted (historical) |
 | ADR-002 | 2025-08-08 | [Assignment is loaded without structural verification](decisions/ADR-002-skip-assignment-verification.md) | Accepted (historical) |
-| ADR-003 | 2025-09-15 | [Real-time data is served through a streaming Portal proxy](decisions/ADR-003-real-time-proxy.md) | Accepted (historical; amended by ADR-011) |
+| ADR-003 | 2025-09-15 | [Real-time data is served through a streaming Portal proxy](decisions/ADR-003-real-time-proxy.md) | Accepted (historical; amended by ADR-011, ADR-015) |
 | ADR-004 | 2025-12-02 | [Asymmetric worker penalties; one query per worker](decisions/ADR-004-worker-penalties.md) | Accepted (historical) |
 | ADR-005 | 2026-05-27 | [Two-phase graceful shutdown](decisions/ADR-005-two-phase-shutdown.md) | Accepted (historical) |
 | ADR-006 | 2026-06-03 | [Network bandwidth is the modeled limiting resource](decisions/ADR-006-bandwidth-limiting-resource.md) | Accepted (historical) |
@@ -56,6 +56,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 | ADR-011 | 2026-07-16 | [Portal API errors use a stable two-axis taxonomy](decisions/ADR-011-error-taxonomy.md) | Accepted |
 | ADR-012 | 2026-07-17 | [Every shed response carries an explicit retry hint](decisions/ADR-012-retry-after-on-shed.md) | Accepted |
 | ADR-014 | 2026-07-17 | [Contract reconciliation: overload hints, conflict precedence, artifact regression, archival finalized head, EMPTY metadata, timestamp frontier, gated debug surface](decisions/ADR-014-contract-reconciliation.md) | Accepted |
+| ADR-015 | 2026-07-21 | [One connection-class replay on the real-time path](decisions/ADR-015-real-time-connection-replay.md) | Accepted |
 | ADR-013 | 2026-07-17 | [Assignment staleness must be bounded and observable](decisions/ADR-013-assignment-staleness-bound.md) | **Proposed** |
 
 ## Conventions

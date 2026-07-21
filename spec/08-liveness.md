@@ -10,6 +10,9 @@ Liveness claims hold only under a declared environment:
 - **Healthy real-time source:** DC-4 answers within its deadlines.
 - **Adequate resources:** census below P-MAX-STREAMS, congestion utilization below
   P-HEADROOM-THRESHOLD, memory within P-MEMORY-BUDGET.
+- **Patient supervisor:** the orchestrator's kill grace P-KILL-GRACE exceeds
+  P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT. Below it the process is killed mid-drain, and no
+  shutdown bound the Portal can offer holds.
 - **Draining client:** the client consumes the response at least as fast as it is
   produced (streams are client-paced; no liveness bound holds against a stalled
   reader).

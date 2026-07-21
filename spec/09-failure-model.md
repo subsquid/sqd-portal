@@ -12,7 +12,8 @@ one stream's serving path truncates that stream only (INV-36, INV-35).
 
 **FM-2 — Transient vs integrity classification.** Transient faults (timeouts,
 connection failures, 5xx) are retried or rerouted only where the dependency contract
-declares it (DC-1); otherwise they fail-safe in the DEF-10 taxonomy (DC-4). Integrity
+declares it — rerouting across workers (DC-1), one connection-class replay before the
+response head (DC-4, ADR-015) — otherwise they fail-safe in the DEF-10 taxonomy. Integrity
 faults (corrupt artifact, signature failure, contradictory data) are never retried
 blindly: the offending input is rejected and alarmed; the last good state stays in
 service.
@@ -58,12 +59,12 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 
 | Fault | Required response |
 |---|---|
-| Down / connect refused | fail-safe UPSTREAM-FAILURE; archival traffic and readiness unaffected (FM-3) |
-| Stalled read | fail-safe UPSTREAM-FAILURE within P-HOTBLOCKS-READ-TIMEOUT, recorded (ADR-010) |
+| Down / connect refused / connection closed before the response head | mask one replay (ADR-015); still failing ⇒ fail-safe UPSTREAM-FAILURE; archival traffic and readiness unaffected (FM-3) |
+| Stalled read | fail-safe UPSTREAM-FAILURE within P-HOTBLOCKS-READ-TIMEOUT, never replayed, recorded (ADR-010) |
 | Upstream 429 / 503 / 529 | fail-safe `overloaded` envelope; public headers retained, `Retry-After` injected at P-RETRY-AFTER-MIN when absent (INV-26); upstream body never leaked (ADR-011) |
 | Other erroring 5xx | fail-safe `upstream_unavailable` envelope; public headers retained, upstream body never leaked (ADR-011) |
 | Erroring 4xx (unmatched) | fail-safe `malformed_request` envelope at 400; upstream body never leaked (DC-4) |
-| Mid-proxy failure | truncate per INV-25 |
+| Mid-proxy failure | truncate per INV-25; never replayed — a replay past the response head would duplicate a prefix (ADR-003, ADR-015) |
 | Retention gap | fail-safe EMPTY (INV-27) |
 
 ## Other dependencies
@@ -83,6 +84,7 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 | Panic inside a stream task | truncate that stream (INV-25); process lives (FM-1) |
 | Panic in a background loop | alarm; loop restarts or the failure is surfaced — a dead refresh loop must not be silent (ties to GAP-2) |
 | Memory pressure beyond P-MEMORY-BUDGET | fail-safe refusal preferred over process death — byte-budget admission is the pressure valve (REQ-27; today unmet — GAP-3/GAP-17) |
+| Kill grace below the shutdown budget (P-KILL-GRACE) | environment defect, outside the Portal's reach: the process dies mid-drain, streams are severed without a well-formed truncation (INV-25) and LIV-11's bound is void — the deployment must raise it (REQ-24) |
 | Invalid config values | fail-safe at startup: refuse to run (REQ-33) |
 | Unknown config keys | mask + warn (ADR-008) |
 | Dual instance behind one address | tolerated: no shared mutable state exists outside the process (NG5) |

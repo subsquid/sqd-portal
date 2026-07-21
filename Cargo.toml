@@ -26,6 +26,8 @@ dotenv = "0.15"
 flate2 = "1.0.33"
 futures = "0.3"
 hex-literal = "0.4.1"
+# ADR-015 fault classification; reqwest's error API can't see a pre-head connection death.
+hyper = "1"
 itertools = "0.12"
 lazy_static = "1.4.0"
 libz-ng-sys = "1.1.23"
