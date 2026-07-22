@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.11.8"
+version = "0.11.9"
 edition = "2021"
 default-run = "sqd-portal"
 

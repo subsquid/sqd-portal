@@ -24,6 +24,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY Cargo.toml .
 COPY Cargo.lock .
 COPY src ./src
+# openapi.rs / http_server.rs embed these with include_str!
+COPY docs ./docs
 
 RUN cargo build --release --workspace
 
