@@ -1,0 +1,11 @@
+# Suppressions for tools/spec-lint.py.
+#
+#   check-name | file-glob | message-regex
+#
+# The glob and regex are optional; an empty field matches anything. Keep every
+# entry justified on the line above it — a suppression with no reason is a
+# finding someone chose not to fix.
+#
+# Examples:
+#   param-bare-constant | 02-requirements.md | 300 MB
+#   id-orphan           | 13-conformance.md  |

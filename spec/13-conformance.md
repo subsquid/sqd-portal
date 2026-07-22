@@ -1,7 +1,7 @@
 # 13 — Conformance & TDD plan
 
-**Mutable doc.** Statuses as of **2026-07-17** (0.11.8,
-`master@531e713f8ccb933ffc52fd50b3056db637e4f5fa` + working tree). Statuses: **C** covered · **P** partial · **U**
+**Mutable doc.** Statuses as of **2026-07-22** (0.11.9,
+`master@c9da0dd872fd28c1b9c5f598e9d8ff7e8d552b2d`). Statuses: **C** covered · **P** partial · **U**
 unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
 The **Phase-0 harness exists** (`harness/` crate: IB-7 stubs with ledgers — including
 a real p2p worker stub on the pinned transport rev — toy world, reference model, the six
@@ -43,7 +43,7 @@ model is a bug to fix here. Pseudocode:
 
 ```
 model(req, cfg, world) -> Response | ErrorClass:
-  ds = resolve(req.alias, world.catalog)             # else NOT-FOUND
+  ds = resolve(req.alias, world.catalog)             # DEF-1 alias equality; else NOT-FOUND
   if not wellformed(req, cfg): return BAD-REQUEST    # DEF-7; OP-1 order: tuning → parse → size → items → range
   if admission_closed(world.load): return OVERLOADED(hint >= P-RETRY-AFTER-MIN)  # INV-12
   frontier = frontier_of(ds, req.mode, world)        # DEF-5
@@ -103,7 +103,8 @@ chunk-boundary records FV-6 licenses.
 
 ## Structural validators (kind-agnostic, applied to every response)
 
-1. Body decodes under its declared encoding, line by line (INV-25).
+1. Body decodes under its declared encoding, line by line (INV-25); the encoding and
+   framing themselves are free (FV-5).
 2. Records parse; block numbers strictly ascending; no duplicates (INV-20).
 3. Every record within [fromBlock, min(toBlock, frontier)] (INV-21).
 4. Records belong to the requested dataset and match the field-selection shape.
@@ -114,7 +115,7 @@ chunk-boundary records FV-6 licenses.
 6. Errors: type/code ∈ DEF-10; hint iff OVERLOADED — present on proxied overloads too,
    preserved or injected at the floor (ADR-014); no data alongside errors (INV-26).
 
-## Traceability matrix — properties (2026-07-17)
+## Traceability matrix — properties (2026-07-22)
 
 | Property | CT | Status | Note |
 |---|---|---|---|
@@ -135,6 +136,7 @@ chunk-boundary records FV-6 licenses.
 | INV-26 | CT-5 | P | **Known-violated** — current master still emits legacy/mixed and proxied error bodies (GAP-16); ADR-011 target is not yet integrated |
 | INV-27 | CT-1 | P | gap detection tested; proxied 204 smoke-tested; delay untested |
 | INV-28 | CT-3 | U | — |
+| INV-29 | CT-1 | P | boundary emission asserted by the CT-1 selective-tail resume on both sources; the network multi-chunk case exercises the per-chunk granularity FV-6 licenses. Interior boundary records are not audited, and the EMPTY case (no block evaluated) is untested |
 | INV-30 | CT-3/7 | U | gauge accounting was a past defect class |
 | INV-31 | CT-2 | P | shutdown flip e2e-tested; other conjuncts not; *known-violated* on staleness intent (GAP-2) |
 | INV-35 | CT-8 | U | — |
@@ -150,9 +152,11 @@ chunk-boundary records FV-6 licenses.
 | LIV-11 | CT-2 | P | drain race + signal sequencing tested |
 | LIV-12 | CT-2 | U | *known-violated* for the artifact loop (log-only — GAP-2) |
 | FM-1 | CT-9 | P | see INV-36 |
+| FM-2 | CT-2 | P | the DC-4 replay classifier is unit-tested on both sides of the transient/integrity line (clean close, reset, the two non-replay exclusions — ADR-015); worker-side classification and every integrity path (corrupt artifact GAP-1, signature failure, contradictory data) are untested, and the integrity-exhaustion outcome is inside GAP-16 |
+| FM-3 | CT-2/3 | U | per-dependency confinement never exercised: no outage tests (REQ-25), no isolation swarm (INV-35) |
 | SLI-1..SLI-6 | CT-6 | U | no benchmarks; baselines from incidents only |
 
-## Acceptance matrix — requirements (2026-07-17)
+## Acceptance matrix — requirements (2026-07-22)
 
 | REQ | Status | Note |
 |---|---|---|
@@ -173,7 +177,7 @@ chunk-boundary records FV-6 licenses.
 | REQ-20 | P | **Known-violated** — cap exhaustion is not exercised and current master misclassifies it (GAP-4); taxonomy target is GAP-16 |
 | REQ-21 | P | Two crash regressions; latent panic (GAP-5, INV-36) |
 | REQ-22 | P | Real-time deadline units exist, including ADR-015's exclusion of read stalls from replay; **known-violated** because chain-RPC calls lack explicit deadlines (GAP-18), and because a replayed request can spend the read budget twice (ADR-015). The per-call bound is tested; a client request's total upstream spend is neither bounded nor tested |
-| REQ-23 | P | Shutdown flip tested; other conjuncts not; staleness unimplemented (GAP-2, INV-31) |
+| REQ-23 | P | Shutdown flip tested; other conjuncts not; staleness unimplemented (GAP-2, INV-31); the container healthcheck probes a route that does not exist (GAP-10) |
 | REQ-24 | P | Drain race tested; in-flight behavior during drain untested (LIV-11); the P-KILL-GRACE conjunct is environmental — no in-process test can assert it |
 | REQ-25 | U | No outage tests |
 | REQ-26 | U | **Known-violated** (GAP-1, ADR-002) |
@@ -184,11 +188,11 @@ chunk-boundary records FV-6 licenses.
 | REQ-33 | C | Config warn/reject/defaults tested |
 | REQ-40 | P | Variant selection tested; effective-time & outage untested (INV-2, LIV-6); regression guard unimplemented (GAP-20) |
 | REQ-41 | U | Selection/penalties untested (LIV-7); FV-2 attempt bound ledger-checked by the smoke |
-| REQ-42 | P | Scheduler units; headroom refusal untested (INV-4, LIV-8) |
+| REQ-42 | P | Scheduler units; headroom refusal untested (INV-4, LIV-8), and its observable — shrink cause, download utilization, headroom-refusal counter (OB-7) — is unasserted |
 | REQ-43 | P | Positive path exercised by the smoke (signed stub responses verified and delivered); rejection path untested |
 | REQ-44 | U | — |
 
-## Gap register — 2026-07-21
+## Gap register — 2026-07-22
 
 Priorities: P0 blocks the program · P1 active production risk · P2 correctness hole
 with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
@@ -197,7 +201,7 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 |---|---|---|---|---|
 | GAP-1 | Assignment artifact adopted with no structural validation; a corrupt blob can panic the refresh path or leave the Portal ready on garbage routing | REQ-26, INV-36, FM-2 (ADR-002) | P1 | CT-2: truncated-artifact stub → assert reject + alarm + prior artifact kept |
 | GAP-2 | Artifact staleness unbounded and invisible: fetch failures log-only; readiness ignores age | REQ-23/40, INV-31 ⚠, LIV-12, OB-6/9 (ADR-013, OQ-3) | P1 | age gauge; readiness-degradation test past P-ASSIGNMENT-MAX-AGE |
-| GAP-3 | Refresh holds old + new artifacts resident and first-byte waits are unmetered. Baseline: 2026-07-17 OOM-kill restart storm on 0.11.8 | REQ-27, PF-1, SLI-5 (OQ-4) | P1 | RSS-during-refresh probe under S4; heap profile to pin the dominant term |
+| GAP-3 | Refresh holds old + new artifacts resident (HZ-1, ~2× P-ASSIGNMENT-SIZE) and first-byte waits are unmetered (HZ-2). Baseline: 2026-07-17 OOM-kill restart storm on 0.11.8 | REQ-27, PF-1, SLI-5 (OQ-4) | P1 | RSS-during-refresh probe under S4; heap profile to pin the dominant term |
 | GAP-4 | Current master does not implement the stream-cap refusal contract: cap exhaustion yields a 503/no mandatory hint, timestamp handling does not preserve the overload outcome, and a beyond-frontier timestamp still returns 404 where ADR-014 fixes it as the 204 EMPTY outcome | REQ-20, REQ-13, INV-12, PF-6 | P1 | CT-3: occupy P-MAX-STREAMS; assert 529 + hint and admitted-stream integrity |
 | GAP-5 | Latent panic on an empty stream ("first chunk missing") — known trigger fenced only | REQ-21, INV-36 | P2 | replace panic with error; empty-yield test |
 | GAP-6 | Worker-labeled metric cardinality and name interning grow without eviction | REQ-30, OB cardinality rule, HZ-6 | P2 | CT-7 series-count audit across churn |
@@ -208,7 +212,7 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-12 | Download-priority key wraps at ~43 M streams (HZ-4) | REQ-42 fairness | P3 | widen key; wrap-boundary unit test |
 | GAP-13 | ADR-009 accepted but portal-side injection unimplemented — decision drift | OQ-5 | P3 | schedule or supersede |
 | GAP-16 | Current master exposes legacy/mixed error bodies and passes real-time error bodies through. ADR-011's closed type/code envelope is not integrated; its 409 and readiness exceptions also need CT-5 proof against IB-5 when the taxonomy change lands, together with ADR-014's amendments (proxied-hint injection, unmatched-4xx normalization, EMPTY head metadata, integrity-exhaustion WORKER-FAILURE) | DEF-10, INV-26, IB-5, REQ-7/13/20 | P1 | CT-5 table-driven local + proxied error-shape/status tests |
-| GAP-17 | Count caps imply a multi-terabyte theoretical buffer ceiling and no global byte budget or accounting exists | REQ-27, PF-1, OQ-9 | P1 | add byte meter/admission test; set P-BUFFERED-BYTES-BUDGET |
+| GAP-17 | Count caps imply a multi-terabyte theoretical buffer ceiling and no global byte budget or accounting exists; the congestion waiter queue is unbounded on the same path (HZ-9) | REQ-27, PF-1, OQ-9 | P1 | add byte meter/admission test; set P-BUFFERED-BYTES-BUDGET |
 | GAP-18 | Chain-RPC calls have no explicit deadline despite accepted ADR-010 | REQ-22, DC-5, HZ-8 | P2 | stalled-RPC stub → assert bounded call and loop recovery |
 | GAP-19 | Conflict detection is not known to precede the beyond-frontier EMPTY: a real-time continuation at the head with a stale parent may poll empty instead of getting 409 (the pre-ADR-014 oracle ordered EMPTY first; master unverified) | REQ-3, INV-23, INV-27 (ADR-014) | P2 | CT-2: reorg-at-head stub world → assert 409 precedence |
 | GAP-20 | No regression guard on artifact application: a republished older artifact (different identifier) would be re-applied | REQ-40, INV-2, DEF-4 (ADR-014) | P2 | CT-2: regressive publisher stub → assert not applied |

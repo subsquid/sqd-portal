@@ -57,6 +57,19 @@ jobs:
       - uses: dsherret/rust-toolchain-file@v1
       - run: cargo fmt --all -- --check
 
+  spec:
+    name: Spec lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || !github.event.pull_request.draft
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the freshness checks read per-file commit dates
+      - name: Annotate findings
+        run: ./tools/spec-lint.py --format github || true
+      - name: Gate on errors
+        run: ./tools/spec-lint.py
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
