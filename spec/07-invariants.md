@@ -154,8 +154,8 @@ concurrent load, prior traffic, or process age.
 **INV-29 — Boundary-block emission.** [response]
 A successful response that evaluates at least one block delivers a record for at least the
 first and the last block of its coverage — header-only when the block matches no item
-filter — regardless of `includeAllBlocks`. The engine pins this boundary per *served
-chunk* (`sqd-query` runs `Plan::execute` once per chunk), so a multi-chunk response also
+filter — regardless of `includeAllBlocks`. The source pins this boundary per *served
+chunk* — the query engine evaluates one plan per chunk — so a multi-chunk response also
 carries header-only records at interior chunk boundaries; coverage's global first and last
 are the guaranteed minimum. Hence the last delivered record's reference equals the coverage
 cursor (DEF-8), and a client resumes from it gap-free even when a selective query matched

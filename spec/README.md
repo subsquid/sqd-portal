@@ -49,7 +49,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 | ADR-004 | 2025-12-02 | [Asymmetric worker penalties; one query per worker](decisions/ADR-004-worker-penalties.md) | Accepted (historical) |
 | ADR-005 | 2026-05-27 | [Two-phase graceful shutdown](decisions/ADR-005-two-phase-shutdown.md) | Accepted (historical) |
 | ADR-006 | 2026-06-03 | [Network bandwidth is the modeled limiting resource](decisions/ADR-006-bandwidth-limiting-resource.md) | Accepted (historical) |
-| ADR-007 | 2026-06-04 | [Overload gets its own status code, distinct from data unavailability](decisions/ADR-007-overload-529.md) | Accepted (historical) |
+| ADR-007 | 2026-06-04 | [Overload gets its own status code (529), distinct from data unavailability](decisions/ADR-007-overload-529.md) | Accepted (historical) |
 | ADR-008 | 2026-06-08 | [Unknown config fields warn, don't reject](decisions/ADR-008-config-unknown-fields-warn.md) | Accepted (historical) |
 | ADR-009 | 2026-06-25 | Per-request artificial head latency for real-time streams *(canonical record kept in the sqd-network decision log; not bundled in this suite — see OQ-5)* | Accepted |
 | ADR-010 | 2026-07-09 | [Upstream deadlines sit strictly below client deadlines](decisions/ADR-010-upstream-deadline-below-client.md) | Accepted (historical) |

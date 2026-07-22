@@ -36,8 +36,8 @@ connection fault whose shape the replay classifier stopped recognising. A wedged
 dependency must be visible from the Portal's own metrics alone (REQ-22).
 
 **OB-5 — Readiness reason.** The readiness state as a gauge with a reason code
-(loading / insufficient-connectivity / shutting-down / ⚠ stale-artifact), and logged
-transitions. A probe flip is attributable without log archaeology.
+(loading / insufficient-connectivity / shutting-down / ⚠ stale-artifact — ADR-013,
+GAP-2), and logged transitions. A probe flip is attributable without log archaeology.
 
 **OB-6 — Artifact provenance.** Applied artifact identifier and ⚠ age
 (ADR-013/GAP-2), application timestamps, skipped/unchanged fetch counts. A wedged

@@ -1,7 +1,8 @@
 # 15 — Parameter registry
 
-**Mutable doc.** Every `P-*` symbol used anywhere in the suite has a row here.
-"Observed" is the current default/behavior at version 0.11.8 (operator-overridable
+**Mutable doc.** Every `P-*` symbol used anywhere in the suite has a row here; the
+operator binds them through the configuration object (DEF-15).
+"Observed" is the current default/behavior at version 0.11.9 (operator-overridable
 unless marked *fixed*); "Target" is the ratified intent. ⚠ = proposed, awaiting
 ratification via the linked ADR. Environmental rows describe the world the Portal
 assumes, not knobs it owns.
