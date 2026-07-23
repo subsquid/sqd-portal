@@ -10,5 +10,7 @@ pub use client::{
 };
 pub use contracts_state::Status;
 pub use priorities::{NoWorker, PrioritiesConfig, Priority};
+#[cfg(test)]
+pub(crate) use state::TestLeasePool;
 pub use state::{NetworkState, WorkerLease};
 pub use storage::{ChunkNotFound, StorageClient};
