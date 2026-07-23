@@ -99,6 +99,11 @@ pub(crate) async fn run_archival_stream(
     dataset_id: DatasetId,
     mut request: StreamRequest,
 ) -> Response {
+    let permit = match task_manager.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => return network_error_response(e),
+    };
+
     let mut res = Response::builder();
     res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
     if let Some(head) = network.head(&dataset_id) {
@@ -112,7 +117,7 @@ pub(crate) async fn run_archival_stream(
     request.dataset_id = dataset_id;
     let compression = request.compression;
 
-    match task_manager.spawn_stream(request).await {
+    match task_manager.spawn_stream(permit, request).await {
         Ok(stream) => {
             let body = response_body(stream, compression, config.use_gzjoin);
             res.header(header::CONTENT_TYPE, "application/jsonl")
@@ -125,7 +130,7 @@ pub(crate) async fn run_archival_stream(
             tokio::time::sleep(Duration::from_secs(5)).await;
             res.status(StatusCode::NO_CONTENT).body(().into()).unwrap()
         }
-        Err(e) => e.into_response(),
+        Err(e) => network_error_response(e),
     }
 }
 
@@ -288,6 +293,14 @@ async fn run_stream_internal(
     }
 }
 
+fn network_error_response(e: RequestError) -> Response {
+    let mut response = e.into_response();
+    response
+        .headers_mut()
+        .insert(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
+    response
+}
+
 async fn stream_from_network(
     task_manager: Arc<TaskManager>,
     config: Arc<Config>,
@@ -298,6 +311,13 @@ async fn stream_from_network(
     dataset_id: DatasetId,
     hotblocks_name: String,
 ) -> Response {
+    // Before the head fetch below: that spawn outlives a rejection and would
+    // hit hotblocks for an answer nobody reads.
+    let permit = match task_manager.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => return network_error_response(e),
+    };
+
     let archival_head = network.head(&dataset_id);
     let head_task = tokio::spawn({
         let archival_head = archival_head.clone();
@@ -315,15 +335,9 @@ async fn stream_from_network(
     request.dataset_id = dataset_id;
     let compression = request.compression;
 
-    let stream = match task_manager.spawn_stream(request).await {
+    let stream = match task_manager.spawn_stream(permit, request).await {
         Ok(stream) => stream,
-        Err(e) => {
-            let mut response = e.into_response();
-            response
-                .headers_mut()
-                .insert(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
-            return response;
-        }
+        Err(e) => return network_error_response(e),
     };
 
     let mut res = Response::builder().header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
