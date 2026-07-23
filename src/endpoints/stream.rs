@@ -331,8 +331,17 @@ async fn stream_from_network(
         res = res.header(FINALIZED_NUMBER_HEADER, head.number);
         res = res.header(FINALIZED_HASH_HEADER, head.hash);
     }
-    if let Some(head) = head_task.await.unwrap() {
-        res = res.header(HEAD_NUMBER_HEADER, head);
+    match head_task.await {
+        Ok(Some(head)) => {
+            res = res.header(HEAD_NUMBER_HEADER, head);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // A panicked head lookup must not 500 the whole stream (the header
+            // is best-effort), but it must leave a trace — a bare `.unwrap()`
+            // here used to kill the handler with no error-level log at all.
+            tracing::error!(error = %e, "head lookup task panicked; omitting head header");
+        }
     }
     let body = response_body(stream, compression, config.use_gzjoin);
     res.header(header::CONTENT_TYPE, "application/jsonl")

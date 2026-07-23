@@ -378,6 +378,7 @@ impl NetworkClient {
         let mut first_fetch = true;
         let mut current_epoch: u32 = 0;
         let mut operator;
+        let mut consecutive_failures: u32 = 0;
         loop {
             if first_iteration {
                 first_iteration = false;
@@ -399,9 +400,24 @@ impl NetworkClient {
                 epoch_started,
                 compute_units_per_epoch,
             ) = match self.fetch_blockchain_state().await {
-                Ok(data) => data,
+                Ok(data) => {
+                    consecutive_failures = 0;
+                    data
+                }
                 Err(e) => {
-                    tracing::warn!("Couldn't get blockchain data: {e}");
+                    // Fires once per polling interval while the chain RPC is
+                    // unavailable; the counter separates a one-off blip from a
+                    // persistent outage (contracts_state silently going stale).
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 5 {
+                        tracing::error!(
+                            consecutive_failures,
+                            error = %e,
+                            "Couldn't get blockchain data; contracts state is stale"
+                        );
+                    } else {
+                        tracing::warn!(consecutive_failures, error = %e, "Couldn't get blockchain data");
+                    }
                     continue;
                 }
             };
@@ -531,7 +547,15 @@ impl NetworkClient {
         self.network_state.get_height(dataset)
     }
 
-    #[instrument(skip_all, level = "debug", fields(query_id))]
+    #[instrument(skip_all, level = "debug", fields(
+        query_id,
+        peer_id = %lease.worker(),
+        dataset = %chunk_id.dataset,
+        chunk = %chunk_id.chunk,
+        first_block = *block_range.start(),
+        last_block = *block_range.end(),
+        request_id,
+    ))]
     pub async fn query_worker(
         self: Arc<Self>,
         lease: WorkerLease,
@@ -755,16 +779,25 @@ impl NetworkClient {
             })
     }
 
+    // Worker-query failures used to be metrics-only: the most common cause of
+    // elevated 5xx (worker timeouts / transport errors) left no trace in logs.
+    // Emit one warn per failure so log readers can localize the failing peer
+    // and failure kind; events inherit the `query_worker` span fields
+    // (dataset/chunk/request_id). Known risk: volume scales with the failure
+    // rate, so a large incident produces a noticeable stream of warns — if
+    // that proves too noisy, rate-limit here rather than dropping the events.
     fn convert_query_failure(&self, peer_id: PeerId, failure: QueryFailure) -> QueryError {
         match failure {
             QueryFailure::InvalidRequest(e) => {
                 metrics::report_query_result(&peer_id, "invalid");
                 self.network_state.report_query_success(peer_id, None);
+                tracing::warn!(peer_id = %peer_id, kind = "invalid_request", error = %e, "worker query failed");
                 QueryError::Failure(format!("portal tried to send invalid request: {e}"))
             }
             QueryFailure::InvalidResponse(e) => {
                 metrics::report_query_result(&peer_id, "invalid");
                 self.network_state.report_query_error(peer_id);
+                tracing::warn!(peer_id = %peer_id, kind = "invalid_response", error = %e, "worker query failed");
                 QueryError::Retriable(format!("couldn't decode response: {e}"))
             }
             QueryFailure::Timeout(t) => {
@@ -774,11 +807,13 @@ impl NetworkClient {
                     StreamClientTimeout::Connect => "timed out connecting to the peer",
                     StreamClientTimeout::Request => "timed out reading response",
                 };
+                tracing::warn!(peer_id = %peer_id, kind = "timeout", phase = msg, "worker query failed");
                 QueryError::Retriable(msg.to_owned())
             }
             QueryFailure::TransportError(e) => {
                 metrics::report_query_result(&peer_id, "transport_error");
                 self.network_state.report_query_failure(peer_id);
+                tracing::warn!(peer_id = %peer_id, kind = "transport_error", error = %e, "worker query failed");
                 QueryError::Retriable(format!("transport error: {e}"))
             }
         }
@@ -791,6 +826,7 @@ impl NetworkClient {
             ReadError::TooLarge => "response too large".to_owned(),
             ReadError::Transport(e) => format!("transport error: {e}"),
         };
+        tracing::warn!(peer_id = %peer_id, kind = "read_error", error = %msg, "worker query failed");
         QueryError::Retriable(msg)
     }
 

@@ -102,6 +102,29 @@ fn setup_tracing(json: bool, log_span_durations: bool) {
         .init();
 }
 
+/// Panics in spawned tokio tasks bypass `tracing` entirely and die as bare
+/// stderr text — invisible to JSON log pipelines, so a crash-looping pod shows
+/// no structured cause. Log the panic through `tracing` before the default
+/// handler runs (the default still prints the backtrace and aborts as before).
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        tracing::error!(panic = true, message, location, "thread panicked");
+        default_hook(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -114,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
         .then(|| setup_sentry(&args.config, &args));
 
     setup_tracing(args.json_log, args.log_span_durations);
+    install_panic_hook();
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
 

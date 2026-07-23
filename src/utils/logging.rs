@@ -86,6 +86,9 @@ impl StreamStats {
         // );
         tracing::info!(
             dataset = %request.dataset_id,
+            // The summary is written on Drop, outside the `http_request` span —
+            // without an explicit field it cannot be joined with the access log.
+            request_id = %request.request_id,
             first_block = request.query.first_block(),
             last_block = request.query.last_block(),
             queries_sent = self.queries_sent,
