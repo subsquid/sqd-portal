@@ -42,7 +42,7 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 | Erroring | mask via reroute + cooldown P-WORKER-ERROR-COOLDOWN |
 | Rate-limiting | mask via backoff honor; all-candidates-limited ⇒ fail-safe OVERLOADED |
 | Oversized response | fail-safe BAD-REQUEST (advise narrower query) |
-| Equivocating (bad signature / wrong-range data) | integrity: discard, reroute, count (REQ-43); never delivered; all attempts equivocating ⇒ fail-safe WORKER-FAILURE (pages) |
+| Equivocating (bad signature / wrong-range data) | integrity: discard, reroute, count (REQ-43); never delivered; all attempts equivocating ⇒ fail-safe WORKER-FAILURE (pages); equivocation mixed with transient failures ⇒ fail-safe RETRIES-EXHAUSTED, the equivocation still counted and alarmed (DC-1) |
 | Fork verdict (parent mismatch) | fail-safe CONFLICT (INV-23) |
 | All attempts exhausted transiently | fail-safe RETRIES-EXHAUSTED listing nothing sensitive; alarm-adjacent counter |
 

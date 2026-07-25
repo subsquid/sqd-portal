@@ -31,6 +31,12 @@ pub enum QueryError {
     BadRequest(String),
     #[error("{0}")]
     Retriable(String),
+    /// The response contradicts the query contract — bad signature, undecodable
+    /// body, or data outside the queried range. Rerouted like a transient
+    /// failure, but exhaustion pages instead of reporting a transient outage:
+    /// the network is serving bad data or verification is broken (DC-1, FM-2).
+    #[error("{0}")]
+    Integrity(String),
     #[error("{0}")]
     Failure(String),
     #[error("rate limit exceeded")]
@@ -53,6 +59,9 @@ impl RequestError {
             QueryError::BadRequest(s) => RequestError::BadRequest(s),
             QueryError::Retriable(s) => {
                 RequestError::InternalError(format!("received an error from worker {worker}: {s}"))
+            }
+            QueryError::Integrity(s) => {
+                RequestError::Failure(format!("worker {worker} returned invalid data: {s}"))
             }
             QueryError::Failure(s) => RequestError::Failure(format!("worker {worker} failed: {s}")),
             QueryError::RateLimitExceeded => RequestError::RateLimitExceeded,

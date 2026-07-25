@@ -59,6 +59,11 @@ pub trait StreamingNetwork: Send + Sync + 'static {
         compression: Compression,
         priority: Option<u32>,
     ) -> futures::future::BoxFuture<'static, QueryResult>;
+
+    /// A response the controller rejected as contract-violating. The transport
+    /// can't catch these — only the caller knows the range it asked for — so the
+    /// penalty and the OB-4 counter are raised from here instead.
+    fn report_integrity_failure(&self, worker: PeerId);
 }
 
 impl StreamingNetwork for NetworkClient {
@@ -94,6 +99,11 @@ impl StreamingNetwork for NetworkClient {
             compression,
             priority,
         ))
+    }
+
+    fn report_integrity_failure(&self, worker: PeerId) {
+        metrics::report_query_result(&worker, "integrity");
+        self.network_state.report_query_error(worker);
     }
 }
 
@@ -763,9 +773,9 @@ impl NetworkClient {
                 QueryError::Failure(format!("portal tried to send invalid request: {e}"))
             }
             QueryFailure::InvalidResponse(e) => {
-                metrics::report_query_result(&peer_id, "invalid");
+                metrics::report_query_result(&peer_id, "integrity");
                 self.network_state.report_query_error(peer_id);
-                QueryError::Retriable(format!("couldn't decode response: {e}"))
+                QueryError::Integrity(format!("couldn't decode response: {e}"))
             }
             QueryFailure::Timeout(t) => {
                 metrics::report_query_result(&peer_id, "timeout");
@@ -805,9 +815,9 @@ impl NetworkClient {
 
         match result {
             Ok(q) if self.verify_responses && !verify_signature(&q, peer_id).await => {
-                metrics::report_query_result(&peer_id, "validation_error");
+                metrics::report_query_result(&peer_id, "integrity");
                 self.network_state.report_query_failure(peer_id);
-                Err(QueryError::Retriable(format!(
+                Err(QueryError::Integrity(format!(
                     "invalid worker signature from {peer_id}, result: {q:?}"
                 )))
             }
