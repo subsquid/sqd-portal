@@ -27,12 +27,40 @@ impl WorkerLease {
     /// mock the network without a full [`NetworkState`].
     #[cfg(test)]
     pub(crate) fn for_tests(worker: PeerId) -> Self {
-        let pool = Arc::new(RwLock::new(
-            WorkersPool::new(PrioritiesConfig::default()),
-            "WorkerLease::for_tests pool",
-        ));
-        pool.write().lease(worker);
-        Self { pool, worker }
+        TestLeasePool::new().lease(worker)
+    }
+}
+
+/// A shared lease pool for tests that mock the network without a full
+/// [`NetworkState`], allowing them to verify that every issued
+/// [`WorkerLease`] is eventually returned.
+#[cfg(test)]
+pub(crate) struct TestLeasePool {
+    pool: Arc<RwLock<WorkersPool>>,
+}
+
+#[cfg(test)]
+impl TestLeasePool {
+    pub fn new() -> Self {
+        Self {
+            pool: Arc::new(RwLock::new(
+                WorkersPool::new(PrioritiesConfig::default()),
+                "TestLeasePool::pool",
+            )),
+        }
+    }
+
+    pub fn lease(&self, worker: PeerId) -> WorkerLease {
+        self.pool.write().lease(worker);
+        WorkerLease {
+            pool: self.pool.clone(),
+            worker,
+        }
+    }
+
+    /// The number of leases issued and not yet dropped.
+    pub fn outstanding(&self) -> usize {
+        self.pool.read().running_queries_total()
     }
 }
 

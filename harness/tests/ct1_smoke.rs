@@ -133,6 +133,7 @@ async fn ct1_smoke() -> anyhow::Result<()> {
             id.keypair.clone(),
             &dummy_path,
             worker_udp_ports[i],
+            stubs::worker::WorkerFaults::none(),
         )
         .await?;
         worker_ledgers.push(stub.ledger.clone());

@@ -31,7 +31,7 @@ alternatives exist.
 | server error / not found | reroute; cooldown P-WORKER-ERROR-COOLDOWN; exhausted ⇒ RETRIES-EXHAUSTED |
 | timeout / transport failure | reroute; cooldown P-WORKER-TIMEOUT-COOLDOWN; congestion signal; exhausted ⇒ RETRIES-EXHAUSTED |
 | rate-limit / overload verdict | honor backoff (worker's hint, default P-WORKER-BACKOFF); all candidates backing off longer than P-MAX-IDLE-TIME ⇒ OVERLOADED |
-| integrity failure (bad signature, wrong-range or undecodable result) | discard result, reroute (REQ-43); attempts exhausted on integrity failures ⇒ WORKER-FAILURE (pages — the network serves bad data or verification is broken) |
+| integrity failure (bad signature, wrong-range or undecodable result) | discard result, reroute (REQ-43); exhausted with *every* attempt an integrity failure ⇒ WORKER-FAILURE (pages — the network serves bad data or verification is broken); exhausted with any transient failure among the attempts ⇒ RETRIES-EXHAUSTED, since a later retry can still succeed and the class tells the client whether to come back. Equivocation stays operator-visible either way: it is counted per worker and alarmed regardless of the response class (OB-4/OB-9) |
 | no worker leasable for the chunk | DATA-UNAVAILABLE |
 
 *Degradation.* Per-worker penalties (ADR-004) — never a global circuit-break; the pool
