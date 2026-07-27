@@ -13,7 +13,7 @@ use crate::{
     config::Config,
     controller::task_manager::TaskManager,
     datasets::DatasetConfig,
-    hotblocks::{HeadMode, HotblocksHandle, Status},
+    hotblocks::{HeadMode, HotblocksErr, HotblocksHandle, Status},
     network::NetworkClient,
     openapi::BlockNumberResponse,
     types::{Compression, DatasetId, GenericError, ParsedQuery, StreamRequest},
@@ -315,7 +315,7 @@ async fn get_hotblocks_blocknumber_by_timestamp_once(
         .await
         .map_err(|e| {
             tracing::warn!("hotblocks status error: {:?}", e);
-            BlockNumberLookupError::Unavailable("Hotblocks status error".to_string())
+            classify_hotblocks_error(e, "Hotblocks status error")
         })?;
 
     get_hotblocks_blocknumber_by_timestamp_inner(
@@ -329,7 +329,7 @@ async fn get_hotblocks_blocknumber_by_timestamp_once(
                 .await
                 .map_err(|e| {
                     tracing::warn!("hotblocks stream error: {:?}", e);
-                    BlockNumberLookupError::Unavailable("Hotblocks stream error".to_string())
+                    classify_hotblocks_error(e, "Hotblocks stream error")
                 })?;
 
             let status = response.status();
@@ -347,6 +347,21 @@ async fn get_hotblocks_blocknumber_by_timestamp_once(
         },
     )
     .await
+}
+
+/// Classify a hotblocks client error for the timestamp endpoint.
+///
+/// Only transient failures become `Unavailable` — the variant retried by
+/// `retry_once_on_unavailable`. A missing dataset URL or an unparseable
+/// response body fails identically on a second attempt.
+fn classify_hotblocks_error(error: HotblocksErr, message: &str) -> BlockNumberLookupError {
+    match &error {
+        HotblocksErr::UnknownDataset => BlockNumberLookupError::Internal(message.to_string()),
+        HotblocksErr::Request(e) if e.is_decode() => {
+            BlockNumberLookupError::Internal(message.to_string())
+        }
+        HotblocksErr::Request(_) => BlockNumberLookupError::Unavailable(message.to_string()),
+    }
 }
 
 async fn get_hotblocks_blocknumber_by_timestamp_inner<StreamLookup, StreamFuture>(
