@@ -17,6 +17,14 @@ pub struct Config {
     #[serde(default = "default_max_parallel_streams")]
     pub max_parallel_streams: usize,
 
+    /// Backoff reported to clients turned away because `max_parallel_streams` is reached.
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
+    #[serde(
+        rename = "task_limit_retry_after_ms",
+        default = "default_task_limit_retry_after"
+    )]
+    pub task_limit_retry_after: Duration,
+
     pub max_chunks_per_stream: Option<usize>,
 
     #[serde_as(as = "DurationSeconds")]
@@ -205,6 +213,10 @@ fn default_true() -> bool {
 
 fn default_max_parallel_streams() -> usize {
     1024
+}
+
+fn default_task_limit_retry_after() -> Duration {
+    Duration::from_millis(9999)
 }
 
 fn default_transport_timeout() -> Duration {
