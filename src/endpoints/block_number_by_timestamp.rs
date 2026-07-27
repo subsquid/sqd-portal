@@ -271,7 +271,41 @@ async fn get_archival_blocknumber_by_timestamp(
     })
 }
 
+/// Resolve a block number from HotblocksDB, retrying once on a transient failure.
+///
+/// It sends two requests non-atomically. A change of state between them can lead
+/// to, e.g., "range unavailable" responses. Retry to reduce the number of 503s.
 async fn get_hotblocks_blocknumber_by_timestamp(
+    timestamp: u64,
+    hotblocks: &HotblocksHandle,
+    dataset: &DatasetConfig,
+) -> Result<u64, BlockNumberLookupError> {
+    retry_once_on_unavailable(|| {
+        get_hotblocks_blocknumber_by_timestamp_once(timestamp, hotblocks, dataset)
+    })
+    .await
+}
+
+async fn retry_once_on_unavailable<Lookup, LookupFuture>(
+    mut lookup: Lookup,
+) -> Result<u64, BlockNumberLookupError>
+where
+    Lookup: FnMut() -> LookupFuture,
+    LookupFuture: Future<Output = Result<u64, BlockNumberLookupError>>,
+{
+    match lookup().await {
+        Err(BlockNumberLookupError::Unavailable(reason)) => {
+            tracing::debug!(
+                reason,
+                "hotblocks timestamp lookup unavailable, retrying once"
+            );
+            lookup().await
+        }
+        result => result,
+    }
+}
+
+async fn get_hotblocks_blocknumber_by_timestamp_once(
     timestamp: u64,
     hotblocks: &HotblocksHandle,
     dataset: &DatasetConfig,
@@ -633,5 +667,75 @@ mod tests {
             "{\"header\":{\"number\":101,\"timestamp\":1700000012}}\n"
         )
         .to_string())
+    }
+
+    #[tokio::test]
+    async fn retry_once_on_unavailable_retries_after_stale_retention_window() {
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let result = retry_once_on_unavailable(|| {
+            let calls = calls.clone();
+            async move {
+                if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    // What a pruned range looks like coming back from HotblocksDB.
+                    Err(BlockNumberLookupError::Unavailable(
+                        "Hotblocks stream failed with status 400 Bad Request".to_string(),
+                    ))
+                } else {
+                    Ok(42)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, 42);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_once_on_unavailable_gives_up_after_a_single_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let result = retry_once_on_unavailable(|| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Err(BlockNumberLookupError::Unavailable(
+                    "still gone".to_string(),
+                ))
+            }
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(BlockNumberLookupError::Unavailable(ref m)) if m == "still gone"
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_once_on_unavailable_does_not_retry_other_errors() {
+        for error in [
+            BlockNumberLookupError::NotFound("block not in hotblocks".to_string()),
+            BlockNumberLookupError::Internal("stream processing error".to_string()),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let error = Arc::new(std::sync::Mutex::new(Some(error)));
+
+            let result = retry_once_on_unavailable(|| {
+                let calls = calls.clone();
+                let error = error.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Err(error.lock().unwrap().take().expect("called twice"))
+                }
+            })
+            .await;
+
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
     }
 }
