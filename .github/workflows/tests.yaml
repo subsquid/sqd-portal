@@ -48,6 +48,49 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
+  harness:
+    # The conformance suites of spec/13. Its own job, and its own crate: the harness
+    # is not a workspace member, so `cargo test` at the root never reaches it.
+    name: Conformance harness
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || !github.event.pull_request.draft
+    steps:
+      - name: Cache protoc
+        id: cache-protoc
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/protoc
+          key: protoc-${{ env.PROTOC_VERSION }}-${{ runner.arch }}
+
+      - name: Install protoc (if not cached)
+        if: steps.cache-protoc.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p ~/.local/protoc
+          curl -L -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${ARCH}.zip"
+          unzip -q /tmp/protoc.zip -d ~/.local/protoc
+
+      - name: Add protoc to PATH
+        run: echo "$HOME/.local/protoc/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            harness
+
+      - name: Build the portal under test
+        # The stubs run it as a black box; the harness looks for target/debug/sqd-portal.
+        run: cargo build --all-features
+
+      - name: Run conformance suites
+        run: cargo test --manifest-path harness/Cargo.toml
+        env:
+          PORTAL_BIN: ${{ github.workspace }}/target/debug/sqd-portal
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

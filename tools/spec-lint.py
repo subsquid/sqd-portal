@@ -63,9 +63,12 @@ CONFORMANCE = "13-conformance.md"
 REQUIREMENTS = "02-requirements.md"
 README = "README.md"
 
-# Which prefixes must appear in which matrix of 13.
+# Which prefixes must appear in which matrix of 13, and which column holds the status.
 MATRIX_PROPERTIES = ("INV", "LIV", "FM", "SLI")
 MATRIX_REQUIREMENTS = ("REQ",)
+# The closed set 13's header declares. A status outside it reads as a claim but means
+# nothing, and no other check looks at that column.
+MATRIX_STATUSES = {"C", "P", "U"}
 
 # Docs whose normative text must not carry bare dimensioned constants (the
 # `P-*`-only rule). 13 and 15 are the mutable registries; ADRs are exempt.
@@ -122,6 +125,7 @@ CHECKS: dict[str, tuple[str, str]] = {
     "adr-log-order":          ("warn",  "accepted decisions are not in ascending number/date order"),
     "trace-missing":          ("error", "defined property/requirement has no row in a 13 matrix"),
     "trace-unknown":          ("error", "13 matrix row names an ID that is not defined"),
+    "trace-bad-status":       ("error", "13 matrix row's status is not one of the declared values"),
     "doc-unlisted":           ("error", "spec document missing from the README document map"),
     "doc-missing":            ("error", "README document map lists a file that does not exist"),
     "req-missing-tag":        ("error", "requirement carries no RFC 2119 keyword"),
@@ -627,10 +631,11 @@ class Linter:
         if not doc:
             return
         matrices = {
-            "properties": (MATRIX_PROPERTIES, section_bounds(doc, lambda t: t.startswith("Traceability matrix"))),
-            "requirements": (MATRIX_REQUIREMENTS, section_bounds(doc, lambda t: t.startswith("Acceptance matrix"))),
+            # label: (prefixes, bounds, status column)
+            "properties": (MATRIX_PROPERTIES, section_bounds(doc, lambda t: t.startswith("Traceability matrix")), 2),
+            "requirements": (MATRIX_REQUIREMENTS, section_bounds(doc, lambda t: t.startswith("Acceptance matrix")), 1),
         }
-        for label, (prefixes, bounds) in matrices.items():
+        for label, (prefixes, bounds, status_col) in matrices.items():
             if bounds is None:
                 self.report("trace-missing", CONFORMANCE, 1,
                             f"no {label} matrix section found")
@@ -640,13 +645,21 @@ class Linter:
             for line, cells in parse_table_rows(doc, start, end):
                 if not cells:
                     continue
-                for m in ID_TOKEN.finditer(cells[0]):
+                ids = list(ID_TOKEN.finditer(cells[0]))
+                if not ids:
+                    continue  # the column header, not a row
+                for m in ids:
                     hard, soft = expand_ids(m)
                     for ident in hard + soft:
                         covered.add(ident)
                         if ident not in self.definitions and ident not in soft:
                             self.report("trace-unknown", CONFORMANCE, line,
                                         f"{label} matrix row names {ident}, which is not defined")
+                status = re.sub(r"[*_`]", "", cells[status_col]).strip() if len(cells) > status_col else ""
+                if status not in MATRIX_STATUSES:
+                    self.report("trace-bad-status", CONFORMANCE, line,
+                                f"{label} matrix status {status!r} is not one of "
+                                f"{sorted(MATRIX_STATUSES)}")
             for ident, (home, dline) in sorted(self.definitions.items()):
                 if ident.split("-")[0] in prefixes and ident not in covered:
                     self.report("trace-missing", home, dline,

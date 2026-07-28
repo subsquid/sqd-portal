@@ -107,6 +107,87 @@ impl StreamingNetwork for NetworkClient {
     }
 }
 
+/// Whether the worker stays a candidate. Only two outcomes today; the split from the
+/// cooldown *class* is GAP-27.
+enum Health {
+    Ok,
+    Error,
+}
+
+/// One DC-1 row: how a worker verdict is classified, counted, and charged. The three
+/// were chosen independently in each match arm — eight arms times three decisions — and
+/// they drifted: the two capacity refusals shared a row in the spec while disagreeing
+/// here on both the error class and the health signal.
+struct Verdict {
+    error: QueryError,
+    label: &'static str,
+    health: Health,
+    backs_off: bool,
+}
+
+impl Verdict {
+    fn of(err: query_error::Err) -> Self {
+        use query_error::Err;
+        let row = |error, label, health, backs_off| Verdict {
+            error,
+            label,
+            health,
+            backs_off,
+        };
+        match err {
+            Err::BadRequest(s) => row(
+                QueryError::BadRequest(format!("couldn't parse request: {s}")),
+                "bad_request",
+                Health::Ok,
+                false,
+            ),
+            // Probably still downloading the chunk.
+            Err::NotFound(s) => row(QueryError::Retriable(s), "not_found", Health::Error, false),
+            // Input validation, not a bad response.
+            Err::ServerError(s) if parse_base_block_mismatch(&s).is_some() => row(
+                QueryError::BaseBlockMismatch(parse_base_block_mismatch(&s).expect("just matched")),
+                "block_mismatch",
+                Health::Ok,
+                false,
+            ),
+            // The query covers too much data: narrowing it is the client's move, and
+            // another worker would answer the same.
+            Err::ServerError(s) if s == "Response too large" => row(
+                QueryError::BadRequest(
+                    "the response for this block exceeds the size limit; \
+                     try narrowing the query to request only the necessary data"
+                        .to_owned(),
+                ),
+                "response_too_large",
+                Health::Ok,
+                false,
+            ),
+            Err::ServerError(s) => {
+                row(QueryError::Failure(s), "server_error", Health::Error, false)
+            }
+            // One row, two verdicts: both are capacity refusals.
+            Err::ServerOverloaded(()) => row(
+                QueryError::RateLimitExceeded,
+                "server_overloaded",
+                Health::Error,
+                true,
+            ),
+            Err::TooManyRequests(()) => row(
+                QueryError::RateLimitExceeded,
+                "too_many_requests",
+                Health::Ok,
+                true,
+            ),
+        }
+    }
+}
+
+/// The data is opaque, so a `last_block` outside the queried range cannot be trimmed to
+/// it, and the continuation derived from it is inverted or re-covers delivered blocks.
+fn out_of_range(ok: &QueryOk, range: &BlockRange) -> bool {
+    !range.contains(&ok.last_block)
+}
+
 #[derive(Debug)]
 pub struct QuerySuccess {
     pub ok: QueryOk,
@@ -569,7 +650,9 @@ impl NetworkClient {
                 compression,
             )
             .await;
-        let result = self.execute_query(worker, query, priority).await;
+        let result = self
+            .execute_query(worker, query, &block_range, priority)
+            .await;
         result
     }
 
@@ -577,6 +660,7 @@ impl NetworkClient {
         &self,
         worker: PeerId,
         query: Query,
+        block_range: &BlockRange,
         priority: Option<u32>,
     ) -> QueryResult {
         let mut stream = self.send_to_transport(worker, query, priority).await?;
@@ -587,7 +671,7 @@ impl NetworkClient {
             .download_body(worker, &mut stream, &mut buf, priority)
             .await?;
         let query_time = network_start.elapsed();
-        self.finalize_response(worker, buf, ttfb, transfer_time, query_time)
+        self.finalize_response(worker, buf, block_range, ttfb, transfer_time, query_time)
             .await
     }
 
@@ -731,6 +815,7 @@ impl NetworkClient {
         &self,
         worker: PeerId,
         buf: Vec<u8>,
+        block_range: &BlockRange,
         ttfb: Duration,
         transfer_time: Duration,
         query_time: Duration,
@@ -754,7 +839,7 @@ impl NetworkClient {
         } else {
             None
         };
-        self.parse_query_result(worker, result, throughput)
+        self.parse_query_result(worker, result, block_range, throughput)
             .await
             .inspect(|_| metrics::report_query_ok(query_time))
             .map(|ok| QuerySuccess {
@@ -809,10 +894,9 @@ impl NetworkClient {
         &self,
         peer_id: PeerId,
         result: Result<sqd_messages::QueryResult, QueryFailure>,
+        block_range: &BlockRange,
         throughput: Option<f64>,
     ) -> Result<QueryOk, QueryError> {
-        use query_error::Err;
-
         match result {
             Ok(q) if self.verify_responses && !verify_signature(&q, peer_id).await => {
                 metrics::report_query_result(&peer_id, "integrity");
@@ -832,67 +916,36 @@ impl NetworkClient {
                     metrics::report_backoff(&peer_id);
                 };
                 match result {
+                    // Before the success is recorded: counted first, one wrong-range
+                    // answer landed in both `ok` and `integrity`, and left its latency
+                    // and throughput in the worker's health.
+                    query_result::Result::Ok(ok) if out_of_range(&ok, block_range) => {
+                        metrics::report_query_result(&peer_id, "integrity");
+                        self.network_state.report_query_error(peer_id);
+                        Err(QueryError::Integrity(format!(
+                            "worker returned last block {} outside the queried range {}-{}",
+                            ok.last_block,
+                            block_range.start(),
+                            block_range.end()
+                        )))
+                    }
                     query_result::Result::Ok(ok) => {
                         metrics::report_query_result(&peer_id, "ok");
                         self.network_state.report_query_success(peer_id, throughput);
                         Ok(ok)
                     }
                     query_result::Result::Err(sqd_messages::QueryError { err: Some(err) }) => {
-                        match err {
-                            Err::BadRequest(s) => {
-                                metrics::report_query_result(&peer_id, "bad_request");
-                                self.network_state.report_query_success(peer_id, None);
-                                Err(QueryError::BadRequest(format!(
-                                    "couldn't parse request: {s}"
-                                )))
-                            }
-                            Err::NotFound(s) => {
-                                // Chunk was not found on the worker. It's probably still downloading it
-                                metrics::report_query_result(&peer_id, "not_found");
-                                self.network_state.report_query_error(peer_id);
-                                Err(QueryError::Retriable(s))
-                            }
-                            Err::ServerError(s) => {
-                                if let Some(block_ref) = parse_base_block_mismatch(&s) {
-                                    // That's input validation rather than bad query response
-                                    metrics::report_query_result(&peer_id, "block_mismatch");
-                                    self.network_state.report_query_success(peer_id, None);
-                                    Err(QueryError::BaseBlockMismatch(block_ref))
-                                } else if s == "Response too large" {
-                                    // Caused by the query covering too much data; the client
-                                    // should narrow it down rather than retry against another worker
-                                    metrics::report_query_result(&peer_id, "response_too_large");
-                                    self.network_state.report_query_success(peer_id, None);
-                                    Err(QueryError::BadRequest(
-                                        "the response for this block exceeds the size limit; \
-                                         try narrowing the query to request only the necessary data"
-                                            .to_owned(),
-                                    ))
-                                } else {
-                                    metrics::report_query_result(&peer_id, "server_error");
-                                    self.network_state.report_query_error(peer_id);
-                                    Err(QueryError::Failure(s))
-                                }
-                            }
-                            Err::ServerOverloaded(()) => {
-                                metrics::report_query_result(&peer_id, "server_overloaded");
-                                self.network_state.report_query_error(peer_id);
-                                if retry_after_ms.is_none() {
-                                    self.network_state
-                                        .hint_backoff(peer_id, self.default_worker_backoff);
-                                }
-                                Err(QueryError::Retriable("worker overloaded".to_owned()))
-                            }
-                            Err::TooManyRequests(()) => {
-                                metrics::report_query_result(&peer_id, "too_many_requests");
-                                self.network_state.report_query_success(peer_id, None);
-                                if retry_after_ms.is_none() {
-                                    self.network_state
-                                        .hint_backoff(peer_id, self.default_worker_backoff);
-                                }
-                                Err(QueryError::RateLimitExceeded)
-                            }
+                        let verdict = Verdict::of(err);
+                        metrics::report_query_result(&peer_id, verdict.label);
+                        match verdict.health {
+                            Health::Ok => self.network_state.report_query_success(peer_id, None),
+                            Health::Error => self.network_state.report_query_error(peer_id),
                         }
+                        if verdict.backs_off && retry_after_ms.is_none() {
+                            self.network_state
+                                .hint_backoff(peer_id, self.default_worker_backoff);
+                        }
+                        Err(verdict.error)
                     }
                     query_result::Result::Err(sqd_messages::QueryError { err: None }) => {
                         metrics::report_query_result(&peer_id, "invalid");

@@ -9,5 +9,9 @@ pub use api_types::DatasetRef;
 pub use chunk::*;
 pub use common::*;
 pub use dataset::*;
-pub use errors::{GenericError, QueryError, RequestError, SendQueryError};
+pub use errors::{
+    coded_response, error_body_response, error_response, server_overloaded, ErrorBody, ErrorCode,
+    ErrorDetail, ErrorResponse, ErrorType, ExhaustionClass, QueryError, RequestError,
+    SendQueryError, RETRY_AFTER_FLOOR,
+};
 pub use request::*;

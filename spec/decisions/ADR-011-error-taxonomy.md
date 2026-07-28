@@ -22,10 +22,16 @@ specific `code` for client handling.
 | `availability_error` | yes | Data or a dependency is temporarily unavailable | no |
 | `api_error` | no | A Portal-owned invariant failed | yes |
 
-The closed code vocabulary is `malformed_request`, `unknown_dataset`, `not_found`,
-`base_block_mismatch`, `no_data`, `overloaded`, `no_workers`, `retries_exhausted`,
-`upstream_unavailable`, `not_ready`, `worker_failure`, `internal_error`, and
-`unclassified`. A code has exactly one type; its status mapping is fixed by IB-5.
+The closed code vocabulary is `malformed_request`, `method_not_allowed`,
+`unknown_dataset`, `not_found`, `base_block_mismatch`, `overloaded`, `no_workers`,
+`retries_exhausted`, `upstream_unavailable`, `not_ready`, `worker_failure`,
+`internal_error`, and `unclassified`. A code has exactly one type; its status mapping is
+fixed by IB-5.
+
+The taxonomy covers failures only. A 204 is the correct answer to a range that is not
+produced yet, so it has no `type` and no `code`: it carries no body, so a code could
+never reach a client, and on the metric it would only have restated `status="204"` while
+making the steady state of every polling client read as an `availability_error`.
 
 Every body-bearing error uses this envelope:
 
@@ -42,18 +48,98 @@ Every body-bearing error uses this envelope:
 ```
 
 `message` is unstable prose. `param` and `request_id` are optional. A 204 response is
-bodyless. A 409 response keeps `previousBlocks` at the top level and adds the `error`
-object beside it, preserving the recovery contract.
+bodyless and untyped. A 409 response keeps `previousBlocks` at the top level and adds
+the `error` object beside it, preserving the recovery contract.
 
-For proxied real-time errors, the Portal classifies the upstream response by status,
-rewrites the body into this envelope, and preserves public upstream headers. Successes
-and 204 remain streaming pass-through under ADR-003. The source marker records that the
-error originated on the real-time path; upstream implementation-specific codes and
-bodies are not public Portal API.
+`request_id` is emitted on 5xx only. Every response carries it as `x-request-id`
+regardless (REQ-9); the body copy exists for the support flow, where a user pastes JSON
+and loses the headers. A 4xx is the client's own fault and is handled programmatically —
+a 409 is a routine reorg resolved from `previousBlocks` — so nobody opens a ticket
+holding one, and the copy would cost a re-render of the whole body, siblings included.
+
+One renderer builds this body for both emitters — locally produced errors and rewritten
+upstream ones. That is a correctness requirement, not a tidiness one: the two emitters
+previously drifted, and 409, the one status carrying a top-level sibling, is served by
+both data sources.
+
+For proxied real-time errors, the Portal classifies the upstream response by status and
+rewrites the body into this envelope, preserving public upstream headers. One classifier
+serves every surface that talks to the real-time source, not just the stream proxy: an
+upstream status cannot mean one thing on `/stream` and another on the timestamp route. The upstream's
+own body is never published — its prose is not public API and can name instances, paths
+and internal ids — and the envelope carries the code's own message instead.
+
+The body is not read either, on any status but 409. Nothing consumes it: an upstream
+server error is already logged with the pod that served it, and the upstream logs its own
+failures in full, so copying a fragment here would duplicate diagnostics that already
+exist where they are complete — while buffering an unbounded body would let an upstream
+fault size Portal memory. `previousBlocks` on a 409 is the one upstream field that
+survives, because clients walk it to recover, and it is the only reason to read at all.
+
+That field is parsed into a non-empty typed list, not forwarded as whatever value sits
+under the key. It is the one place an upstream can put bytes in front of a client, so an
+upstream must not be able to put something else there — a scalar, an empty list, internal
+data — and an empty list strands the client exactly as a missing one does. A body past
+the read cap is refused rather than truncated: half a chain slice would resume the client
+from an ancestor that is not the deepest one. A 409 left with no usable list is not a
+legal 409 under IB-5 and is indistinguishable from a healthy reorg on the wire and on the
+metric, so it is logged at `error` — the only witness. Whether it should instead be
+refused as `unclassified` is open (GAP-28).
+
+Successes and 204 remain streaming pass-through under ADR-003. The source marker records
+that the error originated on the real-time path; upstream implementation-specific codes
+and bodies are not public Portal API.
+
+### Field casing
+
+Envelope keys are snake_case: `request_id` is the only multi-word one, and it matches the
+other Portal-emitted fields (`portal_version`, `start_block`, `block_number`). `code` and
+`type` values are identifiers rather than prose and double as metric label values, where
+snake_case is the convention.
+
+`param` is the exception by construction — it echoes the offending field's wire name
+exactly as the client sent it, so snake_case for query parameters (`buffer_size`) and
+camelCase for body fields (`fromBlock`). It points into the request rather than following
+a convention of its own — so an otherwise snake_case `error` object can carry
+`"param": "fromBlock"`, and a 409 sets `previousBlocks` beside it. That is compatibility,
+not design.
+
+**Unsettled.** None of this ratifies a casing convention for the API. It records what
+Portal-owned JSON does today, not a decision that it should stay. Do not cite it as
+precedent when adding fields elsewhere; settling the question is a breaking change owed
+its own migration.
+
+## Observability
 
 Metrics use the same `error_type` and `error_code` values. An error reaching the
 middleware without a classification is `unclassified`; an unmatched 4xx is treated as
 an invalid request, while an unclassified 5xx remains an `api_error` so it cannot hide.
+
+Errors the router raises before a handler runs — a path segment that will not parse, an
+unreadable query, an over-limit body — are rebuilt into the envelope at the middleware
+rather than at each extractor. A bad path parameter is the commonest client mistake there
+is, so "one envelope on every endpoint" is false without it, and converting call sites
+one at a time leaves the next one to be found by a client. A 4xx is named
+`malformed_request` and answers **400**: the code→status mapping above is closed, so a
+rejection the framework happened to answer with 413 or 415 cannot keep that status while
+claiming a code bound to 400 — the specifics stay in `message`. A 5xx keeps
+`unclassified` and its status, and still pages, since the router failing on its own is
+not the client's fault to name.
+
+A wrong verb on an existing route is the exception, and gets its own code bound to
+**405**. Folding it into `malformed_request` would be wrong on both axes: the request is
+well-formed, and the answer is `Allow`, which a 400 has nowhere to carry. It is also the
+one rejection the framework raises with an empty body, so the collapsed form left the
+client holding a bare "Bad request" — the shape this taxonomy replaced.
+
+The rebuilt response carries the original's extensions, not only its headers: the
+endpoint label lives there, and without it the metric falls back to the raw request path,
+which on a rejection is client-supplied. A malformed dynamic path would then mint an
+`endpoint` label per request.
+
+`doc_url` is deliberately omitted from the envelope. It is the remaining field worth
+adding once per-code documentation pages exist; the codes are stable, so the URLs are
+derivable then without a second migration.
 
 ## Consequences
 

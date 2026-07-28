@@ -46,8 +46,8 @@ use crate::{
     controller::timeouts::TimeoutManager,
     network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult, StreamingNetwork, WorkerLease},
     types::{
-        BlockRange, ChunkId, DataChunk, QueryError, RequestError, ResponseChunk, SendQueryError,
-        StreamRequest,
+        BlockRange, ChunkId, DataChunk, ErrorCode, ExhaustionClass, QueryError, RequestError,
+        ResponseChunk, SendQueryError, StreamRequest,
     },
     utils::{logging::StreamStats, SlidingArray},
 };
@@ -193,7 +193,7 @@ impl<N: StreamingNetwork> StreamController<N> {
             }
             Err(e) => {
                 // Should not be the case under normal operation
-                return Err(RequestError::InternalError(format!(
+                return Err(RequestError::Internal(format!(
                     "block {} could not be found in dataset {} ({e}), please report this to the developers",
                     first_block, request.dataset_id
                 )));
@@ -387,22 +387,27 @@ impl<N: StreamingNetwork> StreamController<N> {
                             running.worker,
                             join_err,
                         );
-                        return Err(RequestState::Done(Err(RequestError::InternalError(
-                            format!("worker query task failed: {join_err}"),
-                        ))));
+                        return Err(RequestState::Done(Err(RequestError::Internal(format!(
+                            "worker query task failed: {join_err}"
+                        )))));
                     }
                 };
-                let response = check_response_range(response, &data_range.range);
-                if let Err(QueryError::Integrity(reason)) = &response {
-                    tracing::warn!(
-                        "Discarding invalid response for range {}-{} from worker {}: {}",
-                        data_range.range.start(),
-                        data_range.range.end(),
-                        running.worker,
-                        reason,
-                    );
-                    self.network.report_integrity_failure(running.worker);
-                }
+                // Only what this layer rejects: the network reports its own, so
+                // reporting every `Integrity` counted a bad signature twice.
+                let response = match wrong_range(&response, &data_range.range) {
+                    Some(reason) => {
+                        tracing::warn!(
+                            "Discarding invalid response for range {}-{} from worker {}: {}",
+                            data_range.range.start(),
+                            data_range.range.end(),
+                            running.worker,
+                            reason,
+                        );
+                        self.network.report_integrity_failure(running.worker);
+                        Err(QueryError::Integrity(reason))
+                    }
+                    None => response,
+                };
 
                 if retriable(&response) {
                     tracing::debug!(
@@ -459,27 +464,36 @@ impl<N: StreamingNetwork> StreamController<N> {
 
     fn all_attempts_failed(pending: &mut PendingRequests) -> RequestState {
         let mut errors = Vec::with_capacity(pending.requests.len());
-        let mut all_integrity = true;
+        let mut classes = Vec::with_capacity(pending.requests.len());
         for request in pending.requests.drain(..) {
             let WorkerRequest::Finished(f) = request else {
                 unreachable!("all worker requests should be finished")
             };
             let error = f.result.unwrap_err();
-            all_integrity &= matches!(error, QueryError::Integrity(_));
+            classes.push(error.exhaustion_class());
             // Format from the QueryError directly so every attempt is labeled with its
             // worker. Going through RequestError would drop the peer id for variants whose
             // Display is a fixed string (e.g. RateLimitExceeded, BaseBlockMismatch).
             errors.push(format!("worker {}: {}", f.worker, error));
         }
-        let message = format!("All query attempts failed: {}", errors.join("; "));
-        // Every attempt equivocating means the network is serving bad data or
-        // verification is broken — an operator problem, not a transient outage,
-        // so it pages rather than reporting the data temporarily unavailable
-        // (DC-1). A mix of transient and integrity failures stays transient.
-        RequestState::Done(Err(if all_integrity {
-            RequestError::Failure(message)
-        } else {
-            RequestError::InternalError(message)
+        // A class is claimed only when every attempt agrees; a mixed run stays
+        // transient, and an empty one claims nothing.
+        let unanimous = classes
+            .first()
+            .copied()
+            .filter(|first| classes.iter().all(|c| c == first));
+        let message = errors.join("; ");
+
+        RequestState::Done(Err(match unanimous {
+            Some(ExhaustionClass::Integrity) => {
+                RequestError::Failure(format!("All query attempts failed: {message}"))
+            }
+            Some(ExhaustionClass::Capacity) => {
+                tracing::debug!("All query attempts refused for capacity: {message}");
+                RequestError::RateLimitExceeded
+            }
+            // RetriesExhausted prefixes the message itself.
+            _ => RequestError::RetriesExhausted(message),
         }))
     }
 
@@ -1089,28 +1103,21 @@ fn parse_response(
     state
 }
 
-/// A misbehaving worker may report a `last_block` outside the range it was
-/// asked for, in either direction. The data is an opaque compressed blob, so it
-/// can't be trimmed to the range without decompressing and re-encoding it — and
-/// the continuation range derived from such a `last_block` is inverted (past the
-/// end) or re-covers blocks the client already has (below the start). Reject the
-/// whole response as an integrity failure: it is discarded, never delivered, and
-/// the next reserved worker serves the range (DC-1).
-fn check_response_range(response: QueryResult, range: &BlockRange) -> QueryResult {
-    let Ok(success) = &response else {
-        return response;
-    };
-    let last_block = success.ok.last_block;
+/// Why a response falls outside the range this slot asked for, if it does.
+///
+/// The network rejects these at the source. This is the delivery boundary refusing to
+/// emit them (INV-21) whatever a [`StreamingNetwork`] hands it — unreachable in
+/// production, which is the point.
+fn wrong_range(response: &QueryResult, range: &BlockRange) -> Option<String> {
+    let last_block = response.as_ref().ok()?.ok.last_block;
     let bound = if last_block > *range.end() {
         format!("beyond the queried range end {}", range.end())
     } else if last_block < *range.start() {
         format!("below the first queried block {}", range.start())
     } else {
-        return response;
+        return None;
     };
-    Err(QueryError::Integrity(format!(
-        "worker returned last block {last_block} {bound}"
-    )))
+    Some(format!("worker returned last block {last_block} {bound}"))
 }
 
 fn retriable(result: &QueryResult) -> bool {
@@ -1129,7 +1136,9 @@ fn retriable(result: &QueryResult) -> bool {
 fn short_code(result: &RequestState) -> &'static str {
     match result {
         RequestState::Done(Ok(_)) => "ok",
-        RequestState::Done(Err(e)) => e.short_code(),
+        // NoData is the one variant with no code: a 204 is not a failure.
+        RequestState::Done(Err(RequestError::NoData)) => "no_data",
+        RequestState::Done(Err(e)) => e.code().map_or("-", ErrorCode::as_str),
         RequestState::Partial(_) => "partial",
         RequestState::Pending(_) | RequestState::Paused(_) | RequestState::NoWorkers => "-",
     }
@@ -1730,6 +1739,10 @@ mod tests {
         /// (first_block, last_block) of every response chunk, in emission order.
         emissions: Vec<(u64, u64)>,
         error: Option<String>,
+        /// What the client is actually told. The message is prose and carries a random
+        /// PeerId, so two runs differ whatever they were classified as — only the code
+        /// distinguishes an integrity exhaustion from a transient one.
+        code: Option<ErrorCode>,
     }
 
     struct ScenarioOutcome {
@@ -1747,6 +1760,7 @@ mod tests {
         let mut controller = StreamController::new(request, network, stream_index, 1).unwrap();
         let mut emissions = Vec::new();
         let mut error = None;
+        let mut code = None;
         while let Some(item) = controller.next().await {
             match item {
                 Ok(bytes) => {
@@ -1756,11 +1770,16 @@ mod tests {
                 }
                 Err(e) => {
                     error = Some(e.to_string());
+                    code = e.code();
                     break;
                 }
             }
         }
-        StreamOutcome { emissions, error }
+        StreamOutcome {
+            emissions,
+            error,
+            code,
+        }
     }
 
     fn run_scenario(scenario: &Scenario) -> ScenarioOutcome {
@@ -1929,20 +1948,22 @@ mod tests {
         let range = BlockRange::new(100, 150);
 
         for (last_block, case) in [(151, "overshoot"), (99, "undershoot")] {
-            let rejected = check_response_range(success(last_block), &range);
-            assert!(
-                matches!(rejected, Err(QueryError::Integrity(_))),
-                "{case} must become an integrity error"
-            );
+            let reason = wrong_range(&success(last_block), &range);
+            assert!(reason.is_some(), "{case} must be rejected");
+            let rejected: QueryResult = Err(QueryError::Integrity(reason.unwrap()));
             assert!(retriable(&rejected), "{case} must be rerouted");
         }
 
         for last_block in [100, 125, 150] {
             assert!(
-                check_response_range(success(last_block), &range).is_ok(),
+                wrong_range(&success(last_block), &range).is_none(),
                 "in-range response {last_block} must pass through"
             );
         }
+
+        // A failure the network already classified is not re-reported here.
+        let from_network: QueryResult = Err(QueryError::Integrity("bad signature".into()));
+        assert!(wrong_range(&from_network, &range).is_none());
     }
 
     /// Exhaustion class: transient failures report the data as temporarily
@@ -1978,6 +1999,12 @@ mod tests {
             2,
             "every discarded response must be counted against its worker"
         );
+        assert_eq!(
+            outcome.code,
+            Some(ErrorCode::WorkerFailure),
+            "an all-equivocating run is our bug to page on, not an outage to retry: {:?}",
+            outcome.error
+        );
 
         // One transient failure in the mix keeps the outcome transient.
         let mixed = scenario(vec![QueryEvent::Retriable, QueryEvent::Overshoot(5)]);
@@ -1986,10 +2013,81 @@ mod tests {
         let mixed_outcome =
             collect_stream(mixed.request(&mixed.streams[0], 0), network.clone(), 0).await;
         assert!(mixed_outcome.emissions.is_empty());
-        assert_ne!(
-            outcome.error, mixed_outcome.error,
-            "integrity exhaustion must not be reported as a transient outage"
+        assert_eq!(
+            mixed_outcome.code,
+            Some(ErrorCode::RetriesExhausted),
+            "one transient attempt means a later retry can still succeed: {:?}",
+            mixed_outcome.error
         );
+    }
+
+    /// The class is chosen here; every other taxonomy test starts from a `RequestError`
+    /// that already exists. Capacity refusals used to land in `retries_exhausted`, so a
+    /// rate-limited fleet answered a bare 503 — the 2026-07 storm's shape (ADR-012).
+    #[tokio::test]
+    async fn the_exhaustion_class_follows_what_every_attempt_agreed_on() {
+        let exhaust = |errors: Vec<QueryError>| {
+            let mut pending = PendingRequests::new(
+                errors
+                    .iter()
+                    .map(|_| WorkerLease::for_tests(PeerId::random())),
+                Duration::from_secs(1),
+            );
+            pending.requests = errors
+                .into_iter()
+                .map(|e| {
+                    WorkerRequest::Finished(FinishedWorkerRequest {
+                        result: Err(e),
+                        worker: PeerId::random(),
+                    })
+                })
+                .collect();
+            match StreamController::<ScriptedNetwork>::all_attempts_failed(&mut pending) {
+                RequestState::Done(Err(e)) => e,
+                _ => panic!("exhaustion must produce an error"),
+            }
+        };
+        let integrity = || QueryError::Integrity("equivocated".into());
+        let transient = || QueryError::Retriable("timed out".into());
+
+        let cases = [
+            (
+                vec![QueryError::RateLimitExceeded, QueryError::RateLimitExceeded],
+                ErrorCode::Overloaded,
+                "capacity refusals",
+            ),
+            (
+                vec![integrity(), integrity()],
+                ErrorCode::WorkerFailure,
+                "equivocation",
+            ),
+            (
+                vec![transient(), transient()],
+                ErrorCode::RetriesExhausted,
+                "transient failures",
+            ),
+            // No class is claimed unless every attempt agrees on it.
+            (
+                vec![QueryError::RateLimitExceeded, transient()],
+                ErrorCode::RetriesExhausted,
+                "a mix with a transient attempt",
+            ),
+            (
+                vec![QueryError::RateLimitExceeded, integrity()],
+                ErrorCode::RetriesExhausted,
+                "a mix of refusal and equivocation",
+            ),
+        ];
+
+        for (errors, want, case) in cases {
+            assert_eq!(exhaust(errors).code(), Some(want), "{case}");
+        }
+
+        // The hint INV-26 owes an overload has to survive to the wire.
+        use axum::response::IntoResponse;
+        let response = exhaust(vec![QueryError::RateLimitExceeded]).into_response();
+        assert_eq!(response.status().as_u16(), 529);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
     }
 
     /// The undershoot half of the wrong-range contract: a worker reporting a

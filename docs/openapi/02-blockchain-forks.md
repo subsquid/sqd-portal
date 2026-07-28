@@ -61,6 +61,11 @@ If the client tries to resume at `fromBlock = N+2` with `parentBlockHash = hash(
 
 ```json
 {
+  "error": {
+    "type": "invalid_request_error",
+    "code": "base_block_mismatch",
+    "message": "Base block mismatch"
+  },
   "previousBlocks": [
     {
       "number": 21780872,
@@ -74,8 +79,10 @@ If the client tries to resume at `fromBlock = N+2` with `parentBlockHash = hash(
 }
 ```
 
+- `error` is the standard error object every failing response carries. Match on `error.code`
+  (`base_block_mismatch` here) rather than on `error.message`, which is prose and may change.
 - `previousBlocks` is a single array of `{ number, hash }` pairs from the **current canonical chain** at and below the
-  conflict point.
+  conflict point. It stays at the **top level**, beside `error`, so the recovery walk below is unchanged.
 - The array length is arbitrary, but is **guaranteed to contain at least the parent of the requested `fromBlock`**.
 - Order: most recent first (canonical chain descending from the conflict point).
 

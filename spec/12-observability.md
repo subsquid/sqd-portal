@@ -15,7 +15,12 @@ idle-input (EMPTY polling) from a stalled service: a stream with no heartbeat
 progress past P-STALL-BUDGET ⚠ is the LIV-2 witness.
 
 **OB-3 — Operation metrics.** Responses counted by operation × ADR-011 error type/code
-(or success) × serving source, with latency histograms. The source label is `network`,
+(or success) × serving source, with latency histograms. The taxonomy rides as the
+`error_code`/`error_type` labels (prefixed: a bare `type` label says nothing on a
+metric), attached to **4xx/5xx only** — a 2xx carries neither, so the routine 204 that
+is the steady state of every polling client cannot inflate an availability alert
+(INV-30). A failure reaching the middleware unclassified is still counted, as
+`unclassified`. The source label is `network`,
 `real_time`, or `none` for pre-routing failures; it does not imply a response header.
 **Truncations count separately** from completions (SLI-6 is computed from this);
 refusals by code distinguish `overloaded` from `no_workers` — the 2026-07 storm was

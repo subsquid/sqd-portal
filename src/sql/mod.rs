@@ -1,7 +1,6 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use sql_query_plan::plan;
 
@@ -15,7 +14,7 @@ use query::{QueryErr, SqlQueryResponse, TableItem};
 
 use crate::datasets;
 use crate::network::NetworkClient;
-use crate::types::GenericError;
+use crate::types::{coded_response, ErrorCode};
 
 use axum::body;
 
@@ -33,13 +32,12 @@ impl IntoResponse for SqlErr {
     fn into_response(self) -> Response {
         match self {
             SqlErr::QueryErr(err) => err.into_response(),
-            SqlErr::Metadata(err) => (
-                StatusCode::BAD_REQUEST,
-                axum::Json(GenericError {
-                    message: err.to_string(),
-                }),
-            )
-                .into_response(),
+            // Only a missing schema is the caller's problem; a failed read or parse
+            // of our own schema files is ours.
+            SqlErr::Metadata(err @ SchemaErr::SchemaNotFound(_)) => {
+                coded_response(ErrorCode::MalformedRequest, err.to_string())
+            }
+            SqlErr::Metadata(err) => coded_response(ErrorCode::Internal, err.to_string()),
         }
     }
 }

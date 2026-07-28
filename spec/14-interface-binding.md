@@ -5,9 +5,13 @@ encodings — as *observable contract*, still no internals. **Anything not speci
 here is unspecified: clients and tests must not pin it** (IB-8).
 
 **IB-1 — Transport generalities.** HTTP/1.1+; permissive CORS (any origin/method/
-header). Request bodies may be gzip-compressed. Every response carries `x-request-id`
-(client's value echoed verbatim if supplied — any bytes tolerated, REQ-21 — else a
-generated UUID). Stream responses are chunked `application/jsonl`, compressed:
+header), exposing `Retry-After`, `x-request-id` and the `x-sqd-*` stream metadata —
+allowing an origin does not make a response header readable, and the CORS-safelisted set
+contains none of ours, so a browser client would otherwise see the status and nothing
+else. Request bodies may be gzip-compressed. Every response carries `x-request-id`
+(client's value echoed verbatim when it is ASCII; a non-ASCII value is rejected with
+400 `malformed_request` and a generated UUID; an absent value also gets a generated
+UUID). Stream responses are chunked `application/jsonl`, compressed:
 `Content-Encoding: gzip` by default, `zstd` when the client offers it via
 `Accept-Encoding` (or `X-Forwarded-Accept-Encoding`).
 
@@ -63,23 +67,29 @@ ADR-011. Completion vs truncation is not distinguished in-band (ADR-001, OQ-2).
 
 **IB-5 — Error mapping.** Each body-bearing error uses the ADR-011 envelope
 `{"error":{"type":…, "code":…, "message":…, "param"?:…, "request_id"?:…}}`.
-`message` is not stable; clients match `type` and `code`. The exact closed mapping is:
+`message` is not stable; clients match `type` and `code`. `request_id` appears on 5xx
+only; every response carries the same id as `x-request-id` (REQ-9, ADR-011). The exact
+closed mapping is:
 
 | Wire `type` / `code` | Status | Body / headers |
 |---|---|---|
 | `invalid_request_error` / `malformed_request` | 400 | envelope; `param` only for parameter validation |
+| `invalid_request_error` / `method_not_allowed` | 405 | envelope; `Allow` preserved. The one rejection status that is *not* normalized to 400: the request is well-formed, the verb is the fault, and `Allow` is the recovery a 400 has nowhere to carry |
 | `invalid_request_error` / `unknown_dataset` | 404 | envelope |
 | `invalid_request_error` / `not_found` | 404 | envelope |
-| `invalid_request_error` / `base_block_mismatch` | 409 | envelope plus top-level `previousBlocks` (≥ 1 entry, ascending, ending at the parent height; archival path currently lacks the richer-ancestor SHOULD — GAP-7) |
-| `availability_error` / `no_data` | 204 | no body; head-marker headers per IB-4; after ≥ P-NO-DATA-DELAY. Also the beyond-frontier outcome of OP-5 (ADR-014) |
-| `rate_limit_error` / `overloaded` | 529 for Portal-local refusal; a proxied 429/503/529 retains its public status | `Retry-After` always present and ≥ P-RETRY-AFTER-MIN (INV-26): Portal-set locally, preserved from the upstream when proxied, injected at P-RETRY-AFTER-MIN when the upstream omitted it (ADR-014); other public upstream headers preserved |
+| `invalid_request_error` / `base_block_mismatch` | 409 | envelope plus top-level `previousBlocks` (≥ 1 entry, ascending, ending at the parent height; archival path currently lacks the richer-ancestor SHOULD — GAP-7). A proxied list is typed and non-empty or it is not published at all (GAP-28) |
+| `rate_limit_error` / `overloaded` | 529 for Portal-local refusal; a proxied 429/529 retains its public status | `Retry-After` always present and ≥ P-RETRY-AFTER-MIN (INV-26): Portal-set locally, preserved from the upstream when proxied *and* readable as seconds at or above the floor, replaced at P-RETRY-AFTER-MIN otherwise — omitted, `0`, non-numeric, or the RFC's HTTP-date form, which this header is not documented to carry (ADR-014); other public upstream headers preserved |
 | `availability_error` / `no_workers` | 503 | envelope; no `Retry-After` |
 | `availability_error` / `retries_exhausted` | 503 | envelope |
-| `availability_error` / `upstream_unavailable` | 502 for a local upstream failure; proxied upstream failures retain their status | envelope; public upstream headers retained |
+| `availability_error` / `upstream_unavailable` | 502 for a local upstream failure; proxied upstream failures retain their status, **503 among them** — it is unavailability, not congestion (ADR-007, ADR-014) | envelope; public upstream headers retained, a `Retry-After` the upstream sent included; none is invented, since a hint on a dependency that is down rather than busy just aims the client back at it. A refusal the Portal already classified is carried whole, not re-labelled here: capacity and congestion are the Portal's own faults, not the upstream's |
 | `availability_error` / `not_ready` | 503 | envelope |
 | `api_error` / `worker_failure` | 500 | envelope |
 | `api_error` / `internal_error` | 500 | envelope |
 | `api_error` / `unclassified` | contextual 5xx | envelope; must be counted and investigated |
+
+EMPTY (204) is not in this table: it is a success, not a refusal, and carries no
+`type`/`code`. It is bound by IB-4 — no body, head-marker headers, emitted after
+≥ P-NO-DATA-DELAY, and the beyond-frontier outcome of OP-5 (ADR-014).
 
 Client recovery from 409 (normative): scan `previousBlocks` newest-first for the last
 block also on the client's chain; re-request from its number + 1 with its hash as

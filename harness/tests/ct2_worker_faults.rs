@@ -62,6 +62,21 @@ async fn await_pool_recovery(fx: &Fixture, label: &str) -> anyhow::Result<Decode
     anyhow::bail!("pool never recovered before {label} (last status {last:?}) — LIV-7")
 }
 
+/// The ADR-011 code, after validator 6 has passed on the envelope carrying it.
+fn error_code(context: &str, d: &Decoded) -> anyhow::Result<String> {
+    let verdict = harness::validators::validate_error(d);
+    ensure!(
+        verdict.errors.is_empty(),
+        "{context}: {:?}",
+        verdict.errors
+    );
+    let body: serde_json::Value = serde_json::from_slice(&d.body)?;
+    Ok(body["error"]["code"]
+        .as_str()
+        .context("validated envelope has a code")?
+        .to_owned())
+}
+
 /// The full range, in order, exactly once — INV-20/21 on the delivered body.
 fn assert_complete(context: &str, d: &Decoded) -> anyhow::Result<()> {
     ensure!(
@@ -129,6 +144,8 @@ async fn run(fx: &mut Fixture) -> anyhow::Result<()> {
             "not-found",
             WorkerFault::NotFound("still downloading".into()),
         ),
+        ("too-many-requests", WorkerFault::TooManyRequests),
+        ("server-overloaded", WorkerFault::ServerOverloaded),
         ("server-error", WorkerFault::ServerError("scripted".into())),
     ] {
         await_pool_recovery(fx, label).await?;
@@ -237,19 +254,56 @@ async fn run(fx: &mut Fixture) -> anyhow::Result<()> {
         "transient exhaustion must exhaust real attempts, only {} were answered",
         fx.queries_answered() - before
     );
-    // Codes themselves are not asserted: the ADR-011 taxonomy is not integrated
-    // yet (GAP-16), so only the split is contract today.
-    eprintln!(
-        "[ct2] exhaustion split — integrity {} / transient {}",
-        exhausted.status, transient.status
+    // The codes are the contract, not just the fact that the statuses differ: a
+    // client branches on them, and asserting only "some error" lets the classes
+    // collapse into one.
+    ensure!(
+        error_code("integrity exhaustion", &exhausted)? == "worker_failure",
+        "integrity exhaustion must page as WORKER-FAILURE, got {}",
+        error_code("integrity exhaustion", &exhausted)?
     );
     ensure!(
-        exhausted.status != transient.status,
-        "integrity exhaustion ({}) must not be reported as a transient outage ({}) — \
-         DC-1 splits these into WORKER-FAILURE and RETRIES-EXHAUSTED",
-        exhausted.status,
-        transient.status,
+        error_code("transient exhaustion", &transient)? == "retries_exhausted",
+        "transient exhaustion must be RETRIES-EXHAUSTED, got {}",
+        error_code("transient exhaustion", &transient)?
     );
+
+    // Every attempt refusing for capacity is congestion, not an outage: OVERLOADED
+    // with the hint INV-26 owes the client. As a transient exhaustion it answered a
+    // bare 503, which is the 2026-07 refusal storm's shape (ADR-007/012).
+    for (label, fault) in [
+        ("too-many-requests", WorkerFault::TooManyRequests),
+        ("server-overloaded", WorkerFault::ServerOverloaded),
+    ] {
+        await_pool_recovery(fx, label).await?;
+        fx.worker_faults.always(fault);
+        let before = fx.queries_answered();
+        let refused = driver::stream(
+            &http,
+            &base,
+            "toy",
+            "finalized-stream",
+            &query(FROM, TO),
+            &format!("ct2-{label}-exhausted"),
+        )
+        .await?;
+        ensure!(
+            fx.queries_answered() >= before + 2,
+            "{label}: exhaustion must consume real attempts, only {} answered",
+            fx.queries_answered() - before
+        );
+        ensure!(
+            error_code(label, &refused)? == "overloaded",
+            "{label}: capacity exhaustion must be OVERLOADED, got {} at {}",
+            error_code(label, &refused)?,
+            refused.status
+        );
+        ensure!(
+            refused.status == 529,
+            "{label}: OVERLOADED answers 529, got {}",
+            refused.status
+        );
+    }
 
     // Mixed exhaustion follows the transient class, not the integrity one: if
     // any attempt failed transiently a later retry can still succeed, so the
@@ -281,10 +335,9 @@ async fn run(fx: &mut Fixture) -> anyhow::Result<()> {
         fx.queries_answered() - before
     );
     ensure!(
-        mixed.status == transient.status,
-        "mixed exhaustion must take the transient class ({}), got {}",
-        transient.status,
-        mixed.status
+        error_code("mixed exhaustion", &mixed)? == "retries_exhausted",
+        "mixed exhaustion must take the transient class, got {}",
+        error_code("mixed exhaustion", &mixed)?
     );
 
     // Recovery: penalties are not latched. Once the faults stop, the pool

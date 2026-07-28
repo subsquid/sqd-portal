@@ -27,7 +27,8 @@ assumes, not knobs it owns.
 
 | Parameter | Role (where used) | Observed | Target |
 |---|---|---|---|
-| P-TRANSPORT-TIMEOUT | Worker query request deadline (REQ-41) | 60 s | 60 s |
+| P-TRANSPORT-TIMEOUT | Worker query request deadline (REQ-41); binds first-byte wait — an aggregate per-attempt bound is intent, not implemented (GAP-26) | 60 s | 60 s |
+| P-WORKER-CONNECT-TIMEOUT | Worker stream connect deadline — transport crate default, not operator-bound today (GAP-26) | 10 s | 10 s |
 | P-HOTBLOCKS-CONNECT-TIMEOUT | Real-time source connect deadline (REQ-22) | 1 s | 1 s |
 | P-HOTBLOCKS-READ-TIMEOUT | Real-time source per-read deadline; must stay < P-CLIENT-TIMEOUT (REQ-22, ADR-010). A replayed request spends it twice (ADR-015) | 20 s | 20 s |
 | P-CLIENT-TIMEOUT | *Environmental:* the request deadline callers default to (ADR-010) | 30 s | ≥ 30 s assumed |
@@ -88,7 +89,7 @@ assumes, not knobs it owns.
 |---|---|---|---|
 | P-SLO-STREAM-TTFB-P99 | ⚠ Stream time-to-first-byte p99 (SLI-1, S1) | unmeasured | ⚠ 5 s (draft) |
 | P-SLO-METADATA-TTFB-P99 | ⚠ Head/metadata time-to-first-byte p99 (SLI-1, S1) | unmeasured | ⚠ 1 s (draft) |
-| P-SLO-REFUSAL-CORRECTNESS | Refusals with correct ADR-011 code and required hint (SLI-3) | **violated** — bare 503s at 314 rps in the 2026-07 storm; ADR-011/012 integration pending on master (GAP-4/GAP-16) | 100% (INV-26) |
+| P-SLO-REFUSAL-CORRECTNESS | Refusals with correct ADR-011 code and required hint (SLI-3) | ADR-011 integrated and CT-5-gated: every refusal carries a code, and OVERLOADED carries a hint at or above the floor on both emitters. Capacity exhaustion at every layer — cap refusal, worker backoff, and an exhausted run of worker capacity verdicts — answers 529 with a hint | 100% (INV-26) |
 | P-SLO-AVAILABILITY | ⚠ Monthly readiness availability (SLI-4) | unmeasured | ⚠ 99.9% (draft) |
 | P-SLO-MEMORY-HEADROOM | ⚠ Peak RSS / P-MEMORY-BUDGET cap (SLI-5) | unmeasured | ⚠ 0.8 (draft) |
 | P-SLO-COMPLETION-INTEGRITY | ⚠ Complete stream fraction (SLI-6, S1) | unmeasured | ⚠ 0.99 (draft) |

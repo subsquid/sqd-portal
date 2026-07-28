@@ -30,12 +30,14 @@ alternatives exist.
 | parent-hash mismatch verdict | CONFLICT (real-time mode only — finalized-mode queries carry no parent hash, REQ-3) |
 | server error / not found | reroute; cooldown P-WORKER-ERROR-COOLDOWN; exhausted ⇒ RETRIES-EXHAUSTED |
 | timeout / transport failure | reroute; cooldown P-WORKER-TIMEOUT-COOLDOWN; congestion signal; exhausted ⇒ RETRIES-EXHAUSTED |
-| rate-limit / overload verdict | honor backoff (worker's hint, default P-WORKER-BACKOFF); all candidates backing off longer than P-MAX-IDLE-TIME ⇒ OVERLOADED |
+| rate-limit / overload verdict | honor backoff (worker's hint, default P-WORKER-BACKOFF); all candidates backing off longer than P-MAX-IDLE-TIME ⇒ OVERLOADED, as does an exhausted run in which *every* attempt returned one of these two verdicts — the refusal is congestion whether it arrives before the query or as its answer |
 | integrity failure (bad signature, wrong-range or undecodable result) | discard result, reroute (REQ-43); exhausted with *every* attempt an integrity failure ⇒ WORKER-FAILURE (pages — the network serves bad data or verification is broken); exhausted with any transient failure among the attempts ⇒ RETRIES-EXHAUSTED, since a later retry can still succeed and the class tells the client whether to come back. Equivocation stays operator-visible either way: it is counted per worker and alarmed regardless of the response class (OB-4/OB-9) |
 | no worker leasable for the chunk | DATA-UNAVAILABLE |
 
 *Degradation.* Per-worker penalties (ADR-004) — never a global circuit-break; the pool
 degrades worker-by-worker. Health state is in-memory (DEF-12) and resets on restart.
+Which penalty class a fault draws is meant to follow its cost; today it does not always,
+and the divergence can take the whole pool out at once (GAP-27).
 
 ## DC-2 — Assignment publisher
 
@@ -78,8 +80,8 @@ IB-4/IB-5).
 |---|---|
 | connect/transport failure before the response head | one replay (ADR-015); still failing ⇒ UPSTREAM-FAILURE (recorded) |
 | read stall past deadline | UPSTREAM-FAILURE, never replayed (recorded — a stalled upstream must never be invisible, REQ-22) |
-| upstream 429 / 503 / 529 | OVERLOADED / `overloaded`; preserve public retry/header semantics, injecting `Retry-After` = P-RETRY-AFTER-MIN when the upstream omitted it (INV-26, ADR-014) |
-| other upstream 5xx | UPSTREAM-FAILURE / `upstream_unavailable`; preserve public headers, never the upstream body |
+| upstream 429 / 529 | OVERLOADED / `overloaded`; preserve public retry/header semantics, injecting `Retry-After` = P-RETRY-AFTER-MIN when the upstream omitted it (INV-26, ADR-014) |
+| upstream 503 and other 5xx | UPSTREAM-FAILURE / `upstream_unavailable`; preserve public headers — including a `Retry-After` the upstream sent — but never invent one, and never the upstream body. 503 is unavailability, not congestion: the ADR-007 line, applied to the dependency (ADR-014) |
 | other upstream 4xx (unmatched) | BAD-REQUEST / `malformed_request` (ADR-011 unmatched-4xx rule); status normalized to 400, upstream body never leaked |
 | upstream conflict | CONFLICT / `base_block_mismatch`; preserve `previousBlocks`, add Portal envelope |
 | requested range below upstream retention (gap) | EMPTY after P-NO-DATA-DELAY |
