@@ -104,9 +104,8 @@ additional public values.
 
 | Spec outcome | Wire `type` / `code` | Meaning |
 |---|---|---|
-| BAD-REQUEST | `invalid_request_error` / `malformed_request` | DEF-7 violation or bad parameter |
+| BAD-REQUEST | `invalid_request_error` / `malformed_request` or `method_not_allowed` | DEF-7 violation, bad parameter, or a verb the surface does not serve |
 | NOT-FOUND | `invalid_request_error` / `unknown_dataset` or `not_found` | Alias/surface absent, or lookup has no result |
-| EMPTY | `availability_error` / `no_data` | Successful bodyless poll result (INV-27) |
 | CONFLICT | `invalid_request_error` / `base_block_mismatch` | Parent-hash mismatch (DEF-9) |
 | OVERLOADED | `rate_limit_error` / `overloaded` | Capacity refusal with retry hint |
 | DATA-UNAVAILABLE | `availability_error` / `no_workers` | No worker holds the data |
@@ -115,6 +114,11 @@ additional public values.
 | NOT-READY | `availability_error` / `not_ready` | Readiness probe declines traffic |
 | WORKER-FAILURE | `api_error` / `worker_failure` | Worker results violated an owned integrity invariant and rerouting was exhausted (DC-1) |
 | INTERNAL | `api_error` / `internal_error` or `unclassified` | Portal invariant failed or a failure escaped classification |
+
+EMPTY is deliberately absent: a bodyless poll result is the correct answer to a range
+that is not produced yet (INV-27), not a failure, so it carries no `type` and no `code`.
+It is bound by IB-4 and observed as `status="204"`, which is exactly what a code on it
+would have restated.
 
 Exact statuses and envelope exceptions are fixed by IB-5. No dependency-specific body
 or code extends this set.

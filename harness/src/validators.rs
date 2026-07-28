@@ -1,10 +1,10 @@
 //! The structural validators of spec/13. Validators 1–5 run on every stream
-//! response via `validate_stream`; validator 6 (`validate_error`) covers error
-//! envelopes and is not yet exercised by the Phase-0 smoke (no error-path request).
+//! response via `validate_stream`; validator 6 (`validate_error`) runs on every
+//! error response and is exercised by CT-2's fault cases.
 //! `errors` are hard conformance failures; `warnings` cover surfaces the gap
-//! register already knows are not integrated on current master (GAP-16 error
-//! envelope, ADR-014's 204 metadata) — reported, not fatal, so the Phase-0
-//! smoke stays green while the gaps stay visible.
+//! register already knows are not integrated on current master (ADR-014's 204
+//! metadata) — reported, not fatal, so the suites stay green while the gaps stay
+//! visible.
 
 use crate::driver::Decoded;
 use crate::model::{Expect, StreamReq};
@@ -25,28 +25,31 @@ impl Verdict {
     }
 }
 
-const KNOWN_CODES: &[&str] = &[
-    "malformed_request",
-    "unknown_dataset",
-    "not_found",
-    "base_block_mismatch",
-    "no_data",
-    "overloaded",
-    "no_workers",
-    "retries_exhausted",
-    "upstream_unavailable",
-    "not_ready",
-    "worker_failure",
-    "internal_error",
-    "unclassified",
+/// DEF-10's closed vocabulary bound to IB-5: `(code, type, permitted statuses)`.
+/// An empty status list means the binding leaves it contextual, and only 5xx is legal.
+///
+/// Transcribed from the spec rather than imported from the portal: a validator sharing
+/// the implementation's table would agree with it by construction, including where both
+/// are wrong. `no_data` is absent because a 204 is a success and carries no code.
+const TAXONOMY: &[(&str, &str, &[u16])] = &[
+    ("malformed_request", "invalid_request_error", &[400]),
+    ("method_not_allowed", "invalid_request_error", &[405]),
+    ("unknown_dataset", "invalid_request_error", &[404]),
+    ("not_found", "invalid_request_error", &[404]),
+    ("base_block_mismatch", "invalid_request_error", &[409]),
+    // 529 for a Portal-local refusal; a proxied one keeps the upstream's status.
+    ("overloaded", "rate_limit_error", &[429, 529]),
+    ("no_workers", "availability_error", &[503]),
+    ("retries_exhausted", "availability_error", &[503]),
+    // 502 locally; a proxied upstream failure retains its own 5xx.
+    ("upstream_unavailable", "availability_error", &[]),
+    ("not_ready", "availability_error", &[503]),
+    ("worker_failure", "api_error", &[500]),
+    ("internal_error", "api_error", &[500]),
+    ("unclassified", "api_error", &[]),
 ];
 
-pub fn validate_stream(
-    world: &ToyWorld,
-    req: &StreamReq,
-    expect: &Expect,
-    d: &Decoded,
-) -> Verdict {
+pub fn validate_stream(world: &ToyWorld, req: &StreamReq, expect: &Expect, d: &Decoded) -> Verdict {
     let mut v = Verdict::default();
 
     // 1 — body decodes under its declared encoding, line by line (INV-25).
@@ -55,7 +58,12 @@ pub fn validate_stream(
     }
 
     match expect {
-        Expect::Stream { records, head, finalized_head, source } => {
+        Expect::Stream {
+            records,
+            head,
+            finalized_head,
+            source,
+        } => {
             if d.status != 200 {
                 v.err(format!("expected 200, got {}", d.status));
                 return v;
@@ -68,7 +76,10 @@ pub fn validate_stream(
             }
             for w in numbers.windows(2) {
                 if w[1] <= w[0] {
-                    v.err(format!("validator2: not strictly ascending: {} then {}", w[0], w[1]));
+                    v.err(format!(
+                        "validator2: not strictly ascending: {} then {}",
+                        w[0], w[1]
+                    ));
                 }
             }
 
@@ -76,7 +87,10 @@ pub fn validate_stream(
             let expected_last = records.last().and_then(|r| r["header"]["number"].as_u64());
             for n in &numbers {
                 if *n < req.from {
-                    v.err(format!("validator3: record {n} below fromBlock {}", req.from));
+                    v.err(format!(
+                        "validator3: record {n} below fromBlock {}",
+                        req.from
+                    ));
                 }
                 if let Some(last) = expected_last {
                     if *n > last {
@@ -130,7 +144,10 @@ pub fn validate_stream(
 
             let _ = world;
         }
-        Expect::Empty { head, finalized_head } => {
+        Expect::Empty {
+            head,
+            finalized_head,
+        } => {
             if d.status != 204 {
                 v.err(format!("expected 204 EMPTY, got {}", d.status));
                 return v;
@@ -166,7 +183,10 @@ fn check_head_headers(
         Some(Err(_)) => push("head number unparsable".to_string()),
         None => push("missing x-sqd-head-number".to_string()),
     }
-    match d.header("x-sqd-finalized-head-number").map(|s| s.parse::<u64>()) {
+    match d
+        .header("x-sqd-finalized-head-number")
+        .map(|s| s.parse::<u64>())
+    {
         Some(Ok(f)) if f == finalized_head.0 => {}
         Some(Ok(f)) => push(format!("finalized head {f}, expected {}", finalized_head.0)),
         Some(Err(_)) => push("finalized head unparsable".to_string()),
@@ -180,7 +200,8 @@ fn check_head_headers(
     // Coherence is a hard rule regardless of provenance (validator 5).
     if let (Some(Ok(h)), Some(Ok(f))) = (
         d.header("x-sqd-head-number").map(|s| s.parse::<u64>()),
-        d.header("x-sqd-finalized-head-number").map(|s| s.parse::<u64>()),
+        d.header("x-sqd-finalized-head-number")
+            .map(|s| s.parse::<u64>()),
     ) {
         if f > h {
             v.err(format!("validator5: finalized {f} > head {h}"));
@@ -188,30 +209,169 @@ fn check_head_headers(
     }
 }
 
-/// Validator 6 on error responses: ADR-011 envelope, closed vocabulary.
-/// GAP-16: current master does not emit the envelope — warnings for now.
+/// Validator 6 on error responses: the ADR-011 envelope against the whole of DEF-10 and
+/// IB-5 — code in the vocabulary, the type *bound to that code*, a status the binding
+/// permits, and the hint rule. Checking the code alone left `type` free-form, so a
+/// response could name a type outside the axis, or pair a code with the wrong one, and
+/// still pass (INV-26).
 pub fn validate_error(d: &Decoded) -> Verdict {
     let mut v = Verdict::default();
     if d.status < 400 {
         v.err(format!("expected an error status, got {}", d.status));
         return v;
     }
-    match serde_json::from_slice::<serde_json::Value>(&d.body) {
-        Ok(body) => {
-            let t = body["error"]["type"].as_str();
-            let c = body["error"]["code"].as_str();
-            match (t, c) {
-                (Some(_), Some(code)) if KNOWN_CODES.contains(&code) => {}
-                _ => v.warn(format!(
-                    "GAP-16: error body is not the ADR-011 envelope: {}",
-                    String::from_utf8_lossy(&d.body)
-                )),
-            }
-        }
-        Err(_) => v.warn(format!(
-            "GAP-16: error body is not JSON: {}",
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&d.body) else {
+        v.err(format!(
+            "validator6: error body is not JSON: {}",
             String::from_utf8_lossy(&d.body)
+        ));
+        return v;
+    };
+
+    let Some(code) = body["error"]["code"].as_str() else {
+        v.err(format!(
+            "validator6: error body is not the ADR-011 envelope: {}",
+            String::from_utf8_lossy(&d.body)
+        ));
+        return v;
+    };
+    let Some(&(_, want_type, statuses)) = TAXONOMY.iter().find(|(c, _, _)| *c == code) else {
+        v.err(format!(
+            "validator6: {code} is outside the DEF-10 vocabulary"
+        ));
+        return v;
+    };
+
+    match body["error"]["type"].as_str() {
+        Some(t) if t == want_type => {}
+        other => v.err(format!(
+            "validator6: {code} is bound to {want_type}, got {other:?}"
         )),
     }
+    if !statuses.is_empty() && !statuses.contains(&d.status) {
+        v.err(format!(
+            "validator6: IB-5 binds {code} to {statuses:?}, got {}",
+            d.status
+        ));
+    } else if statuses.is_empty() && d.status < 500 {
+        v.err(format!(
+            "validator6: {code} is a contextual 5xx, got {}",
+            d.status
+        ));
+    }
+    if !body["error"]["message"]
+        .as_str()
+        .is_some_and(|m| !m.is_empty())
+    {
+        v.err(format!("validator6: {code} does not explain itself"));
+    }
+
+    // INV-26: OVERLOADED always says how long to wait, DATA-UNAVAILABLE never does.
+    let hint = d.header("retry-after");
+    match code {
+        "overloaded" => match hint.map(|h| h.trim().parse::<u64>()) {
+            Some(Ok(seconds)) if seconds >= 1 => {}
+            other => v.err(format!(
+                "validator6: overloaded needs a usable hint, got {other:?}"
+            )),
+        },
+        "no_workers" if hint.is_some() => {
+            v.err(format!(
+                "validator6: no_workers must carry no hint, got {hint:?}"
+            ));
+        }
+        _ => {}
+    }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn response(status: u16, body: &str, hint: Option<&str>) -> Decoded {
+        let mut headers = HashMap::new();
+        if let Some(hint) = hint {
+            headers.insert("retry-after".to_owned(), hint.to_owned());
+        }
+        Decoded {
+            status,
+            headers,
+            body: body.as_bytes().to_vec(),
+            lines: Vec::new(),
+            decode_errors: Vec::new(),
+        }
+    }
+
+    fn envelope(t: &str, code: &str) -> String {
+        format!(r#"{{"error":{{"type":"{t}","code":"{code}","message":"m"}}}}"#)
+    }
+
+    /// The validator is the gate the CI job rests on, so its own holes are invisible:
+    /// accepting the code alone let a type outside the axis — or bound to a different
+    /// code — pass, and the suite would have stayed green through it.
+    #[test]
+    fn a_type_outside_its_code_is_rejected() {
+        let banana = response(529, &envelope("banana", "overloaded"), Some("1"));
+        assert!(!validate_error(&banana).errors.is_empty());
+
+        let crossed = response(500, &envelope("availability_error", "internal_error"), None);
+        assert!(!validate_error(&crossed).errors.is_empty());
+
+        let ok = response(500, &envelope("api_error", "internal_error"), None);
+        assert!(
+            validate_error(&ok).errors.is_empty(),
+            "{:?}",
+            validate_error(&ok).errors
+        );
+    }
+
+    /// IB-5 fixes the status per code, so a right code on a wrong status is still a
+    /// contract break — and `unclassified` may be any 5xx but never a 4xx.
+    #[test]
+    fn a_status_outside_its_binding_is_rejected() {
+        let wrong = response(
+            500,
+            &envelope("invalid_request_error", "malformed_request"),
+            None,
+        );
+        assert!(!validate_error(&wrong).errors.is_empty());
+
+        let proxied = response(429, &envelope("rate_limit_error", "overloaded"), Some("30"));
+        assert!(validate_error(&proxied).errors.is_empty());
+
+        let contextual = response(503, &envelope("api_error", "unclassified"), None);
+        assert!(validate_error(&contextual).errors.is_empty());
+        let as_4xx = response(400, &envelope("api_error", "unclassified"), None);
+        assert!(!validate_error(&as_4xx).errors.is_empty());
+    }
+
+    /// INV-26 is an iff: the overload owes a usable hint, DATA-UNAVAILABLE owes none.
+    #[test]
+    fn the_hint_rule_runs_both_ways() {
+        for hint in [None, Some("0"), Some("Wed, 21 Oct 2015 07:28:00 GMT")] {
+            let d = response(529, &envelope("rate_limit_error", "overloaded"), hint);
+            assert!(!validate_error(&d).errors.is_empty(), "{hint:?}");
+        }
+        let with_hint = response(
+            503,
+            &envelope("availability_error", "no_workers"),
+            Some("5"),
+        );
+        assert!(!validate_error(&with_hint).errors.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_code_and_a_silent_message_are_rejected() {
+        let unknown = response(500, &envelope("api_error", "kaboom"), None);
+        assert!(!validate_error(&unknown).errors.is_empty());
+
+        let silent = response(
+            500,
+            r#"{"error":{"type":"api_error","code":"internal_error","message":""}}"#,
+            None,
+        );
+        assert!(!validate_error(&silent).errors.is_empty());
+    }
 }

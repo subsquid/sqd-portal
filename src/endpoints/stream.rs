@@ -16,8 +16,8 @@ use crate::{
     hotblocks::{traceless_key, HeadMode, HotblocksHandle},
     http_server::{forward_hotblocks_response, forward_response},
     network::NetworkClient,
-    openapi::{ConflictResponse, StreamRequestBody},
-    types::{Compression, DatasetId, RequestError, StreamRequest},
+    openapi::{BaseBlockConflictResponse, StreamRequestBody},
+    types::{Compression, DatasetId, ErrorResponse, RequestError, StreamRequest},
     utils::conversion::{join_gzip_default, recompress_gzip},
 };
 
@@ -39,14 +39,20 @@ use crate::{
                 ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
             )),
         (status = 204, description = "No new blocks available in the requested range"),
-        (status = 400, description = "Invalid request parameters or query"),
-        (status = 404, description = "Dataset not found"),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later",
+        (status = 400, description = "Invalid request parameters or query", body = ErrorResponse),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
+        (status = 409, description = "\
+Parent block hash mismatch — `query.parentBlockHash` does not match the canonical parent of \
+the first requested block. This data does not reorganize, so the client's hash is stale or was \
+carried over from an unfinalized block. The body (see schema below) lists recent canonical-chain \
+blocks so the client can find a shared ancestor and resume. See \
+[How parentBlockHash works](#description/how-parentblockhash-works) for the recovery procedure.", body = BaseBlockConflictResponse),
+        (status = 529, description = "Overloaded - not enough compute units, or the service is at capacity; retry after the interval in `Retry-After`", body = ErrorResponse,
             headers(
                 ("Retry-After" = String, description = "Delay in seconds before retrying (at least 1)"),
             )),
-        (status = 500, description = "Internal server error"),
-        (status = 503, description = "Service temporarily unavailable"),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 503, description = "Service temporarily unavailable", body = ErrorResponse),
     ),
     tag = "Streaming",
     extensions(("x-internal" = json!(true))),
@@ -80,14 +86,20 @@ pub(crate) async fn run_archival_stream_restricted(
                 ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
             )),
         (status = 204, description = "No new blocks available in the requested range"),
-        (status = 400, description = "Invalid request parameters or query"),
-        (status = 404, description = "Dataset not found"),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later",
+        (status = 400, description = "Invalid request parameters or query", body = ErrorResponse),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
+        (status = 409, description = "\
+Parent block hash mismatch — `query.parentBlockHash` does not match the canonical parent of \
+the first requested block. This data does not reorganize, so the client's hash is stale or was \
+carried over from an unfinalized block. The body (see schema below) lists recent canonical-chain \
+blocks so the client can find a shared ancestor and resume. See \
+[How parentBlockHash works](#description/how-parentblockhash-works) for the recovery procedure.", body = BaseBlockConflictResponse),
+        (status = 529, description = "Overloaded - not enough compute units, or the service is at capacity; retry after the interval in `Retry-After`", body = ErrorResponse,
             headers(
                 ("Retry-After" = String, description = "Delay in seconds before retrying (at least 1)"),
             )),
-        (status = 500, description = "Internal server error"),
-        (status = 503, description = "Service temporarily unavailable"),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 503, description = "Service temporarily unavailable", body = ErrorResponse),
     ),
     tag = "Streaming",
     extensions(("x-internal" = json!(true))),
@@ -147,20 +159,25 @@ pub(crate) async fn run_archival_stream(
                 ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
             )),
         (status = 204, description = "No new blocks available in the requested range"),
-        (status = 400, description = "Invalid request parameters or query"),
-        (status = 404, description = "Dataset not found"),
+        (status = 400, description = "Invalid request parameters or query", body = ErrorResponse),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
         (status = 409, description = "\
 Parent block hash mismatch — the `parentHash` of the first requested block does not match \
 `query.parentBlockHash`, typically a chain reorganization relative to the client's state. \
 The body (see schema below) lists recent canonical-chain blocks so the client can find a \
 shared ancestor and resume. See [How parentBlockHash works](#description/how-parentblockhash-works) \
-for the recovery procedure and a worked example.", body = ConflictResponse),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later",
+for the recovery procedure and a worked example.", body = BaseBlockConflictResponse),
+        (status = 429, description = "Too many requests - retry after the interval in `Retry-After`", body = ErrorResponse,
             headers(
                 ("Retry-After" = String, description = "Delay in seconds before retrying (at least 1)"),
             )),
-        (status = 500, description = "Internal server error"),
-        (status = 503, description = "Service temporarily unavailable"),
+        (status = 529, description = "Overloaded - not enough compute units, or the service is at capacity; retry after the interval in `Retry-After`", body = ErrorResponse,
+            headers(
+                ("Retry-After" = String, description = "Delay in seconds before retrying (at least 1)"),
+            )),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 502, description = "The requested data could not be retrieved right now - retry later", body = ErrorResponse),
+        (status = 503, description = "Service temporarily unavailable - retry later. May carry `Retry-After`; honour it when present", body = ErrorResponse),
     ),
     tag = "Streaming"
 )]
@@ -186,8 +203,9 @@ pub(crate) async fn run_stream(
 
 /// Finalized stream
 ///
-/// Returns only finalized blocks matching the query. Same request format as /stream;
-/// no chain reorganizations (no 409 responses).
+/// Returns only finalized blocks matching the query. Same request format as /stream.
+/// Finalized data does not reorganize, but a stale `query.parentBlockHash` still
+/// conflicts, so 409 remains reachable.
 #[utoipa::path(
     post,
     path = "/datasets/{dataset}/finalized-stream",
@@ -203,14 +221,25 @@ pub(crate) async fn run_stream(
                 ("X-Sqd-Head-Number" = Option<u64>, description = "Last available block number"),
             )),
         (status = 204, description = "No new blocks available in the requested range"),
-        (status = 400, description = "Invalid request parameters or query"),
-        (status = 404, description = "Dataset not found"),
-        (status = 529, description = "Overloaded - not enough compute units or all workers busy, retry later",
+        (status = 400, description = "Invalid request parameters or query", body = ErrorResponse),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
+        (status = 409, description = "\
+Parent block hash mismatch — `query.parentBlockHash` does not match the canonical parent of \
+the first requested block. This data does not reorganize, so the client's hash is stale or was \
+carried over from an unfinalized block. The body (see schema below) lists recent canonical-chain \
+blocks so the client can find a shared ancestor and resume. See \
+[How parentBlockHash works](#description/how-parentblockhash-works) for the recovery procedure.", body = BaseBlockConflictResponse),
+        (status = 429, description = "Too many requests - retry after the interval in `Retry-After`", body = ErrorResponse,
             headers(
                 ("Retry-After" = String, description = "Delay in seconds before retrying (at least 1)"),
             )),
-        (status = 500, description = "Internal server error"),
-        (status = 503, description = "Service temporarily unavailable"),
+        (status = 529, description = "Overloaded - not enough compute units, or the service is at capacity; retry after the interval in `Retry-After`", body = ErrorResponse,
+            headers(
+                ("Retry-After" = String, description = "Delay in seconds before retrying (at least 1)"),
+            )),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 502, description = "The requested data could not be retrieved right now - retry later", body = ErrorResponse),
+        (status = 503, description = "Service temporarily unavailable - retry later. May carry `Retry-After`; honour it when present", body = ErrorResponse),
     ),
     tag = "Streaming"
 )]
@@ -369,9 +398,9 @@ async fn stream_from_hotblocks(
                 return delayed_no_content_response(DATA_SOURCE_REALTIME).await;
             }
 
-            forward_response(&dataset.default_name, response)
+            forward_response(&dataset.default_name, response).await
         }
-        Err(e) => forward_hotblocks_response(&dataset.default_name, Err(e)),
+        Err(e) => forward_hotblocks_response(&dataset.default_name, Err(e)).await,
     };
 
     res.headers_mut()
@@ -474,9 +503,9 @@ async fn delayed_no_content_response_with_builder(
         .unwrap()
 }
 
-const FINALIZED_NUMBER_HEADER: &str = "x-sqd-finalized-head-number";
-const FINALIZED_HASH_HEADER: &str = "x-sqd-finalized-head-hash";
-const HEAD_NUMBER_HEADER: &str = "x-sqd-head-number";
+pub(crate) const FINALIZED_NUMBER_HEADER: &str = "x-sqd-finalized-head-number";
+pub(crate) const FINALIZED_HASH_HEADER: &str = "x-sqd-finalized-head-hash";
+pub(crate) const HEAD_NUMBER_HEADER: &str = "x-sqd-head-number";
 pub(crate) const DATA_SOURCE_HEADER: &str = "x-sqd-data-source";
 pub(crate) const DATA_SOURCE_NETWORK_METRIC: &str = "network";
 pub(crate) const DATA_SOURCE_REALTIME_METRIC: &str = "real_time";

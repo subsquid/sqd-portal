@@ -112,12 +112,13 @@ at P-BUFFER-MAX; absent parameters default to P-BUFFER-DEFAULT. (Two advertised
 parameters are currently accepted and ignored: GAP-8, OQ-1.)
 
 **REQ-9 — Request correlation.** [MUST]
-Every response carries a request identifier: the client's, if supplied, else a generated
-one. The identifier is echoed in the response, attached to logs, and propagated to
-upstream calls, so one identifier traces a request end to end. Any byte sequence a
-client supplies as an identifier is safe (REQ-21).
-*Acceptance:* a supplied `x-request-id` is echoed verbatim and appears in Portal logs
-for that request; absent one, a unique identifier is generated and echoed.
+Every response carries a request identifier: the client's, if supplied as ASCII text,
+else a generated one. A valid client identifier is echoed in the response, attached to
+logs, and propagated to upstream calls, so one identifier traces a request end to end.
+A non-ASCII `x-request-id` is malformed input and is rejected safely (REQ-21).
+*Acceptance:* a supplied ASCII `x-request-id` is echoed verbatim and appears in Portal
+logs for that request; a non-ASCII value receives a 400 `malformed_request` response
+with a generated identifier; absent one, a unique identifier is generated and echoed.
 
 ## Discovery & metadata (10–16)
 
@@ -314,7 +315,8 @@ artifact on any fetch or validation failure. First applied assignment gates read
 (REQ-23).
 *Acceptance:* a new artifact with a future effective time is not visible in routing
 until that time; killing the publisher leaves serving unaffected for the duration of
-the outage (staleness intent: ADR-013).
+the outage (staleness intent: ADR-013). Cutting over together assumes the workers wait
+too, which they do not today (OQ-11).
 
 **REQ-41 — Worker selection and penalties.** [MUST]
 Chunk queries go to the most promising worker holding the chunk: healthy and fast
@@ -379,6 +381,7 @@ Deliberately left open — tests and clients must not pin these:
 | OQ-7 | A stream body without a first block silently defaults to block 0, while the API description marks it required — reject instead? | REQ-7 | portal team |
 | OQ-9 | Ratify a global P-BUFFERED-BYTES-BUDGET and its accounting/admission semantics. | REQ-27, GAP-17 | portal team |
 | OQ-10 | Ratify the draft SLO target parameters and their benchmark gating policy. | 11 SLO table | portal team |
+| OQ-11 | REQ-40's fleet-cutover premise assumes workers also honor `effective_from`; workers currently apply assignments immediately (recorded in the worker suite's open questions, `worker-rs/spec/02`), so each publication opens a window of routing to reshuffling workers (transient `no_workers`/`retries_exhausted` churn). Size the window for worker convergence, or have workers delay too? | REQ-40, REQ-41 | network team |
 
 Closed: **OQ-6** (should the clamp-bypassing debug stream variant be exposed unconditionally,
 or gated behind an operator flag?) — resolved by ADR-014: the variant is gated behind an

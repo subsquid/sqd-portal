@@ -1,19 +1,26 @@
 # 13 — Conformance & TDD plan
 
-**Mutable doc.** Statuses as of **2026-07-25** (0.11.9,
+**Mutable doc.** Statuses as of **2026-07-27** (0.11.9,
 `master@15fcaeeea803b39e4985a7c91dada20203f411ef`). Statuses: **C** covered · **P** partial · **U**
 unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
 The **Phase-0 harness exists** (`harness/` crate: IB-7 stubs with ledgers — including
 a real p2p worker stub on the pinned transport rev — toy world, reference model, the six
 validators, client driver, quiescence-gated gauge audit; CT-1 smoke green — GAP-14
 closed 2026-07-17). CT-1 exercises only success paths, so validators 1–5 run on every
-response and the 6th (error-envelope) is defined but not yet exercised.
+response there; the 6th (error-envelope) is exercised by CT-2, the sole path by which it
+reads an error code.
 **CT-2 has started**: the worker stub is now a DC-1 fault injector (wrong-range both
 directions, bad signature, server-error and not-found verdicts) shared across workers so
 a fault lands wherever the portal routes, and `Fixture` boots the whole stub world for
-any class that needs it. `ct2_worker_faults` covers the worker-fault reroute rows and the
+any class that needs it. Caveat: production workers pin a newer transport rev whose
+server was rewritten (stream-based accept with silent drop at buffer capacity); the stub
+speaks the portal's older pinned rev, so the production server's drop paths are not
+exercised — re-verify on the next dependency bump. `ct2_worker_faults` covers the worker-fault reroute rows and the
 exhaustion split; the rest of CT-2 and CT-3..CT-9 remain to be built per the build order.
 Coverage outside those two classes is still inline unit tests.
+Both suites run on every pull request: the harness is a separate crate, so it needs a
+build of the portal and a job of its own — a status this document cites has to be one
+something re-checks.
 
 ## Harness architecture
 
@@ -120,10 +127,11 @@ chunk-boundary records FV-6 licenses.
    ∈ {network, real_time}; the coverage cursor — the last delivered record — agrees with
    the ledger (INV-24, INV-13, DEF-8, INV-29). 204 EMPTY carries head markers, and a source marker iff a source was
    selected (retention-gap case). Pre-routing failures have no source marker.
-6. Errors: type/code ∈ DEF-10; hint iff OVERLOADED — present on proxied overloads too,
-   preserved or injected at the floor (ADR-014); no data alongside errors (INV-26).
+6. Errors: type/code ∈ DEF-10; a hint on every OVERLOADED — on proxied ones too,
+   preserved or injected at the floor — never on DATA-UNAVAILABLE, and on no other class
+   unless the upstream sent one (ADR-014); no data alongside errors (INV-26).
 
-## Traceability matrix — properties (2026-07-25)
+## Traceability matrix — properties (2026-07-27)
 
 | Property | CT | Status | Note |
 |---|---|---|---|
@@ -138,13 +146,13 @@ chunk-boundary records FV-6 licenses.
 | INV-20 | CT-1 | P | exactly-once regression + ordering units; CT-1 smoke oracle-diffs toy-world streams; controller property test asserts gapless/monotonic/no-duplicate emission under randomized scheduling adversity |
 | INV-21 | CT-1/2 | P | bounds validator green on smoke responses; wrong-range worker responses are now rejected at the source seam and CT-2 proves they are never delivered; randomized worlds are controller-level only |
 | INV-22 | CT-1/2 | P | smoke diffs delivered records against the stub ledger (signed responses); CT-2 now drives the rejection path — wrong-range (both directions) and bad-signature responses are discarded, rerouted, and byte-identical output is delivered from another worker |
-| INV-23 | CT-2 | P | verdict parsing tested; flow untested; minimum 409 payload meets the invariant; richer ancestors remain a REQ-3 SHOULD shortfall (GAP-7); EMPTY-precedence at the head unverified (GAP-19) |
+| INV-23 | CT-2 | P | verdict parsing tested; flow untested; minimum 409 payload meets the invariant; richer ancestors remain a REQ-3 SHOULD shortfall (GAP-7); EMPTY-precedence at the head unverified (GAP-19); verdict detection is exact-string parsing of worker messages (GAP-25) |
 | INV-24 | CT-5 | P | smoke asserts head markers against stub/artifact heads on success paths |
 | INV-25 | CT-2 | U | truncation never exercised |
-| INV-26 | CT-5 | P | **Known-violated** — current master still emits legacy/mixed and proxied error bodies (GAP-16); ADR-011 target is not yet integrated |
+| INV-26 | CT-5 | C | CT-5 asserts the envelope, status, type/code and hint presence across the local and proxied emitters, including the 409 sibling, the OVERLOADED hint floor, replacement of an unusable upstream hint (0, non-numeric, HTTP-date), the classes that get no invented hint (upstream 503/500), a wrong verb keeping 405 with its `Allow`, and normalization of the router's other rejections |
 | INV-27 | CT-1 | P | gap detection tested; proxied 204 smoke-tested; delay untested |
 | INV-28 | CT-3 | U | — |
-| INV-29 | CT-1 | P | boundary emission asserted by the CT-1 selective-tail resume on both sources; the network multi-chunk case exercises the per-chunk granularity FV-6 licenses. Interior boundary records are not audited, and the EMPTY case (no block evaluated) is untested |
+| INV-29 | CT-1 | P | boundary emission asserted by the CT-1 selective-tail resume on both sources; the network multi-chunk case exercises the per-chunk granularity FV-6 licenses. Interior boundary records are not audited, and the EMPTY case (no block evaluated) is untested. Boundary pinning is a worker-engine behavior — re-prove before adopting new engine/format fields on a dependency bump |
 | INV-30 | CT-3/7 | U | gauge accounting was a past defect class |
 | INV-31 | CT-2 | P | shutdown flip e2e-tested; other conjuncts not; *known-violated* on staleness intent (GAP-2) |
 | INV-35 | CT-8 | U | — |
@@ -164,7 +172,7 @@ chunk-boundary records FV-6 licenses.
 | FM-3 | CT-2/3 | U | per-dependency confinement never exercised: no outage tests (REQ-25), no isolation swarm (INV-35) |
 | SLI-1..SLI-6 | CT-6 | U | no benchmarks; baselines from incidents only |
 
-## Acceptance matrix — requirements (2026-07-25)
+## Acceptance matrix — requirements (2026-07-27)
 
 | REQ | Status | Note |
 |---|---|---|
@@ -176,10 +184,10 @@ chunk-boundary records FV-6 licenses.
 | REQ-6 | U | Truncation never exercised (INV-25) |
 | REQ-7 | U | No tests over the rejection table (INV-10) |
 | REQ-8 | U | Clamping untested; params ignored (GAP-8, INV-11) |
-| REQ-9 | P | Non-ASCII id regression; response echo e2e-tested by the smoke — which found the propagate layer attached to the empty router (dead); fixed 2026-07-17. Upstream propagation untested |
+| REQ-9 | P | Non-ASCII id rejection regression; response echo e2e-tested by the smoke — which found the propagate layer attached to the empty router (dead); fixed 2026-07-17. Upstream propagation untested |
 | REQ-10, REQ-11 | P | Catalog listing + archival head (number and hash) asserted by the smoke |
 | REQ-12 | U | — |
-| REQ-13 | P | Direction/fallback units exist, but timestamp overload mapping and the ADR-011 envelope are not integrated (GAP-4, GAP-16) |
+| REQ-13 | P | The ADR-011 envelope is integrated on the timestamp surface; a classified refusal reaches the client whole (529 with its hint, or 503 `no_workers`) rather than flattened, and a real-time refusal runs through the same upstream classifier the stream proxy uses, so a 429 stays an overload with its hint instead of surfacing as a 500. A local upstream failure answers 502 per IB-5; the beyond-frontier 404 remains (GAP-4) |
 | REQ-14 | P | Internal-endpoint hiding tested |
 | REQ-15 | P | Plan extraction/rewrite units; no e2e |
 | REQ-20 | P | **Known-violated** — cap exhaustion is not exercised and current master misclassifies it (GAP-4); taxonomy target is GAP-16 |
@@ -195,12 +203,12 @@ chunk-boundary records FV-6 licenses.
 | REQ-32 | P | Internal hiding tested; drift (GAP-11) |
 | REQ-33 | C | Config warn/reject/defaults tested |
 | REQ-40 | P | Variant selection tested; effective-time & outage untested (INV-2, LIV-6); regression guard unimplemented (GAP-20) |
-| REQ-41 | P | FV-2 attempt bound ledger-checked by the smoke; CT-2 exercises reroute-on-failure and penalty decay (LIV-7). **Known-violated**: a generic worker server-error is classified terminal, so one erroring worker fails the request instead of rerouting (GAP-23). Cooldown durations and priority-group selection remain untested |
+| REQ-41 | P | FV-2 attempt bound ledger-checked by the smoke; CT-2 exercises reroute-on-failure and penalty decay (LIV-7) across five verdicts, the two capacity ones included — an exhausted run of those answers OVERLOADED with its hint rather than a bare transient outage. **Known-violated**: a generic worker server-error is classified terminal, so one erroring worker fails the request instead of rerouting (GAP-23). Cooldown durations and priority-group selection remain untested |
 | REQ-42 | P | Scheduler units; headroom refusal untested (INV-4, LIV-8), and its observable — shrink cause, download utilization, headroom-refusal counter (OB-7) — is unasserted |
 | REQ-43 | P | Positive path exercised by the smoke (signed stub responses verified and delivered); CT-2 now drives the rejection path — a wrongly-signed response is not delivered and the attempt is retried elsewhere, meeting the acceptance criterion. Integrity failures are counted per worker but raise no OB-9 alarm state (GAP-24) |
 | REQ-44 | U | — |
 
-## Gap register — 2026-07-25
+## Gap register — 2026-07-27
 
 Priorities: P0 blocks the program · P1 active production risk · P2 correctness hole
 with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
@@ -210,7 +218,7 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-1 | Assignment artifact adopted with no structural validation; a corrupt blob can panic the refresh path or leave the Portal ready on garbage routing | REQ-26, INV-36, FM-2 (ADR-002) | P1 | CT-2: truncated-artifact stub → assert reject + alarm + prior artifact kept |
 | GAP-2 | Artifact staleness unbounded and invisible: fetch failures log-only; readiness ignores age | REQ-23/40, INV-31 ⚠, LIV-12, OB-6/9 (ADR-013, OQ-3) | P1 | age gauge; readiness-degradation test past P-ASSIGNMENT-MAX-AGE |
 | GAP-3 | Refresh holds old + new artifacts resident (HZ-1, ~2× P-ASSIGNMENT-SIZE) and first-byte waits are unmetered (HZ-2). Baseline: 2026-07-17 OOM-kill restart storm on 0.11.8 | REQ-27, PF-1, SLI-5 (OQ-4) | P1 | RSS-during-refresh probe under S4; heap profile to pin the dominant term |
-| GAP-4 | Current master does not implement the stream-cap refusal contract: cap exhaustion yields a 503/no mandatory hint, timestamp handling does not preserve the overload outcome, and a beyond-frontier timestamp still returns 404 where ADR-014 fixes it as the 204 EMPTY outcome | REQ-20, REQ-13, INV-12, PF-6 | P1 | CT-3: occupy P-MAX-STREAMS; assert 529 + hint and admitted-stream integrity |
+| GAP-4 | Current master does not implement the stream-cap refusal contract: cap exhaustion yields a 503/no mandatory hint, and a beyond-frontier timestamp still returns 404 where ADR-014 fixes it as the 204 EMPTY outcome. The timestamp surface no longer flattens the overload outcome — it carries the classified refusal whole, so a congested resolve answers 529 with its hint rather than 503 `upstream_unavailable` | REQ-20, REQ-13, INV-12, PF-6 | P1 | CT-3: occupy P-MAX-STREAMS; assert 529 + hint and admitted-stream integrity |
 | GAP-5 | Latent panic on an empty stream ("first chunk missing") — known trigger fenced only | REQ-21, INV-36 | P2 | replace panic with error; empty-yield test |
 | GAP-6 | Worker-labeled metric cardinality and name interning grow without eviction | REQ-30, OB cardinality rule, HZ-6 | P2 | CT-7 series-count audit across churn |
 | GAP-7 | Archival-path CONFLICT payload has only one entry. It meets the REQ-3/INV-23 MUST minimum but not REQ-3's richer-ancestor SHOULD | REQ-3 SHOULD | P2 | CT-5 contract test on the 409 body |
@@ -219,7 +227,8 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-11 | Served API description drift: undocumented route/header, stale examples, size-doc conflict | REQ-32, IB-2/4 | P3 | CT-5 description-vs-router sweep |
 | GAP-12 | Download-priority key wraps at ~43 M streams (HZ-4) | REQ-42 fairness | P3 | widen key; wrap-boundary unit test |
 | GAP-13 | ADR-009 accepted but portal-side injection unimplemented — decision drift | OQ-5 | P3 | schedule or supersede |
-| GAP-16 | Current master exposes legacy/mixed error bodies and passes real-time error bodies through. ADR-011's closed type/code envelope is not integrated; its 409 and readiness exceptions also need CT-5 proof against IB-5 when the taxonomy change lands, together with ADR-014's amendments (proxied-hint injection, unmatched-4xx normalization, EMPTY head metadata, integrity-exhaustion WORKER-FAILURE) | DEF-10, INV-26, IB-5, REQ-7/13/20 | P1 | CT-5 table-driven local + proxied error-shape/status tests |
+| GAP-16 | ADR-011's envelope is integrated and CT-5-covered on both emitters, with proxied-hint injection and clamping, unmatched-4xx normalization to 400, upstream bodies neither published nor read, framework rejections normalized at the middleware onto their bound status and with their endpoint label preserved, one upstream classifier shared by the stream proxy and the timestamp route, and `/ready` declining with the IB-6 envelope. Responses that never reach the routed middleware are normalized, logged and counted by an outer layer — an unmatched *route*, which a `route_layer` cannot see, and the decompression layer's 415, which every encoding but `gzip` earns — under a constant `endpoint` label, the path being client-supplied there. Remaining: EMPTY head metadata from ADR-014; and an unmatched proxied 4xx is indistinguishable from a genuine 400 on the metric, so there is no signal for an upstream returning a status the Portal does not model | INV-26, OB-3, REQ-13 | P2 | ADR-014 remainder |
+| GAP-28 | A proxied 409 whose body carries no usable `previousBlocks` — absent, empty, wrong-shaped, or past the read cap — still answers 409. The list is now typed and non-empty, so nothing unusable is published, and the refusal is logged at `error`; but the client receives a status IB-5's normative recovery procedure cannot be run against. Refusing it as `unclassified` instead is the open contract call | IB-5, INV-23, REQ-3 | P2 | decide the status; CT-5 already pins the current shape |
 | GAP-17 | Count caps imply a multi-terabyte theoretical buffer ceiling and no global byte budget or accounting exists; the congestion waiter queue is unbounded on the same path (HZ-9) | REQ-27, PF-1, OQ-9 | P1 | add byte meter/admission test; set P-BUFFERED-BYTES-BUDGET |
 | GAP-18 | Chain-RPC calls have no explicit deadline despite accepted ADR-010 | REQ-22, DC-5, HZ-8 | P2 | stalled-RPC stub → assert bounded call and loop recovery |
 | GAP-19 | Conflict detection is not known to precede the beyond-frontier EMPTY: a real-time continuation at the head with a stale parent may poll empty instead of getting 409 (the pre-ADR-014 oracle ordered EMPTY first; master unverified) | REQ-3, INV-23, INV-27 (ADR-014) | P2 | CT-2: reorg-at-head stub world → assert 409 precedence |
@@ -228,6 +237,9 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-22 | Pre-first-byte outcomes of the real-time source now have one denominator in `hotblocks_requests`, but no objective. `response` and `replay_response` obtained a response head; `replay_failed`, `timeout`, and `transport_failed` did not; cancellation remains visible without inventing an upstream result. SLI-4 is readiness availability and excludes deploys, SLI-6 counts truncated streams, and neither turns this counter into a request-success SLI | SLI set, OB-4 (ADR-015) | P2 | define a DC-4 response-head SLI over `hotblocks_requests`, with cancellations explicitly included or excluded by policy |
 | GAP-23 | A generic worker `ServerError` verdict is classified terminal, so the first erroring worker fails the whole request with no reroute — while `NotFound` and `ServerOverloaded` from the same worker *are* rerouted. DC-1 and the 09 worker table both put server errors in the reroute column. Found by the CT-2 injector on 2026-07-25; recorded as known-violated in `ct2_worker_faults` | REQ-41, DC-1, FM-3, LIV-12 | P1 | reclassify as retriable and drop the case from CT-2's known-violated list; the risk to weigh is added load on a fleet that is erroring |
 | GAP-24 | Integrity failures are counted per worker (`query_results{status="integrity"}`) but raise no alarm *state*: OB-9 lists signature-verification failures as an alarm, and FM-2 requires integrity faults to be "rejected and alarmed". A fleet quietly serving wrong-range data is visible only to someone already looking at the counter | OB-9, FM-2, REQ-43 | P2 | add the OB-9 alarm state over the integrity counter; assert the edge event in CT-2 |
+| GAP-25 | DC-1's parent-hash-mismatch and oversized-result verdicts are detected by exact-string parsing of worker `server_error` messages (`unexpected base block: …`, `Response too large`); the worker contract declares message strings unstable, and the worker's second oversize string (`query result too large`) already misses the parse and lands in the terminal generic-failure path (GAP-23). Blocked on a stable worker-side verdict surface (tracked in the worker suite: `worker-rs/spec/13`, anchor-verdict gap) | DC-1, REQ-3, INV-23 | P2 | CT-2: worker stub emits a reworded mismatch string — today the client gets a terminal error instead of 409; flips to a hard gate when the stable surface lands |
+| GAP-26 | No aggregate deadline bounds a worker attempt: connect is a 10 s crate default (P-WORKER-CONNECT-TIMEOUT, not operator-bound), first byte 60 s, and the body is read in 1 s-stall-bounded reads with no total bound — DC-1's single "request deadline P-TRANSPORT-TIMEOUT" is not what runs, and the transport's `request_timeout` is set but unused on this path | DC-1, REQ-22, HZ-2 | P2 | stub worker trickles a body at just under the per-read stall bound indefinitely; assert the attempt is bounded |
+| GAP-27 | Penalty classification diverges from ADR-004's cost rationale: an instant stream reset (the worker's documented flood-shed posture) draws the 300 s timeout-class cooldown plus a congestion signal, and integrity penalties are split (bad signature 300 s vs undecodable/wrong-range 30 s) though DC-1 treats them as one class — a brief worker-side flood can push the whole pool to AllUnavailable | REQ-41, DC-1, LIV-7 | P2 | CT-2: instant-reset injector; assert the cooldown class matches observed cost and the pool recovers within the error-cooldown window |
 
 ### Closed findings
 

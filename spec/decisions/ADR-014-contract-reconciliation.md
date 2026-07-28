@@ -13,10 +13,19 @@ are recorded here so the immutable docs can change under the suite's own rules.
 ## Decisions
 
 1. **Proxied overload responses always carry a retry hint.** ADR-012's rule is
-   universal: when the real-time upstream returns 429/503/529 without `Retry-After`,
+   universal: when the real-time upstream returns 429 or 529 without `Retry-After`,
    the Portal injects `Retry-After: P-RETRY-AFTER-MIN` while otherwise preserving
    public upstream headers. A hint-less proxied overload would re-create the 2026-07
    refusal storm on the real-time path. (INV-26, DC-4, IB-5.)
+
+   An upstream **503 is not in that set**: ADR-007 reserves 503 for genuine
+   unavailability and gives congestion its own status, and that line holds whether the
+   saturated party is us or a dependency. Classifying it as `overloaded` asserted
+   exhausted capacity of a source that may have none running, made a dead dependency
+   read on the metric exactly like a healthy one shedding load — neither pages, so the
+   counter was the only difference — and invented a hint aiming the client back into it.
+   A 503 is `upstream_unavailable`; a `Retry-After` the upstream sent is still forwarded
+   as the public header it is. (ADR-007, DC-4, IB-5.)
 
 2. **Conflict detection precedes the beyond-frontier EMPTY outcome.** In real-time
    mode, a parent hash whose height is at or below the frontier is validated before

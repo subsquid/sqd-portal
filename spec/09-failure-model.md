@@ -61,8 +61,8 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 |---|---|
 | Down / connect refused / connection closed before the response head | mask one replay (ADR-015); still failing ⇒ fail-safe UPSTREAM-FAILURE; archival traffic and readiness unaffected (FM-3) |
 | Stalled read | fail-safe UPSTREAM-FAILURE within P-HOTBLOCKS-READ-TIMEOUT, never replayed, recorded (ADR-010) |
-| Upstream 429 / 503 / 529 | fail-safe `overloaded` envelope; public headers retained, `Retry-After` injected at P-RETRY-AFTER-MIN when absent (INV-26); upstream body never leaked (ADR-011) |
-| Other erroring 5xx | fail-safe `upstream_unavailable` envelope; public headers retained, upstream body never leaked (ADR-011) |
+| Upstream 429 / 529 | fail-safe `overloaded` envelope; public headers retained, `Retry-After` injected at P-RETRY-AFTER-MIN when absent (INV-26); upstream body never leaked (ADR-011) |
+| Upstream 503 and other erroring 5xx | fail-safe `upstream_unavailable` envelope; public headers retained — a `Retry-After` the upstream sent is passed on, none is invented — upstream body never leaked (ADR-011, ADR-014) |
 | Erroring 4xx (unmatched) | fail-safe `malformed_request` envelope at 400; upstream body never leaked (DC-4) |
 | Mid-proxy failure | truncate per INV-25; never replayed — a replay past the response head would duplicate a prefix (ADR-003, ADR-015) |
 | Retention gap | fail-safe EMPTY (INV-27) |

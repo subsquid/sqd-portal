@@ -8,6 +8,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::network::{CurrentEpoch, NetworkClientStatus, Status, Workers};
 use crate::types::api_types::AvailableDatasetApiResponse;
+use crate::types::{ErrorDetail, ErrorResponse};
 
 /// Status response for the portal
 #[derive(Serialize, Clone, Debug, ToSchema)]
@@ -25,32 +26,33 @@ pub struct BlockHead {
     pub hash: String,
 }
 
-/// Body of a `409 Conflict` on a stream request — a slice of the **current
-/// canonical chain** at and below the conflict point, most recent first.
-#[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
-#[serde(rename_all = "camelCase")]
-#[schema(example = json!({
-    "previousBlocks": [
-        { "number": 21780872, "hash": "0xf6a96a29..." },
-        { "number": 21780871, "hash": "0xab12cd..." }
-    ]
-}))]
-pub struct ConflictResponse {
-    /// `{ number, hash }` pairs from the canonical chain, descending from the conflict
-    /// point. Guaranteed to contain at least the parent of the requested `fromBlock`.
-    pub previous_blocks: Vec<BlockHead>,
-}
-
 /// Block number response for timestamp query
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
 pub struct BlockNumberResponse {
     pub block_number: u64,
 }
 
-/// Generic error response
-#[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
-pub struct ErrorResponse {
-    pub message: String,
+/// 409 body: the standard error envelope, plus `previousBlocks` at the top level — a slice
+/// of the **current canonical chain** at and below the conflict point, most recent first.
+// Documentation-only; ErrorDetail borrows 'static strs and cannot Deserialize.
+#[derive(Serialize, Clone, Debug, ToSchema)]
+#[serde(rename_all = "camelCase")]
+#[schema(example = json!({
+    "error": {
+        "type": "invalid_request_error",
+        "code": "base_block_mismatch",
+        "message": "Base block mismatch"
+    },
+    "previousBlocks": [
+        { "number": 21780872, "hash": "0xf6a96a29..." },
+        { "number": 21780871, "hash": "0xab12cd..." }
+    ]
+}))]
+pub struct BaseBlockConflictResponse {
+    pub error: ErrorDetail,
+    /// `{ number, hash }` pairs from the canonical chain, descending from the conflict
+    /// point. Guaranteed to contain at least the parent of the requested `fromBlock`.
+    pub previous_blocks: Vec<BlockHead>,
 }
 
 /// Metadata query parameters
@@ -133,9 +135,10 @@ pub struct DatasetStateResponse {
             Status,
             AvailableDatasetApiResponse,
             BlockHead,
-            ConflictResponse,
             BlockNumberResponse,
             ErrorResponse,
+            ErrorDetail,
+            BaseBlockConflictResponse,
             MetadataQueryParams,
             StreamRequestBody,
             QueryRequest,

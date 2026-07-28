@@ -45,6 +45,10 @@ pub enum WorkerFault {
     /// Answer "chunk not found" — the worker is still downloading it. Same
     /// DC-1 row as ServerError, but the portal treats it as retriable.
     NotFound(String),
+    /// Refuse for capacity: the rate-limit verdict.
+    TooManyRequests,
+    /// Refuse for capacity: the overload verdict. One DC-1 row with the above.
+    ServerOverloaded,
 }
 
 /// A fault queue shared by every stub worker in a test, so a single queued
@@ -177,6 +181,12 @@ fn answer(
         }
         Some(WorkerFault::NotFound(m)) => {
             return verdict_result(query, keypair, query_error::Err::NotFound(m.clone()))
+        }
+        Some(WorkerFault::TooManyRequests) => {
+            return verdict_result(query, keypair, query_error::Err::TooManyRequests(()))
+        }
+        Some(WorkerFault::ServerOverloaded) => {
+            return verdict_result(query, keypair, query_error::Err::ServerOverloaded(()))
         }
         _ => {}
     }

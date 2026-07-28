@@ -45,7 +45,10 @@ use crate::{
     controller::task_manager::TaskManager,
     hotblocks::{traceless_key, HeadMode, HotblocksHandle},
     network::{NetworkClient, NoWorker, NotReady},
-    types::{ChunkId, DatasetId, ParsedQuery, RequestError, StreamRequest},
+    types::{
+        coded_response, error_body_response, error_response, ChunkId, DatasetId, ErrorBody,
+        ErrorCode, ErrorResponse, ParsedQuery, RequestError, StreamRequest, RETRY_AFTER_FLOOR,
+    },
     utils::logging,
 };
 
@@ -53,6 +56,33 @@ use crate::{
 use crate::sql;
 #[cfg(feature = "sql")]
 use axum::body;
+
+/// Response headers a cross-origin client must be able to read.
+///
+/// The Fetch spec hands JavaScript only the CORS-safelisted headers unless the server
+/// names the rest here — and that list contains none of ours: not `Retry-After`, the hint
+/// INV-26 makes mandatory, nor `x-request-id` (REQ-9), nor the stream metadata IB-2 binds
+/// to every 200. Those headers were on the wire all along, which is why no server-side
+/// test saw the gap: the filtering happens in the browser.
+///
+/// Spelled out rather than `Any`, so a header added later is invisible until someone
+/// decides it is public — `x-internal-*` above all.
+const EXPOSED_HEADERS: [axum::http::HeaderName; 6] = [
+    header::RETRY_AFTER,
+    logging::X_REQUEST_ID,
+    axum::http::HeaderName::from_static(crate::endpoints::stream::DATA_SOURCE_HEADER),
+    axum::http::HeaderName::from_static(crate::endpoints::stream::HEAD_NUMBER_HEADER),
+    axum::http::HeaderName::from_static(crate::endpoints::stream::FINALIZED_NUMBER_HEADER),
+    axum::http::HeaderName::from_static(crate::endpoints::stream::FINALIZED_HASH_HEADER),
+];
+
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
+        .allow_headers(Any)
+        .allow_origin(Any)
+        .expose_headers(EXPOSED_HEADERS)
+}
 
 #[allow(deprecated)]
 pub async fn run_server(
@@ -67,10 +97,7 @@ pub async fn run_server(
     show_internal_docs: bool,
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
-    let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::PUT])
-        .allow_headers(Any)
-        .allow_origin(Any);
+    let cors = cors_layer();
 
     tracing::info!("Starting HTTP server listening on {addr}");
     let app = Router::new()
@@ -172,6 +199,11 @@ pub async fn run_server(
         .route_layer(axum::middleware::from_fn(logging::middleware))
         .layer(sentry_tower::NewSentryLayer::new_from_top())
         .layer(RequestDecompressionLayer::new())
+        .layer(
+            // Outside the decompression layer and the router, both of which can answer
+            // without reaching `logging::middleware`.
+            axum::middleware::from_fn(logging::observe_bypassed),
+        )
         .layer(cors)
         .layer(
             // Copies the request id onto every response (REQ-9). Must be added
@@ -183,6 +215,11 @@ pub async fn run_server(
         .layer(
             // This layer is added here to be applied before the request reaches trace layers
             SetRequestIdLayer::x_request_id(MakeRequestUuid),
+        )
+        .layer(
+            // Outside SetRequestIdLayer: a non-ASCII client id is rejected with a 400 and
+            // a generated response correlation id before it can enter logs or handlers.
+            axum::middleware::from_fn(logging::reject_non_ascii_request_id),
         )
         .layer(Extension(task_manager))
         .layer(Extension(network_client))
@@ -249,7 +286,7 @@ where
     ),
     responses(
         (status = 200, description = "Archival head block retrieved", body = Option<BlockHead>),
-        (status = 404, description = "Dataset has no archival data source"),
+        (status = 404, description = "Dataset has no archival data source", body = ErrorResponse),
     ),
     tag = "Streaming",
     extensions(("x-internal" = json!(true))),
@@ -263,14 +300,13 @@ async fn get_archival_head(
         return axum::Json(network.head(&dataset_id)).into_response();
     }
 
-    (
-        StatusCode::NOT_FOUND,
+    coded_response(
+        ErrorCode::UnknownDataset,
         format!(
             "Dataset {} has no archival data source",
             dataset.default_name
         ),
     )
-        .into_response()
 }
 
 /// Whether the head must be reported as the minimum of the traced and traceless variants.
@@ -330,14 +366,15 @@ async fn head_response(
             if reports_min_finalized_head(dataset, mode) {
                 return match real_time_head(hotblocks, dataset, mode).await {
                     Ok(head) => axum::Json(head).into_response(),
-                    Err(e) => forward_hotblocks_response(&dataset.default_name, Err(e)),
+                    Err(e) => forward_hotblocks_response(&dataset.default_name, Err(e)).await,
                 };
             }
             // Pass the hotblocks response through unchanged.
             return forward_hotblocks_response(
                 &dataset.default_name,
                 hotblocks.request_head(&dataset.default_name, mode).await,
-            );
+            )
+            .await;
         };
 
         match real_time_head(hotblocks, dataset, mode).await {
@@ -359,11 +396,10 @@ async fn head_response(
         return axum::Json(network.head(dataset_id)).into_response();
     }
 
-    (
-        StatusCode::NOT_FOUND,
+    coded_response(
+        ErrorCode::UnknownDataset,
         format!("Dataset {} has no data sources", dataset.default_name),
     )
-        .into_response()
 }
 
 /// Latest finalized head
@@ -380,7 +416,7 @@ async fn head_response(
     ),
     responses(
         (status = 200, description = "Finalized head block retrieved", body = Option<BlockHead>),
-        (status = 404, description = "Dataset has no data sources"),
+        (status = 404, description = "Dataset has no data sources", body = ErrorResponse),
     ),
     tag = "Streaming"
 )]
@@ -406,7 +442,7 @@ async fn get_finalized_head(
     ),
     responses(
         (status = 200, description = "Head block retrieved", body = Option<BlockHead>),
-        (status = 404, description = "Dataset has no data sources"),
+        (status = 404, description = "Dataset has no data sources", body = ErrorResponse),
     ),
     tag = "Streaming"
 )]
@@ -517,7 +553,7 @@ async fn get_datasets(
     ),
     responses(
         (status = 200, description = "Dataset state retrieved successfully", body = serde_json::Value),
-        (status = 404, description = "Dataset not found"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
     ),
     tag = "Datasets",
     extensions(("x-internal" = json!(true))),
@@ -541,7 +577,7 @@ async fn get_dataset_state(
     ),
     responses(
         (status = 200, description = "Dataset metadata retrieved successfully", body = AvailableDatasetApiResponse),
-        (status = 404, description = "Dataset not found"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
     ),
     tag = "Datasets"
 )]
@@ -578,7 +614,7 @@ async fn get_dataset_metadata(
     ),
     responses(
         (status = 200, description = "Debug information retrieved", body = serde_json::Value),
-        (status = 404, description = "Dataset or block not found"),
+        (status = 404, description = "Dataset or block not found", body = ErrorResponse),
     ),
     tag = "Debug",
     extensions(("x-internal" = json!(true))),
@@ -653,7 +689,7 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
     path = "/ready",
     responses(
         (status = 200, description = "Portal is ready"),
-        (status = 503, description = "Portal is not ready"),
+        (status = 503, description = "Portal is not ready", body = ErrorResponse),
     ),
     tag = "Monitoring",
     extensions(("x-internal" = json!(true))),
@@ -700,7 +736,7 @@ async fn get_readiness(
         };
 
     if LAST_STATE.swap(state, Ordering::Relaxed) != state {
-        match (state, reason) {
+        match (state, &reason) {
             (READY, _) => tracing::info!("readiness check now passing: portal is ready"),
             (SHUTTING_DOWN, _) => tracing::info!("readiness check now failing: shutting down"),
             (_, Some(reason)) => tracing::warn!("readiness check now failing: {reason}"),
@@ -708,7 +744,29 @@ async fn get_readiness(
         }
     }
 
-    (code, body).into_response()
+    readiness_response(code, &readiness_detail(reason.as_ref(), body))
+}
+
+/// What the probe is told, beyond the status: the live reason when there is one, the
+/// category otherwise.
+///
+/// Separate from [`readiness_response`] because this is the half OB-5 cares about — a
+/// probe flip must be attributable without log archaeology — and the half a test can
+/// reach without building a `NetworkClient`.
+fn readiness_detail(reason: Option<&NotReady>, category: &str) -> String {
+    match reason {
+        Some(reason) => reason.to_string(),
+        None => category.to_owned(),
+    }
+}
+
+/// IB-6: a declining probe answers with the ADR-011 `not_ready` envelope. 200 stays bare
+/// text — there is no error to describe, and probes read the status either way.
+fn readiness_response(code: StatusCode, detail: &str) -> Response {
+    if code == StatusCode::OK {
+        return (code, detail.to_owned()).into_response();
+    }
+    error_response(code, ErrorCode::NotReady, detail)
 }
 
 /// Dataset Height
@@ -722,7 +780,7 @@ async fn get_readiness(
     ),
     responses(
         (status = 200, description = "Height retrieved successfully", body = String),
-        (status = 404, description = "Dataset not found"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
     ),
     tag = "Streaming",
     extensions(("x-internal" = json!(true))),
@@ -747,7 +805,7 @@ async fn get_height(
     ),
     responses(
         (status = 200, description = "Height retrieved successfully", body = String),
-        (status = 404, description = "Dataset not found"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
     ),
     tag = "Streaming",
     extensions(("x-internal" = json!(true))),
@@ -772,7 +830,7 @@ async fn get_finalized_stream_height(
     ),
     responses(
         (status = 200, description = "Height retrieved successfully", body = String),
-        (status = 404, description = "Dataset not found"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
     ),
     tag = "Streaming",
     extensions(("x-internal" = json!(true))),
@@ -786,15 +844,12 @@ async fn get_archival_stream_height(
     height_response(&network, &dataset, &dataset_id)
 }
 
-fn height_response(
-    network: &NetworkClient,
-    dataset: &str,
-    dataset_id: &DatasetId,
-) -> (StatusCode, String) {
+fn height_response(network: &NetworkClient, dataset: &str, dataset_id: &DatasetId) -> Response {
     match network.get_height(dataset_id) {
-        Some(height) => (StatusCode::OK, height.to_string()),
-        None => (
-            StatusCode::NOT_FOUND,
+        // Bare number, not JSON: the deprecated height endpoints' response contract.
+        Some(height) => (StatusCode::OK, height.to_string()).into_response(),
+        None => coded_response(
+            ErrorCode::UnknownDataset,
             format!("No data for dataset {dataset}"),
         ),
     }
@@ -812,9 +867,9 @@ fn height_response(
     ),
     responses(
         (status = 200, description = "Worker URL retrieved", body = String),
-        (status = 404, description = "Dataset not found"),
-        (status = 429, description = "Rate limit exceeded"),
-        (status = 503, description = "No available workers"),
+        (status = 404, description = "Dataset not found", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 503, description = "No available workers", body = ErrorResponse),
     ),
     tag = "Debug",
     extensions(("x-internal" = json!(true))),
@@ -829,19 +884,22 @@ async fn get_worker(
     let worker_id = match client.find_worker(&dataset_id, start_block) {
         Ok(worker_id) => worker_id.worker(),
         Err(NoWorker::AllUnavailable) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
+            return coded_response(
+                ErrorCode::NoWorkers,
                 format!("No available worker for dataset {dataset} block {start_block}"),
-            )
-                .into_response();
+            );
         }
         Err(NoWorker::Backoff(retry_at)) => {
             let seconds = retry_at.duration_since(Instant::now()).as_secs() + 1; // +1 for rounding up
-            return Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header(header::RETRY_AFTER, seconds)
-                .body(Body::from("Too many requests"))
-                .unwrap();
+            let mut response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::Overloaded,
+                "Too many requests",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, seconds.into());
+            return response;
         }
     };
 
@@ -869,9 +927,9 @@ async fn get_worker(
     request_body = serde_json::Value,
     responses(
         (status = 200, description = "Query executed successfully", body = String),
-        (status = 400, description = "Invalid query"),
-        (status = 404, description = "Dataset or worker not found"),
-        (status = 503, description = "Service unavailable"),
+        (status = 400, description = "Invalid query", body = ErrorResponse),
+        (status = 404, description = "Dataset or worker not found", body = ErrorResponse),
+        (status = 503, description = "Service unavailable", body = ErrorResponse),
     ),
     tag = "Streaming",
     extensions(("x-internal" = json!(true))),
@@ -886,11 +944,10 @@ async fn execute_query(
     let dataset_id = match DatasetId::from_base64(&dataset_id_encoded) {
         Ok(dataset_id) => dataset_id,
         Err(e) => {
-            return (
-                StatusCode::NOT_FOUND,
+            return coded_response(
+                ErrorCode::UnknownDataset,
                 format!("Couldn't parse dataset id: {e}"),
             )
-                .into_response()
         }
     };
 
@@ -929,9 +986,7 @@ async fn execute_query(
             .header(header::CONTENT_ENCODING, "gzip")
             .body(Body::from(data))
             .unwrap(),
-        Err(e) => {
-            RequestError::InternalError(format!("Couldn't convert response: {e}")).into_response()
-        }
+        Err(e) => RequestError::Internal(format!("Couldn't convert response: {e}")).into_response(),
     }
 }
 
@@ -951,7 +1006,7 @@ where
             .map_err(IntoResponse::into_response)?;
         let (_, alias) = args
             .first()
-            .ok_or((StatusCode::NOT_FOUND, "not enough arguments").into_response())?;
+            .ok_or_else(|| coded_response(ErrorCode::UnknownDataset, "not enough arguments"))?;
         let Extension(network) = parts
             .extract::<Extension<Arc<NetworkClient>>>()
             .await
@@ -959,9 +1014,10 @@ where
 
         match network.dataset(alias) {
             Some(config) => Ok(config.clone()),
-            None => {
-                Err((StatusCode::NOT_FOUND, format!("Unknown dataset: {alias}")).into_response())
-            }
+            None => Err(coded_response(
+                ErrorCode::UnknownDataset,
+                format!("Unknown dataset: {alias}"),
+            )),
         }
     }
 }
@@ -985,8 +1041,8 @@ where
             .expect("RequestId should be set by the SetRequestIdLayer")
             .header_value()
             .to_str()
-            // A client-supplied `x-request-id` is preserved verbatim and can contain
-            // non-visible-ASCII bytes; fall back rather than panic on the request task.
+            // The outer validator rejects a non-ASCII id before routing. Keep this
+            // defensive fallback for stacks that omit the production layer.
             .unwrap_or_default()
             .to_owned();
 
@@ -1001,17 +1057,19 @@ where
 
         let buffer_size = match params.get("buffer_size").map(|v| v.parse()) {
             Some(Ok(0)) => {
-                return Err(RequestError::BadRequest(
-                    "buffer_size must be greater than 0".to_string(),
-                )
+                return Err(RequestError::InvalidParam {
+                    param: "buffer_size",
+                    message: "buffer_size must be greater than 0".to_string(),
+                }
                 .into_response())
             }
             Some(Ok(value)) => value,
             Some(Err(e)) => {
-                return Err(
-                    RequestError::BadRequest(format!("Couldn't parse buffer_size: {e}"))
-                        .into_response(),
-                )
+                return Err(RequestError::InvalidParam {
+                    param: "buffer_size",
+                    message: format!("Couldn't parse buffer_size: {e}"),
+                }
+                .into_response())
             }
             None => config.default_buffer_size,
         };
@@ -1019,9 +1077,10 @@ where
             Some(value) => match value.parse() {
                 Ok(quantile) => quantile,
                 Err(e) => {
-                    return Err(RequestError::BadRequest(format!(
-                        "Couldn't parse timeout_quantile: {e}"
-                    ))
+                    return Err(RequestError::InvalidParam {
+                        param: "timeout_quantile",
+                        message: format!("Couldn't parse timeout_quantile: {e}"),
+                    }
                     .into_response())
                 }
             },
@@ -1031,10 +1090,11 @@ where
             Some(value) => match value.parse() {
                 Ok(value) => value,
                 Err(e) => {
-                    return Err(
-                        RequestError::BadRequest(format!("Couldn't parse retries: {e}"))
-                            .into_response(),
-                    )
+                    return Err(RequestError::InvalidParam {
+                        param: "retries",
+                        message: format!("Couldn't parse retries: {e}"),
+                    }
+                    .into_response())
                 }
             },
             None => config.default_retries,
@@ -1042,17 +1102,19 @@ where
         let max_chunks = match params.get("max_chunks") {
             Some(value) => match value.parse() {
                 Ok(0) => {
-                    return Err(RequestError::BadRequest(
-                        "max_chunks must be greater than 0".to_string(),
-                    )
+                    return Err(RequestError::InvalidParam {
+                        param: "max_chunks",
+                        message: "max_chunks must be greater than 0".to_string(),
+                    }
                     .into_response())
                 }
                 Ok(value) => Some(value),
                 Err(e) => {
-                    return Err(
-                        RequestError::BadRequest(format!("Couldn't parse max_chunks: {e}"))
-                            .into_response(),
-                    )
+                    return Err(RequestError::InvalidParam {
+                        param: "max_chunks",
+                        message: format!("Couldn't parse max_chunks: {e}"),
+                    }
+                    .into_response())
                 }
             },
             None => None,
@@ -1141,41 +1203,44 @@ where
 
         match dataset.network_id {
             Some(dataset_id) => Ok(dataset_id),
-            None => Err((
-                StatusCode::NOT_FOUND,
+            None => Err(coded_response(
+                ErrorCode::UnknownDataset,
                 format!(
                     "Dataset {} doesn't have archival data",
                     dataset.default_name
                 ),
-            )
-                .into_response()),
+            )),
         }
     }
 }
 
-pub(crate) fn forward_hotblocks_response(
+pub(crate) async fn forward_hotblocks_response(
     dataset: &str,
     response: Result<reqwest::Response, HotblocksErr>,
 ) -> Response {
     match response {
-        Ok(response) => forward_response(dataset, response),
+        Ok(response) => forward_response(dataset, response).await,
+        // Unreachable by construction; a panic here would kill the connection task.
         Err(HotblocksErr::UnknownDataset) => {
-            unreachable!("dataset should be known by the hotblocks service")
+            RequestError::Internal("dataset should be known by the hotblocks service".to_owned())
+                .into_response()
         }
         Err(HotblocksErr::Request(e)) => {
             // Until this fires, a stalled upstream leaves no trace: the request never
-            // returns, so it carries no status. reqwest's Display already names the URL.
+            // returns, so it carries no status. reqwest's Display already names the URL —
+            // which is why it stays in the log and out of the body. DC-4 keeps an
+            // upstream's own prose unpublished; a transport error names the same internal
+            // topology in the same way, and the client can do nothing with either.
             tracing::warn!(
                 dataset,
                 timed_out = e.is_timeout(),
                 error = %e,
                 "hotblocks request failed"
             );
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Hotblocks request error: {e}"),
+            coded_response(
+                ErrorCode::UpstreamUnavailable,
+                ErrorCode::UpstreamUnavailable.default_message(),
             )
-                .into_response()
         }
     }
 }
@@ -1189,33 +1254,155 @@ const INTERNAL_HEADER_PREFIX: &str = "x-internal-";
 /// single ClusterIP, so this is the portal's only way to attribute a response to a pod.
 const HOTBLOCKS_INSTANCE_HEADER: &str = "x-internal-hotblocks-instance";
 
-pub(crate) fn forward_response(
+/// Proxy a hotblocks response, rewriting error bodies into the portal's envelope: one
+/// stream endpoint is served by either data source and must not emit two body shapes.
+pub(crate) async fn forward_response(
     dataset: &str,
-    response: reqwest::Response,
+    mut response: reqwest::Response,
 ) -> axum::response::Response {
     let status = response.status();
+    let instance = || {
+        response
+            .headers()
+            .get(HOTBLOCKS_INSTANCE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+    };
     if status.is_server_error() {
         tracing::warn!(
             dataset,
             status = status.as_u16(),
-            instance = response
-                .headers()
-                .get(HOTBLOCKS_INSTANCE_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("-"),
+            instance = instance(),
             "hotblocks returned a server error"
         );
     }
+    // The portal validated this alias against its own catalog before asking, so a 404
+    // here is the two deployments disagreeing about what exists, not a client typo — and
+    // on the wire and on the metric the two are identical (DC-4, spec/05). Since the
+    // upstream's own prose is not published, this log is the only witness.
+    if status == StatusCode::NOT_FOUND {
+        tracing::error!(
+            dataset,
+            instance = instance(),
+            "hotblocks does not know a dataset the portal advertises: catalog incoherence"
+        );
+    }
 
-    let mut builder = Response::builder().status(status);
+    // 204 and success stream through untouched, keeping x-sqd-finalized-head-*.
+    if status == StatusCode::NO_CONTENT || status.is_success() || status.is_redirection() {
+        return stream_response(response);
+    }
+
+    let (public_status, class) = ErrorCode::classify_upstream(status);
+    let headers = response.headers().clone();
+
+    let mut error = ErrorBody::new(class, class.default_message());
+
+    // 409 is the only status whose body is read at all. The upstream's prose is never
+    // published (DC-4) and adds nothing to the log — a server error is already recorded
+    // above with the pod that served it, and hotblocks logs its own errors in full — so
+    // every other status streams straight to drop.
+    if status == StatusCode::CONFLICT {
+        // Clients walk `previousBlocks` to find a shared ancestor, so it is preserved at
+        // the top level beside `error` (IB-5). It is the one public upstream field.
+        match conflict_previous_blocks(&mut response).await {
+            Some(blocks) => {
+                error = error.with_sibling("previousBlocks", serde_json::json!(blocks));
+            }
+            // Not a legal 409 under IB-5, and unrecoverable for the client: it has
+            // nothing to walk, so it re-requests the same range and conflicts again.
+            // Indistinguishable from a healthy reorg on the wire and on the metric, so
+            // this log is the only witness.
+            None => tracing::error!(
+                dataset,
+                "hotblocks 409 carried no usable previousBlocks: clients cannot resolve the reorg"
+            ),
+        }
+    }
+
+    let mut rewritten = error_body_response(public_status, error);
+
+    // Keep upstream headers (retry-after, x-sqd-*), but not the replaced body's own, and
+    // never the internal ones — this path bypasses stream_response's filter.
+    let out = rewritten.headers_mut();
+    for (key, value) in headers.iter() {
+        if key == header::CONTENT_TYPE
+            || key == header::CONTENT_LENGTH
+            || key == header::CONTENT_ENCODING
+            || key == header::TRANSFER_ENCODING
+            || key.as_str().starts_with(INTERNAL_HEADER_PREFIX)
+        {
+            continue;
+        }
+        out.insert(key, value.clone());
+    }
+
+    // INV-26: OVERLOADED always carries a *usable* hint. An upstream value survives only
+    // if it reads as seconds at or above the floor — a 0 would invite an immediate retry
+    // loop against a source that just shed load, and the portal documents this header in
+    // seconds, so the RFC's HTTP-date form is replaced rather than passed on.
+    if class == ErrorCode::Overloaded {
+        let usable = out
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .is_some_and(|seconds| seconds >= RETRY_AFTER_FLOOR);
+        if !usable {
+            out.insert(header::RETRY_AFTER, RETRY_AFTER_FLOOR.into());
+        }
+    }
+
+    rewritten
+}
+
+/// A 409's recovery list is a short `{number, hash}` slice by contract, so this bounds a
+/// broken upstream rather than budgeting a legitimate one: a body past the cap is not the
+/// contract, and is refused instead of truncated.
+const MAX_CONFLICT_BODY: usize = 64 * 1024;
+
+/// The 409 recovery list, or `None` if the upstream did not supply a usable one.
+///
+/// Typed and non-empty rather than forwarded as an opaque value: `previousBlocks` is the
+/// one upstream field clients are told to walk, so an upstream must not be able to put
+/// something else — a scalar, an empty list, arbitrary internal data — under that name.
+/// Read here and nowhere else, bounded, because this is the only upstream body the portal
+/// consumes at all.
+async fn conflict_previous_blocks(response: &mut reqwest::Response) -> Option<Vec<BlockRef>> {
+    #[derive(serde::Deserialize)]
+    struct Conflict {
+        #[serde(rename = "previousBlocks")]
+        previous_blocks: Vec<BlockRef>,
+    }
+
+    let mut body = bytes::BytesMut::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if body.len() + chunk.len() <= MAX_CONFLICT_BODY => {
+                body.extend_from_slice(&chunk)
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) => break,
+            // A truncated prefix cannot be parsed, and half a chain slice is worse than
+            // none: the client would resume from an ancestor that is not the deepest one.
+            Err(_) => return None,
+        }
+    }
+
+    let conflict: Conflict = serde_json::from_slice(&body).ok()?;
+    (!conflict.previous_blocks.is_empty()).then_some(conflict.previous_blocks)
+}
+
+fn stream_response(response: reqwest::Response) -> axum::response::Response {
+    let mut builder = Response::builder().status(response.status());
     for (key, value) in response.headers() {
         if key.as_str().starts_with(INTERNAL_HEADER_PREFIX) {
             continue;
         }
         builder = builder.header(key, value);
     }
-    let body = Body::from_stream(response.bytes_stream());
-    builder.body(body).unwrap()
+    builder
+        .body(Body::from_stream(response.bytes_stream()))
+        .unwrap()
 }
 
 #[cfg(feature = "sql")]
@@ -1248,10 +1435,80 @@ async fn sql_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::server_overloaded;
     use std::time::Duration;
 
-    #[test]
-    fn forward_response_strips_internal_headers() {
+    /// A server-side test can only see that a header is *on* the response — whether a
+    /// browser hands it to JavaScript is decided by `access-control-expose-headers`, and
+    /// that is why no assertion on a handler could ever have caught its absence. The
+    /// names are written out here rather than read from [`EXPOSED_HEADERS`]: a test that
+    /// iterates the list it is checking restates the implementation instead of pinning
+    /// the contract, and dropping a name would quietly move both.
+    #[tokio::test]
+    async fn cors_exposes_every_header_a_client_is_told_to_read() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/refused",
+                get(|| async { RequestError::BusyFor(Duration::from_secs(9)).into_response() }),
+            )
+            .layer(cors_layer());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/refused")
+                    .header(header::ORIGIN, "https://app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), server_overloaded());
+        assert_eq!(
+            response.headers()[header::RETRY_AFTER],
+            "10",
+            "the hint must be on the wire before exposing it can matter"
+        );
+
+        let exposed = response
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .expect("a cross-origin response must name what it exposes")
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        let exposed: Vec<&str> = exposed.split(',').map(str::trim).collect();
+
+        for name in [
+            // INV-26 owes an overload a back-off interval; unreadable, it owes nothing.
+            "retry-after",
+            // REQ-9: the id a user quotes in a ticket.
+            "x-request-id",
+            // IB-2's stream metadata, which the harness asserts on every 200.
+            "x-sqd-data-source",
+            "x-sqd-head-number",
+            "x-sqd-finalized-head-number",
+            "x-sqd-finalized-head-hash",
+        ] {
+            assert!(
+                exposed.contains(&name),
+                "{name} is unreadable cross-origin: {exposed:?}"
+            );
+        }
+        assert!(
+            !exposed
+                .iter()
+                .any(|h| *h == "*" || h.starts_with(INTERNAL_HEADER_PREFIX)),
+            "the exposed set must stay explicit and free of internal headers: {exposed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_response_strips_internal_headers() {
         let upstream = axum::http::Response::builder()
             .status(StatusCode::OK)
             .header(HOTBLOCKS_INSTANCE_HEADER, "hotblocks-db-0")
@@ -1259,7 +1516,8 @@ mod tests {
             .body(Vec::new())
             .unwrap();
 
-        let forwarded = forward_response("polygon-mainnet", reqwest::Response::from(upstream));
+        let forwarded =
+            forward_response("polygon-mainnet", reqwest::Response::from(upstream)).await;
 
         let headers = forwarded.headers();
         assert!(
@@ -1273,6 +1531,447 @@ mod tests {
             "42",
             "client-facing headers must still be forwarded"
         );
+    }
+
+    /// Error responses are rebuilt into the envelope rather than streamed, so they copy
+    /// upstream headers on a separate path that has to strip the internal ones too.
+    #[tokio::test]
+    async fn forward_response_strips_internal_headers_on_errors() {
+        let upstream = axum::http::Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(HOTBLOCKS_INSTANCE_HEADER, "hotblocks-db-0")
+            .header(header::RETRY_AFTER, "5")
+            .body(Vec::from("upstream is down"))
+            .unwrap();
+
+        let forwarded =
+            forward_response("polygon-mainnet", reqwest::Response::from(upstream)).await;
+
+        let headers = forwarded.headers();
+        assert!(
+            !headers
+                .keys()
+                .any(|k| k.as_str().starts_with(INTERNAL_HEADER_PREFIX)),
+            "internal headers must not reach clients: {headers:?}"
+        );
+        assert_eq!(
+            headers.get(header::RETRY_AFTER).unwrap(),
+            "5",
+            "upstream retry-after must survive the body rewrite"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // CT-5 — interface conformance for the error surface (IB-5, INV-26).
+    //
+    // The taxonomy has two emitters: locally produced errors and rewritten upstream
+    // ones. The invariant that matters is that a client cannot tell them apart, so
+    // these assert the *proxied* shape and pin it against the local one. Unit tests
+    // per emitter cannot catch a divergence between them.
+    // ---------------------------------------------------------------------------
+
+    async fn proxied(status: StatusCode, body: &'static str) -> (StatusCode, serde_json::Value) {
+        let upstream = axum::http::Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Vec::from(body))
+            .unwrap();
+        let response = forward_response("polygon-mainnet", reqwest::Response::from(upstream)).await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("proxied error bodies are the JSON envelope")
+        };
+        (status, json)
+    }
+
+    /// Every proxied failure arrives as the envelope on the public status DC-4 fixes,
+    /// classified onto the closed vocabulary. A matched status is preserved; an
+    /// unmatched 4xx normalizes to 400.
+    #[tokio::test]
+    async fn proxied_errors_use_the_envelope() {
+        let cases = [
+            (400, 400, "malformed_request", "invalid_request_error"),
+            (403, 400, "malformed_request", "invalid_request_error"),
+            (418, 400, "malformed_request", "invalid_request_error"),
+            (404, 404, "unknown_dataset", "invalid_request_error"),
+            (429, 429, "overloaded", "rate_limit_error"),
+            (529, 529, "overloaded", "rate_limit_error"),
+            (500, 500, "upstream_unavailable", "availability_error"),
+            (502, 502, "upstream_unavailable", "availability_error"),
+            // ADR-007: 503 is unavailability, not congestion. Read as an overload it
+            // claimed exhausted capacity of a source that may have none running at all.
+            (503, 503, "upstream_unavailable", "availability_error"),
+        ];
+
+        for (upstream, want_status, want_code, want_type) in cases {
+            let upstream = StatusCode::from_u16(upstream).unwrap();
+            let (got_status, body) =
+                proxied(upstream, "instance hotblocks-db-0: /var/lib oops").await;
+
+            assert_eq!(got_status.as_u16(), want_status, "upstream {upstream}");
+            assert_eq!(body["error"]["code"], want_code, "upstream {upstream}");
+            assert_eq!(body["error"]["type"], want_type, "upstream {upstream}");
+        }
+    }
+
+    /// DC-4: the upstream's prose is not public API and can name instances and paths.
+    /// No proxied error may echo it.
+    /// The other half of DC-4. `a_proxied_error_never_leaks_the_upstream_body` only ever
+    /// builds an `Ok(reqwest::Response)`, so the branch where the request never completed
+    /// went uncovered — and that is the one whose `reqwest::Error` Display carries the
+    /// upstream URL, naming the internal service, namespace and port to any client that
+    /// can make hotblocks time out.
+    #[tokio::test]
+    async fn a_transport_failure_does_not_publish_the_upstream_url() {
+        // Port 1 is privileged and unbound, so this refuses immediately without DNS.
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/datasets/internal-only-name/stream")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(
+            error.to_string().contains("127.0.0.1:1"),
+            "reqwest names the url, which is the whole hazard: {error}"
+        );
+
+        let response =
+            forward_hotblocks_response("eth-mainnet", Err(HotblocksErr::Request(error))).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "upstream_unavailable");
+        assert_eq!(body["error"]["type"], "availability_error");
+
+        let message = body["error"]["message"].as_str().unwrap();
+        for leak in ["127.0.0.1", "internal-only-name", "http://", ":1/"] {
+            assert!(
+                !message.contains(leak),
+                "the upstream url must stay in the log: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_proxied_error_never_leaks_the_upstream_body() {
+        let secret = "instance hotblocks-db-0 at /var/lib/hotblocks: shard 7 corrupt";
+        for upstream in [400u16, 403, 404, 409, 429, 500, 502, 503] {
+            let status = StatusCode::from_u16(upstream).unwrap();
+            let (_, body) = proxied(status, secret).await;
+            let rendered = body.to_string();
+            assert!(
+                !rendered.contains("hotblocks-db-0") && !rendered.contains("/var/lib"),
+                "upstream {upstream} leaked its body: {rendered}"
+            );
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| !m.is_empty()),
+                "upstream {upstream} must still explain itself"
+            );
+        }
+    }
+
+    /// The bug this class of test exists to catch: 409 is the one status where the
+    /// envelope has a top-level sibling, and it is served by both data sources.
+    #[tokio::test]
+    async fn both_stream_paths_emit_the_same_409_shape() {
+        let (proxied_status, proxied_body) = proxied(
+            StatusCode::CONFLICT,
+            r#"{"previousBlocks":[{"number":42,"hash":"0xdead"}]}"#,
+        )
+        .await;
+
+        let local = RequestError::BaseBlockMismatch(BlockRef {
+            number: 42,
+            hash: "0xdead".to_owned(),
+        })
+        .into_response();
+        let local_status = local.status();
+        let local_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(local.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(proxied_status, local_status);
+        for (source, body) in [("proxied", &proxied_body), ("local", &local_body)] {
+            assert_eq!(body["error"]["code"], "base_block_mismatch", "{source}");
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{source}");
+            assert!(
+                body["error"]["message"].is_string(),
+                "{source} must explain itself"
+            );
+            // IB-5: the recovery contract stays a top-level sibling, not nested.
+            assert_eq!(body["previousBlocks"][0]["number"], 42, "{source}");
+            assert_eq!(body["previousBlocks"][0]["hash"], "0xdead", "{source}");
+        }
+    }
+
+    /// INV-26: an overload refusal must always tell the client how long to wait, even
+    /// when the upstream forgot to. Nothing else invents one — a hint on a 503 pointed
+    /// the client straight back at a dependency that may be down rather than busy.
+    #[tokio::test]
+    async fn only_a_proxied_overload_carries_an_invented_retry_hint() {
+        for (status, wants_hint) in [(429u16, true), (529, true), (503, false), (500, false)] {
+            let upstream = axum::http::Response::builder()
+                .status(status)
+                .body(Vec::from("busy"))
+                .unwrap();
+            let forwarded =
+                forward_response("polygon-mainnet", reqwest::Response::from(upstream)).await;
+
+            let hint = forwarded.headers().get(header::RETRY_AFTER);
+            assert_eq!(hint.is_some(), wants_hint, "{status}");
+            if let Some(hint) = hint {
+                assert!(
+                    hint.to_str().unwrap().parse::<u64>().unwrap() >= RETRY_AFTER_FLOOR,
+                    "{status} hint must be at least the floor"
+                );
+            }
+        }
+    }
+
+    /// 204 streams through as-is: it is not a failure, so it gets no envelope, no code,
+    /// and keeps the head markers clients read off it.
+    #[tokio::test]
+    async fn proxied_204_is_untouched() {
+        let upstream = axum::http::Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("x-sqd-finalized-head-number", "99")
+            .body(Vec::new())
+            .unwrap();
+        let forwarded =
+            forward_response("polygon-mainnet", reqwest::Response::from(upstream)).await;
+
+        assert_eq!(forwarded.status(), StatusCode::NO_CONTENT);
+        assert_eq!(forwarded.headers()["x-sqd-finalized-head-number"], "99");
+        assert!(
+            forwarded.extensions().get::<ErrorCode>().is_none(),
+            "a 204 must not be tagged with a taxonomy code"
+        );
+    }
+
+    /// An upstream error body cannot size our response, however large it is: it is not
+    /// copied into the envelope at all.
+    #[tokio::test]
+    async fn a_huge_upstream_body_does_not_size_the_response() {
+        let upstream = axum::http::Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body("x".repeat(200 * 1024).into_bytes())
+            .unwrap();
+        let forwarded =
+            forward_response("polygon-mainnet", reqwest::Response::from(upstream)).await;
+        let bytes = axum::body::to_bytes(forwarded.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert!(
+            bytes.len() < 1024,
+            "envelope must not carry the upstream body"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "upstream_unavailable");
+    }
+
+    /// The stronger claim behind the test above: the body is not merely omitted from the
+    /// response, it is never read. Nothing consumes it — it is not published (DC-4) and a
+    /// server error is already logged with the pod that served it — so buffering it would
+    /// let an upstream fault size portal memory. 409 is the sole exception.
+    #[tokio::test]
+    async fn only_a_409_reads_the_upstream_body() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        async fn forward_watching_the_body(status: StatusCode, payload: &'static str) -> bool {
+            let polled = Arc::new(AtomicBool::new(false));
+            let flag = polled.clone();
+            let body = reqwest::Body::wrap_stream(futures::stream::once(async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(payload.as_bytes()))
+            }));
+            let upstream = axum::http::Response::builder()
+                .status(status)
+                .body(body)
+                .unwrap();
+
+            forward_response("polygon-mainnet", reqwest::Response::from(upstream)).await;
+            polled.load(Ordering::SeqCst)
+        }
+
+        for status in [400u16, 404, 429, 500, 502, 503] {
+            assert!(
+                !forward_watching_the_body(StatusCode::from_u16(status).unwrap(), "prose").await,
+                "{status} must not read the upstream body"
+            );
+        }
+
+        assert!(
+            forward_watching_the_body(StatusCode::CONFLICT, r#"{"previousBlocks":[]}"#).await,
+            "409 must read the body — previousBlocks lives in it"
+        );
+    }
+
+    /// `previousBlocks` is the one upstream field clients are told to walk, so it is
+    /// parsed into a non-empty typed list rather than forwarded as whatever value happens
+    /// to sit under that key. Anything else — absent, empty, a scalar, arbitrary internal
+    /// data, or a body too large to be the contract — is refused rather than passed on as
+    /// a recovery hint the client cannot use.
+    #[tokio::test]
+    async fn a_409_publishes_only_a_usable_recovery_list() {
+        let unusable = [
+            ("not json at all", "non-JSON body"),
+            (r#"{"code":"conflict"}"#, "key absent"),
+            (r#"{"previousBlocks":[]}"#, "empty list"),
+            (r#"{"previousBlocks":"0xdead"}"#, "scalar"),
+            (
+                r#"{"previousBlocks":[{"secret":"/var/lib"}]}"#,
+                "wrong shape",
+            ),
+        ];
+
+        for (upstream_body, case) in unusable {
+            let (status, body) = proxied(StatusCode::CONFLICT, upstream_body).await;
+
+            assert_eq!(status, StatusCode::CONFLICT, "{case}");
+            assert_eq!(body["error"]["code"], "base_block_mismatch", "{case}");
+            assert!(
+                body.get("previousBlocks").is_none(),
+                "{case}: no recovery hint can be invented, and none may be echoed: {body}"
+            );
+        }
+
+        let (_, body) = proxied(
+            StatusCode::CONFLICT,
+            r#"{"previousBlocks":[{"number":42,"hash":"0xdead"}],"internal":"/var/lib"}"#,
+        )
+        .await;
+        assert_eq!(body["previousBlocks"][0]["number"], 42);
+        assert!(
+            body.get("internal").is_none(),
+            "only the recovery list survives: {body}"
+        );
+    }
+
+    /// A body past the cap is not the short `{number, hash}` slice IB-5 describes, so it
+    /// is refused rather than truncated — a partial chain slice would resume the client
+    /// from an ancestor that is not the deepest one.
+    #[tokio::test]
+    async fn an_oversized_409_body_is_refused_not_truncated() {
+        let filler = "x".repeat(MAX_CONFLICT_BODY);
+        let upstream = axum::http::Response::builder()
+            .status(StatusCode::CONFLICT)
+            .body(
+                format!(
+                    r#"{{"previousBlocks":[{{"number":42,"hash":"0xdead"}}],"pad":"{filler}"}}"#
+                )
+                .into_bytes(),
+            )
+            .unwrap();
+        let forwarded =
+            forward_response("polygon-mainnet", reqwest::Response::from(upstream)).await;
+
+        assert_eq!(forwarded.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(forwarded.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.get("previousBlocks").is_none(), "{body}");
+    }
+
+    /// INV-26 asks for a hint a client can act on, not merely a present header. A 0 would
+    /// send it straight back at a source that just shed load, and the header is documented
+    /// in seconds, so the RFC's date form is replaced rather than forwarded.
+    #[tokio::test]
+    async fn an_unusable_upstream_retry_hint_is_replaced() {
+        for hint in ["0", "-1", "not-a-number", "Wed, 21 Oct 2015 07:28:00 GMT"] {
+            let upstream = axum::http::Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(header::RETRY_AFTER, hint)
+                .body(Vec::from("busy"))
+                .unwrap();
+            let forwarded =
+                forward_response("polygon-mainnet", reqwest::Response::from(upstream)).await;
+
+            let got = forwarded.headers()[header::RETRY_AFTER].to_str().unwrap();
+            assert!(
+                got.parse::<u64>().is_ok_and(|s| s >= RETRY_AFTER_FLOOR),
+                "{hint:?} must not survive as a hint, got {got:?}"
+            );
+        }
+
+        // A usable one is still preserved.
+        let upstream = axum::http::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(header::RETRY_AFTER, "30")
+            .body(Vec::from("busy"))
+            .unwrap();
+        let forwarded =
+            forward_response("polygon-mainnet", reqwest::Response::from(upstream)).await;
+        assert_eq!(forwarded.headers()[header::RETRY_AFTER], "30");
+    }
+
+    /// IB-6: a declining probe answers with the `not_ready` envelope, not bare prose,
+    /// and names the live reason so a flip is attributable (OB-5). 200 has no error to
+    /// describe and stays plain.
+    #[tokio::test]
+    async fn readiness_declines_with_the_envelope() {
+        // Drive the real `NotReady` through the same selection `get_readiness` uses.
+        // Passing the renderer a string of the test's own invention asserted nothing
+        // about the wiring: `detail = category` would have satisfied it, and OB-5 turns
+        // on exactly that substitution.
+        let reason = NotReady::InsufficientConnections {
+            active: 2,
+            required: 10,
+            workers: 12,
+        };
+        let detail = readiness_detail(Some(&reason), "Not ready");
+        let response = readiness_response(StatusCode::SERVICE_UNAVAILABLE, &detail);
+        assert_eq!(
+            response.extensions().get::<ErrorCode>().copied(),
+            Some(ErrorCode::NotReady),
+            "a drain must not be counted as an api_error"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "not_ready");
+        assert_eq!(body["error"]["type"], "availability_error");
+        // The live counts, not the category: an operator must be able to tell a
+        // bootstrapping portal from one that lost half its connections (OB-5).
+        let message = body["error"]["message"].as_str().unwrap();
+        assert_eq!(message, reason.to_string());
+        for detail in ["2", "10", "12"] {
+            assert!(
+                message.contains(detail),
+                "the reason's counts must survive into the body: {message}"
+            );
+        }
+        assert_ne!(message, "Not ready", "the category is not the reason");
+
+        // The other variant carries no counts, so pin it by identity too.
+        assert_eq!(
+            readiness_detail(Some(&NotReady::NoWorkers), "Not ready"),
+            NotReady::NoWorkers.to_string()
+        );
+        // Shutting down has no `NotReady` to report; the category is all there is.
+        assert_eq!(readiness_detail(None, "Shutting down"), "Shutting down");
+
+        let ready = readiness_response(StatusCode::OK, "Ready");
+        assert!(ready.extensions().get::<ErrorCode>().is_none());
+        let bytes = axum::body::to_bytes(ready.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"Ready");
     }
 
     /// End-to-end: real TCP listener + axum router + reqwest client. Verifies that
