@@ -16,13 +16,16 @@ a partially applied artifact is never observable.
 
 **INV-2 — Artifact application legality.** [transition]
 An artifact is applied only if its identifier differs from the applied one, its
-effective-from time has passed, and its effective-from is not earlier than the applied
-artifact's (a republished older artifact is never re-applied). Application replaces the
-whole artifact.
+effective-from time has passed, and fetch and validation succeeded. The publisher's
+currently visible different identifier is authoritative: the Portal does not order
+artifacts by identifier or effective-from, so a rollback to a valid artifact with an
+earlier effective-from remains legal. Application replaces the whole artifact.
 *Why:* re-applying identical artifacts churns; early application splits the fleet;
-regression re-serves routing the network already retired.
-*Check:* CT-2 — publisher stub serves future-effective and regressive artifacts; assert
-neither is applied.
+treating activation time as a revision prevents publisher-controlled recovery from a
+bad assignment.
+*Check:* CT-2 — publisher stub serves unchanged, future-effective, invalid, and
+earlier-effective rollback artifacts; assert deduplication, delayed activation,
+rejection with prior routing retained, and rollback respectively.
 
 **INV-3 — Lease balance.** [state]
 Per worker, open leases ≤ P-MAX-QUERIES-PER-WORKER; every lease acquired is released

@@ -301,10 +301,13 @@ The Portal polls the assignment publisher every P-ASSIGNMENT-REFRESH, skips unch
 artifacts (by identifier), applies new ones atomically no earlier than their declared
 effective time (so the fleet cuts over together), and keeps serving the previous
 artifact on any fetch or validation failure. First applied assignment gates readiness
-(REQ-23).
+(REQ-23). Effective time is an activation gate, not a revision: a different identifier
+currently selected by the publisher remains eligible even when its effective time
+predates the applied artifact, allowing publisher-controlled rollback (ADR-016).
 *Acceptance:* a new artifact with a future effective time is not visible in routing
 until that time; killing the publisher leaves serving unaffected for the duration of
-the outage (staleness intent: ADR-013).
+the outage (staleness intent: ADR-013); changing the published identifier back to a
+valid earlier-effective artifact rolls routing back to it.
 
 **REQ-41 — Worker selection and penalties.** [MUST]
 Chunk queries go to the most promising worker holding the chunk: healthy and fast

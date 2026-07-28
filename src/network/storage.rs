@@ -16,18 +16,10 @@ use crate::{
 pub struct StorageClient {
     assignment: RwLock<Option<Assignment>>,
     datasets_config: Arc<RwLock<Datasets>>,
-    applied: RwLock<Option<Applied>>,
+    latest_assignment_id: RwLock<Option<String>>,
     network_state_url: String,
     reqwest_client: reqwest::Client,
     ignore_deprecated_workers: bool,
-}
-
-/// Applied-artifact provenance: `effective_from` orders, the id only
-/// deduplicates (DEF-4, OB-6).
-#[derive(Clone)]
-struct Applied {
-    id: String,
-    effective_from: u64,
 }
 
 /// Why a refresh cycle produced no new applied artifact.
@@ -67,7 +59,7 @@ impl StorageClient {
         Self {
             assignment: RwLock::new(None, "StorageClient::assignment"),
             datasets_config,
-            applied: RwLock::new(None, "StorageClient::applied"),
+            latest_assignment_id: RwLock::new(None, "StorageClient::latest_assignment"),
             network_state_url,
             reqwest_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
@@ -118,36 +110,21 @@ impl StorageClient {
             .clone()
             .ok_or(anyhow!("Missing assignment URL"))?;
         let effective_from = visible_assignment.effective_from;
-
-        let applied = self.applied.read().clone();
-        if let Some(applied) = &applied {
-            if applied.id == assignment_id {
-                tracing::debug!("Assignment has not been changed");
-                return Ok(AssignmentRefresh::Unchanged);
-            }
-            // Before the download: no reason to pay for a rejected blob.
-            // Ordering is effective-from, not arrival (DEF-4, INV-2).
-            if effective_from < applied.effective_from {
-                tracing::warn!(
-                    "Skipping assignment \"{}\": effective from {}, older than the applied \"{}\" at {}",
-                    assignment_id,
-                    effective_from,
-                    applied.id,
-                    applied.effective_from,
-                );
-                return Ok(AssignmentRefresh::Regressive);
-            }
+        let latest_id = self.latest_assignment_id.read().clone();
+        if latest_id.as_ref() == Some(&assignment_id) {
+            tracing::debug!("Assignment has not been changed");
+            return Ok(AssignmentRefresh::Unchanged);
         }
 
         let assignment = self
             .fetch_assignment(&assignment_url, &assignment_id)
             .await?;
 
-        if applied.is_some() {
+        if latest_id.is_some() {
             sleep_until(effective_from).await;
         }
 
-        self.set_assignment(assignment, &assignment_id, effective_from);
+        self.set_assignment(assignment, &assignment_id);
 
         tracing::info!("Applied assignment \"{}\"", assignment_id);
         Ok(AssignmentRefresh::Applied)
@@ -203,11 +180,8 @@ impl StorageClient {
     }
 
     #[instrument(skip_all)]
-    fn set_assignment(&self, assignment: Assignment, id: &str, effective_from: u64) {
-        *self.applied.write() = Some(Applied {
-            id: id.to_owned(),
-            effective_from,
-        });
+    fn set_assignment(&self, assignment: Assignment, id: &str) {
+        *self.latest_assignment_id.write() = Some(id.to_owned());
 
         let prev = self.assignment.read();
         for dataset in assignment.datasets().iter() {
@@ -435,9 +409,9 @@ mod tests {
     }
 }
 
-/// The CT-2 injectors of GAP-1/GAP-20, in-crate. These drive `update_assignment`
-/// rather than `try_update_assignment`, to assert the typed outcome and leave the
-/// process-global refresh metrics alone.
+/// The CT-2 assignment-ingestion injectors, in-crate. These drive
+/// `update_assignment` rather than `try_update_assignment`, to assert the typed
+/// outcome and leave the process-global refresh metrics alone.
 #[cfg(test)]
 mod refresh_tests {
     use std::{
@@ -598,7 +572,10 @@ mod refresh_tests {
             matches!(err, RefreshError::Invalid { .. }),
             "expected a verification failure, got {err:?}",
         );
-        assert!(client.applied.read().is_none(), "corrupt artifact applied");
+        assert!(
+            client.latest_assignment_id.read().is_none(),
+            "corrupt artifact applied"
+        );
         assert_eq!(client.num_workers(), 0);
     }
 
@@ -613,7 +590,7 @@ mod refresh_tests {
 
         assert!(matches!(err, RefreshError::Invalid { .. }));
         assert_eq!(
-            client.applied.read().as_ref().map(|a| a.id.clone()),
+            client.latest_assignment_id.read().clone(),
             Some("good".to_owned()),
             "a rejected artifact must not become the applied one",
         );
@@ -625,42 +602,27 @@ mod refresh_tests {
     }
 
     #[tokio::test]
-    async fn regressive_assignment_is_not_applied() {
-        let publisher = Publisher::start("current", valid_artifact()).await;
+    async fn publisher_can_restore_previously_applied_assignment() {
+        let publisher = Publisher::start("previous", valid_artifact()).await;
         let client = publisher.client();
+        client.update_assignment().await.unwrap();
+
+        publisher.publish("current", EFFECTIVE_FROM + 100, valid_artifact());
         client.update_assignment().await.unwrap();
         let downloads = publisher.artifact_hits();
 
-        // Different identifier, earlier effective-from.
-        publisher.publish("stale-republish", EFFECTIVE_FROM - 100, valid_artifact());
-        let outcome = client.update_assignment().await.unwrap();
-
-        assert!(matches!(outcome, AssignmentRefresh::Regressive));
-        assert_eq!(
-            client.applied.read().as_ref().map(|a| a.id.clone()),
-            Some("current".to_owned()),
-        );
-        assert_eq!(
-            publisher.artifact_hits(),
-            downloads,
-            "the guard should reject before paying for the download",
-        );
-    }
-
-    #[tokio::test]
-    async fn equal_effective_from_is_still_applied() {
-        // Only strictly-earlier is a regression.
-        let publisher = Publisher::start("first", valid_artifact()).await;
-        let client = publisher.client();
-        client.update_assignment().await.unwrap();
-
-        publisher.publish("correction", EFFECTIVE_FROM, valid_artifact());
+        publisher.publish("previous", EFFECTIVE_FROM, valid_artifact());
         let outcome = client.update_assignment().await.unwrap();
 
         assert!(matches!(outcome, AssignmentRefresh::Applied));
         assert_eq!(
-            client.applied.read().as_ref().map(|a| a.id.clone()),
-            Some("correction".to_owned()),
+            client.latest_assignment_id.read().clone(),
+            Some("previous".to_owned()),
+        );
+        assert_eq!(
+            publisher.artifact_hits(),
+            downloads + 1,
+            "the rollback artifact should be downloaded",
         );
     }
 
@@ -675,7 +637,7 @@ mod refresh_tests {
 
         assert!(matches!(outcome, AssignmentRefresh::Applied));
         assert_eq!(
-            client.applied.read().as_ref().map(|a| a.id.clone()),
+            client.latest_assignment_id.read().clone(),
             Some("second".to_owned()),
         );
     }

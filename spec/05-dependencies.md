@@ -43,7 +43,8 @@ degrades worker-by-worker. Health state is in-memory (DEF-12) and resets on rest
 never on a request path.
 *Call contract.* Poll every P-ASSIGNMENT-REFRESH; fetch deadline
 P-ASSIGNMENT-FETCH-TIMEOUT; unchanged identifier ⇒ no re-download; application waits
-for effective-from.
+for effective-from. A different identifier is authoritative regardless of whether its
+effective-from predates the applied artifact's (ADR-016).
 *Error mapping.* Fetch/parse failure → keep serving the applied artifact; alarm
 (⚠ today only a log — GAP-2). Never surfaces to clients directly.
 *Degradation.* Serve-stale, currently unbounded; intent bounds it at

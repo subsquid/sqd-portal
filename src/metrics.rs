@@ -219,8 +219,6 @@ pub fn report_mutex_held_duration(
 pub enum AssignmentRefresh {
     Applied,
     Unchanged,
-    /// Effective-from earlier than the applied artifact's (DEF-4, INV-2).
-    Regressive,
     FetchFailed,
     /// Structurally invalid — never applied (REQ-26, FM-2).
     Invalid,
@@ -231,7 +229,6 @@ impl AssignmentRefresh {
         match self {
             Self::Applied => "applied",
             Self::Unchanged => "unchanged",
-            Self::Regressive => "regressive",
             Self::FetchFailed => "fetch_failed",
             Self::Invalid => "invalid",
         }

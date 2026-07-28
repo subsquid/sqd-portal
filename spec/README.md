@@ -55,7 +55,8 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 | ADR-010 | 2026-07-09 | [Upstream deadlines sit strictly below client deadlines](decisions/ADR-010-upstream-deadline-below-client.md) | Accepted (historical) |
 | ADR-011 | 2026-07-16 | [Portal API errors use a stable two-axis taxonomy](decisions/ADR-011-error-taxonomy.md) | Accepted |
 | ADR-012 | 2026-07-17 | [Every shed response carries an explicit retry hint](decisions/ADR-012-retry-after-on-shed.md) | Accepted |
-| ADR-014 | 2026-07-17 | [Contract reconciliation: overload hints, conflict precedence, artifact regression, archival finalized head, EMPTY metadata, timestamp frontier, gated debug surface](decisions/ADR-014-contract-reconciliation.md) | Accepted |
+| ADR-014 | 2026-07-17 | [Contract reconciliation: overload hints, conflict precedence, artifact regression, archival finalized head, EMPTY metadata, timestamp frontier, gated debug surface](decisions/ADR-014-contract-reconciliation.md) | Accepted; decision 3 superseded by ADR-016 |
+| ADR-016 | 2026-07-28 | [Effective-from gates activation; the publisher controls assignment selection](decisions/ADR-016-assignment-publisher-authority.md) | Accepted |
 | ADR-013 | 2026-07-17 | [Assignment staleness must be bounded and observable](decisions/ADR-013-assignment-staleness-bound.md) | **Proposed** |
 
 ## Conventions

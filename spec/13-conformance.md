@@ -1,7 +1,7 @@
 # 13 — Conformance & TDD plan
 
-**Mutable doc.** Statuses as of **2026-07-20** (0.11.8,
-`master@531e713f8ccb933ffc52fd50b3056db637e4f5fa` + working tree). Statuses: **C** covered · **P** partial · **U**
+**Mutable doc.** Statuses as of **2026-07-28** (0.11.8,
+`fix/assignment-integrity@2bea276` + working tree). Statuses: **C** covered · **P** partial · **U**
 unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
 The **Phase-0 harness exists** (`harness/` crate: IB-7 stubs with ledgers — including
 a real p2p worker stub on the pinned transport rev — toy world, reference model, the six
@@ -118,7 +118,7 @@ chunk-boundary records FV-6 licenses.
 
 | Property | CT | Status | Note |
 |---|---|---|---|
-| INV-1, INV-2 | CT-3/2 | P | INV-2's monotonicity is covered by the refresh tests (regressive artifact skipped, equal effective-from still applied); atomic application (INV-1) still unit-tested only |
+| INV-1, INV-2 | CT-3/2 | P | INV-2's identifier deduplication and publisher-controlled rollback are covered by refresh tests; future-effective deferral remains untested, and atomic application (INV-1) is still unit-tested only |
 | INV-3 | CT-3 | U | lease underflow guarded in debug builds only |
 | INV-4 | CT-1/3 | P | window grow/shrink/priority unit tests |
 | INV-5 | CT-3 | U | transient overshoot untested |
@@ -219,10 +219,10 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
   rather than logged only. The in-crate publisher stub confirmed the failure mode
   first: under the unchecked read a corrupt blob panicked inside `flatbuffers`
   on the refresh path, exactly as the gap claimed.
-- **GAP-20** (closed 2026-07-20): artifact application is monotone in
-  effective-from (DEF-4, INV-2). A republished older artifact is skipped before
-  the download and counted as `outcome="regressive"`; a re-publish at the *same*
-  effective-from still applies, since only strictly-earlier is a regression.
+- **GAP-20** (withdrawn 2026-07-28): it incorrectly treated effective-from as an
+  artifact revision and encoded an unverified scheduler assumption. ADR-016 restores
+  publisher authority: a different identifier can intentionally roll routing back
+  even when its effective-from predates the applied artifact's.
 - **GAP-2** (closed 2026-07-20): artifact age is bounded by P-ASSIGNMENT-MAX-AGE and
   exposed as `assignment_age_seconds` / `assignment_stale`, computed at scrape time so a
   dead refresh loop cannot pin them; refresh failures are reason-coded counters rather
