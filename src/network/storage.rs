@@ -13,8 +13,17 @@ use crate::{
     utils::RwLock,
 };
 
+/// The assignment currently held by the client: either the legacy shared format, or (under
+/// `mvcc-chunks`) the portal-oriented split format. See docs/assignment-wire-format.md in
+/// network-scheduler for the split rationale.
+enum ActiveAssignment {
+    Legacy(Assignment),
+    #[cfg(feature = "mvcc-chunks")]
+    Portal(sqd_assignments::PortalAssignment),
+}
+
 pub struct StorageClient {
-    assignment: RwLock<Option<Assignment>>,
+    assignment: RwLock<Option<ActiveAssignment>>,
     datasets_config: Arc<RwLock<Datasets>>,
     latest_assignment_id: RwLock<Option<String>>,
     network_state_url: String,
@@ -65,10 +74,12 @@ impl StorageClient {
     }
 
     pub fn num_workers(&self) -> usize {
-        self.assignment
-            .read()
-            .as_ref()
-            .map_or(0, |a| a.workers().len())
+        match self.assignment.read().as_ref() {
+            Some(ActiveAssignment::Legacy(a)) => a.workers().len(),
+            #[cfg(feature = "mvcc-chunks")]
+            Some(ActiveAssignment::Portal(a)) => a.workers().len(),
+            None => 0,
+        }
     }
 
     pub async fn try_update_assignment(&self) {
@@ -84,7 +95,7 @@ impl StorageClient {
     async fn update_assignment(&self) -> anyhow::Result<()> {
         tracing::debug!("Checking for new assignment");
         let network_state = self.fetch_network_state().await?;
-        let visible_assignment = visible_assignment(&network_state);
+        let (visible_assignment, is_portal_assignment) = visible_assignment(&network_state);
         let assignment_id = visible_assignment.id.clone();
         let assignment_url = visible_assignment
             .fb_url_v1
@@ -97,7 +108,9 @@ impl StorageClient {
             return Ok(());
         }
 
-        let assignment = self.fetch_assignment(&assignment_url).await?;
+        let assignment = self
+            .fetch_assignment(&assignment_url, is_portal_assignment)
+            .await?;
 
         if latest_id.is_some() {
             sleep_until(effective_from).await;
@@ -120,8 +133,13 @@ impl StorageClient {
         Ok(network_state)
     }
 
-    #[instrument(skip_all)]
-    async fn fetch_assignment(&self, url: &str) -> anyhow::Result<Assignment> {
+    #[instrument(skip(self, url))]
+    #[allow(unused_variables)]
+    async fn fetch_assignment(
+        &self,
+        url: &str,
+        is_portal_assignment: bool,
+    ) -> anyhow::Result<ActiveAssignment> {
         use async_compression::tokio::bufread::GzipDecoder;
         use futures::TryStreamExt;
         use tokio::io::AsyncReadExt;
@@ -144,52 +162,120 @@ impl StorageClient {
 
         tracing::debug!("Downloaded assignment from {}", url);
 
-        Ok(Assignment::from_owned_unchecked(buf))
+        #[cfg(feature = "mvcc-chunks")]
+        if is_portal_assignment {
+            return Ok(ActiveAssignment::Portal(
+                sqd_assignments::PortalAssignment::from_owned_unchecked(buf),
+            ));
+        }
+
+        Ok(ActiveAssignment::Legacy(Assignment::from_owned_unchecked(
+            buf,
+        )))
     }
 
     #[instrument(skip_all)]
-    fn set_assignment(&self, assignment: Assignment, id: &str) {
+    fn set_assignment(&self, assignment: ActiveAssignment, id: &str) {
         *self.latest_assignment_id.write() = Some(id.to_owned());
 
         let prev = self.assignment.read();
-        for dataset in assignment.datasets().iter() {
-            let dataset_id = DatasetId::from_url(dataset.id());
-            let new_len = dataset.chunks().len();
-            let last_block = dataset.last_block();
-            let prev_ds = prev.as_ref().and_then(|p| p.get_dataset(dataset.id()));
-            let old_len = prev_ds.map_or(0, |p| p.chunks().len());
-            if old_len < new_len {
-                tracing::info!(
-                    "Got {} new chunk(s) for dataset {}",
-                    new_len - old_len,
-                    dataset_id,
-                );
+        let workers_len = match &assignment {
+            ActiveAssignment::Legacy(assignment) => {
+                for dataset in assignment.datasets().iter() {
+                    let prev_len = match prev.as_ref() {
+                        Some(ActiveAssignment::Legacy(p)) => {
+                            p.get_dataset(dataset.id()).map(|d| d.chunks().len())
+                        }
+                        #[cfg(feature = "mvcc-chunks")]
+                        Some(ActiveAssignment::Portal(_)) => None,
+                        None => None,
+                    };
+                    self.report_dataset_update(
+                        dataset.id(),
+                        dataset.chunks().len(),
+                        dataset.last_block(),
+                        prev_len,
+                    );
+                }
+                assignment.workers().len()
             }
-
-            let dataset_name = self
-                .datasets_config
-                .read()
-                .default_name(&dataset_id)
-                .map(ToOwned::to_owned);
-            metrics::report_chunk_list_updated(&dataset_id, dataset_name, new_len, last_block);
-        }
+            #[cfg(feature = "mvcc-chunks")]
+            ActiveAssignment::Portal(assignment) => {
+                for dataset in assignment.datasets().iter() {
+                    let prev_len = match prev.as_ref() {
+                        Some(ActiveAssignment::Portal(p)) => {
+                            p.get_dataset(dataset.id()).map(|d| d.chunks().len())
+                        }
+                        Some(ActiveAssignment::Legacy(_)) => None,
+                        None => None,
+                    };
+                    self.report_dataset_update(
+                        dataset.id(),
+                        dataset.chunks().len(),
+                        dataset.last_block(),
+                        prev_len,
+                    );
+                }
+                assignment.workers().len()
+            }
+        };
         drop(prev);
 
-        crate::metrics::KNOWN_WORKERS.set(assignment.workers().len() as i64);
+        crate::metrics::KNOWN_WORKERS.set(workers_len as i64);
 
         *self.assignment.write() = Some(assignment);
     }
 
+    fn report_dataset_update(
+        &self,
+        dataset_id: &str,
+        new_len: usize,
+        last_block: u64,
+        prev_len: Option<usize>,
+    ) {
+        let dataset_id = DatasetId::from_url(dataset_id);
+        let old_len = prev_len.unwrap_or(0);
+        if old_len < new_len {
+            tracing::info!(
+                "Got {} new chunk(s) for dataset {}",
+                new_len - old_len,
+                dataset_id,
+            );
+        }
+
+        let dataset_name = self
+            .datasets_config
+            .read()
+            .default_name(&dataset_id)
+            .map(ToOwned::to_owned);
+        metrics::report_chunk_list_updated(&dataset_id, dataset_name, new_len, last_block);
+    }
+
     pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound> {
-        let dataset = dataset.to_url();
+        let dataset_url = dataset.to_url();
         let guard = self.assignment.read();
-        let assignment = guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)?;
-        let chunk = assignment
-            .find_chunk(dataset, block)
-            .map_err(|e| convert_chunk_not_found(e, assignment, dataset))?;
-        chunk.id().parse().map_err(|e| {
+        let chunk_id = match guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)? {
+            ActiveAssignment::Legacy(assignment) => {
+                let chunk = assignment.find_chunk(dataset_url, block).map_err(|e| {
+                    convert_chunk_not_found(e, || {
+                        assignment.get_dataset(dataset_url).unwrap().first_block()
+                    })
+                })?;
+                chunk.id().to_owned()
+            }
+            #[cfg(feature = "mvcc-chunks")]
+            ActiveAssignment::Portal(assignment) => {
+                let chunk = assignment.find_chunk(dataset_url, block).map_err(|e| {
+                    convert_chunk_not_found(e, || {
+                        assignment.get_dataset(dataset_url).unwrap().first_block()
+                    })
+                })?;
+                chunk.id().to_owned()
+            }
+        };
+        chunk_id.parse().map_err(|e| {
             tracing::warn!(error = %e, "Failed to parse chunk ID");
-            ChunkNotFound::InvalidID(chunk.id().to_string())
+            ChunkNotFound::InvalidID(chunk_id)
         })
     }
 
@@ -198,15 +284,34 @@ impl StorageClient {
         dataset: &DatasetId,
         ts: u64,
     ) -> Result<DataChunk, ChunkNotFound> {
-        let dataset = dataset.to_url();
+        let dataset_url = dataset.to_url();
         let guard = self.assignment.read();
-        let assignment = guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)?;
-        let chunk = assignment
-            .find_chunk_by_timestamp(dataset, ts)
-            .map_err(|e| convert_chunk_not_found(e, assignment, dataset))?;
-        chunk.id().parse().map_err(|e| {
+        let chunk_id = match guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)? {
+            ActiveAssignment::Legacy(assignment) => {
+                let chunk = assignment
+                    .find_chunk_by_timestamp(dataset_url, ts)
+                    .map_err(|e| {
+                        convert_chunk_not_found(e, || {
+                            assignment.get_dataset(dataset_url).unwrap().first_block()
+                        })
+                    })?;
+                chunk.id().to_owned()
+            }
+            #[cfg(feature = "mvcc-chunks")]
+            ActiveAssignment::Portal(assignment) => {
+                let chunk = assignment
+                    .find_chunk_by_timestamp(dataset_url, ts)
+                    .map_err(|e| {
+                        convert_chunk_not_found(e, || {
+                            assignment.get_dataset(dataset_url).unwrap().first_block()
+                        })
+                    })?;
+                chunk.id().to_owned()
+            }
+        };
+        chunk_id.parse().map_err(|e| {
             tracing::warn!(error = %e, "Failed to parse chunk ID");
-            ChunkNotFound::InvalidID(chunk.id().to_string())
+            ChunkNotFound::InvalidID(chunk_id)
         })
     }
 
@@ -215,32 +320,62 @@ impl StorageClient {
         dataset: &DatasetId,
         block: u64,
     ) -> Result<Vec<PeerId>, ChunkNotFound> {
-        let dataset = dataset.to_url();
+        let dataset_url = dataset.to_url();
         let guard = self.assignment.read();
-        let assignment = guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)?;
-        let chunk = assignment
-            .find_chunk(dataset, block)
-            .map_err(|e| convert_chunk_not_found(e, assignment, dataset))?;
-        Ok(chunk
-            .worker_indexes()
-            .iter()
+        match guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)? {
+            ActiveAssignment::Legacy(assignment) => {
+                let chunk = assignment.find_chunk(dataset_url, block).map_err(|e| {
+                    convert_chunk_not_found(e, || {
+                        assignment.get_dataset(dataset_url).unwrap().first_block()
+                    })
+                })?;
+                Ok(
+                    self.filtered_worker_ids(chunk.worker_indexes().iter(), |idx| {
+                        let w = assignment.get_worker_by_index(idx);
+                        (w.status(), w.peer_id())
+                    }),
+                )
+            }
+            #[cfg(feature = "mvcc-chunks")]
+            ActiveAssignment::Portal(assignment) => {
+                let chunk = assignment.find_chunk(dataset_url, block).map_err(|e| {
+                    convert_chunk_not_found(e, || {
+                        assignment.get_dataset(dataset_url).unwrap().first_block()
+                    })
+                })?;
+                Ok(
+                    self.filtered_worker_ids(chunk.worker_indexes().iter(), |idx| {
+                        let w = assignment.get_worker_by_index(idx);
+                        (w.status(), w.peer_id())
+                    }),
+                )
+            }
+        }
+    }
+
+    fn filtered_worker_ids(
+        &self,
+        indexes: impl Iterator<Item = u16>,
+        lookup: impl Fn(u16) -> (sqd_assignments::WorkerStatus, Result<PeerId, anyhow::Error>),
+    ) -> Vec<PeerId> {
+        indexes
             .filter_map(|idx| {
-                let w = assignment.get_worker_by_index(idx);
-                if w.status() == sqd_assignments::WorkerStatus::UnsupportedVersion {
+                let (status, peer_id) = lookup(idx);
+                if status == sqd_assignments::WorkerStatus::UnsupportedVersion {
                     return None;
                 }
                 if self.ignore_deprecated_workers
-                    && w.status() == sqd_assignments::WorkerStatus::DeprecatedVersion
+                    && status == sqd_assignments::WorkerStatus::DeprecatedVersion
                 {
                     return None;
                 }
-                w.peer_id()
+                peer_id
                     .inspect_err(
                         |e| tracing::warn!(error = %e, "Failed to parse worker ID #{}", idx),
                     )
                     .ok()
             })
-            .collect())
+            .collect()
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
@@ -248,53 +383,71 @@ impl StorageClient {
     }
 
     pub fn first_block(&self, dataset: &DatasetId) -> Option<BlockNumber> {
-        Some(
-            self.assignment
-                .read()
-                .as_ref()?
-                .get_dataset(dataset.to_url())?
-                .first_block(),
-        )
+        let dataset_url = dataset.to_url();
+        match self.assignment.read().as_ref()? {
+            ActiveAssignment::Legacy(a) => Some(a.get_dataset(dataset_url)?.first_block()),
+            #[cfg(feature = "mvcc-chunks")]
+            ActiveAssignment::Portal(a) => Some(a.get_dataset(dataset_url)?.first_block()),
+        }
     }
 
     pub fn head(&self, dataset: &DatasetId) -> Option<BlockRef> {
-        let guard = self.assignment.read();
-        let dataset = guard.as_ref()?.get_dataset(dataset.to_url())?;
-        dataset.last_block_hash().map(|hash| BlockRef {
-            hash: hash.to_owned(),
-            number: dataset.last_block(),
-        })
+        let dataset_url = dataset.to_url();
+        match self.assignment.read().as_ref()? {
+            ActiveAssignment::Legacy(a) => {
+                let dataset = a.get_dataset(dataset_url)?;
+                dataset.last_block_hash().map(|hash| BlockRef {
+                    hash: hash.to_owned(),
+                    number: dataset.last_block(),
+                })
+            }
+            #[cfg(feature = "mvcc-chunks")]
+            ActiveAssignment::Portal(a) => {
+                let dataset = a.get_dataset(dataset_url)?;
+                dataset.last_block_hash().map(|hash| BlockRef {
+                    hash: hash.to_owned(),
+                    number: dataset.last_block(),
+                })
+            }
+        }
     }
 
     pub fn get_all_workers(&self) -> Vec<PeerId> {
-        let guard = self.assignment.read();
-        guard
-            .as_ref()
-            .map(|a| {
-                a.workers()
-                    .iter()
-                    .filter_map(|w| (*w.worker_id()).try_into().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+        match self.assignment.read().as_ref() {
+            Some(ActiveAssignment::Legacy(a)) => a
+                .workers()
+                .iter()
+                .filter_map(|w| (*w.worker_id()).try_into().ok())
+                .collect(),
+            #[cfg(feature = "mvcc-chunks")]
+            Some(ActiveAssignment::Portal(a)) => a
+                .workers()
+                .iter()
+                .filter_map(|w| (*w.worker_id()).try_into().ok())
+                .collect(),
+            None => Vec::new(),
+        }
     }
 
     #[instrument(skip(self))]
     pub fn get_dataset_state(&self, dataset: &DatasetId) -> Option<DatasetState> {
+        let dataset_url = dataset.to_url();
         let mut ranges: HashMap<_, Vec<_>> = HashMap::new();
-        let guard = self.assignment.read();
-        let assignment = guard.as_ref()?;
-        for c in assignment.get_dataset(dataset.to_url())?.chunks().iter() {
-            let range = c.id().parse::<DataChunk>().unwrap().range_msg();
-            for idx in c.worker_indexes() {
-                let peer_id = match assignment.get_worker_id(idx) {
-                    Ok(peer_id) => peer_id,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to parse worker ID #{}", idx);
-                        continue;
-                    }
-                };
-                ranges.entry(peer_id).or_default().push(range)
+        match self.assignment.read().as_ref()? {
+            ActiveAssignment::Legacy(assignment) => {
+                for c in assignment.get_dataset(dataset_url)?.chunks().iter() {
+                    accumulate_range(&mut ranges, c.id(), c.worker_indexes().iter(), |idx| {
+                        assignment.get_worker_id(idx)
+                    });
+                }
+            }
+            #[cfg(feature = "mvcc-chunks")]
+            ActiveAssignment::Portal(assignment) => {
+                for c in assignment.get_dataset(dataset_url)?.chunks().iter() {
+                    accumulate_range(&mut ranges, c.id(), c.worker_indexes().iter(), |idx| {
+                        assignment.get_worker_id(idx)
+                    });
+                }
             }
         }
         Some(DatasetState {
@@ -306,31 +459,48 @@ impl StorageClient {
     }
 }
 
-/// Selects the assignment portals should use for routing.
+fn accumulate_range(
+    ranges: &mut HashMap<PeerId, Vec<sqd_messages::Range>>,
+    chunk_id: &str,
+    worker_indexes: impl Iterator<Item = u16>,
+    get_worker_id: impl Fn(u16) -> Result<PeerId, anyhow::Error>,
+) {
+    let range = chunk_id.parse::<DataChunk>().unwrap().range_msg();
+    for idx in worker_indexes {
+        let peer_id = match get_worker_id(idx) {
+            Ok(peer_id) => peer_id,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to parse worker ID #{}", idx);
+                continue;
+            }
+        };
+        ranges.entry(peer_id).or_default().push(range);
+    }
+}
+
+/// Selects the assignment portals should use for routing, and reports whether it was the
+/// dedicated portal assignment (`true`) or the legacy shared assignment (`false`).
 ///
-/// In the first NET-683 phase, `mvcc-chunks` portals prefer the dedicated
-/// portal assignment but temporarily fall back to the legacy assignment so
-/// rollouts can tolerate schedulers that have not started publishing
+/// Under `mvcc-chunks`, portals prefer `portal_assignment` but fall back to the legacy
+/// assignment so rollouts can tolerate schedulers that have not started publishing
 /// `portal_assignment` yet.
-fn visible_assignment(network_state: &sqd_assignments::NetworkState) -> &NetworkAssignment {
+fn visible_assignment(network_state: &sqd_assignments::NetworkState) -> (&NetworkAssignment, bool) {
     #[cfg(feature = "mvcc-chunks")]
     {
-        // First NET-683 step only splits portal discovery/publication.
-        // Until MVCC visibility logic lands, fall back to the legacy assignment.
         match network_state.portal_assignment.as_ref() {
-            Some(assignment) => assignment,
+            Some(assignment) => (assignment, true),
             None => {
                 tracing::warn!(
                     "portal_assignment missing in network state; falling back to legacy assignment"
                 );
-                &network_state.assignment
+                (&network_state.assignment, false)
             }
         }
     }
 
     #[cfg(not(feature = "mvcc-chunks"))]
     {
-        &network_state.assignment
+        (&network_state.assignment, false)
     }
 }
 
@@ -364,7 +534,9 @@ mod tests {
     fn visible_assignment_uses_legacy_assignment() {
         let state = network_state();
 
-        assert_eq!(visible_assignment(&state).id, "legacy");
+        let (visible, is_portal) = visible_assignment(&state);
+        assert_eq!(visible.id, "legacy");
+        assert!(!is_portal);
     }
 
     #[cfg(feature = "mvcc-chunks")]
@@ -373,19 +545,20 @@ mod tests {
         let mut state = network_state();
         state.portal_assignment = Some(assignment("portal"));
 
-        assert_eq!(visible_assignment(&state).id, "portal");
+        let (visible, is_portal) = visible_assignment(&state);
+        assert_eq!(visible.id, "portal");
+        assert!(is_portal);
     }
 }
 
 fn convert_chunk_not_found(
     e: sqd_assignments::ChunkNotFound,
-    assignment: &Assignment,
-    dataset: &str,
+    first_block: impl FnOnce() -> u64,
 ) -> ChunkNotFound {
     match e {
         sqd_assignments::ChunkNotFound::AfterLast => ChunkNotFound::AfterLast,
         sqd_assignments::ChunkNotFound::BeforeFirst => ChunkNotFound::BeforeFirst {
-            first_block: assignment.get_dataset(dataset).unwrap().first_block(),
+            first_block: first_block(),
         },
         sqd_assignments::ChunkNotFound::UnknownDataset => ChunkNotFound::UnknownDataset,
     }

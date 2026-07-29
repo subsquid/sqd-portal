@@ -7733,7 +7733,7 @@ dependencies = [
 [[package]]
 name = "sqd-assignments"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=e9a3434#e9a34341035ac7745b71eb87dabc8501aa434376"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=1e334ec#1e334ec47b3ab3ed36213d108e615627db7e5be8"
 dependencies = [
  "anyhow",
  "crypto_box",
