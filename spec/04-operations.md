@@ -121,7 +121,7 @@ of the conformance surface beyond existence and freshness.
 
 *Effect.* Pure read of local state — never calls a dependency. *Post.* Ready iff:
 an artifact is applied ∧ worker connectivity ≥ P-READY-CONNECTION-RATIO ∧ not shutting
-down (INV-31). Intent (ADR-013 ⚠): also degrade when artifact age > P-ASSIGNMENT-MAX-AGE.
+down (INV-31). Artifact age is not a conjunct — staleness is signalled only (ADR-016).
 
 ## OP-9 — Metrics read
 

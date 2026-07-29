@@ -42,13 +42,14 @@ degrades worker-by-worker. Health state is in-memory (DEF-12) and resets on rest
 *Role.* Source of the assignment artifact (DEF-4); consulted by a background loop only,
 never on a request path.
 *Call contract.* Poll every P-ASSIGNMENT-REFRESH; fetch deadline
-P-ASSIGNMENT-FETCH-TIMEOUT; unchanged identifier ⇒ no re-download; application waits
-for effective-from.
-*Error mapping.* Fetch/parse failure → keep serving the applied artifact; alarm
-(⚠ today only a log — GAP-2). Never surfaces to clients directly.
-*Degradation.* Serve-stale, currently unbounded; intent bounds it at
-P-ASSIGNMENT-MAX-AGE ⚠ with degraded readiness (ADR-013). *Integrity:* intent is
-validate-before-apply (REQ-26); currently trusted unverified (ADR-002, GAP-1).
+P-ASSIGNMENT-FETCH-TIMEOUT; unchanged identifier ⇒ no re-download. Whichever identifier
+the publisher currently selects is authoritative; application is delayed by the
+deprecated effective-from when it has not yet passed (ADR-016).
+*Error mapping.* Fetch/parse failure → keep serving the applied artifact; reason-coded
+counter and alarm. Never surfaces to clients directly.
+*Degradation.* Serve-stale, bounded and signalled at P-ASSIGNMENT-MAX-AGE; readiness is
+independent of artifact age by decision (ADR-016). *Integrity:* validate-before-apply
+(REQ-26) — a rejected artifact leaves the applied one untouched.
 
 ## DC-3 — Dataset registry
 
@@ -115,7 +116,7 @@ never delays or fails serving.
 
 | Snapshot | Refreshed by | Staleness bound | Staleness visible? |
 |---|---|---|---|
-| Applied artifact (DEF-4) | DC-2 poll | one successful P-ASSIGNMENT-REFRESH cycle while healthy; none during outage today; ⚠ P-ASSIGNMENT-MAX-AGE (ADR-013) | intent: age gauge + readiness (GAP-2) |
+| Applied artifact (DEF-4) | DC-2 poll | one successful P-ASSIGNMENT-REFRESH cycle while healthy; bounded and signalled at P-ASSIGNMENT-MAX-AGE (ADR-016) | age gauge + stale signal; readiness independent |
 | Dataset catalog (DEF-14) | DC-3 poll | none (accepted) | no |
 | Chain status | DC-5 poll | none (status only) | loading state before first fetch |
 | Worker health map (DEF-12) | per-query outcomes | rolling windows (P-WORKER-ERROR-COOLDOWN / P-WORKER-TIMEOUT-COOLDOWN) | operator debug view |

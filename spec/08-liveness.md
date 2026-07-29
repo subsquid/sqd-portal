@@ -86,6 +86,6 @@ within P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT + slack, regardless of client behavio
 **LIV-12 — No silent infinite retry.** Any divergence converges or alarms: chunk
 attempts are bounded by 1 + retries, then surface RETRIES-EXHAUSTED (WORKER-FAILURE
 for integrity exhaustion, DC-1) before the first record or truncation after it; refresh loops that fail
-persistently raise the OB-9 alarm state (⚠ artifact case pending ADR-013); nothing
-retries forever without an externally visible signal. Witness: OB-9. Check: CT-2 —
+persistently raise the OB-9 alarm state (the artifact case is reason-coded and
+age-signalled per ADR-016); nothing retries forever without an externally visible signal. Witness: OB-9. Check: CT-2 —
 permanent-failure stubs; assert bounded attempts + alarm.

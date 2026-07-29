@@ -52,8 +52,7 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 |---|---|
 | Unreachable / fetch timeout | degrade serve-stale + alarm ⚠ (today: log only — GAP-2) |
 | Corrupt / truncated artifact | integrity: reject, keep last good, alarm — **intent** (today: adopted unverified — GAP-1, ADR-002) |
-| Stale (identifier never advances) | degrade + alarm past P-ASSIGNMENT-MAX-AGE ⚠ (ADR-013) |
-| Regressive (older identifier republished) | mask — application legality ignores it (INV-2) |
+| Stale (identifier never advances) | signal + alarm past P-ASSIGNMENT-MAX-AGE; readiness unaffected (ADR-016) |
 
 ## Real-time source faults (DC-4)
 

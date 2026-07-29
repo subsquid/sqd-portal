@@ -133,7 +133,10 @@ async fn main() -> anyhow::Result<()> {
     let mut metrics_registry = Registry::with_labels(
         vec![(Cow::Borrowed("portal_id"), Cow::Owned(peer_id.to_string()))].into_iter(),
     );
-    sqd_portal::metrics::register_metrics(metrics_registry.sub_registry_with_prefix("portal"));
+    sqd_portal::metrics::register_metrics(
+        metrics_registry.sub_registry_with_prefix("portal"),
+        config.assignment_max_age,
+    );
     sqd_network_transport::metrics::register_metrics(
         metrics_registry.sub_registry_with_prefix("transport"),
     );

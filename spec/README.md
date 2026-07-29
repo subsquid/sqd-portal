@@ -55,9 +55,10 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 | ADR-010 | 2026-07-09 | [Upstream deadlines sit strictly below client deadlines](decisions/ADR-010-upstream-deadline-below-client.md) | Accepted (historical) |
 | ADR-011 | 2026-07-16 | [Portal API errors use a stable two-axis taxonomy](decisions/ADR-011-error-taxonomy.md) | Accepted |
 | ADR-012 | 2026-07-17 | [Every shed response carries an explicit retry hint](decisions/ADR-012-retry-after-on-shed.md) | Accepted |
-| ADR-014 | 2026-07-17 | [Contract reconciliation: overload hints, conflict precedence, artifact regression, archival finalized head, EMPTY metadata, timestamp frontier, gated debug surface](decisions/ADR-014-contract-reconciliation.md) | Accepted |
+| ADR-014 | 2026-07-17 | [Contract reconciliation: overload hints, conflict precedence, artifact regression, archival finalized head, EMPTY metadata, timestamp frontier, gated debug surface](decisions/ADR-014-contract-reconciliation.md) | Accepted; decision 3 superseded by ADR-016 |
 | ADR-015 | 2026-07-21 | [One connection-class replay on the real-time path](decisions/ADR-015-real-time-connection-replay.md) | Accepted |
-| ADR-013 | 2026-07-17 | [Assignment staleness must be bounded and observable](decisions/ADR-013-assignment-staleness-bound.md) | **Proposed** |
+| ADR-016 | 2026-07-28 | [The publisher owns assignment selection; the Portal signals staleness instead of overriding it](decisions/ADR-016-assignment-publisher-authority.md) | Accepted |
+| ADR-013 | 2026-07-17 | [Assignment staleness must be bounded and observable](decisions/ADR-013-assignment-staleness-bound.md) | Superseded by ADR-016 |
 
 ## Conventions
 
@@ -86,7 +87,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 1. **Extend the harness past Phase 0** (13 §build order): the Phase-0 skeleton —
    dependency stubs per IB-7, the structural validators, the reference model — has
    landed (GAP-14 closed 2026-07-17); build the `CT-2..CT-9` classes on it next.
-2. **Ratify or reject proposed ADR-013** and the ⚠ targets in [15-parameters.md](15-parameters.md)
+2. **Ratify or reject** the ⚠ targets in [15-parameters.md](15-parameters.md)
    and the SLO table (11); close the open questions in
    [02-requirements.md](02-requirements.md).
 3. **Burn down the gap register** in [13-conformance.md](13-conformance.md) in priority
