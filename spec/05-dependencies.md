@@ -31,7 +31,7 @@ alternatives exist.
 | server error / not found | reroute; cooldown P-WORKER-ERROR-COOLDOWN; exhausted ⇒ RETRIES-EXHAUSTED |
 | timeout / transport failure | reroute; cooldown P-WORKER-TIMEOUT-COOLDOWN; congestion signal; exhausted ⇒ RETRIES-EXHAUSTED |
 | rate-limit / overload verdict | honor backoff (worker's hint, default P-WORKER-BACKOFF); all candidates backing off longer than P-MAX-IDLE-TIME ⇒ OVERLOADED |
-| integrity failure (bad signature, wrong-range or undecodable result) | discard result, reroute (REQ-43); attempts exhausted on integrity failures ⇒ WORKER-FAILURE (pages — the network serves bad data or verification is broken) |
+| integrity failure (bad signature, wrong-range or undecodable result) | discard result, reroute (REQ-43); exhausted with *every* attempt an integrity failure ⇒ WORKER-FAILURE (pages — the network serves bad data or verification is broken); exhausted with any transient failure among the attempts ⇒ RETRIES-EXHAUSTED, since a later retry can still succeed and the class tells the client whether to come back. Equivocation stays operator-visible either way: it is counted per worker and alarmed regardless of the response class (OB-4/OB-9) |
 | no worker leasable for the chunk | DATA-UNAVAILABLE |
 
 *Degradation.* Per-worker penalties (ADR-004) — never a global circuit-break; the pool
@@ -42,14 +42,14 @@ degrades worker-by-worker. Health state is in-memory (DEF-12) and resets on rest
 *Role.* Source of the assignment artifact (DEF-4); consulted by a background loop only,
 never on a request path.
 *Call contract.* Poll every P-ASSIGNMENT-REFRESH; fetch deadline
-P-ASSIGNMENT-FETCH-TIMEOUT; unchanged identifier ⇒ no re-download; application waits
-for effective-from. A different identifier is authoritative regardless of whether its
-effective-from predates the applied artifact's (ADR-016).
-*Error mapping.* Fetch/parse failure → keep serving the applied artifact; alarm
-(⚠ today only a log — GAP-2). Never surfaces to clients directly.
-*Degradation.* Serve-stale, currently unbounded; intent bounds it at
-P-ASSIGNMENT-MAX-AGE ⚠ with degraded readiness (ADR-013). *Integrity:* intent is
-validate-before-apply (REQ-26); currently trusted unverified (ADR-002, GAP-1).
+P-ASSIGNMENT-FETCH-TIMEOUT; unchanged identifier ⇒ no re-download. Whichever identifier
+the publisher currently selects is authoritative; application is delayed by the
+deprecated effective-from when it has not yet passed (ADR-016).
+*Error mapping.* Fetch/parse failure → keep serving the applied artifact; reason-coded
+counter and alarm. Never surfaces to clients directly.
+*Degradation.* Serve-stale, bounded and signalled at P-ASSIGNMENT-MAX-AGE; readiness is
+independent of artifact age by decision (ADR-016). *Integrity:* validate-before-apply
+(REQ-26) — a rejected artifact leaves the applied one untouched.
 
 ## DC-3 — Dataset registry
 
@@ -65,15 +65,20 @@ permanent failure is fatal (the Portal cannot know what it serves).
 *Role.* Recent blocks near the head; the real-time path of OP-1, head reads (OP-2),
 timestamp fallback (OP-5).
 *Call contract.* Per-request proxy: connect deadline P-HOTBLOCKS-CONNECT-TIMEOUT;
-per-read idle deadline P-HOTBLOCKS-READ-TIMEOUT, strictly below P-CLIENT-SDK-TIMEOUT
-(ADR-010); no retries; no redirects. Success and 204 responses stream through with
-internal headers stripped; error responses are status-classified and rewritten into the
-Portal envelope (ADR-003, amended by ADR-011; IB-4/IB-5).
+per-read idle deadline P-HOTBLOCKS-READ-TIMEOUT, strictly below P-CLIENT-TIMEOUT
+(ADR-010); at most one replay, and only for a connection-class fault before the response
+head (ADR-015) — a replayed request gets a fresh read budget, so its worst case is twice
+the deadline and is not bounded by P-CLIENT-TIMEOUT; HTTP/1.1 only, since the replay's
+fault classification reads HTTP/1 error shapes (ADR-015); no redirects. Success and 204
+responses stream through with internal headers stripped; error responses are
+status-classified and rewritten into the Portal envelope (ADR-003, amended by ADR-011;
+IB-4/IB-5).
 *Error mapping.*
 
 | Fault | Own class |
 |---|---|
-| connect/transport failure, read stall past deadline | UPSTREAM-FAILURE (recorded — a stalled upstream must never be invisible, REQ-22) |
+| connect/transport failure before the response head | one replay (ADR-015); still failing ⇒ UPSTREAM-FAILURE (recorded) |
+| read stall past deadline | UPSTREAM-FAILURE, never replayed (recorded — a stalled upstream must never be invisible, REQ-22) |
 | upstream 429 / 503 / 529 | OVERLOADED / `overloaded`; preserve public retry/header semantics, injecting `Retry-After` = P-RETRY-AFTER-MIN when the upstream omitted it (INV-26, ADR-014) |
 | other upstream 5xx | UPSTREAM-FAILURE / `upstream_unavailable`; preserve public headers, never the upstream body |
 | other upstream 4xx (unmatched) | BAD-REQUEST / `malformed_request` (ADR-011 unmatched-4xx rule); status normalized to 400, upstream body never leaked |
@@ -81,7 +86,8 @@ Portal envelope (ADR-003, amended by ADR-011; IB-4/IB-5).
 | requested range below upstream retention (gap) | EMPTY after P-NO-DATA-DELAY |
 | upstream reports unknown dataset (404) | NOT-FOUND / `unknown_dataset`; log the possible configuration incoherence, never leak the upstream body |
 
-*Degradation.* Fail-fast per request; no caching, no health state. An outage affects
+*Degradation.* Fail-fast per request after at most one replay; no caching, no health
+state. An outage affects
 only real-time traffic (REQ-25); readiness ignores this dependency by design.
 
 ## DC-5 — Chain RPC & contracts
@@ -110,7 +116,7 @@ never delays or fails serving.
 
 | Snapshot | Refreshed by | Staleness bound | Staleness visible? |
 |---|---|---|---|
-| Applied artifact (DEF-4) | DC-2 poll | one successful P-ASSIGNMENT-REFRESH cycle while healthy; none during outage today; ⚠ P-ASSIGNMENT-MAX-AGE (ADR-013) | intent: age gauge + readiness (GAP-2) |
+| Applied artifact (DEF-4) | DC-2 poll | one successful P-ASSIGNMENT-REFRESH cycle while healthy; bounded and signalled at P-ASSIGNMENT-MAX-AGE (ADR-016) | age gauge + stale signal; readiness independent |
 | Dataset catalog (DEF-14) | DC-3 poll | none (accepted) | no |
 | Chain status | DC-5 poll | none (status only) | loading state before first fetch |
 | Worker health map (DEF-12) | per-query outcomes | rolling windows (P-WORKER-ERROR-COOLDOWN / P-WORKER-TIMEOUT-COOLDOWN) | operator debug view |

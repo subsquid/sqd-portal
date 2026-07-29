@@ -145,12 +145,7 @@ async fn main() -> anyhow::Result<()> {
     let network_client = network_client_builder.build()?;
     tracing::info!("Network client initialized");
 
-    let task_manager = Arc::new(TaskManager::new(
-        network_client.clone(),
-        config.max_parallel_streams,
-        config.congestion.headroom_threshold,
-        config.congestion.priority_stride,
-    ));
+    let task_manager = Arc::new(TaskManager::new(network_client.clone(), &config));
 
     let cancellation_token = CancellationToken::new();
     let shutting_down = Arc::new(AtomicBool::new(false));

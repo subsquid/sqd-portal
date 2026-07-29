@@ -199,9 +199,16 @@ counterexample tracked as GAP-5.
 **REQ-22 — Bounded upstream interactions.** [MUST]
 Every outbound call carries a deadline. Deadlines on the request path are strictly below
 the deadlines of clients waiting on them (P-HOTBLOCKS-READ-TIMEOUT <
-P-CLIENT-SDK-TIMEOUT), so a stalled upstream surfaces as a Portal-attributed gateway
+P-CLIENT-TIMEOUT), so a stalled upstream surfaces as a Portal-attributed gateway
 error and a recorded metric — never as a silent client-side timeout the Portal did not
-observe.
+observe. The bound is per upstream call: a connection that dies late in the read budget
+is replayed with a fresh one (ADR-015), so a single call's worst case is
+2 × P-HOTBLOCKS-READ-TIMEOUT and can exceed P-CLIENT-TIMEOUT. The ordering still holds
+where it earns its keep — a stall is never replayed — and the tail costs one upstream
+attempt for a caller that has already disconnected, not a silent failure. No requirement
+bounds what one *client request* spends upstream: a handler that makes real-time calls in
+sequence multiplies the per-call worst case, and already exceeded P-CLIENT-TIMEOUT before
+ADR-015 doubled each call.
 *Acceptance:* stalling the real-time source makes the Portal answer 502 within
 P-HOTBLOCKS-READ-TIMEOUT and record the failure; no outbound call in the codebase is
 deadline-free. The chain-RPC status loop currently violates the latter clause (GAP-18).
@@ -211,8 +218,8 @@ deadline-free. The chain-RPC status loop currently violates the latter clause (G
 The readiness probe answers "can this instance serve correctly right now": ready only
 when routing data is loaded and worker connectivity is at or above
 P-READY-CONNECTION-RATIO of the known worker set; not-ready immediately once shutdown
-begins. *Intent:* readiness also degrades when routing data is older than
-P-ASSIGNMENT-MAX-AGE ⚠ — currently not enforced (GAP-2, ADR-013).
+begins. Routing-data age is deliberately excluded: past P-ASSIGNMENT-MAX-AGE the
+artifact is reported stale through metrics, but readiness stays green (ADR-016).
 *Acceptance:* a fresh instance is not-ready until the first assignment applies; killing
 connectivity below the ratio flips readiness within one probe interval; readiness flips
 to not-ready at SIGTERM before the listener closes.
@@ -221,11 +228,14 @@ to not-ready at SIGTERM before the listener closes.
 Shutdown is two-phase: on SIGTERM the Portal immediately advertises not-ready while
 continuing to serve for P-PRE-DRAIN-GRACE (letting load balancers drain it), then stops
 accepting work and drains in-flight streams for at most P-DRAIN-TIMEOUT. Total shutdown
-never exceeds P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT plus a constant; the orchestrator's
-kill grace must exceed that sum.
+never exceeds P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT plus a constant, and the deployment
+must give the process that long: P-KILL-GRACE exceeds that sum. The Portal cannot enforce
+its own grace — below it the process is killed mid-drain and this requirement is void,
+which is an environment defect rather than a Portal one.
 *Acceptance:* under load, SIGTERM → readiness 503 at once; new connections keep being
 served during the grace window; process exits within the budget; in-flight streams
-either complete or truncate per REQ-6.
+either complete or truncate per REQ-6; the deployment manifest sets P-KILL-GRACE above
+the budget.
 *Trace:* ADR-005.
 
 **REQ-25 — Fault isolation across upstreams.** [MUST]
@@ -298,16 +308,15 @@ a reason.
 
 **REQ-40 — Assignment ingestion.** [MUST]
 The Portal polls the assignment publisher every P-ASSIGNMENT-REFRESH, skips unchanged
-artifacts (by identifier), applies new ones atomically no earlier than their declared
-effective time (so the fleet cuts over together), and keeps serving the previous
-artifact on any fetch or validation failure. First applied assignment gates readiness
-(REQ-23). Effective time is an activation gate, not a revision: a different identifier
-currently selected by the publisher remains eligible even when its effective time
-predates the applied artifact, allowing publisher-controlled rollback (ADR-016).
-*Acceptance:* a new artifact with a future effective time is not visible in routing
-until that time; killing the publisher leaves serving unaffected for the duration of
-the outage (staleness intent: ADR-013); changing the published identifier back to a
-valid earlier-effective artifact rolls routing back to it.
+artifacts (by identifier), applies whichever artifact the publisher currently selects
+atomically, and keeps serving the previous artifact on any fetch or validation failure.
+The publisher's selection is authoritative — the Portal does not order or version
+artifacts, so a rollback to an earlier one is applied like any other change (ADR-016).
+First applied assignment gates readiness (REQ-23). Application is delayed by the
+deprecated effective-from time when it has not yet passed.
+*Acceptance:* killing the publisher leaves serving unaffected for the duration of the
+outage (staleness signalling: ADR-016); changing the published identifier back to a
+previously applied artifact rolls routing back to it.
 
 **REQ-41 — Worker selection and penalties.** [MUST]
 Chunk queries go to the most promising worker holding the chunk: healthy and fast
@@ -372,7 +381,9 @@ Deliberately left open — tests and clients must not pin these:
 | OQ-9 | Ratify a global P-BUFFERED-BYTES-BUDGET and its accounting/admission semantics. | REQ-27, GAP-17 | portal team |
 | OQ-10 | Ratify the draft SLO target parameters and their benchmark gating policy. | 11 SLO table | portal team |
 
-Closed: **OQ-6** (should the clamp-bypassing debug stream variant be exposed unconditionally,
-or gated behind an operator flag?) — resolved by ADR-014: the variant is gated behind an
-operator flag and disabled by default (GAP-21 until implemented). OQ numbers are never
-recycled.
+Closed: **OQ-3** (ratify P-ASSIGNMENT-MAX-AGE and the degraded-readiness semantics) —
+resolved by ADR-016: the age is fixed at 15 min and readiness is deliberately independent
+of it. **OQ-6** (should the clamp-bypassing debug stream variant be exposed
+unconditionally, or gated behind an operator flag?) — resolved by ADR-014: the variant is
+gated behind an operator flag and disabled by default (GAP-21 until implemented). OQ
+numbers are never recycled.

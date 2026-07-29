@@ -15,17 +15,15 @@ a partially applied artifact is never observable.
 *Check:* CT-3 — route reads racing an artifact swap; CT-1 oracle comparison.
 
 **INV-2 — Artifact application legality.** [transition]
-An artifact is applied only if its identifier differs from the applied one, its
-effective-from time has passed, and fetch and validation succeeded. The publisher's
-currently visible different identifier is authoritative: the Portal does not order
-artifacts by identifier or effective-from, so a rollback to a valid artifact with an
-earlier effective-from remains legal. Application replaces the whole artifact.
-*Why:* re-applying identical artifacts churns; early application splits the fleet;
-treating activation time as a revision prevents publisher-controlled recovery from a
-bad assignment.
-*Check:* CT-2 — publisher stub serves unchanged, future-effective, invalid, and
-earlier-effective rollback artifacts; assert deduplication, delayed activation,
-rejection with prior routing retained, and rollback respectively.
+An artifact is applied only if its identifier differs from the applied one and fetch and
+validation succeeded. The publisher's currently visible identifier is authoritative: the
+Portal never orders artifacts, so rolling back to a valid earlier one is legal.
+Application replaces the whole artifact, and is delayed by the deprecated effective-from
+if it has not yet passed.
+*Why:* re-applying identical artifacts churns; treating the publisher's selection as
+anything but authoritative prevents publisher-controlled recovery from a bad assignment.
+*Check:* CT-2 — publisher stub serves unchanged, invalid, and rollback artifacts; assert
+deduplication, rejection with prior routing retained, and rollback respectively.
 
 **INV-3 — Lease balance.** [state]
 Per worker, open leases ≤ P-MAX-QUERIES-PER-WORKER; every lease acquired is released
@@ -157,8 +155,8 @@ concurrent load, prior traffic, or process age.
 **INV-29 — Boundary-block emission.** [response]
 A successful response that evaluates at least one block delivers a record for at least the
 first and the last block of its coverage — header-only when the block matches no item
-filter — regardless of `includeAllBlocks`. The engine pins this boundary per *served
-chunk* (`sqd-query` runs `Plan::execute` once per chunk), so a multi-chunk response also
+filter — regardless of `includeAllBlocks`. The source pins this boundary per *served
+chunk* — the query engine evaluates one plan per chunk — so a multi-chunk response also
 carries header-only records at interior chunk boundaries; coverage's global first and last
 are the guaranteed minimum. Hence the last delivered record's reference equals the coverage
 cursor (DEF-8), and a client resumes from it gap-free even when a selective query matched
@@ -184,8 +182,8 @@ through them).
 
 **INV-31 — Readiness honesty.** [state]
 Ready ⇒ (an artifact is applied ∧ connectivity ≥ P-READY-CONNECTION-RATIO ∧ not
-shutting down). Shutdown flips readiness before intake stops (ADR-005). Intent ⚠:
-ready also ⇒ artifact age ≤ P-ASSIGNMENT-MAX-AGE (ADR-013, GAP-2).
+shutting down). Shutdown flips readiness before intake stops (ADR-005). Artifact age is
+deliberately not a conjunct: staleness is signalled, never served-around (ADR-016).
 *Why:* orchestrators route by this; a lying probe turns deploys into outages.
 *Check:* CT-2 — drive each conjunct false via stubs; probe.
 

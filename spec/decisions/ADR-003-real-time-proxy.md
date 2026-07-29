@@ -1,6 +1,7 @@
 # ADR-003 — Real-time data is served through a streaming Portal proxy
 
-Status: Accepted (historical, 2025-09-15); error handling amended by ADR-011
+Status: Accepted (historical, 2025-09-15); error handling amended by ADR-011, the
+no-retry rule narrowed to post-response-head faults by ADR-015
 
 ## Context
 
@@ -23,6 +24,11 @@ The original implementation also passed upstream error bodies through unchanged.
 part of the historical decision is amended by ADR-011: error statuses are classified
 into the Portal's public taxonomy and their bodies are rewritten into the Portal error
 envelope. Public upstream headers such as `Retry-After` and `x-sqd-*` remain preserved.
+
+The no-retry rule is narrowed by ADR-015 to the range this decision actually reasoned
+about: a connection-class fault *before* the response head is replayed once, since no
+byte has been delivered and no prefix can be duplicated. Any fault after the response
+head still truncates rather than retries.
 
 ## Consequences
 

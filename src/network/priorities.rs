@@ -149,6 +149,15 @@ impl WorkersPool {
         });
     }
 
+    /// The total number of currently leased query slots across all workers.
+    #[cfg(test)]
+    pub(crate) fn running_queries_total(&self) -> usize {
+        self.workers
+            .values()
+            .map(|stats| stats.running_queries as usize)
+            .sum()
+    }
+
     pub fn success(&mut self, worker: PeerId, throughput: Option<f64>) {
         self.modify(worker, |stats| {
             if let Some(t) = throughput {

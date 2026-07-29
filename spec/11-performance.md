@@ -48,7 +48,7 @@ register ([13-conformance.md](13-conformance.md)), and seed the regression gates
 |---|---|---|
 | SLI-1 (stream) | S1 | p99 ≤ P-SLO-STREAM-TTFB-P99 ⚠ |
 | SLI-1 (heads/metadata) | S1 | p99 ≤ P-SLO-METADATA-TTFB-P99 ⚠ |
-| SLI-2 | S1 | ≥ SDK consumption rate (client-bound, not portal-bound) ⚠ |
+| SLI-2 | S1 | ≥ SDK consumption rate (client-bound, not portal-bound) ⚠ OQ-10 |
 | SLI-3 | S3 | ≥ P-SLO-REFUSAL-CORRECTNESS (hard invariant INV-26) |
 | SLI-4 | any | ≥ P-SLO-AVAILABILITY monthly ⚠ |
 | SLI-5 | S1/S4 | ≤ P-SLO-MEMORY-HEADROOM ⚠ |

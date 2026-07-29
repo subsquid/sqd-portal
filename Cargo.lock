@@ -7840,7 +7840,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.11.8"
+version = "0.11.9"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -7857,6 +7857,7 @@ dependencies = [
  "flate2",
  "futures 0.3.31",
  "hex-literal",
+ "hyper 1.8.1",
  "itertools 0.12.1",
  "lazy_static",
  "libz-ng-sys",

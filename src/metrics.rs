@@ -39,6 +39,39 @@ impl std::fmt::Display for MutexLockMode {
 
 type Labels = Vec<(String, String)>;
 
+/// Final transport outcome of one logical DC-4 request (ADR-015, OB-4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HotblocksRequestOutcome {
+    /// The first attempt obtained a response head.
+    Response,
+    /// A replay obtained a response head.
+    ReplayResponse,
+    /// A replay completed with another transport fault.
+    ReplayFailed,
+    /// The caller went away during the first attempt.
+    Canceled,
+    /// The caller went away during the replay.
+    ReplayCanceled,
+    /// The first attempt exhausted its read-idle budget and was not replayed.
+    Timeout,
+    /// The first attempt failed for another non-replayable transport reason.
+    TransportFailed,
+}
+
+impl HotblocksRequestOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Response => "response",
+            Self::ReplayResponse => "replay_response",
+            Self::ReplayFailed => "replay_failed",
+            Self::Canceled => "canceled",
+            Self::ReplayCanceled => "replay_canceled",
+            Self::Timeout => "timeout",
+            Self::TransportFailed => "transport_failed",
+        }
+    }
+}
+
 fn buckets(start: f64, count: usize) -> impl Iterator<Item = f64> {
     iter::successors(Some(start), |x| Some(x * 10.))
         .flat_map(|x| [x, x * 1.5, x * 2.5, x * 5.0])
@@ -87,6 +120,8 @@ lazy_static::lazy_static! {
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 3.0, 20)));
     pub static ref STREAM_THROTTLED_RATIO: Histogram = Histogram::new(iter::empty());
 
+    static ref HOTBLOCKS_REQUESTS: Family<Labels, Counter> = Default::default();
+
     pub static ref CONGESTION_WINDOW: Gauge = Default::default();
     pub static ref CONGESTION_IN_FLIGHT: Gauge = Default::default();
     pub static ref CONGESTION_SHRINKS: Counter = Default::default();
@@ -125,6 +160,24 @@ pub fn report_backoff(worker: &PeerId) {
     QUERY_BACKOFF
         .get_or_create(&vec![("worker".to_owned(), worker.to_string())])
         .inc();
+}
+
+/// Records exactly one final transport outcome for a logical DC-4 request.
+pub fn report_hotblocks_request(outcome: HotblocksRequestOutcome) {
+    HOTBLOCKS_REQUESTS
+        .get_or_create(&hotblocks_request_labels(outcome))
+        .inc();
+}
+
+fn hotblocks_request_labels(outcome: HotblocksRequestOutcome) -> Labels {
+    vec![("outcome".to_owned(), outcome.as_str().to_owned())]
+}
+
+#[cfg(test)]
+pub fn hotblocks_requests(outcome: HotblocksRequestOutcome) -> u64 {
+    HOTBLOCKS_REQUESTS
+        .get_or_create(&hotblocks_request_labels(outcome))
+        .get()
 }
 
 pub fn report_http_response(
@@ -256,7 +309,7 @@ fn assignment_age() -> Option<Duration> {
 }
 
 /// Read at scrape time: a gauge the refresh loop writes would freeze at its last
-/// value, which is the failure this exists to expose (ADR-013, OB-6, GAP-2).
+/// value, which is the failure this exists to expose (ADR-016, OB-6).
 #[derive(Debug)]
 struct AssignmentAge {
     max_age: Duration,
@@ -400,6 +453,12 @@ pub fn register_metrics(registry: &mut Registry, assignment_max_age: Duration) {
     );
 
     registry.register(
+        "hotblocks_requests",
+        "Logical DC-4 requests by final response-head transport outcome: response, replay_response, replay_failed, canceled, replay_canceled, timeout, or transport_failed",
+        HOTBLOCKS_REQUESTS.clone(),
+    );
+
+    registry.register(
         "congestion_window",
         "Current congestion control window size",
         CONGESTION_WINDOW.clone(),
@@ -475,7 +534,7 @@ mod tests {
         assert!(scrape.contains("portal_assignment_stale 0\n"), "{scrape}");
     }
 
-    /// The degraded signal of ADR-013: `/ready` stays green, this flips.
+    /// The degraded signal of ADR-016: `/ready` stays green, this flips.
     #[test]
     fn stale_flips_past_max_age() {
         let scrape = scrape_with_age(Some(1000), Duration::from_secs(900));

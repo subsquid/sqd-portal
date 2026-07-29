@@ -1,6 +1,8 @@
 # ADR-013 — Assignment staleness must be bounded and observable
 
-Status: Accepted (2026-07-20), implemented in #138.
+Status: Superseded by ADR-016. Proposed 2026-07-17, never ratified standalone; its
+decision and reasoning were carried into ADR-016 on 2026-07-28, which owns the
+assignment-refresh contract as a whole. Retained for the record — read ADR-016 instead.
 
 ## Context
 

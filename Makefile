@@ -1,4 +1,4 @@
-.PHONY: openapi openapi-open client build-client portal-status
+.PHONY: openapi openapi-open client build-client portal-status spec-lint
 
 openapi: openapi.html
 
@@ -20,3 +20,6 @@ build-client: client
 
 portal-status:
 	cargo run --manifest-path ./tools/portal-status/Cargo.toml -- $(URL)
+
+spec-lint:
+	./tools/spec-lint.py

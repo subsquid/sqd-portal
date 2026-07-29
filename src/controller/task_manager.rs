@@ -9,6 +9,7 @@ use futures::{Stream, StreamExt};
 use tracing_futures::Instrument;
 
 use crate::{
+    config::Config,
     metrics,
     network::NetworkClient,
     types::{RequestError, ResponseChunk, StreamRequest},
@@ -21,25 +22,22 @@ pub struct TaskManager {
     network_client: Arc<NetworkClient>,
     running_tasks: AtomicUsize,
     max_tasks: usize,
+    task_limit_retry_after: Duration,
     next_stream_index: AtomicU32,
     bandwidth_utilization_threshold: f64,
     priority_stride: u32,
 }
 
 impl TaskManager {
-    pub fn new(
-        network_client: Arc<NetworkClient>,
-        max_parallel_streams: usize,
-        bandwidth_utilization_threshold: f64,
-        priority_stride: u32,
-    ) -> TaskManager {
+    pub fn new(network_client: Arc<NetworkClient>, config: &Config) -> TaskManager {
         TaskManager {
             network_client,
             running_tasks: 0.into(),
-            max_tasks: max_parallel_streams,
+            max_tasks: config.max_parallel_streams,
+            task_limit_retry_after: config.task_limit_retry_after,
             next_stream_index: AtomicU32::new(0),
-            bandwidth_utilization_threshold,
-            priority_stride,
+            bandwidth_utilization_threshold: config.congestion.headroom_threshold,
+            priority_stride: config.congestion.priority_stride,
         }
     }
 
@@ -50,7 +48,7 @@ impl TaskManager {
         let running_tasks = self.running_tasks.fetch_add(1, Ordering::Relaxed);
         if running_tasks >= self.max_tasks {
             self.running_tasks.fetch_sub(1, Ordering::Relaxed);
-            return Err(RequestError::Unavailable);
+            return Err(RequestError::BusyFor(self.task_limit_retry_after));
         }
 
         if let Some(util) = self.network_client.download_utilization() {

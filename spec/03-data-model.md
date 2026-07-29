@@ -23,15 +23,14 @@ the archival network's unit of storage, assignment, and query. Chunks of a datas
 totally ordered and gap-free from the dataset's start block to the archival head.
 
 **DEF-4 — Assignment artifact.** The routing document the network publishes:
-(identifier, effective-from time, worker set, per-dataset chunk sequences — each chunk
-carrying its block range and the reference (DEF-2) of its last block — and the chunk →
-worker-subset mapping). Identifiers are opaque and compared only for equality.
-Effective-from is an activation time, not a version or ordering key. The **applied
-artifact** is the single artifact the Portal currently routes by. An artifact is
-*applied* atomically, never partially (INV-1), and no earlier than its effective-from
-time. A different identifier currently selected by the publisher is eligible even
-when its effective-from predates the applied artifact's, preserving intentional
-rollback (INV-2, ADR-016).
+(identifier, worker set, per-dataset chunk sequences — each chunk carrying its block
+range and the reference (DEF-2) of its last block — and the chunk → worker-subset
+mapping). Identifiers are opaque and compared only for equality. The **applied
+artifact** is the single artifact the Portal currently routes by; whichever identifier
+the publisher currently selects is the eligible one (INV-2, ADR-016). An artifact is
+*applied* atomically, never partially (INV-1). Artifacts also carry a deprecated
+effective-from time, honoured only as an activation delay; it does not order or version
+them, and nothing else in this spec depends on it.
 
 **DEF-5 — Heads and the frontier.** Per dataset: the **archival head** (the reference
 of the last assigned chunk's last block), the **real-time head** (reported by the

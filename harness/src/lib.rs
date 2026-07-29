@@ -8,6 +8,7 @@
 pub mod artifact;
 pub mod driver;
 pub mod dummy_chain;
+pub mod fixture;
 pub mod keys;
 pub mod metrics_audit;
 pub mod model;

@@ -120,6 +120,8 @@ impl StorageClient {
             .fetch_assignment(&assignment_url, &assignment_id)
             .await?;
 
+        // Deprecated publisher field, still honoured as an activation delay so a
+        // scheduled cutover lands fleet-wide at once (ADR-016). Never an ordering key.
         if latest_id.is_some() {
             sleep_until(effective_from).await;
         }
