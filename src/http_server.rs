@@ -265,6 +265,9 @@ pub async fn run_server(
         )
         .layer(Extension(task_manager))
         .layer(Extension(network_client))
+        // `None` without a `commercial:` block, so `/ready` behaves exactly as
+        // it does on an OSS portal.
+        .layer(Extension(commercial_gate))
         .layer(Extension(config))
         .layer(Extension(Arc::new(metrics_registry)))
         .layer(Extension(hotblocks))
@@ -739,48 +742,23 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
 async fn get_readiness(
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(shutting_down): Extension<Arc<AtomicBool>>,
+    Extension(commercial): Extension<Option<Arc<Gate>>>,
 ) -> impl IntoResponse {
-    // Stable discriminant per readiness *category*. `/ready` is polled
-    // continuously, so we log only when the category changes — entering a new
-    // state logs once (with live detail), while fluctuating connection counts
-    // within `InsufficientConnections` do not. Starts `READY` so a portal that
-    // never becomes ready still logs the reason on its first probe.
-    const READY: u8 = 0;
-    const SHUTTING_DOWN: u8 = 1;
-    const NO_WORKERS: u8 = 2;
-    const INSUFFICIENT_CONNECTIONS: u8 = 3;
     static LAST_STATE: AtomicU8 = AtomicU8::new(READY);
 
-    let (state, code, body, reason): (u8, StatusCode, &str, Option<NotReady>) =
-        if shutting_down.load(Ordering::Relaxed) {
-            (
-                SHUTTING_DOWN,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Shutting down",
-                None,
-            )
-        } else {
-            match client.readiness() {
-                Ok(()) => (READY, StatusCode::OK, "Ready", None),
-                Err(reason) => {
-                    let state = match reason {
-                        NotReady::NoWorkers => NO_WORKERS,
-                        NotReady::InsufficientConnections { .. } => INSUFFICIENT_CONNECTIONS,
-                    };
-                    (
-                        state,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Not ready",
-                        Some(reason),
-                    )
-                }
-            }
-        };
+    let (state, code, body, reason) = readiness_verdict(
+        shutting_down.load(Ordering::Relaxed),
+        commercial.as_deref(),
+        client.readiness(),
+    );
 
     if LAST_STATE.swap(state, Ordering::Relaxed) != state {
         match (state, &reason) {
             (READY, _) => tracing::info!("readiness check now passing: portal is ready"),
             (SHUTTING_DOWN, _) => tracing::info!("readiness check now failing: shutting down"),
+            (NO_KEY_SNAPSHOT, _) => tracing::warn!(
+                "readiness check now failing: the commercial key snapshot has not synced yet"
+            ),
             (_, Some(reason)) => tracing::warn!("readiness check now failing: {reason}"),
             (_, None) => {}
         }
@@ -809,6 +787,56 @@ fn readiness_response(code: StatusCode, detail: &str) -> Response {
         return (code, detail.to_owned()).into_response();
     }
     error_response(code, ErrorCode::NotReady, detail)
+}
+
+// Stable discriminant per readiness *category*. `/ready` is polled
+// continuously, so we log only when the category changes — entering a new
+// state logs once (with live detail), while fluctuating connection counts
+// within `InsufficientConnections` do not. Starts `READY` so a portal that
+// never becomes ready still logs the reason on its first probe.
+const READY: u8 = 0;
+const SHUTTING_DOWN: u8 = 1;
+const NO_WORKERS: u8 = 2;
+const INSUFFICIENT_CONNECTIONS: u8 = 3;
+const NO_KEY_SNAPSHOT: u8 = 4;
+
+fn readiness_verdict(
+    shutting_down: bool,
+    commercial: Option<&Gate>,
+    network: Result<(), NotReady>,
+) -> (u8, StatusCode, &'static str, Option<NotReady>) {
+    if shutting_down {
+        return (
+            SHUTTING_DOWN,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Shutting down",
+            None,
+        );
+    }
+    if let Err(reason) = network {
+        let state = match reason {
+            NotReady::NoWorkers => NO_WORKERS,
+            NotReady::InsufficientConnections { .. } => INSUFFICIENT_CONNECTIONS,
+        };
+        return (
+            state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Not ready",
+            Some(reason),
+        );
+    }
+    // A gated portal without the key snapshot answers 401 to every valid key,
+    // which is worse than answering nothing: keep it out of rotation until it
+    // has mirrored the control plane. Ungated portals never reach this.
+    if commercial.is_some_and(|gate| !gate.snapshot_ready()) {
+        return (
+            NO_KEY_SNAPSHOT,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Not ready",
+            None,
+        );
+    }
+    (READY, StatusCode::OK, "Ready", None)
 }
 
 /// Dataset Height
@@ -1572,6 +1600,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A gated portal that has not mirrored the control plane's key set knows
+    /// no keys, so it answers 401 to every valid one. Serving that is worse
+    /// than serving nothing: it must stay out of rotation until the first sync
+    /// (or a fresh disk cache) lands.
+    #[test]
+    fn readiness_waits_for_the_commercial_key_snapshot() {
+        use crate::commercial::test_support::gate_with_readiness;
+
+        // Without a commercial block nothing changes.
+        assert_eq!(readiness_verdict(false, None, Ok(())).1, StatusCode::OK);
+        assert_eq!(
+            readiness_verdict(true, None, Ok(())).1,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            readiness_verdict(false, None, Err(NotReady::NoWorkers)),
+            (
+                NO_WORKERS,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Not ready",
+                Some(NotReady::NoWorkers)
+            )
+        );
+
+        let empty = gate_with_readiness(false);
+        let synced = gate_with_readiness(true);
+
+        assert_eq!(
+            readiness_verdict(false, Some(&empty), Ok(())),
+            (
+                NO_KEY_SNAPSHOT,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Not ready",
+                None
+            )
+        );
+        assert_eq!(
+            readiness_verdict(false, Some(&synced), Ok(())).1,
+            StatusCode::OK
+        );
+        // Shutdown still outranks everything.
+        assert_eq!(
+            readiness_verdict(true, Some(&synced), Ok(())).0,
+            SHUTTING_DOWN
+        );
     }
 
     #[tokio::test]

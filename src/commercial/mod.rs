@@ -117,9 +117,10 @@ pub mod test_support {
         })
     }
 
-    /// A store that never reaches a control plane, preloaded with `records`.
-    pub fn store_with(records: Vec<KeyRecord>) -> Arc<SnapshotStore> {
-        let config = CommercialConfig {
+    /// A config pointing at a port nothing listens on, so a store built from it
+    /// never reaches a control plane.
+    pub fn offline_config() -> CommercialConfig {
+        CommercialConfig {
             control_plane_url: "http://127.0.0.1:1/".parse().unwrap(),
             service_token_env: service_token_env(),
             portal_id: "portal-premium-eu".to_string(),
@@ -129,10 +130,36 @@ pub mod test_support {
             resolve_rate_per_sec: 20,
             max_inflight_resolves: 16,
             negative_cache_secs: 15,
-        };
-        let store = SnapshotStore::new(&config).expect("store should build");
+        }
+    }
+
+    /// A store that never reaches a control plane, preloaded with `records`.
+    pub fn store_with(records: Vec<KeyRecord>) -> Arc<SnapshotStore> {
+        let store = SnapshotStore::new(&offline_config()).expect("store should build");
         store.install_for_test(records);
         store
+    }
+
+    struct NoCatalog;
+
+    impl DatasetCatalog for NoCatalog {
+        fn canonical_name(&self, _alias: &str) -> Option<String> {
+            None
+        }
+
+        fn canonical_name_for_id(&self, _id: &crate::types::DatasetId) -> Option<String> {
+            None
+        }
+    }
+
+    /// A gate whose snapshot store has synced, or one that never has.
+    pub fn gate_with_readiness(ready: bool) -> Arc<Gate> {
+        let config = offline_config();
+        let store = SnapshotStore::new(&config).expect("store should build");
+        if ready {
+            store.install_for_test(Vec::new());
+        }
+        Arc::new(Gate::new(&config, store, Arc::new(NoCatalog)))
     }
 
     #[derive(Clone)]

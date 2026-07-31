@@ -104,6 +104,13 @@ impl Gate {
         self.enforcement
     }
 
+    /// Whether the portal has mirrored the control plane's key set yet. A gated
+    /// portal that has not knows no keys, so it would answer 401 to every valid
+    /// one — it belongs out of rotation until this turns true.
+    pub fn snapshot_ready(&self) -> bool {
+        self.store.is_ready()
+    }
+
     async fn decide(
         &self,
         headers: &HeaderMap,
