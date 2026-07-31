@@ -112,7 +112,16 @@ fn evaluate_record(
     now_secs: u64,
 ) -> Decision {
     let Some(expected) = record.secret_sha256.as_deref() else {
-        return Decision::Reject(INVALID_SECRET);
+        // No digest is the control plane's tombstone shape. There is no secret
+        // left to protect, so the real reason can be named — and it has to be,
+        // or `reason="revoked"` is a label that never appears in any log. A
+        // record that still carries a digest keeps secret-first ordering below,
+        // where answering "revoked" would confirm a guessed key id.
+        return Decision::Reject(if record.status == KeyStatus::Active {
+            INVALID_SECRET
+        } else {
+            REVOKED
+        });
     };
     if !constant_time_eq(expected, &credential.secret_sha256) {
         return Decision::Reject(INVALID_SECRET);
@@ -243,6 +252,9 @@ mod tests {
         assert_eq!(reason(decision), "invalid_secret");
     }
 
+    /// An *active* record with no digest is malformed rather than tombstoned,
+    /// and there is nothing to authenticate against: it stays indistinguishable
+    /// from a wrong secret.
     #[tokio::test]
     async fn a_record_without_a_secret_digest_cannot_authenticate() {
         let mut record = key_record("k1", 1);
@@ -253,14 +265,58 @@ mod tests {
         assert_eq!(reason(decision), "invalid_secret");
     }
 
+    /// The control plane publishes a revoked key as a tombstone: identity,
+    /// status and sequence, and no digest at all. That is the only shape a
+    /// revoked key ever arrives in, so it is the shape this rung is tested on.
+    fn cp_tombstone() -> KeyRecord {
+        serde_json::from_value(serde_json::json!({
+            "key_id": "k1",
+            "organization_id": "11111111-1111-1111-1111-111111111111",
+            "status": "revoked",
+            "seq": 2,
+        }))
+        .expect("the control plane's tombstone shape must parse")
+    }
+
     #[tokio::test]
     async fn rule_4_revoked_is_401() {
-        let mut record = key_record("k1", 1);
-        record.status = KeyStatus::Revoked;
+        let record = cp_tombstone();
+        assert_eq!(record.secret_sha256, None);
 
         let decision = decide(record, Some(&valid()), Some("ethereum-mainnet")).await;
 
-        assert_eq!(reason(decision), "revoked");
+        assert_eq!(
+            reason(decision),
+            "revoked",
+            "the operator has to be able to tell a revoked key from a wrong secret"
+        );
+        assert_eq!(
+            decision,
+            Decision::Reject(Rejection {
+                status: StatusCode::UNAUTHORIZED,
+                ..REVOKED
+            })
+        );
+    }
+
+    /// A tombstone carries no secret to protect, so naming the reason leaks
+    /// nothing. A key that still has a digest is a different matter: answering
+    /// "revoked" there would confirm the id to whoever guessed it, so the
+    /// secret is still checked first.
+    #[tokio::test]
+    async fn a_revoked_key_that_still_carries_a_digest_checks_the_secret_first() {
+        let mut record = key_record("k1", 1);
+        record.status = KeyStatus::Revoked;
+
+        let wrong = credential("k1", &"0".repeat(64));
+        assert_eq!(
+            reason(decide(record.clone(), Some(&wrong), Some("ethereum-mainnet")).await),
+            "invalid_secret"
+        );
+        assert_eq!(
+            reason(decide(record, Some(&valid()), Some("ethereum-mainnet")).await),
+            "revoked"
+        );
     }
 
     #[tokio::test]
