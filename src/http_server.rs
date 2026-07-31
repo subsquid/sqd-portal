@@ -1577,6 +1577,198 @@ mod tests {
         );
     }
 
+    /// Every route that serves data, with how it names its dataset and a URI
+    /// that matches it. Adding a data route to `run_server` without wrapping it
+    /// in `gated(...)` fails `the_route_table_matches_the_checked_in_gating`,
+    /// which compares this list against the routes actually wrapped.
+    const GATED_DATA_ROUTES: &[(&str, &str, DatasetSource, &str)] = &[
+        (
+            "/datasets/:dataset/archival-stream",
+            "POST",
+            DatasetSource::Alias,
+            "/datasets/base/archival-stream",
+        ),
+        (
+            "/datasets/:dataset/archival-stream/debug",
+            "POST",
+            DatasetSource::Alias,
+            "/datasets/base/archival-stream/debug",
+        ),
+        (
+            "/datasets/:dataset/finalized-stream",
+            "POST",
+            DatasetSource::Alias,
+            "/datasets/base/finalized-stream",
+        ),
+        (
+            "/datasets/:dataset/stream",
+            "POST",
+            DatasetSource::Alias,
+            "/datasets/base/stream",
+        ),
+        (
+            "/datasets/:dataset/timestamps/:timestamp/block",
+            "GET",
+            DatasetSource::Alias,
+            "/datasets/base/timestamps/1700000000/block",
+        ),
+        (
+            "/datasets/:dataset_id/query/:worker_id",
+            "POST",
+            DatasetSource::EncodedId,
+            "/datasets/czM6Ly9iYXNlLW1haW5uZXQ/query/worker",
+        ),
+        ("/sql/query", "POST", DatasetSource::Absent, "/sql/query"),
+    ];
+
+    /// Routes that deliberately answer without a key: portal and dataset
+    /// metadata, heads and heights, ops probes, and the debug surface. A route
+    /// belongs here only if serving it to anyone is intended.
+    const UNGATED_ROUTES: &[&str] = &[
+        "/status",
+        "/datasets",
+        "/datasets/:dataset/archival-head",
+        "/datasets/:dataset/finalized-head",
+        "/datasets/:dataset/head",
+        "/datasets/:dataset/state",
+        "/datasets/:dataset",
+        "/datasets/:dataset/metadata",
+        "/datasets/:dataset/finalized-stream/height",
+        "/datasets/:dataset/archival-stream/height",
+        "/datasets/:dataset/height",
+        "/datasets/:dataset/:start_block/worker",
+        "/debug/workers",
+        "/datasets/:dataset/:block/debug",
+        "/metrics",
+        "/ready",
+        "/api-docs/openapi.json",
+        "/sql/metadata",
+    ];
+
+    /// Every `.route(…)` in `run_server`'s table, paired with whether its
+    /// method router is wrapped in `gated(`. Read from the source because the
+    /// router itself cannot be built without a live `NetworkClient`, and
+    /// because the question — "did someone add a route and forget?" — is about
+    /// the table as written.
+    fn routes_in_source() -> Vec<(String, bool)> {
+        const SOURCE: &str = include_str!("http_server.rs");
+        let start = SOURCE
+            .find("let app = Router::new()")
+            .expect("the route table starts at the router literal");
+        let end = SOURCE
+            .find("let drain_timeout")
+            .expect("the route table ends before the layer stack");
+
+        let mut routes = Vec::new();
+        let mut rest = &SOURCE[start..end];
+        while let Some(index) = rest.find(".route(") {
+            rest = &rest[index + ".route(".len()..];
+            let path = rest
+                .split('"')
+                .nth(1)
+                .expect("a route's first argument is its path literal")
+                .to_owned();
+            let mut depth = 1usize;
+            let end = rest
+                .char_indices()
+                .find_map(|(index, character)| {
+                    match character {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some(index);
+                            }
+                        }
+                        _ => {}
+                    }
+                    None
+                })
+                .expect("balanced parentheses in a route call");
+            routes.push((path, rest[..end].contains("gated(")));
+            rest = &rest[end..];
+        }
+        routes
+    }
+
+    /// The regression insurance: a new route has to be classified. Gate it, or
+    /// state in `UNGATED_ROUTES` that serving it to anyone is intended.
+    #[test]
+    fn the_route_table_matches_the_checked_in_gating() {
+        let routes = routes_in_source();
+        assert_eq!(
+            routes.len(),
+            GATED_DATA_ROUTES.len() + UNGATED_ROUTES.len(),
+            "a route was added or removed without updating this test: {routes:#?}"
+        );
+
+        let (gated, ungated): (Vec<_>, Vec<_>) = routes.into_iter().partition(|(_, gated)| *gated);
+        let gated: Vec<_> = gated.into_iter().map(|(path, _)| path).collect();
+        let ungated: Vec<_> = ungated.into_iter().map(|(path, _)| path).collect();
+
+        assert_eq!(
+            gated,
+            GATED_DATA_ROUTES
+                .iter()
+                .map(|(path, ..)| *path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ungated, UNGATED_ROUTES.to_vec());
+    }
+
+    /// And the gating actually turns requests away: every listed data route
+    /// answers 401 without a credential and serves a valid key.
+    #[tokio::test]
+    async fn every_gated_data_route_requires_a_key() {
+        use tower::ServiceExt;
+
+        use crate::commercial::test_support::{gate_with, key_record, SECRET};
+
+        let gate = Some(gate_with(vec![key_record("k1", 1)]));
+        let token = format!("Bearer sqd_portal_k1_{SECRET}");
+
+        for (path, method, source, uri) in GATED_DATA_ROUTES {
+            let router = || {
+                let handler = match *method {
+                    "GET" => get(|| async { "served" }),
+                    "POST" => post(|| async { "served" }),
+                    other => panic!("unhandled method {other}"),
+                };
+                Router::new().route(path, gated(handler, &gate, *source))
+            };
+            let request = || {
+                axum::http::Request::builder()
+                    .method(*method)
+                    .uri(*uri)
+                    .body(Body::empty())
+                    .unwrap()
+            };
+
+            let anonymous = router().oneshot(request()).await.unwrap();
+            assert_eq!(
+                anonymous.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must not serve a request with no key"
+            );
+
+            let authorized = router()
+                .oneshot({
+                    let mut request = request();
+                    request
+                        .headers_mut()
+                        .insert(header::AUTHORIZATION, token.parse().unwrap());
+                    request
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                authorized.status(),
+                StatusCode::OK,
+                "{path} must serve a valid key"
+            );
+        }
+    }
+
     /// The kill switch: with no `commercial:` block there is no gate, so a data
     /// route is served without any authorization middleware in front of it.
     #[tokio::test]
