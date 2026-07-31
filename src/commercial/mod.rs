@@ -124,9 +124,6 @@ pub mod test_support {
             portal_id: "portal-premium-eu".to_string(),
             enforcement: Enforcement::Enforce,
             sync_interval_secs: 10,
-            resolve_rate_per_sec: 20,
-            max_inflight_resolves: 16,
-            negative_cache_secs: 15,
         }
     }
 
@@ -211,9 +208,6 @@ pub mod test_support {
                 portal_id: "portal-premium-eu".to_string(),
                 enforcement: Enforcement::Enforce,
                 sync_interval_secs: 10,
-                resolve_rate_per_sec: 100,
-                max_inflight_resolves: 16,
-                negative_cache_secs: 15,
             }
         }
 

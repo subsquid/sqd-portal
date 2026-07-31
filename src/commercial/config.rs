@@ -7,10 +7,6 @@ use url::Url;
 /// file, so the id is normally injected per pod and overrides the file value.
 const PORTAL_ID_ENV: &str = "PORTAL_ID";
 
-/// Upper bound on concurrent authorize-on-miss calls, so an unknown-key flood
-/// cannot turn into an unbounded fan-out against the control plane.
-const MAX_INFLIGHT_RESOLVES: usize = 64;
-
 /// Presence of this block turns the portal commercial: the data API then
 /// requires a key. Absent, the portal behaves exactly like an OSS build.
 #[derive(Debug, Clone, Deserialize)]
@@ -30,18 +26,6 @@ pub struct CommercialConfig {
 
     #[serde(default = "default_sync_interval_secs")]
     pub sync_interval_secs: u64,
-
-    /// Token-bucket rate for authorize-on-miss lookups. Zero disables them, so
-    /// keys absent from the snapshot are rejected until the next sync.
-    #[serde(default = "default_resolve_rate_per_sec")]
-    pub resolve_rate_per_sec: u64,
-
-    #[serde(default = "default_max_inflight_resolves")]
-    pub max_inflight_resolves: usize,
-
-    /// How long a control-plane "unknown key" answer suppresses repeat lookups.
-    #[serde(default = "default_negative_cache_secs")]
-    pub negative_cache_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -65,10 +49,6 @@ impl CommercialConfig {
         anyhow::ensure!(
             self.sync_interval_secs >= 1,
             "commercial.sync_interval_secs must be at least 1"
-        );
-        anyhow::ensure!(
-            (1..=MAX_INFLIGHT_RESOLVES).contains(&self.max_inflight_resolves),
-            "commercial.max_inflight_resolves must be between 1 and {MAX_INFLIGHT_RESOLVES}"
         );
         Ok(())
     }
@@ -99,26 +79,10 @@ impl CommercialConfig {
     pub fn sync_interval(&self) -> Duration {
         Duration::from_secs(self.sync_interval_secs.max(1))
     }
-
-    pub fn negative_cache_ttl(&self) -> Duration {
-        Duration::from_secs(self.negative_cache_secs)
-    }
 }
 
 fn default_sync_interval_secs() -> u64 {
     10
-}
-
-fn default_resolve_rate_per_sec() -> u64 {
-    20
-}
-
-fn default_max_inflight_resolves() -> usize {
-    16
-}
-
-fn default_negative_cache_secs() -> u64 {
-    15
 }
 
 #[cfg(test)]
@@ -142,26 +106,16 @@ portal_id: portal-premium-eu
 
         assert_eq!(config.enforcement, Enforcement::Enforce);
         assert_eq!(config.sync_interval_secs, 10);
-        assert_eq!(config.resolve_rate_per_sec, 20);
-        assert_eq!(config.max_inflight_resolves, 16);
-        assert_eq!(config.negative_cache_secs, 15);
     }
 
     #[test]
     fn full_block_parses_every_field() {
         let config = parse(&format!(
-            "{MINIMAL}enforcement: log_only\n\
-             sync_interval_secs: 3\n\
-             resolve_rate_per_sec: 7\n\
-             max_inflight_resolves: 5\n\
-             negative_cache_secs: 30\n"
+            "{MINIMAL}enforcement: log_only\nsync_interval_secs: 3\n"
         ));
 
         assert_eq!(config.enforcement, Enforcement::LogOnly);
         assert_eq!(config.sync_interval_secs, 3);
-        assert_eq!(config.resolve_rate_per_sec, 7);
-        assert_eq!(config.max_inflight_resolves, 5);
-        assert_eq!(config.negative_cache_secs, 30);
     }
 
     #[test]
@@ -214,14 +168,6 @@ portal_id: portal-premium-eu
 
         let mut config = parse(MINIMAL);
         config.sync_interval_secs = 0;
-        assert!(config.validate().is_err());
-
-        let mut config = parse(MINIMAL);
-        config.max_inflight_resolves = 0;
-        assert!(config.validate().is_err());
-
-        let mut config = parse(MINIMAL);
-        config.max_inflight_resolves = MAX_INFLIGHT_RESOLVES + 1;
         assert!(config.validate().is_err());
 
         let mut config = parse(MINIMAL);

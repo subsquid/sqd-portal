@@ -21,10 +21,23 @@ use super::{
 const MAX_BOOTSTRAP_PAGES: usize = 10_000;
 
 /// Upper bound on remembered "the control plane has never heard of this key"
-/// answers. The ids are attacker-chosen, so the map is capped rather than
-/// merely swept: past the cap new answers are dropped instead of cached, which
-/// costs a rate-limited lookup rather than unbounded memory.
+/// answers. The ids are attacker-chosen, so the map is capped: past the cap new
+/// answers are dropped instead of cached, which costs a rate-limited lookup
+/// rather than unbounded memory.
 const NEGATIVE_CACHE_CAPACITY: usize = 4096;
+
+/// How long one of those answers suppresses repeat lookups for the same id.
+/// Short enough that a key minted moments after a miss still works quickly.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
+
+/// Token-bucket rate for authorize-on-miss lookups: what a portal may ask the
+/// control plane about keys its snapshot has not caught up with yet.
+const RESOLVE_RATE_PER_SEC: u64 = 20;
+
+/// Upper bound on concurrent authorize-on-miss calls, so an unknown-key flood
+/// cannot turn into an unbounded fan-out against the control plane, and a
+/// control plane that stops answering cannot pile up handlers.
+const MAX_INFLIGHT_RESOLVES: usize = 16;
 
 /// The portal's view of the control plane's key set: a full snapshot pulled at
 /// startup and kept current by cursor-paged deltas. A sync failure never drops
@@ -39,10 +52,7 @@ pub struct SnapshotStore {
     /// failed tick reports the distance from it, so a feed that has been down
     /// for hours does not read like one that missed a single tick.
     last_success: AtomicU64,
-    negative_cache_ttl: Duration,
     negative_cache: Mutex<HashMap<String, Instant>>,
-    /// Bounds how many authorize calls may be in flight at once, so a control
-    /// plane that stops answering cannot pile up handlers without limit.
     inflight_permits: Semaphore,
     limiter: Mutex<RateLimiter>,
 }
@@ -77,10 +87,9 @@ impl SnapshotStore {
             ready: AtomicBool::new(false),
             sync_interval: config.sync_interval(),
             last_success: AtomicU64::new(now_secs()),
-            negative_cache_ttl: config.negative_cache_ttl(),
             negative_cache: Mutex::new(HashMap::new()),
-            inflight_permits: Semaphore::new(config.max_inflight_resolves),
-            limiter: Mutex::new(RateLimiter::new(config.resolve_rate_per_sec)),
+            inflight_permits: Semaphore::new(MAX_INFLIGHT_RESOLVES),
+            limiter: Mutex::new(RateLimiter::new(RESOLVE_RATE_PER_SEC)),
         }))
     }
 
@@ -192,7 +201,7 @@ impl SnapshotStore {
                 return;
             }
         }
-        cache.insert(key_id.to_owned(), now + self.negative_cache_ttl);
+        cache.insert(key_id.to_owned(), now + NEGATIVE_CACHE_TTL);
     }
 
     fn negative_cached(&self, key_id: &str) -> bool {
@@ -806,10 +815,15 @@ mod tests {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
         cp.authorize_with("k1", Some(key_record("k1", 1)));
-        let mut config = cp.config();
-        config.resolve_rate_per_sec = 0;
-        let store = SnapshotStore::new(&config).unwrap();
+        let store = store_for(&cp).await;
         store.run_tick().await;
+
+        // What a burst of misses does to the bucket, without the burst.
+        {
+            let mut limiter = store.limiter.lock().unwrap();
+            limiter.tokens = 0.0;
+            limiter.last = Instant::now();
+        }
 
         assert!(store.get_or_resolve("k1").await.is_none());
         assert!(cp.authorize_calls().is_empty());
