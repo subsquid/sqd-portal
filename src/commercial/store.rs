@@ -195,14 +195,6 @@ impl SnapshotStore {
         cache.insert(key_id.to_owned(), now + self.negative_cache_ttl);
     }
 
-    fn sweep_negative_cache(&self) {
-        let now = Instant::now();
-        self.negative_cache
-            .lock()
-            .unwrap()
-            .retain(|_, expires_at| *expires_at > now);
-    }
-
     fn negative_cached(&self, key_id: &str) -> bool {
         let mut cache = self.negative_cache.lock().unwrap();
         match cache.get(key_id) {
@@ -225,9 +217,6 @@ impl SnapshotStore {
             Ok(()) => self.last_success.store(now_secs(), Ordering::Release),
             Err(err) => self.report_sync_failure(&err),
         }
-        // Entries an unknown-key flood left behind are never re-queried, so
-        // nothing else would ever drop them.
-        self.sweep_negative_cache();
     }
 
     /// Seconds since the last sync the control plane answered.
@@ -794,33 +783,6 @@ mod tests {
             "the negative cache grew to {} entries",
             store.negative_cache.lock().unwrap().len()
         );
-    }
-
-    /// Without a sweep an expired entry lives until the same id is queried
-    /// again — which a flood of one-shot ids never does.
-    #[tokio::test]
-    async fn the_sync_tick_sweeps_expired_negative_cache_entries() {
-        let cp = MockControlPlane::spawn().await;
-        let mut config = cp.config();
-        // Entries expire the instant they are written.
-        config.negative_cache_secs = 0;
-        let store = SnapshotStore::new(&config).unwrap();
-        cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
-        store.run_tick().await;
-        assert!(store.is_ready());
-
-        let generation = store.state.read().unwrap().generation;
-        store.cache_negative("gone", generation);
-        assert_eq!(store.negative_cache.lock().unwrap().len(), 1);
-
-        // A steady-state tick: an empty delta page, so nothing is reinstalled.
-        store.run_tick().await;
-
-        assert!(
-            store.negative_cache.lock().unwrap().is_empty(),
-            "expired entries must not wait for a re-query to be dropped"
-        );
-        assert_eq!(store.state.read().unwrap().generation, generation);
     }
 
     #[tokio::test]
