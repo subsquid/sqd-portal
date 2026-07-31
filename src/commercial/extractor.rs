@@ -1,7 +1,4 @@
-use std::{
-    fmt,
-    sync::{Arc, Mutex},
-};
+use std::{fmt, sync::Arc};
 
 use axum::{
     extract::Request,
@@ -14,7 +11,7 @@ use url::form_urlencoded;
 
 use super::{
     config::{CommercialConfig, Enforcement},
-    evaluate::{self, DatasetResolver, Decision, Rejection},
+    evaluate::{self, Decision, LazyDataset, Rejection},
     now_secs,
     store::SnapshotStore,
 };
@@ -100,10 +97,6 @@ impl Gate {
         }
     }
 
-    pub fn enforcement(&self) -> Enforcement {
-        self.enforcement
-    }
-
     /// Whether the portal has mirrored the control plane's key set yet. A gated
     /// portal that has not knows no keys, so it would answer 401 to every valid
     /// one — it belongs out of rotation until this turns true.
@@ -117,12 +110,10 @@ impl Gate {
         uri: &axum::http::Uri,
         source: DatasetSource,
     ) -> Decision {
-        let dataset = RequestDataset {
-            gate: self,
-            path: uri.path(),
-            source,
-            resolved: Mutex::new(None),
-        };
+        // Deferred on purpose: canonicalization interns the name in a
+        // process-wide pool and clones the dataset config, so it must stay
+        // behind authentication. Only the dataset rung calls this.
+        let dataset = LazyDataset::new(|| self.dataset_for(uri.path(), source));
         let credential = match credential_from_request(headers, uri.query()) {
             Ok(credential) => credential,
             Err(rejection) => {
@@ -176,64 +167,37 @@ impl Gate {
     /// Log-only mode records every request; enforcing mode records only the
     /// requests it turns away, since admissions are the hot path.
     fn log(&self, decision: Decision, key_id: Option<&str>, dataset: Option<&str>) {
+        let enforcing = self.enforcement == Enforcement::Enforce;
         let key_id = key_id.unwrap_or("none");
         let dataset = dataset.unwrap_or("-");
         let portal_id = self.portal_id.as_str();
-        match (decision, self.enforcement) {
-            (Decision::Admit, Enforcement::Enforce) => {}
-            (Decision::Admit, Enforcement::LogOnly) => tracing::info!(
-                key_id,
-                dataset,
-                portal_id,
-                decision = "admit",
-                reason = "authorized",
-                enforcement = "log_only",
-                "commercial authorization"
-            ),
-            (Decision::Reject(rejection), Enforcement::LogOnly) => tracing::warn!(
-                key_id,
-                dataset,
-                portal_id,
-                decision = "would_reject",
-                reason = rejection.reason,
-                status = rejection.status.as_u16(),
-                enforcement = "log_only",
-                "commercial authorization"
-            ),
-            (Decision::Reject(rejection), Enforcement::Enforce) => tracing::warn!(
-                key_id,
-                dataset,
-                portal_id,
-                decision = "reject",
-                reason = rejection.reason,
-                status = rejection.status.as_u16(),
-                enforcement = "enforce",
-                "commercial authorization"
-            ),
-        }
-    }
-}
+        let enforcement = if enforcing { "enforce" } else { "log_only" };
 
-/// The dataset one request names, resolved at most once and only if a rung of
-/// the ladder asks for it. Canonicalization interns the name in a process-wide
-/// pool and clones the dataset config, so it must stay behind authentication.
-struct RequestDataset<'a> {
-    gate: &'a Gate,
-    path: &'a str,
-    source: DatasetSource,
-    resolved: Mutex<Option<Option<String>>>,
-}
-
-impl DatasetResolver for RequestDataset<'_> {
-    fn resolve(&self) -> Option<String> {
-        let mut resolved = self.resolved.lock().unwrap();
-        resolved
-            .get_or_insert_with(|| self.gate.dataset_for(self.path, self.source))
-            .clone()
-    }
-
-    fn resolved(&self) -> Option<String> {
-        self.resolved.lock().unwrap().clone().flatten()
+        let Decision::Reject(rejection) = decision else {
+            if !enforcing {
+                tracing::info!(
+                    key_id,
+                    dataset,
+                    portal_id,
+                    decision = "admit",
+                    reason = "authorized",
+                    enforcement,
+                    "commercial authorization"
+                );
+            }
+            return;
+        };
+        tracing::warn!(
+            key_id,
+            dataset,
+            portal_id,
+            // Shadow mode says what it would have done, since it did not.
+            decision = if enforcing { "reject" } else { "would_reject" },
+            reason = rejection.reason,
+            status = rejection.status.as_u16(),
+            enforcement,
+            "commercial authorization"
+        );
     }
 }
 
@@ -244,7 +208,7 @@ pub async fn middleware(
     next: Next,
 ) -> Response {
     let decision = gate.decide(req.headers(), req.uri(), source).await;
-    match (decision, gate.enforcement()) {
+    match (decision, gate.enforcement) {
         (Decision::Reject(rejection), Enforcement::Enforce) => rejection.into_response(),
         _ => next.run(req).await,
     }

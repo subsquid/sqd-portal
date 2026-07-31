@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -72,26 +74,47 @@ pub(super) const MALFORMED: Rejection = Rejection {
     message: "Invalid API key",
 };
 
-/// Naming the dataset a request targets is not free: it canonicalizes through
-/// the network client's catalog and interns the result in a process-wide pool.
-/// Only one rung of the ladder needs it, and only for dataset-scoped keys, so
-/// the ladder asks for it there rather than being handed it up front — an
-/// unauthenticated request must not be able to buy that work.
-pub trait DatasetResolver: Send + Sync {
+/// The dataset a request targets, named on demand. Naming it is not free: it
+/// canonicalizes through the network client's catalog and interns the result in
+/// a process-wide pool. Only one rung of the ladder needs it, and only for
+/// dataset-scoped keys, so the ladder asks for it there rather than being
+/// handed it up front — an unauthenticated request must not be able to buy that
+/// work. The laziness is the whole point of this type.
+pub struct LazyDataset<F: Fn() -> Option<String>> {
+    name: F,
+    resolved: Mutex<Option<Option<String>>>,
+}
+
+impl<F: Fn() -> Option<String>> LazyDataset<F> {
+    pub fn new(name: F) -> Self {
+        Self {
+            name,
+            resolved: Mutex::new(None),
+        }
+    }
+
     /// Resolves on first call and remembers the answer.
-    fn resolve(&self) -> Option<String>;
+    pub fn resolve(&self) -> Option<String> {
+        self.resolved
+            .lock()
+            .unwrap()
+            .get_or_insert_with(&self.name)
+            .clone()
+    }
 
     /// What an earlier rung already resolved, if anything. Never resolves.
-    fn resolved(&self) -> Option<String>;
+    pub fn resolved(&self) -> Option<String> {
+        self.resolved.lock().unwrap().clone().flatten()
+    }
 }
 
 /// Phase-1 authorization: authentication plus coarse portal/dataset scoping.
 /// A key that passes streams unrestricted — no limits, no quota, no metering.
-pub async fn evaluate(
+pub async fn evaluate<F: Fn() -> Option<String>>(
     store: &SnapshotStore,
     portal_id: &str,
     credential: Option<&Credential>,
-    dataset: &dyn DatasetResolver,
+    dataset: &LazyDataset<F>,
     now_secs: u64,
 ) -> Decision {
     let Some(credential) = credential else {
@@ -104,11 +127,11 @@ pub async fn evaluate(
     evaluate_record(&record, portal_id, credential, dataset, now_secs)
 }
 
-fn evaluate_record(
+fn evaluate_record<F: Fn() -> Option<String>>(
     record: &KeyRecord,
     portal_id: &str,
     credential: &Credential,
-    dataset: &dyn DatasetResolver,
+    dataset: &LazyDataset<F>,
     now_secs: u64,
 ) -> Decision {
     let Some(expected) = record.secret_sha256.as_deref() else {
@@ -150,19 +173,6 @@ fn evaluate_record(
     }
 
     Decision::Admit
-}
-
-/// Tests hand the ladder a dataset name directly; only the request path has a
-/// resolution to defer.
-#[cfg(test)]
-impl DatasetResolver for Option<&str> {
-    fn resolve(&self) -> Option<String> {
-        self.map(str::to_owned)
-    }
-
-    fn resolved(&self) -> Option<String> {
-        self.map(str::to_owned)
-    }
 }
 
 impl Rejection {
@@ -209,7 +219,13 @@ mod tests {
         dataset: Option<&str>,
     ) -> Decision {
         let store = store_with(vec![record]);
-        evaluate(&store, PORTAL, credential, &dataset, NOW).await
+        evaluate(&store, PORTAL, credential, &named(dataset), NOW).await
+    }
+
+    /// Tests hand the ladder a dataset name directly; only the request path has
+    /// a resolution to defer.
+    fn named(dataset: Option<&str>) -> LazyDataset<impl Fn() -> Option<String> + '_> {
+        LazyDataset::new(move || dataset.map(str::to_owned))
     }
 
     fn reason(decision: Decision) -> &'static str {
@@ -238,7 +254,7 @@ mod tests {
         let store = store_with(vec![key_record("k1", 1)]);
         let credential = credential("other", SECRET_SHA256);
 
-        let decision = evaluate(&store, PORTAL, Some(&credential), &Some("eth"), NOW).await;
+        let decision = evaluate(&store, PORTAL, Some(&credential), &named(Some("eth")), NOW).await;
 
         assert_eq!(reason(decision), "unknown_key");
     }
