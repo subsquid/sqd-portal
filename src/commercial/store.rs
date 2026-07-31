@@ -299,7 +299,6 @@ impl SnapshotStore {
         let mut records = Vec::new();
         let mut epoch = fallback_epoch;
         let mut pages = 0usize;
-        let mut pages_this_attempt = 0usize;
 
         loop {
             anyhow::ensure!(
@@ -309,29 +308,24 @@ impl SnapshotStore {
             let page = self.client.fetch_page(cursor).await?;
             pages += 1;
 
-            let epoch_changed = pages_this_attempt > 0
+            // Pages from two epochs do not compose into a snapshot of either,
+            // so a flip mid-bootstrap fails the tick. The next one starts from
+            // cursor zero anyway, which is exactly the restart this used to do
+            // by hand.
+            let epoch_changed = pages > 1
                 && page
                     .epoch
                     .as_ref()
                     .zip(epoch.as_ref())
                     .is_some_and(|(received, expected)| received != expected);
-            if epoch_changed {
-                tracing::warn!(
-                    cursor,
-                    received_epoch = ?page.epoch,
-                    expected_epoch = ?epoch,
-                    "commercial snapshot epoch changed mid-bootstrap; restarting"
-                );
-                cursor = 0;
-                records.clear();
-                pages_this_attempt = 0;
-                epoch = page.epoch;
-                continue;
-            }
+            anyhow::ensure!(
+                !epoch_changed,
+                "snapshot epoch changed mid-bootstrap: expected {epoch:?}, received {:?}",
+                page.epoch
+            );
             if page.epoch.is_some() {
                 epoch = page.epoch;
             }
-            pages_this_attempt += 1;
 
             let page_len = page.records.len();
             records.extend(parse_records(page.records)?);
@@ -505,6 +499,30 @@ mod tests {
         assert_eq!(store.state.read().unwrap().cursor, 5000);
         assert_eq!(store.state.read().unwrap().epoch.as_deref(), Some("e1"));
         assert!(store.get("last").is_some());
+        assert_eq!(cp.snapshot_cursors(), vec![0, u64::from(PAGE_LIMIT)]);
+    }
+
+    /// Pages read either side of a feed rebuild describe two different key
+    /// sets, and a snapshot stitched from both is a snapshot of neither. The
+    /// tick fails instead; the next one starts clean from cursor zero.
+    #[tokio::test]
+    async fn a_mid_bootstrap_epoch_change_installs_nothing() {
+        let cp = MockControlPlane::spawn().await;
+        let first: Vec<_> = (0..PAGE_LIMIT)
+            .map(|i| key_record(&format!("k{i}"), u64::from(i) + 1))
+            .collect();
+        cp.push_page(0, page(first, u64::from(PAGE_LIMIT), Some("e1"), None));
+        cp.push_page(
+            u64::from(PAGE_LIMIT),
+            page(vec![key_record("late", 5000)], 5000, Some("e2"), Some(5000)),
+        );
+
+        let store = store_for(&cp).await;
+        store.run_tick().await;
+
+        assert!(!store.is_ready(), "a mixed-epoch snapshot must not install");
+        assert!(store.get("k0").is_none());
+        assert!(store.get("late").is_none());
         assert_eq!(cp.snapshot_cursors(), vec![0, u64::from(PAGE_LIMIT)]);
     }
 
