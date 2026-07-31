@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use url::Url;
 
+use crate::commercial::CommercialConfig;
 use crate::network::PrioritiesConfig;
 use crate::types::DatasetRef;
 
@@ -148,6 +149,11 @@ pub struct Config {
     pub sentry_is_enabled: bool,
 
     pub client_id: Option<String>,
+
+    /// Absent means no authentication at all: the portal serves every request,
+    /// exactly as an OSS build does. Present, the data API requires a key.
+    #[serde(default)]
+    pub commercial: Option<CommercialConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +215,9 @@ impl Config {
 
     fn validate(&self) -> anyhow::Result<()> {
         self.congestion.validate()?;
+        if let Some(commercial) = &self.commercial {
+            commercial.validate()?;
+        }
         Ok(())
     }
 }
@@ -436,6 +445,37 @@ sqd_network:
         let config: Config = serde_yaml::from_str(&yaml).expect("parse");
         assert_eq!(config.pre_drain_grace_period, Duration::from_secs(3));
         assert_eq!(config.drain_timeout, Duration::from_secs(7));
+    }
+
+    /// The kill switch: without the block the portal is byte-for-byte an OSS
+    /// portal, and `run_server` installs no authorization middleware.
+    #[test]
+    fn commercial_is_absent_unless_configured() {
+        let config: Config = serde_yaml::from_str(MINIMAL_YAML).expect("parse");
+        assert!(config.commercial.is_none());
+    }
+
+    #[test]
+    fn commercial_block_parses_through_the_production_deserializer() {
+        let yaml = format!(
+            "{MINIMAL_YAML}commercial:\n  \
+             control_plane_url: https://cp.example/\n  \
+             service_token_env: PORTAL_CP_TOKEN\n  \
+             portal_id: portal-premium-eu\n  \
+             enforcement: log_only\n"
+        );
+        let deser = serde_yaml::Deserializer::from_str(&yaml);
+        let config: Config = serde_yaml::with::singleton_map_recursive::deserialize(
+            serde_ignored::Deserializer::new(deser, &mut |_: serde_ignored::Path| {}),
+        )
+        .expect("parse");
+
+        let commercial = config.commercial.expect("commercial block");
+        assert_eq!(commercial.portal_id, "portal-premium-eu");
+        assert_eq!(
+            commercial.enforcement,
+            crate::commercial::Enforcement::LogOnly
+        );
     }
 
     #[test]
