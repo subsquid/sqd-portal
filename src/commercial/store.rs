@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
     time::{Duration, Instant},
@@ -32,6 +32,10 @@ const RESOLVE_FOLLOWER_TIMEOUT: Duration = Duration::from_secs(6);
 /// costs a rate-limited lookup rather than unbounded memory.
 const NEGATIVE_CACHE_CAPACITY: usize = 4096;
 
+/// Floor on how long the snapshot may go unconfirmed before that stops being
+/// routine. Deployments with a long sync interval get five intervals instead.
+const MIN_STALENESS_THRESHOLD: Duration = Duration::from_secs(60);
+
 /// The portal's view of the control plane's key set: a full snapshot pulled at
 /// startup, kept current by cursor-paged deltas, and backed by a disk cache so
 /// a restart serves immediately. A sync failure never drops the served state —
@@ -43,6 +47,14 @@ pub struct SnapshotStore {
     cache_dirty: AtomicBool,
     cache_path: Option<PathBuf>,
     sync_interval: Duration,
+    /// Wall-clock second of the last sync the control plane answered, or of the
+    /// disk cache the store started from. Wall clock rather than `Instant`
+    /// because a cache written by a previous process has to be comparable.
+    last_success: AtomicU64,
+    /// Latches once an episode of staleness has been reported, so a control
+    /// plane that stays down does not reprint the same ERROR every tick.
+    stale_logged: AtomicBool,
+    staleness_threshold: Duration,
     negative_cache_ttl: Duration,
     negative_cache: Mutex<HashMap<String, Instant>>,
     inflight: Mutex<HashMap<String, Arc<ResolveFlight>>>,
@@ -117,6 +129,9 @@ impl SnapshotStore {
             cache_dirty: AtomicBool::new(false),
             cache_path: config.snapshot_cache_path.clone(),
             sync_interval: config.sync_interval(),
+            last_success: AtomicU64::new(now_secs()),
+            stale_logged: AtomicBool::new(false),
+            staleness_threshold: (config.sync_interval() * 5).max(MIN_STALENESS_THRESHOLD),
             negative_cache_ttl: config.negative_cache_ttl(),
             negative_cache: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
@@ -350,18 +365,48 @@ impl SnapshotStore {
         } else {
             self.bootstrap(None).await
         };
-        if let Err(err) = result {
-            // Fail-static: the previously synced snapshot keeps serving.
-            tracing::warn!(
-                error = %err,
-                ready = self.is_ready(),
-                "commercial snapshot sync failed; serving last known keys"
-            );
+        match result {
+            Ok(()) => self.record_sync_success(),
+            Err(err) => self.report_sync_failure(&err),
         }
         // Entries an unknown-key flood left behind are never re-queried, so
         // nothing else would ever drop them.
         self.sweep_negative_cache();
         self.persist_if_dirty().await;
+    }
+
+    fn record_sync_success(&self) {
+        self.last_success.store(now_secs(), Ordering::Release);
+        if self.stale_logged.swap(false, Ordering::AcqRel) {
+            tracing::info!("commercial snapshot sync recovered; the key set is current again");
+        }
+    }
+
+    /// A failed tick is routine — fail-static means the last good snapshot
+    /// keeps serving — right up until the served keys are old enough that
+    /// revocations may already have been missed. That crossing is an ERROR,
+    /// logged once per episode rather than on every tick.
+    fn report_sync_failure(&self, err: &anyhow::Error) {
+        let stale_for = now_secs().saturating_sub(self.last_success.load(Ordering::Acquire));
+        if stale_for >= self.staleness_threshold.as_secs()
+            && !self.stale_logged.swap(true, Ordering::AcqRel)
+        {
+            tracing::error!(
+                error = %err,
+                stale_for_seconds = stale_for,
+                threshold_seconds = self.staleness_threshold.as_secs(),
+                ready = self.is_ready(),
+                "commercial snapshot is stale; served keys may no longer match the control plane"
+            );
+            return;
+        }
+        // Fail-static: the previously synced snapshot keeps serving.
+        tracing::warn!(
+            error = %err,
+            stale_for_seconds = stale_for,
+            ready = self.is_ready(),
+            "commercial snapshot sync failed; serving last known keys"
+        );
     }
 
     async fn sync_once(&self) -> anyhow::Result<()> {
@@ -559,6 +604,22 @@ impl SnapshotStore {
         self.install(cache.records, cache.cursor, cache.epoch);
         // Installing marks the cache dirty; nothing changed relative to disk.
         self.cache_dirty.store(false, Ordering::Release);
+        self.last_success.store(cache.saved_at, Ordering::Release);
+
+        if age > self.staleness_threshold.as_secs() {
+            // Fail-static still holds — an old key set beats none — but the
+            // pod cannot vouch for it, so `install`'s readiness is withdrawn
+            // and the pod stays out of rotation until the first live sync.
+            self.ready.store(false, Ordering::Release);
+            tracing::error!(
+                path = %path.display(),
+                count,
+                age_seconds = age,
+                threshold_seconds = self.staleness_threshold.as_secs(),
+                "commercial snapshot disk cache is stale; serving it but staying out of rotation until the first sync"
+            );
+            return;
+        }
         tracing::info!(
             path = %path.display(),
             count,
@@ -838,6 +899,60 @@ mod tests {
         );
     }
 
+    /// Sync failures were warn-only forever, so a feed that had been down for
+    /// days looked exactly like one that had missed a single tick.
+    #[tokio::test]
+    async fn sync_failures_escalate_once_the_snapshot_goes_stale() {
+        let cp = MockControlPlane::spawn().await;
+        cp.push_page(0, page(vec![key_record("k1", 1)], 1, Some("e1"), Some(1)));
+        let store = store_for(&cp, None).await;
+        store.run_tick().await;
+        assert!(!store.stale_logged.load(Ordering::Acquire));
+
+        cp.fail_snapshots(true);
+        store.run_tick().await;
+        assert!(
+            !store.stale_logged.load(Ordering::Acquire),
+            "one missed tick is routine"
+        );
+
+        // As if the control plane had been unreachable for hours.
+        store
+            .last_success
+            .store(now_secs() - 10_000, Ordering::Release);
+        store.run_tick().await;
+        assert!(
+            store.stale_logged.load(Ordering::Acquire),
+            "past the threshold the failure is an error, not a warning"
+        );
+
+        store.run_tick().await;
+        assert!(
+            store.stale_logged.load(Ordering::Acquire),
+            "and it is reported once per episode, not once per tick"
+        );
+
+        cp.fail_snapshots(false);
+        cp.push_page(1, page(vec![], 1, Some("e1"), Some(1)));
+        store.run_tick().await;
+        assert!(
+            !store.stale_logged.load(Ordering::Acquire),
+            "a successful sync ends the episode"
+        );
+    }
+
+    #[test]
+    fn the_staleness_threshold_never_drops_below_a_minute() {
+        let mut config = crate::commercial::test_support::offline_config();
+        config.sync_interval_secs = 10;
+        let store = SnapshotStore::new(&config).unwrap();
+        assert_eq!(store.staleness_threshold, Duration::from_secs(60));
+
+        config.sync_interval_secs = 30;
+        let store = SnapshotStore::new(&config).unwrap();
+        assert_eq!(store.staleness_threshold, Duration::from_secs(150));
+    }
+
     #[tokio::test]
     async fn sync_failure_keeps_serving_the_last_snapshot() {
         let cp = MockControlPlane::spawn().await;
@@ -871,6 +986,53 @@ mod tests {
         assert_eq!(restarted.get("k1").unwrap().seq, 4);
         assert_eq!(restarted.state.read().unwrap().cursor, 4);
         assert_eq!(restarted.state.read().unwrap().epoch.as_deref(), Some("e1"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn write_cache(path: &Path, age_seconds: u64, records: Vec<KeyRecord>) {
+        let cache = serde_json::json!({
+            "cursor": 4,
+            "epoch": "e1",
+            "records": records,
+            "saved_at": now_secs().saturating_sub(age_seconds),
+        });
+        std::fs::write(path, serde_json::to_vec(&cache).unwrap()).unwrap();
+    }
+
+    /// Fail-static still applies — an old key set beats no key set — but a pod
+    /// serving one has no idea which of those keys were revoked days ago, so it
+    /// must not take traffic until a live sync confirms them.
+    #[tokio::test]
+    async fn a_stale_disk_cache_serves_but_stays_out_of_rotation() {
+        let path = cache_path("stale");
+        write_cache(&path, 2 * 24 * 60 * 60, vec![key_record("k1", 4)]);
+        let cp = MockControlPlane::spawn().await;
+
+        let store = store_for(&cp, Some(path.clone())).await;
+
+        assert!(
+            store.get("k1").is_some(),
+            "an old snapshot is still better than none"
+        );
+        assert!(
+            !store.is_ready(),
+            "but the pod must stay out of rotation until the first live sync"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_disk_cache_puts_the_pod_straight_into_rotation() {
+        let path = cache_path("fresh");
+        write_cache(&path, 5, vec![key_record("k1", 4)]);
+        let cp = MockControlPlane::spawn().await;
+
+        let store = store_for(&cp, Some(path.clone())).await;
+
+        assert!(store.is_ready());
+        assert_eq!(store.get("k1").unwrap().seq, 4);
 
         let _ = std::fs::remove_file(&path);
     }
