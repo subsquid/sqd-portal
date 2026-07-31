@@ -794,6 +794,32 @@ mod tests {
         );
     }
 
+    /// A resolve that started before an epoch resync answers for the OLD
+    /// generation: its record must not join the new snapshot, and its
+    /// negative answer must not be cached against it.
+    #[tokio::test]
+    async fn a_stale_generation_resolve_writes_nothing() {
+        let cp = MockControlPlane::spawn().await;
+        let store = store_for(&cp).await;
+        let stale = store.state.read().unwrap().generation;
+
+        // An epoch resync replaces the generation between the resolve's read
+        // and its write-back.
+        store.install(vec![], 0, Some("e2".to_owned()));
+
+        assert!(store.upsert_resolved(key_record("k1", 5), stale).is_none());
+        assert!(
+            store.get("k1").is_none(),
+            "a stale record must not join the new snapshot"
+        );
+
+        store.cache_negative("k2", stale);
+        assert!(
+            !store.negative_cached("k2"),
+            "a stale negative answer must not be cached"
+        );
+    }
+
     #[tokio::test]
     async fn unknown_keys_are_negative_cached() {
         let cp = MockControlPlane::spawn().await;
