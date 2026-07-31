@@ -145,6 +145,14 @@ async fn main() -> anyhow::Result<()> {
     let task_manager = Arc::new(TaskManager::new(network_client.clone(), &config));
 
     let cancellation_token = CancellationToken::new();
+    let commercial_gate = match config.commercial.as_ref() {
+        Some(commercial) => Some(sqd_portal::commercial::build(
+            commercial,
+            network_client.clone() as Arc<dyn sqd_portal::commercial::DatasetCatalog>,
+            cancellation_token.child_token(),
+        )?),
+        None => None,
+    };
     let shutting_down = Arc::new(AtomicBool::new(false));
     let sigterm = {
         use anyhow::Context;
@@ -176,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
             shutting_down,
             cancellation_token.clone(),
             args.show_internal_docs,
+            commercial_gate,
         )),
         network_client.run(cancellation_token),
     )?;

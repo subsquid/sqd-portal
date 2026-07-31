@@ -9,7 +9,6 @@ use super::{
     store::SnapshotStore,
     types::{KeyRecord, KeyStatus},
 };
-use crate::types::GenericError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -132,9 +131,7 @@ impl Rejection {
     pub fn into_response(self) -> Response {
         (
             self.status,
-            axum::Json(GenericError {
-                message: self.message.to_owned(),
-            }),
+            axum::Json(serde_json::json!({ "message": self.message })),
         )
             .into_response()
     }

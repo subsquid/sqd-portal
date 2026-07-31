@@ -9,7 +9,7 @@ use axum::{
     extract::{FromRequest, FromRequestParts, Path, Query, Request},
     http::{header, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, MethodRouter},
     Extension, RequestExt, Router,
 };
 use prometheus_client::registry::Registry;
@@ -27,6 +27,7 @@ use tower_http::request_id::{
 };
 use utoipa_scalar::{Scalar, Servable as _};
 
+use crate::commercial::{self, DatasetSource, Gate};
 use crate::datasets::DatasetConfig;
 use crate::endpoints::{
     block_number_by_timestamp::get_blocknumber_by_timestamp,
@@ -84,6 +85,18 @@ fn cors_layer() -> CorsLayer {
         .expose_headers(EXPOSED_HEADERS)
 }
 
+/// Wraps a data route in the commercial authorization gate. Without a
+/// `commercial:` block there is no gate and the route is returned untouched,
+/// so an OSS portal runs no extra middleware at all.
+fn gated(route: MethodRouter, gate: &Option<Arc<Gate>>, source: DatasetSource) -> MethodRouter {
+    let Some(gate) = gate.clone() else {
+        return route;
+    };
+    route.route_layer(axum::middleware::from_fn(move |req, next| {
+        commercial::middleware(gate.clone(), source, req, next)
+    }))
+}
+
 #[allow(deprecated)]
 pub async fn run_server(
     task_manager: Arc<TaskManager>,
@@ -95,6 +108,7 @@ pub async fn run_server(
     shutting_down: Arc<AtomicBool>,
     shutdown_signal: CancellationToken,
     show_internal_docs: bool,
+    commercial_gate: Option<Arc<Gate>>,
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
     let cors = cors_layer();
@@ -107,19 +121,34 @@ pub async fn run_server(
         // Streaming data
         .route(
             "/datasets/:dataset/archival-stream",
-            post(run_archival_stream_restricted).endpoint("/archival-stream"),
+            gated(
+                post(run_archival_stream_restricted),
+                &commercial_gate,
+                DatasetSource::Alias,
+            )
+            .endpoint("/archival-stream"),
         )
         .route(
             "/datasets/:dataset/archival-stream/debug",
-            post(run_archival_stream).endpoint("/archival-stream/debug"),
+            gated(
+                post(run_archival_stream),
+                &commercial_gate,
+                DatasetSource::Alias,
+            )
+            .endpoint("/archival-stream/debug"),
         )
         .route(
             "/datasets/:dataset/finalized-stream",
-            post(run_finalized_stream).endpoint("/finalized-stream"),
+            gated(
+                post(run_finalized_stream),
+                &commercial_gate,
+                DatasetSource::Alias,
+            )
+            .endpoint("/finalized-stream"),
         )
         .route(
             "/datasets/:dataset/stream",
-            post(run_stream).endpoint("/stream"),
+            gated(post(run_stream), &commercial_gate, DatasetSource::Alias).endpoint("/stream"),
         )
         // Getting head
         .route(
@@ -146,7 +175,12 @@ pub async fn run_server(
         )
         .route(
             "/datasets/:dataset/timestamps/:timestamp/block",
-            get(get_blocknumber_by_timestamp).endpoint("/timestamps/block"),
+            gated(
+                get(get_blocknumber_by_timestamp),
+                &commercial_gate,
+                DatasetSource::Alias,
+            )
+            .endpoint("/timestamps/block"),
         )
         // Backward compatibility routes
         .route(
@@ -159,7 +193,12 @@ pub async fn run_server(
         )
         .route(
             "/datasets/:dataset_id/query/:worker_id",
-            post(execute_query).endpoint("/query"),
+            gated(
+                post(execute_query),
+                &commercial_gate,
+                DatasetSource::EncodedId,
+            )
+            .endpoint("/query"),
         )
         .route(
             "/datasets/:dataset/height",
@@ -190,7 +229,10 @@ pub async fn run_server(
     // SQL Query Engine
     #[cfg(feature = "sql")]
     let app = app
-        .route("/sql/query", post(sql_query).endpoint("/sql/query"))
+        .route(
+            "/sql/query",
+            gated(post(sql_query), &commercial_gate, DatasetSource::Absent).endpoint("/sql/query"),
+        )
         .route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
 
     let drain_timeout = config.drain_timeout;
@@ -1505,6 +1547,31 @@ mod tests {
                 .any(|h| *h == "*" || h.starts_with(INTERNAL_HEADER_PREFIX)),
             "the exposed set must stay explicit and free of internal headers: {exposed:?}"
         );
+    }
+
+    /// The kill switch: with no `commercial:` block there is no gate, so a data
+    /// route is served without any authorization middleware in front of it.
+    #[tokio::test]
+    async fn data_routes_carry_no_authorization_without_a_commercial_config() {
+        use tower::ServiceExt;
+
+        let app = Router::new().route(
+            "/datasets/:dataset/stream",
+            gated(post(|| async { "served" }), &None, DatasetSource::Alias),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/datasets/ethereum-mainnet/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
