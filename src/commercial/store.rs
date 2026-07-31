@@ -210,21 +210,45 @@ impl SnapshotStore {
         key_id: &str,
         flight: &Arc<ResolveFlight>,
     ) -> Option<Arc<KeyRecord>> {
-        // Subscribing before the check closes the window where the leader
-        // finishes between the two.
+        self.wait_for_flight(key_id, flight, || {}).await
+    }
+
+    /// `interleave` runs in the window between the result check and the wait
+    /// future's first poll — the exact point a second runtime thread can land
+    /// the leader's completion. Production passes a no-op; a test uses it to
+    /// drive that interleaving deterministically.
+    async fn wait_for_flight(
+        &self,
+        key_id: &str,
+        flight: &Arc<ResolveFlight>,
+        interleave: impl FnOnce(),
+    ) -> Option<Arc<KeyRecord>> {
+        // `notify_waiters` is documented to wake "already registered" waiters
+        // and to store no permit for anyone else, and a `Notified` registers
+        // only when first polled. Register up front with `enable`, before the
+        // result check, so a leader finishing in that window is heard by
+        // contract rather than by tokio's current generosity.
         let notified = flight.done.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if let Some(result) = flight.result.lock().unwrap().clone() {
             return result;
         }
+        interleave();
         if tokio::time::timeout(RESOLVE_FOLLOWER_TIMEOUT, notified)
             .await
             .is_err()
         {
-            tracing::warn!(
-                key_id,
-                "commercial authorize wait timed out; failing closed"
-            );
-            return None;
+            // The deadline does not outrank an answer: the leader may have
+            // published between the timer firing and this read.
+            let result = flight.result.lock().unwrap().clone().flatten();
+            if result.is_none() {
+                tracing::warn!(
+                    key_id,
+                    "commercial authorize wait timed out; failing closed"
+                );
+            }
+            return result;
         }
         flight.result.lock().unwrap().clone().flatten()
     }
@@ -652,7 +676,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::commercial::{
-        test_support::{key_record, page, MockControlPlane},
+        test_support::{key_record, page, store_with, MockControlPlane},
         types::KeyStatus,
     };
 
@@ -929,6 +953,53 @@ mod tests {
             "expired entries must not wait for a re-query to be dropped"
         );
         assert_eq!(store.state.read().unwrap().generation, generation);
+    }
+
+    /// The leader can finish on another runtime thread after the follower has
+    /// read the result and before its wait future first registers. Nothing but
+    /// `enable` guarantees that wakeup is kept — `notify_waiters` promises
+    /// nothing to a waiter that is not yet registered — so pin the behaviour:
+    /// stalling here means 401ing a valid, freshly minted key for six seconds.
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_hears_a_leader_that_finishes_before_its_first_poll() {
+        let store = store_with(vec![]);
+        let (flight, leader) = store.begin_flight("k1").expect("a permit is free");
+        assert!(leader, "the first caller leads the flight");
+
+        let record = store
+            .wait_for_flight("k1", &flight, {
+                let flight = flight.clone();
+                move || {
+                    // Exactly what the leader does on completion.
+                    *flight.result.lock().unwrap() = Some(Some(Arc::new(key_record("k1", 7))));
+                    flight.done.notify_waiters();
+                }
+            })
+            .await;
+
+        assert_eq!(
+            record.map(|record| record.seq),
+            Some(7),
+            "the follower must take the leader's answer instead of failing closed"
+        );
+    }
+
+    /// And a result that lands without a wakeup at all is still picked up: the
+    /// deadline decides how long to wait, not whether an answer exists.
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_that_times_out_still_takes_a_result_that_landed() {
+        let store = store_with(vec![]);
+        let (flight, _) = store.begin_flight("k1").expect("a permit is free");
+
+        let record = store
+            .wait_for_flight("k1", &flight, {
+                let flight = flight.clone();
+                // No `notify_waiters`, so the wait runs to its deadline.
+                move || *flight.result.lock().unwrap() = Some(Some(Arc::new(key_record("k1", 9))))
+            })
+            .await;
+
+        assert_eq!(record.map(|record| record.seq), Some(9));
     }
 
     #[tokio::test]
