@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 use serde::Deserialize;
 use url::Url;
@@ -30,11 +30,6 @@ pub struct CommercialConfig {
 
     #[serde(default = "default_sync_interval_secs")]
     pub sync_interval_secs: u64,
-
-    /// Warms the store on restart. Absent means no disk cache: until the first
-    /// successful sync the portal knows no keys and rejects every request.
-    #[serde(default)]
-    pub snapshot_cache_path: Option<PathBuf>,
 
     /// Token-bucket rate for authorize-on-miss lookups. Zero disables them, so
     /// keys absent from the snapshot are rejected until the next sync.
@@ -147,7 +142,6 @@ portal_id: portal-premium-eu
 
         assert_eq!(config.enforcement, Enforcement::Enforce);
         assert_eq!(config.sync_interval_secs, 10);
-        assert_eq!(config.snapshot_cache_path, None);
         assert_eq!(config.resolve_rate_per_sec, 20);
         assert_eq!(config.max_inflight_resolves, 16);
         assert_eq!(config.negative_cache_secs, 15);
@@ -158,7 +152,6 @@ portal_id: portal-premium-eu
         let config = parse(&format!(
             "{MINIMAL}enforcement: log_only\n\
              sync_interval_secs: 3\n\
-             snapshot_cache_path: /var/lib/portal/keys.json\n\
              resolve_rate_per_sec: 7\n\
              max_inflight_resolves: 5\n\
              negative_cache_secs: 30\n"
@@ -166,10 +159,6 @@ portal_id: portal-premium-eu
 
         assert_eq!(config.enforcement, Enforcement::LogOnly);
         assert_eq!(config.sync_interval_secs, 3);
-        assert_eq!(
-            config.snapshot_cache_path,
-            Some(PathBuf::from("/var/lib/portal/keys.json"))
-        );
         assert_eq!(config.resolve_rate_per_sec, 7);
         assert_eq!(config.max_inflight_resolves, 5);
         assert_eq!(config.negative_cache_secs, 30);

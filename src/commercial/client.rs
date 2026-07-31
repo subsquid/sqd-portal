@@ -126,7 +126,7 @@ mod tests {
 
         // Borrows the mock's service-token plumbing; only the URL differs.
         let cp = MockControlPlane::spawn().await;
-        let mut config = cp.config(None);
+        let mut config = cp.config();
         config.control_plane_url = format!("http://{addr}").parse().unwrap();
         let client = ControlPlaneClient::new(&config).unwrap();
 

@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock,
@@ -8,8 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, sync::Semaphore};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -33,19 +31,15 @@ const NEGATIVE_CACHE_CAPACITY: usize = 4096;
 const MIN_STALENESS_THRESHOLD: Duration = Duration::from_secs(60);
 
 /// The portal's view of the control plane's key set: a full snapshot pulled at
-/// startup, kept current by cursor-paged deltas, and backed by a disk cache so
-/// a restart serves immediately. A sync failure never drops the served state —
-/// the last good snapshot keeps answering until the control plane returns.
+/// startup and kept current by cursor-paged deltas. A sync failure never drops
+/// the served state — the last good snapshot keeps answering until the control
+/// plane returns.
 pub struct SnapshotStore {
     client: ControlPlaneClient,
     state: RwLock<State>,
     ready: AtomicBool,
-    cache_dirty: AtomicBool,
-    cache_path: Option<PathBuf>,
     sync_interval: Duration,
-    /// Wall-clock second of the last sync the control plane answered, or of the
-    /// disk cache the store started from. Wall clock rather than `Instant`
-    /// because a cache written by a previous process has to be comparable.
+    /// Wall-clock second of the last sync the control plane answered.
     last_success: AtomicU64,
     /// Latches once an episode of staleness has been reported, so a control
     /// plane that stays down does not reprint the same ERROR every tick.
@@ -69,15 +63,6 @@ struct State {
     generation: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct DiskCache {
-    cursor: u64,
-    #[serde(default)]
-    epoch: Option<String>,
-    records: Vec<KeyRecord>,
-    saved_at: u64,
-}
-
 #[derive(Debug)]
 enum ResyncReason {
     EpochChanged { stored: String, received: String },
@@ -92,12 +77,10 @@ struct RateLimiter {
 
 impl SnapshotStore {
     pub fn new(config: &CommercialConfig) -> anyhow::Result<Arc<Self>> {
-        let store = Arc::new(Self {
+        Ok(Arc::new(Self {
             client: ControlPlaneClient::new(config)?,
             state: RwLock::new(State::default()),
             ready: AtomicBool::new(false),
-            cache_dirty: AtomicBool::new(false),
-            cache_path: config.snapshot_cache_path.clone(),
             sync_interval: config.sync_interval(),
             last_success: AtomicU64::new(now_secs()),
             stale_logged: AtomicBool::new(false),
@@ -106,9 +89,7 @@ impl SnapshotStore {
             negative_cache: Mutex::new(HashMap::new()),
             inflight_permits: Semaphore::new(config.max_inflight_resolves),
             limiter: Mutex::new(RateLimiter::new(config.resolve_rate_per_sec)),
-        });
-        store.load_disk_cache();
-        Ok(store)
+        }))
     }
 
     pub fn spawn_sync(self: &Arc<Self>, cancel: CancellationToken) {
@@ -199,8 +180,6 @@ impl SnapshotStore {
         }
         let record = Arc::new(record);
         state.records.insert(record.key_id.clone(), record.clone());
-        drop(state);
-        self.mark_cache_dirty();
         Some(record)
     }
 
@@ -257,7 +236,6 @@ impl SnapshotStore {
         // Entries an unknown-key flood left behind are never re-queried, so
         // nothing else would ever drop them.
         self.sweep_negative_cache();
-        self.persist_if_dirty().await;
     }
 
     fn record_sync_success(&self) {
@@ -419,13 +397,7 @@ impl SnapshotStore {
         let Some(epoch) = epoch else {
             return;
         };
-        let mut state = self.state.write().unwrap();
-        if state.epoch.as_deref() == Some(epoch.as_str()) {
-            return;
-        }
-        state.epoch = Some(epoch);
-        drop(state);
-        self.mark_cache_dirty();
+        self.state.write().unwrap().epoch = Some(epoch);
     }
 
     fn install(&self, records: Vec<KeyRecord>, cursor: u64, epoch: Option<String>) {
@@ -443,124 +415,26 @@ impl SnapshotStore {
             self.limiter.lock().unwrap().reset();
         }
         self.ready.store(true, Ordering::Release);
-        self.mark_cache_dirty();
     }
 
     fn apply_delta(&self, records: Vec<KeyRecord>, cursor: u64) -> usize {
         let mut applied = 0;
-        {
-            let mut state = self.state.write().unwrap();
-            for record in records {
-                if state
-                    .records
-                    .get(&record.key_id)
-                    .is_some_and(|existing| existing.seq >= record.seq)
-                {
-                    continue;
-                }
-                state
-                    .records
-                    .insert(record.key_id.clone(), Arc::new(record));
-                applied += 1;
+        let mut state = self.state.write().unwrap();
+        for record in records {
+            if state
+                .records
+                .get(&record.key_id)
+                .is_some_and(|existing| existing.seq >= record.seq)
+            {
+                continue;
             }
-            state.cursor = cursor;
+            state
+                .records
+                .insert(record.key_id.clone(), Arc::new(record));
+            applied += 1;
         }
-        self.mark_cache_dirty();
+        state.cursor = cursor;
         applied
-    }
-
-    fn load_disk_cache(&self) {
-        let Some(path) = self.cache_path.as_deref() else {
-            return;
-        };
-        let Ok(bytes) = std::fs::read(path) else {
-            return;
-        };
-        let cache: DiskCache = match serde_json::from_slice(&bytes) {
-            Ok(cache) => cache,
-            Err(err) => {
-                tracing::warn!(path = %path.display(), error = %err, "ignoring unreadable commercial snapshot cache");
-                return;
-            }
-        };
-
-        let age = now_secs().saturating_sub(cache.saved_at);
-        let count = cache.records.len();
-        self.install(cache.records, cache.cursor, cache.epoch);
-        // Installing marks the cache dirty; nothing changed relative to disk.
-        self.cache_dirty.store(false, Ordering::Release);
-        self.last_success.store(cache.saved_at, Ordering::Release);
-
-        if age > self.staleness_threshold.as_secs() {
-            // Fail-static still holds — an old key set beats none — but the
-            // pod cannot vouch for it, so `install`'s readiness is withdrawn
-            // and the pod stays out of rotation until the first live sync.
-            self.ready.store(false, Ordering::Release);
-            tracing::error!(
-                path = %path.display(),
-                count,
-                age_seconds = age,
-                threshold_seconds = self.staleness_threshold.as_secs(),
-                "commercial snapshot disk cache is stale; serving it but staying out of rotation until the first sync"
-            );
-            return;
-        }
-        tracing::info!(
-            path = %path.display(),
-            count,
-            age_seconds = age,
-            "loaded commercial snapshot disk cache"
-        );
-    }
-
-    fn mark_cache_dirty(&self) {
-        self.cache_dirty.store(true, Ordering::Release);
-    }
-
-    async fn persist_if_dirty(&self) {
-        if self.cache_path.is_none() || !self.cache_dirty.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        if let Err(err) = self.persist_disk_cache().await {
-            self.mark_cache_dirty();
-            tracing::warn!(error = %err, "commercial snapshot cache persist failed");
-        }
-    }
-
-    async fn persist_disk_cache(&self) -> anyhow::Result<()> {
-        let Some(path) = self.cache_path.as_deref() else {
-            return Ok(());
-        };
-        let cache = {
-            let state = self.state.read().unwrap();
-            DiskCache {
-                cursor: state.cursor,
-                epoch: state.epoch.clone(),
-                records: state
-                    .records
-                    .values()
-                    .map(|record| (**record).clone())
-                    .collect(),
-                saved_at: now_secs(),
-            }
-        };
-        let bytes = serde_json::to_vec(&cache)?;
-
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        // Write-then-rename: a crash mid-write must not leave a half-written
-        // cache that the next boot would refuse.
-        let tmp = tmp_path(path);
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        file.write_all(&bytes).await?;
-        file.sync_all().await?;
-        drop(file);
-        tokio::fs::rename(&tmp, path).await?;
-        Ok(())
     }
 }
 
@@ -621,12 +495,6 @@ fn parse_records(values: Vec<serde_json::Value>) -> anyhow::Result<Vec<KeyRecord
     Ok(records)
 }
 
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    PathBuf::from(tmp)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,18 +503,8 @@ mod tests {
         types::KeyStatus,
     };
 
-    fn cache_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "sqd-portal-commercial-{name}-{}.json",
-            std::process::id()
-        ))
-    }
-
-    async fn store_for(
-        control_plane: &MockControlPlane,
-        cache: Option<PathBuf>,
-    ) -> Arc<SnapshotStore> {
-        SnapshotStore::new(&control_plane.config(cache)).expect("store should build")
+    async fn store_for(control_plane: &MockControlPlane) -> Arc<SnapshotStore> {
+        SnapshotStore::new(&control_plane.config()).expect("store should build")
     }
 
     #[tokio::test]
@@ -661,7 +519,7 @@ mod tests {
             page(vec![key_record("last", 5000)], 5000, Some("e1"), Some(5000)),
         );
 
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         store.run_tick().await;
 
         assert!(store.is_ready());
@@ -679,7 +537,7 @@ mod tests {
     async fn delta_upserts_by_sequence_and_advances_the_cursor() {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![key_record("k1", 1)], 1, Some("e1"), Some(1)));
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         store.run_tick().await;
 
         let mut revoked = key_record("k1", 2);
@@ -709,7 +567,7 @@ mod tests {
                 Some(2),
             ),
         );
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         store.run_tick().await;
         assert!(store.get("old").is_some());
 
@@ -736,7 +594,7 @@ mod tests {
             0,
             page(vec![key_record("k1", 40)], 40, Some("e1"), Some(40)),
         );
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         store.run_tick().await;
 
         cp.push_page(40, page(vec![], 40, Some("e1"), Some(3)));
@@ -755,7 +613,7 @@ mod tests {
     async fn a_delta_that_does_not_advance_the_cursor_is_refused() {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![key_record("k1", 5)], 5, Some("e1"), Some(5)));
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         store.run_tick().await;
         assert_eq!(store.state.read().unwrap().cursor, 5);
 
@@ -790,7 +648,7 @@ mod tests {
     async fn sync_failures_escalate_once_the_snapshot_goes_stale() {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![key_record("k1", 1)], 1, Some("e1"), Some(1)));
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         store.run_tick().await;
         assert!(!store.stale_logged.load(Ordering::Acquire));
 
@@ -842,7 +700,7 @@ mod tests {
     async fn sync_failure_keeps_serving_the_last_snapshot() {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![key_record("k1", 1)], 1, Some("e1"), Some(1)));
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         store.run_tick().await;
 
         cp.fail_snapshots(true);
@@ -853,92 +711,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disk_cache_round_trips_across_a_restart_without_the_control_plane() {
-        let path = cache_path("round-trip");
-        let _ = std::fs::remove_file(&path);
-        let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![key_record("k1", 4)], 4, Some("e1"), Some(4)));
-
-        let store = store_for(&cp, Some(path.clone())).await;
-        store.run_tick().await;
-        assert!(path.exists(), "a synced snapshot must be persisted");
-
-        let restarted = store_for(&cp, Some(path.clone())).await;
-        assert!(
-            restarted.is_ready(),
-            "the disk cache must serve before the first sync"
-        );
-        assert_eq!(restarted.get("k1").unwrap().seq, 4);
-        assert_eq!(restarted.state.read().unwrap().cursor, 4);
-        assert_eq!(restarted.state.read().unwrap().epoch.as_deref(), Some("e1"));
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    fn write_cache(path: &Path, age_seconds: u64, records: Vec<KeyRecord>) {
-        let cache = serde_json::json!({
-            "cursor": 4,
-            "epoch": "e1",
-            "records": records,
-            "saved_at": now_secs().saturating_sub(age_seconds),
-        });
-        std::fs::write(path, serde_json::to_vec(&cache).unwrap()).unwrap();
-    }
-
-    /// Fail-static still applies — an old key set beats no key set — but a pod
-    /// serving one has no idea which of those keys were revoked days ago, so it
-    /// must not take traffic until a live sync confirms them.
-    #[tokio::test]
-    async fn a_stale_disk_cache_serves_but_stays_out_of_rotation() {
-        let path = cache_path("stale");
-        write_cache(&path, 2 * 24 * 60 * 60, vec![key_record("k1", 4)]);
-        let cp = MockControlPlane::spawn().await;
-
-        let store = store_for(&cp, Some(path.clone())).await;
-
-        assert!(
-            store.get("k1").is_some(),
-            "an old snapshot is still better than none"
-        );
-        assert!(
-            !store.is_ready(),
-            "but the pod must stay out of rotation until the first live sync"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn a_fresh_disk_cache_puts_the_pod_straight_into_rotation() {
-        let path = cache_path("fresh");
-        write_cache(&path, 5, vec![key_record("k1", 4)]);
-        let cp = MockControlPlane::spawn().await;
-
-        let store = store_for(&cp, Some(path.clone())).await;
-
-        assert!(store.is_ready());
-        assert_eq!(store.get("k1").unwrap().seq, 4);
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn corrupt_disk_cache_is_ignored() {
-        let path = cache_path("corrupt");
-        std::fs::write(&path, b"{not json").unwrap();
-        let cp = MockControlPlane::spawn().await;
-
-        let store = store_for(&cp, Some(path.clone())).await;
-        assert!(!store.is_ready());
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
     async fn malformed_records_are_tombstoned_and_unidentifiable_ones_fail_the_page() {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![key_record("k1", 1)], 1, Some("e1"), Some(1)));
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         store.run_tick().await;
         assert_eq!(store.get("k1").unwrap().status, KeyStatus::Active);
 
@@ -978,7 +754,7 @@ mod tests {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
         cp.authorize_with("k1", Some(key_record("k1", 3)));
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         store.run_tick().await;
 
         assert_eq!(store.get_or_resolve("k1").await.unwrap().seq, 3);
@@ -994,7 +770,7 @@ mod tests {
     #[tokio::test]
     async fn the_negative_cache_is_capacity_capped() {
         let cp = MockControlPlane::spawn().await;
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         let generation = store.state.read().unwrap().generation;
 
         for i in 0..NEGATIVE_CACHE_CAPACITY + 500 {
@@ -1013,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn the_sync_tick_sweeps_expired_negative_cache_entries() {
         let cp = MockControlPlane::spawn().await;
-        let mut config = cp.config(None);
+        let mut config = cp.config();
         // Entries expire the instant they are written.
         config.negative_cache_secs = 0;
         let store = SnapshotStore::new(&config).unwrap();
@@ -1039,7 +815,7 @@ mod tests {
     async fn unknown_keys_are_negative_cached() {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         store.run_tick().await;
 
         assert!(store.get_or_resolve("nope").await.is_none());
@@ -1056,7 +832,7 @@ mod tests {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
         cp.authorize_with("k1", Some(key_record("k1", 1)));
-        let mut config = cp.config(None);
+        let mut config = cp.config();
         config.resolve_rate_per_sec = 0;
         let store = SnapshotStore::new(&config).unwrap();
         store.run_tick().await;
@@ -1070,7 +846,7 @@ mod tests {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
         cp.authorize_status("k1", 500);
-        let store = store_for(&cp, None).await;
+        let store = store_for(&cp).await;
         store.run_tick().await;
 
         assert!(store.get_or_resolve("k1").await.is_none());

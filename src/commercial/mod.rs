@@ -53,7 +53,6 @@ pub mod test_support {
     use std::{
         collections::{HashMap, VecDeque},
         net::SocketAddr,
-        path::PathBuf,
         sync::{Mutex, MutexGuard, OnceLock},
     };
 
@@ -125,7 +124,6 @@ pub mod test_support {
             portal_id: "portal-premium-eu".to_string(),
             enforcement: Enforcement::Enforce,
             sync_interval_secs: 10,
-            snapshot_cache_path: None,
             resolve_rate_per_sec: 20,
             max_inflight_resolves: 16,
             negative_cache_secs: 15,
@@ -206,14 +204,13 @@ pub mod test_support {
             Self { addr, state }
         }
 
-        pub fn config(&self, snapshot_cache_path: Option<PathBuf>) -> CommercialConfig {
+        pub fn config(&self) -> CommercialConfig {
             CommercialConfig {
                 control_plane_url: format!("http://{}", self.addr).parse().unwrap(),
                 service_token_env: service_token_env(),
                 portal_id: "portal-premium-eu".to_string(),
                 enforcement: Enforcement::Enforce,
                 sync_interval_secs: 10,
-                snapshot_cache_path,
                 resolve_rate_per_sec: 100,
                 max_inflight_resolves: 16,
                 negative_cache_secs: 15,
