@@ -55,7 +55,6 @@ pub mod test_support {
         net::SocketAddr,
         path::PathBuf,
         sync::{Mutex, MutexGuard, OnceLock},
-        time::Duration,
     };
 
     use axum::{
@@ -182,7 +181,6 @@ pub mod test_support {
         fail_snapshots: Mutex<bool>,
         authorize: Mutex<HashMap<String, serde_json::Value>>,
         authorize_statuses: Mutex<HashMap<String, u16>>,
-        authorize_delays: Mutex<HashMap<String, Duration>>,
         authorize_calls: Mutex<Vec<String>>,
     }
 
@@ -260,14 +258,6 @@ pub mod test_support {
                 .insert(key_id.to_string(), status);
         }
 
-        pub fn authorize_delay(&self, key_id: &str, delay: Duration) {
-            self.state
-                .authorize_delays
-                .lock()
-                .unwrap()
-                .insert(key_id.to_string(), delay);
-        }
-
         pub fn authorize_calls(&self) -> Vec<String> {
             self.state.authorize_calls.lock().unwrap().clone()
         }
@@ -318,10 +308,6 @@ pub mod test_support {
             .to_string();
         state.authorize_calls.lock().unwrap().push(key_id.clone());
 
-        let delay = state.authorize_delays.lock().unwrap().get(&key_id).copied();
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
-        }
         if let Some(status) = state.authorize_statuses.lock().unwrap().get(&key_id) {
             return Err(StatusCode::from_u16(*status).unwrap());
         }

@@ -22,10 +22,6 @@ use super::{
 /// Guards against a feed that never returns a short page.
 const MAX_BOOTSTRAP_PAGES: usize = 10_000;
 
-/// How long a request coalesced behind another request's authorize call waits
-/// before failing closed on its own.
-const RESOLVE_FOLLOWER_TIMEOUT: Duration = Duration::from_secs(6);
-
 /// Upper bound on remembered "the control plane has never heard of this key"
 /// answers. The ids are attacker-chosen, so the map is capped rather than
 /// merely swept: past the cap new answers are dropped instead of cached, which
@@ -57,8 +53,9 @@ pub struct SnapshotStore {
     staleness_threshold: Duration,
     negative_cache_ttl: Duration,
     negative_cache: Mutex<HashMap<String, Instant>>,
-    inflight: Mutex<HashMap<String, Arc<ResolveFlight>>>,
-    inflight_permits: Arc<Semaphore>,
+    /// Bounds how many authorize calls may be in flight at once, so a control
+    /// plane that stops answering cannot pile up handlers without limit.
+    inflight_permits: Semaphore,
     limiter: Mutex<RateLimiter>,
 }
 
@@ -87,33 +84,6 @@ enum ResyncReason {
     HeadRolledBack { cursor: u64, head_seq: u64 },
 }
 
-struct ResolveFlight {
-    result: Mutex<Option<Option<Arc<KeyRecord>>>>,
-    done: tokio::sync::Notify,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-/// Publishes a result even if the leading request is dropped mid-flight (a
-/// disconnecting client cancels its handler), so followers are never stranded
-/// behind a flight that will never complete.
-struct FlightGuard<'a> {
-    store: &'a SnapshotStore,
-    key_id: &'a str,
-    flight: Arc<ResolveFlight>,
-}
-
-impl Drop for FlightGuard<'_> {
-    fn drop(&mut self) {
-        let mut result = self.flight.result.lock().unwrap();
-        if result.is_none() {
-            *result = Some(None);
-        }
-        drop(result);
-        self.store.end_flight(self.key_id, &self.flight);
-        self.flight.done.notify_waiters();
-    }
-}
-
 struct RateLimiter {
     rate_per_sec: f64,
     tokens: f64,
@@ -134,8 +104,7 @@ impl SnapshotStore {
             staleness_threshold: (config.sync_interval() * 5).max(MIN_STALENESS_THRESHOLD),
             negative_cache_ttl: config.negative_cache_ttl(),
             negative_cache: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
-            inflight_permits: Arc::new(Semaphore::new(config.max_inflight_resolves)),
+            inflight_permits: Semaphore::new(config.max_inflight_resolves),
             limiter: Mutex::new(RateLimiter::new(config.resolve_rate_per_sec)),
         });
         store.load_disk_cache();
@@ -170,8 +139,9 @@ impl SnapshotStore {
 
     /// Looks the key up in the snapshot and, on a miss, asks the control plane
     /// directly: a key minted seconds ago must work before the next sync tick.
-    /// Concurrent misses for one key share a single call; unknown answers are
-    /// cached briefly so a bad key cannot be used to hammer the control plane.
+    /// Unknown answers are cached briefly, and the lookups themselves are both
+    /// rate limited and capped in flight, so a bad key cannot be used to hammer
+    /// the control plane.
     pub async fn get_or_resolve(&self, key_id: &str) -> Option<Arc<KeyRecord>> {
         if let Some(record) = self.get(key_id) {
             return Some(record);
@@ -179,103 +149,18 @@ impl SnapshotStore {
         if self.negative_cached(key_id) {
             return None;
         }
-
-        let (flight, leader) = self.begin_flight(key_id)?;
-        if !leader {
-            return self.follow_flight(key_id, &flight).await;
-        }
-
-        let guard = FlightGuard {
-            store: self,
-            key_id,
-            flight: flight.clone(),
-        };
-        let result = self.resolve(key_id).await.unwrap_or_else(|err| {
-            tracing::warn!(key_id, error = %err, "commercial authorize failed; rejecting unknown key");
-            None
-        });
-        *flight.result.lock().unwrap() = Some(result.clone());
-        drop(guard);
-        result
-    }
-
-    fn begin_flight(&self, key_id: &str) -> Option<(Arc<ResolveFlight>, bool)> {
-        let mut inflight = self.inflight.lock().unwrap();
-        if let Some(flight) = inflight.get(key_id) {
-            return Some((flight.clone(), false));
-        }
-        let Ok(permit) = self.inflight_permits.clone().try_acquire_owned() else {
+        let Ok(_permit) = self.inflight_permits.try_acquire() else {
             tracing::warn!(
                 key_id,
                 "commercial authorize skipped: too many lookups in flight"
             );
             return None;
         };
-        let flight = Arc::new(ResolveFlight {
-            result: Mutex::new(None),
-            done: tokio::sync::Notify::new(),
-            _permit: permit,
-        });
-        inflight.insert(key_id.to_owned(), flight.clone());
-        Some((flight, true))
-    }
 
-    async fn follow_flight(
-        &self,
-        key_id: &str,
-        flight: &Arc<ResolveFlight>,
-    ) -> Option<Arc<KeyRecord>> {
-        self.wait_for_flight(key_id, flight, || {}).await
-    }
-
-    /// `interleave` runs in the window between the result check and the wait
-    /// future's first poll — the exact point a second runtime thread can land
-    /// the leader's completion. Production passes a no-op; a test uses it to
-    /// drive that interleaving deterministically.
-    async fn wait_for_flight(
-        &self,
-        key_id: &str,
-        flight: &Arc<ResolveFlight>,
-        interleave: impl FnOnce(),
-    ) -> Option<Arc<KeyRecord>> {
-        // `notify_waiters` is documented to wake "already registered" waiters
-        // and to store no permit for anyone else, and a `Notified` registers
-        // only when first polled. Register up front with `enable`, before the
-        // result check, so a leader finishing in that window is heard by
-        // contract rather than by tokio's current generosity.
-        let notified = flight.done.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if let Some(result) = flight.result.lock().unwrap().clone() {
-            return result;
-        }
-        interleave();
-        if tokio::time::timeout(RESOLVE_FOLLOWER_TIMEOUT, notified)
-            .await
-            .is_err()
-        {
-            // The deadline does not outrank an answer: the leader may have
-            // published between the timer firing and this read.
-            let result = flight.result.lock().unwrap().clone().flatten();
-            if result.is_none() {
-                tracing::warn!(
-                    key_id,
-                    "commercial authorize wait timed out; failing closed"
-                );
-            }
-            return result;
-        }
-        flight.result.lock().unwrap().clone().flatten()
-    }
-
-    fn end_flight(&self, key_id: &str, flight: &Arc<ResolveFlight>) {
-        let mut inflight = self.inflight.lock().unwrap();
-        if inflight
-            .get(key_id)
-            .is_some_and(|current| Arc::ptr_eq(current, flight))
-        {
-            inflight.remove(key_id);
-        }
+        self.resolve(key_id).await.unwrap_or_else(|err| {
+            tracing::warn!(key_id, error = %err, "commercial authorize failed; rejecting unknown key");
+            None
+        })
     }
 
     async fn resolve(&self, key_id: &str) -> anyhow::Result<Option<Arc<KeyRecord>>> {
@@ -746,7 +631,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::commercial::{
-        test_support::{key_record, page, store_with, MockControlPlane},
+        test_support::{key_record, page, MockControlPlane},
         types::KeyStatus,
     };
 
@@ -1089,27 +974,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorize_on_miss_inserts_the_record_and_dedups_concurrent_lookups() {
+    async fn authorize_on_miss_inserts_the_record() {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
         cp.authorize_with("k1", Some(key_record("k1", 3)));
         let store = store_for(&cp, None).await;
         store.run_tick().await;
 
-        // The delay keeps the first lookup in flight long enough for the second
-        // to find it and coalesce.
-        cp.authorize_delay("k1", Duration::from_millis(100));
-        let first = tokio::spawn({
-            let store = store.clone();
-            async move { store.get_or_resolve("k1").await }
-        });
-        let second = tokio::spawn({
-            let store = store.clone();
-            async move { store.get_or_resolve("k1").await }
-        });
-
-        assert_eq!(first.await.unwrap().unwrap().seq, 3);
-        assert_eq!(second.await.unwrap().unwrap().seq, 3);
+        assert_eq!(store.get_or_resolve("k1").await.unwrap().seq, 3);
         assert_eq!(cp.authorize_calls(), vec!["k1".to_string()]);
         assert!(
             store.get("k1").is_some(),
@@ -1161,53 +1033,6 @@ mod tests {
             "expired entries must not wait for a re-query to be dropped"
         );
         assert_eq!(store.state.read().unwrap().generation, generation);
-    }
-
-    /// The leader can finish on another runtime thread after the follower has
-    /// read the result and before its wait future first registers. Nothing but
-    /// `enable` guarantees that wakeup is kept — `notify_waiters` promises
-    /// nothing to a waiter that is not yet registered — so pin the behaviour:
-    /// stalling here means 401ing a valid, freshly minted key for six seconds.
-    #[tokio::test(start_paused = true)]
-    async fn a_follower_hears_a_leader_that_finishes_before_its_first_poll() {
-        let store = store_with(vec![]);
-        let (flight, leader) = store.begin_flight("k1").expect("a permit is free");
-        assert!(leader, "the first caller leads the flight");
-
-        let record = store
-            .wait_for_flight("k1", &flight, {
-                let flight = flight.clone();
-                move || {
-                    // Exactly what the leader does on completion.
-                    *flight.result.lock().unwrap() = Some(Some(Arc::new(key_record("k1", 7))));
-                    flight.done.notify_waiters();
-                }
-            })
-            .await;
-
-        assert_eq!(
-            record.map(|record| record.seq),
-            Some(7),
-            "the follower must take the leader's answer instead of failing closed"
-        );
-    }
-
-    /// And a result that lands without a wakeup at all is still picked up: the
-    /// deadline decides how long to wait, not whether an answer exists.
-    #[tokio::test(start_paused = true)]
-    async fn a_follower_that_times_out_still_takes_a_result_that_landed() {
-        let store = store_with(vec![]);
-        let (flight, _) = store.begin_flight("k1").expect("a permit is free");
-
-        let record = store
-            .wait_for_flight("k1", &flight, {
-                let flight = flight.clone();
-                // No `notify_waiters`, so the wait runs to its deadline.
-                move || *flight.result.lock().unwrap() = Some(Some(Arc::new(key_record("k1", 9))))
-            })
-            .await;
-
-        assert_eq!(record.map(|record| record.seq), Some(9));
     }
 
     #[tokio::test]
