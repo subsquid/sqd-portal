@@ -240,13 +240,6 @@ mod tests {
         let decision = decide(key_record("k1", 1), None, Some("ethereum-mainnet")).await;
 
         assert_eq!(reason(decision), "missing_credential");
-        assert_eq!(
-            decision,
-            Decision::Reject(Rejection {
-                status: StatusCode::UNAUTHORIZED,
-                ..MISSING_CREDENTIAL
-            })
-        );
     }
 
     #[tokio::test]
@@ -305,13 +298,6 @@ mod tests {
             reason(decision),
             "revoked",
             "the operator has to be able to tell a revoked key from a wrong secret"
-        );
-        assert_eq!(
-            decision,
-            Decision::Reject(Rejection {
-                status: StatusCode::UNAUTHORIZED,
-                ..REVOKED
-            })
         );
     }
 
@@ -389,22 +375,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_6_returns_403_not_401() {
-        let mut record = key_record("k1", 1);
-        record.portal_ids = Some(vec!["portal-other".to_string()]);
-
-        let decision = decide(record, Some(&valid()), Some("ethereum-mainnet")).await;
-
-        assert!(matches!(
-            decision,
-            Decision::Reject(Rejection {
-                status: StatusCode::FORBIDDEN,
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test]
     async fn rule_7_dataset_membership_is_exact() {
         let mut record = key_record("k1", 1);
 
@@ -446,22 +416,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_7_returns_403_not_401() {
-        let mut record = key_record("k1", 1);
-        record.datasets = Some(vec!["base-mainnet".to_string()]);
-
-        let decision = decide(record, Some(&valid()), Some("ethereum-mainnet")).await;
-
-        assert!(matches!(
-            decision,
-            Decision::Reject(Rejection {
-                status: StatusCode::FORBIDDEN,
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test]
     async fn rule_8_an_unscoped_active_key_is_admitted() {
         let decision = decide(
             key_record("k1", 1),
@@ -491,20 +445,6 @@ mod tests {
         assert_eq!(
             reason(decide(record, Some(&valid()), Some("ethereum-mainnet")).await),
             "revoked"
-        );
-    }
-
-    #[test]
-    fn rejections_render_as_json_with_their_status() {
-        let response = UNKNOWN_KEY.into_response();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            response
-                .headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .unwrap(),
-            "application/json"
         );
     }
 

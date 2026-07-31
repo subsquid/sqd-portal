@@ -146,13 +146,6 @@ pub mod test_support {
         }
     }
 
-    /// A gate over a synced store holding `records`, resolving no aliases —
-    /// for tests about which routes are gated rather than dataset scoping.
-    pub fn gate_with(records: Vec<KeyRecord>) -> Arc<Gate> {
-        let config = offline_config();
-        Arc::new(Gate::new(&config, store_with(records), Arc::new(NoCatalog)))
-    }
-
     /// A gate whose snapshot store has synced, or one that never has.
     pub fn gate_with_readiness(ready: bool) -> Arc<Gate> {
         let config = offline_config();

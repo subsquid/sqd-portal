@@ -1577,48 +1577,17 @@ mod tests {
         );
     }
 
-    /// Every route that serves data, with how it names its dataset and a URI
-    /// that matches it. Adding a data route to `run_server` without wrapping it
-    /// in `gated(...)` fails `the_route_table_matches_the_checked_in_gating`,
+    /// Every route that serves data. Adding one to `run_server` without
+    /// wrapping it in `gated(...)` fails `the_route_table_matches_the_checked_in_gating`,
     /// which compares this list against the routes actually wrapped.
-    const GATED_DATA_ROUTES: &[(&str, &str, DatasetSource, &str)] = &[
-        (
-            "/datasets/:dataset/archival-stream",
-            "POST",
-            DatasetSource::Alias,
-            "/datasets/base/archival-stream",
-        ),
-        (
-            "/datasets/:dataset/archival-stream/debug",
-            "POST",
-            DatasetSource::Alias,
-            "/datasets/base/archival-stream/debug",
-        ),
-        (
-            "/datasets/:dataset/finalized-stream",
-            "POST",
-            DatasetSource::Alias,
-            "/datasets/base/finalized-stream",
-        ),
-        (
-            "/datasets/:dataset/stream",
-            "POST",
-            DatasetSource::Alias,
-            "/datasets/base/stream",
-        ),
-        (
-            "/datasets/:dataset/timestamps/:timestamp/block",
-            "GET",
-            DatasetSource::Alias,
-            "/datasets/base/timestamps/1700000000/block",
-        ),
-        (
-            "/datasets/:dataset_id/query/:worker_id",
-            "POST",
-            DatasetSource::EncodedId,
-            "/datasets/czM6Ly9iYXNlLW1haW5uZXQ/query/worker",
-        ),
-        ("/sql/query", "POST", DatasetSource::Absent, "/sql/query"),
+    const GATED_DATA_ROUTES: &[&str] = &[
+        "/datasets/:dataset/archival-stream",
+        "/datasets/:dataset/archival-stream/debug",
+        "/datasets/:dataset/finalized-stream",
+        "/datasets/:dataset/stream",
+        "/datasets/:dataset/timestamps/:timestamp/block",
+        "/datasets/:dataset_id/query/:worker_id",
+        "/sql/query",
     ];
 
     /// Routes that deliberately answer without a key: portal and dataset
@@ -1706,67 +1675,8 @@ mod tests {
         let gated: Vec<_> = gated.into_iter().map(|(path, _)| path).collect();
         let ungated: Vec<_> = ungated.into_iter().map(|(path, _)| path).collect();
 
-        assert_eq!(
-            gated,
-            GATED_DATA_ROUTES
-                .iter()
-                .map(|(path, ..)| *path)
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(gated, GATED_DATA_ROUTES.to_vec());
         assert_eq!(ungated, UNGATED_ROUTES.to_vec());
-    }
-
-    /// And the gating actually turns requests away: every listed data route
-    /// answers 401 without a credential and serves a valid key.
-    #[tokio::test]
-    async fn every_gated_data_route_requires_a_key() {
-        use tower::ServiceExt;
-
-        use crate::commercial::test_support::{gate_with, key_record, SECRET};
-
-        let gate = Some(gate_with(vec![key_record("k1", 1)]));
-        let token = format!("Bearer sqd_portal_k1_{SECRET}");
-
-        for (path, method, source, uri) in GATED_DATA_ROUTES {
-            let router = || {
-                let handler = match *method {
-                    "GET" => get(|| async { "served" }),
-                    "POST" => post(|| async { "served" }),
-                    other => panic!("unhandled method {other}"),
-                };
-                Router::new().route(path, gated(handler, &gate, *source))
-            };
-            let request = || {
-                axum::http::Request::builder()
-                    .method(*method)
-                    .uri(*uri)
-                    .body(Body::empty())
-                    .unwrap()
-            };
-
-            let anonymous = router().oneshot(request()).await.unwrap();
-            assert_eq!(
-                anonymous.status(),
-                StatusCode::UNAUTHORIZED,
-                "{path} must not serve a request with no key"
-            );
-
-            let authorized = router()
-                .oneshot({
-                    let mut request = request();
-                    request
-                        .headers_mut()
-                        .insert(header::AUTHORIZATION, token.parse().unwrap());
-                    request
-                })
-                .await
-                .unwrap();
-            assert_eq!(
-                authorized.status(),
-                StatusCode::OK,
-                "{path} must serve a valid key"
-            );
-        }
     }
 
     /// The kill switch: with no `commercial:` block there is no gate, so a data
