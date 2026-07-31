@@ -702,20 +702,63 @@ mod tests {
             "a malformed record must not leave the previous version usable"
         );
 
+        // A status this build predates is malformed like any other unreadable
+        // field, and gets the same tombstone rather than a rule of its own —
+        // digest and all, so the key cannot authenticate anyone.
         cp.push_page(
             2,
             serde_json::json!({
-                "records": [{"nothing": "identifiable"}],
+                "records": [{
+                    "key_id": "k2",
+                    "seq": 3,
+                    "status": "suspended",
+                    "secret_sha256": crate::commercial::test_support::SECRET_SHA256,
+                }],
                 "next_cursor": 3,
+                "epoch": "e1",
+            }),
+        );
+        store.run_tick().await;
+        let k2 = store.get("k2").expect("an identifiable record is kept");
+        assert_eq!(
+            (k2.status, k2.secret_sha256.as_deref()),
+            (KeyStatus::Revoked, None),
+            "a status this build does not know must be tombstoned, not admitted"
+        );
+
+        cp.push_page(
+            3,
+            serde_json::json!({
+                "records": [{"nothing": "identifiable"}],
+                "next_cursor": 4,
                 "epoch": "e1",
             }),
         );
         store.run_tick().await;
         assert_eq!(
             store.state.read().unwrap().cursor,
-            2,
+            3,
             "an unidentifiable record must not advance the cursor"
         );
+    }
+
+    /// The same status on the authorize path is a parse error rather than a
+    /// record, so the key is rejected — and, unlike a "no such key" answer, not
+    /// remembered: the control plane did have something to say.
+    #[tokio::test]
+    async fn an_authorize_answer_with_an_unknown_status_is_rejected_and_not_cached() {
+        let cp = MockControlPlane::spawn().await;
+        cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
+        cp.authorize_raw(
+            "k1",
+            serde_json::json!({"key_id": "k1", "seq": 1, "status": "suspended"}),
+        );
+        let store = store_for(&cp).await;
+        store.run_tick().await;
+
+        assert!(store.get_or_resolve("k1").await.is_none());
+        assert!(store.get_or_resolve("k1").await.is_none());
+        assert_eq!(cp.authorize_calls().len(), 2);
     }
 
     #[tokio::test]

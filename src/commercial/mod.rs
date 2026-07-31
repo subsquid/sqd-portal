@@ -240,11 +240,17 @@ pub mod test_support {
                 self.state.authorize.lock().unwrap().remove(key_id);
                 return;
             };
+            self.authorize_raw(key_id, serde_json::to_value(record).unwrap());
+        }
+
+        /// An answer the `KeyRecord` type cannot express, such as a status this
+        /// build predates.
+        pub fn authorize_raw(&self, key_id: &str, body: serde_json::Value) {
             self.state
                 .authorize
                 .lock()
                 .unwrap()
-                .insert(key_id.to_string(), serde_json::to_value(record).unwrap());
+                .insert(key_id.to_string(), body);
         }
 
         pub fn authorize_status(&self, key_id: &str, status: u16) {

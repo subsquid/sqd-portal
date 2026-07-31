@@ -1,24 +1,14 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Anything the control plane may add later (`suspended`, …) fails the record,
+/// which `parse_records` turns into a tombstone — so an unknown status is
+/// fail-closed by the same mechanism as any other malformed record, rather
+/// than by a second one written just for this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyStatus {
     Active,
     Revoked,
-}
-
-/// Anything the control plane may add later (`suspended`, …) must not admit
-/// traffic on a portal that predates it, and must not fail the whole record
-/// either — an unparseable record would leave the previous, possibly active,
-/// version of the key in place.
-impl<'de> Deserialize<'de> for KeyStatus {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        Ok(match raw.as_str() {
-            "active" => Self::Active,
-            _ => Self::Revoked,
-        })
-    }
 }
 
 /// One key as published by the control-plane feed. Unknown fields are ignored
@@ -115,16 +105,19 @@ mod tests {
         assert_eq!(record.organization_id, None);
     }
 
+    /// A status this build has never heard of must not admit traffic. It fails
+    /// the record, and the snapshot path tombstones records that fail — see
+    /// `store::tests::malformed_records_are_tombstoned_and_unidentifiable_ones_fail_the_page`.
     #[test]
-    fn unknown_status_is_read_as_revoked() {
-        let record: KeyRecord = serde_json::from_value(serde_json::json!({
+    fn an_unknown_status_fails_the_record() {
+        let err = serde_json::from_value::<KeyRecord>(serde_json::json!({
             "key_id": "k1",
             "status": "suspended",
             "seq": 1,
         }))
-        .expect("unknown status must not break parsing");
+        .expect_err("an unknown status must not parse as a usable record");
 
-        assert_eq!(record.status, KeyStatus::Revoked);
+        assert!(err.to_string().contains("suspended"), "got {err}");
     }
 
     #[test]
