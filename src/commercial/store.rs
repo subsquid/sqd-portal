@@ -26,6 +26,12 @@ const MAX_BOOTSTRAP_PAGES: usize = 10_000;
 /// before failing closed on its own.
 const RESOLVE_FOLLOWER_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// Upper bound on remembered "the control plane has never heard of this key"
+/// answers. The ids are attacker-chosen, so the map is capped rather than
+/// merely swept: past the cap new answers are dropped instead of cached, which
+/// costs a rate-limited lookup rather than unbounded memory.
+const NEGATIVE_CACHE_CAPACITY: usize = 4096;
+
 /// The portal's view of the control plane's key set: a full snapshot pulled at
 /// startup, kept current by cursor-paged deltas, and backed by a disk cache so
 /// a restart serves immediately. A sync failure never drops the served state —
@@ -251,14 +257,7 @@ impl SnapshotStore {
                 Ok(self.upsert_resolved(record, generation))
             }
             Authorized::Unknown => {
-                let expires_at = Instant::now() + self.negative_cache_ttl;
-                let state = self.state.read().unwrap();
-                if state.generation == generation {
-                    self.negative_cache
-                        .lock()
-                        .unwrap()
-                        .insert(key_id.to_owned(), expires_at);
-                }
+                self.cache_negative(key_id, generation);
                 Ok(None)
             }
         }
@@ -279,6 +278,34 @@ impl SnapshotStore {
         drop(state);
         self.mark_cache_dirty();
         Some(record)
+    }
+
+    /// Remembers that the control plane knows nothing about `key_id`, unless a
+    /// resync has replaced the generation the answer describes.
+    fn cache_negative(&self, key_id: &str, generation: u64) {
+        if self.state.read().unwrap().generation != generation {
+            return;
+        }
+        let now = Instant::now();
+        let mut cache = self.negative_cache.lock().unwrap();
+        if cache.len() >= NEGATIVE_CACHE_CAPACITY && !cache.contains_key(key_id) {
+            cache.retain(|_, expires_at| *expires_at > now);
+            if cache.len() >= NEGATIVE_CACHE_CAPACITY {
+                // Full of live entries: refuse rather than grow. The rate
+                // limiter and the in-flight cap still bound what the lookups
+                // this forgoes caching can cost.
+                return;
+            }
+        }
+        cache.insert(key_id.to_owned(), now + self.negative_cache_ttl);
+    }
+
+    fn sweep_negative_cache(&self) {
+        let now = Instant::now();
+        self.negative_cache
+            .lock()
+            .unwrap()
+            .retain(|_, expires_at| *expires_at > now);
     }
 
     fn negative_cached(&self, key_id: &str) -> bool {
@@ -307,6 +334,9 @@ impl SnapshotStore {
                 "commercial snapshot sync failed; serving last known keys"
             );
         }
+        // Entries an unknown-key flood left behind are never re-queried, so
+        // nothing else would ever drop them.
+        self.sweep_negative_cache();
         self.persist_if_dirty().await;
     }
 
@@ -853,6 +883,52 @@ mod tests {
             store.get("k1").is_some(),
             "a resolved key joins the snapshot"
         );
+    }
+
+    /// Every unknown key id a client presents lands here, so an anonymous
+    /// flood of distinct tokens must not be able to grow the map without end.
+    #[tokio::test]
+    async fn the_negative_cache_is_capacity_capped() {
+        let cp = MockControlPlane::spawn().await;
+        let store = store_for(&cp, None).await;
+        let generation = store.state.read().unwrap().generation;
+
+        for i in 0..NEGATIVE_CACHE_CAPACITY + 500 {
+            store.cache_negative(&format!("flood-{i}"), generation);
+        }
+
+        assert!(
+            store.negative_cache.lock().unwrap().len() <= NEGATIVE_CACHE_CAPACITY,
+            "the negative cache grew to {} entries",
+            store.negative_cache.lock().unwrap().len()
+        );
+    }
+
+    /// Without a sweep an expired entry lives until the same id is queried
+    /// again — which a flood of one-shot ids never does.
+    #[tokio::test]
+    async fn the_sync_tick_sweeps_expired_negative_cache_entries() {
+        let cp = MockControlPlane::spawn().await;
+        let mut config = cp.config(None);
+        // Entries expire the instant they are written.
+        config.negative_cache_secs = 0;
+        let store = SnapshotStore::new(&config).unwrap();
+        cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
+        store.run_tick().await;
+        assert!(store.is_ready());
+
+        let generation = store.state.read().unwrap().generation;
+        store.cache_negative("gone", generation);
+        assert_eq!(store.negative_cache.lock().unwrap().len(), 1);
+
+        // A steady-state tick: an empty delta page, so nothing is reinstalled.
+        store.run_tick().await;
+
+        assert!(
+            store.negative_cache.lock().unwrap().is_empty(),
+            "expired entries must not wait for a re-query to be dropped"
+        );
+        assert_eq!(store.state.read().unwrap().generation, generation);
     }
 
     #[tokio::test]

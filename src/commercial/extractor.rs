@@ -1,4 +1,7 @@
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     extract::Request,
@@ -11,7 +14,7 @@ use url::form_urlencoded;
 
 use super::{
     config::{CommercialConfig, Enforcement},
-    evaluate::{self, Decision, Rejection},
+    evaluate::{self, DatasetResolver, Decision, Rejection},
     now_secs,
     store::SnapshotStore,
 };
@@ -107,11 +110,16 @@ impl Gate {
         uri: &axum::http::Uri,
         source: DatasetSource,
     ) -> Decision {
-        let dataset = self.dataset_for(uri.path(), source);
+        let dataset = RequestDataset {
+            gate: self,
+            path: uri.path(),
+            source,
+            resolved: Mutex::new(None),
+        };
         let credential = match credential_from_request(headers, uri.query()) {
             Ok(credential) => credential,
             Err(rejection) => {
-                self.log(Decision::Reject(rejection), None, dataset.as_deref());
+                self.log(Decision::Reject(rejection), None, None);
                 return Decision::Reject(rejection);
             }
         };
@@ -120,16 +128,22 @@ impl Gate {
             &self.store,
             &self.portal_id,
             credential.as_ref(),
-            dataset.as_deref(),
+            &dataset,
             now_secs(),
         )
         .await;
+        // Shadow mode logs its admissions, and an admitted request has already
+        // authenticated — naming its dataset costs what a real customer costs.
+        // A rejection logs only what an earlier rung happened to resolve.
+        if let (Decision::Admit, Enforcement::LogOnly) = (decision, self.enforcement) {
+            dataset.resolve();
+        }
         self.log(
             decision,
             credential
                 .as_ref()
                 .map(|credential| credential.key_id.as_str()),
-            dataset.as_deref(),
+            dataset.resolved().as_deref(),
         );
         decision
     }
@@ -190,6 +204,29 @@ impl Gate {
                 "commercial authorization"
             ),
         }
+    }
+}
+
+/// The dataset one request names, resolved at most once and only if a rung of
+/// the ladder asks for it. Canonicalization interns the name in a process-wide
+/// pool and clones the dataset config, so it must stay behind authentication.
+struct RequestDataset<'a> {
+    gate: &'a Gate,
+    path: &'a str,
+    source: DatasetSource,
+    resolved: Mutex<Option<Option<String>>>,
+}
+
+impl DatasetResolver for RequestDataset<'_> {
+    fn resolve(&self) -> Option<String> {
+        let mut resolved = self.resolved.lock().unwrap();
+        resolved
+            .get_or_insert_with(|| self.gate.dataset_for(self.path, self.source))
+            .clone()
+    }
+
+    fn resolved(&self) -> Option<String> {
+        self.resolved.lock().unwrap().clone().flatten()
     }
 }
 
@@ -283,7 +320,10 @@ fn dataset_path_segment(path: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use axum::{
         body::Body,
@@ -307,29 +347,44 @@ mod tests {
     struct StaticCatalog {
         aliases: HashMap<String, String>,
         ids: HashMap<String, String>,
+        /// Counts every canonicalization, so a test can prove which rungs of
+        /// the ladder pay for one.
+        lookups: Arc<AtomicUsize>,
     }
 
     impl DatasetCatalog for StaticCatalog {
         fn canonical_name(&self, alias: &str) -> Option<String> {
+            self.lookups.fetch_add(1, Ordering::Relaxed);
             self.aliases.get(alias).cloned()
         }
 
         fn canonical_name_for_id(&self, id: &DatasetId) -> Option<String> {
+            self.lookups.fetch_add(1, Ordering::Relaxed);
             self.ids.get(&id.to_base64()).cloned()
         }
     }
 
     fn gate(records: Vec<KeyRecord>, enforcement: Enforcement) -> Arc<Gate> {
+        counting_gate(records, enforcement).0
+    }
+
+    fn counting_gate(
+        records: Vec<KeyRecord>,
+        enforcement: Enforcement,
+    ) -> (Arc<Gate>, Arc<AtomicUsize>) {
         let dataset_id = DatasetId::from_url("s3://base-mainnet");
-        Arc::new(Gate {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Gate {
             store: store_with(records),
             catalog: Arc::new(StaticCatalog {
                 aliases: HashMap::from([("base".to_string(), "base-mainnet".to_string())]),
                 ids: HashMap::from([(dataset_id.to_base64(), "base-mainnet".to_string())]),
+                lookups: lookups.clone(),
             }),
             portal_id: PORTAL.to_string(),
             enforcement,
-        })
+        });
+        (gate, lookups)
     }
 
     fn app(gate: Arc<Gate>, path: &str, source: DatasetSource) -> Router {
@@ -352,6 +407,15 @@ mod tests {
 
     fn request(uri: &str) -> axum::http::request::Builder {
         HttpRequest::builder().method("POST").uri(uri)
+    }
+
+    fn header_map(authorization: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(authorization).unwrap(),
+        );
+        headers
     }
 
     #[test]
@@ -646,6 +710,92 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{uri} must be admitted in log_only");
             assert_eq!(body, "served");
         }
+    }
+
+    /// Canonicalizing a dataset interns its name in a process-wide pool and
+    /// clones the dataset config, so unauthenticated traffic must never reach
+    /// it: the rungs below the dataset rung are the whole defence.
+    #[tokio::test]
+    async fn a_request_that_fails_an_earlier_rung_never_resolves_the_dataset() {
+        let mut record = key_record("k1", 1);
+        record.datasets = Some(vec!["base-mainnet".to_string()]);
+        let (gate, lookups) = counting_gate(vec![record], Enforcement::Enforce);
+        let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
+
+        for headers in [
+            // No credential at all.
+            HeaderMap::new(),
+            // A token that cannot be parsed.
+            header_map("Bearer nonsense"),
+            // A well-formed token naming a key the portal does not know.
+            header_map(&format!("Bearer sqd_portal_unknown_{SECRET}")),
+            // A known key presenting the wrong secret.
+            header_map("Bearer sqd_portal_k1_wrong"),
+        ] {
+            let decision = gate.decide(&headers, &uri, DatasetSource::Alias).await;
+            assert!(matches!(decision, Decision::Reject(_)));
+        }
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            0,
+            "a request that never authenticates must not touch the dataset catalog"
+        );
+
+        // The dataset rung itself still resolves, exactly once.
+        let decision = gate
+            .decide(
+                &header_map(&format!("Bearer {TOKEN}")),
+                &uri,
+                DatasetSource::Alias,
+            )
+            .await;
+        assert_eq!(decision, Decision::Admit);
+        assert_eq!(lookups.load(Ordering::Relaxed), 1);
+    }
+
+    /// A key with no dataset list is authorized for every dataset, so nothing
+    /// in the ladder needs the request's dataset resolved.
+    #[tokio::test]
+    async fn an_unscoped_key_does_not_resolve_the_dataset_either() {
+        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::Enforce);
+        let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
+
+        let decision = gate
+            .decide(
+                &header_map(&format!("Bearer {TOKEN}")),
+                &uri,
+                DatasetSource::Alias,
+            )
+            .await;
+
+        assert_eq!(decision, Decision::Admit);
+        assert_eq!(lookups.load(Ordering::Relaxed), 0);
+    }
+
+    /// Shadow mode still names the dataset of the requests it admits: those
+    /// have authenticated, so resolving costs what a real customer costs.
+    #[tokio::test]
+    async fn log_only_still_resolves_the_dataset_of_an_admitted_request() {
+        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::LogOnly);
+        let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
+
+        gate.decide(&HeaderMap::new(), &uri, DatasetSource::Alias)
+            .await;
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            0,
+            "an anonymous request is free in shadow mode too"
+        );
+
+        let decision = gate
+            .decide(
+                &header_map(&format!("Bearer {TOKEN}")),
+                &uri,
+                DatasetSource::Alias,
+            )
+            .await;
+        assert_eq!(decision, Decision::Admit);
+        assert_eq!(lookups.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
