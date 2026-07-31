@@ -391,6 +391,15 @@ impl SnapshotStore {
         }
 
         let next_cursor = page.next_cursor;
+        // Records without forward movement cannot be trusted: `next_cursor`
+        // defaults to zero, so applying such a page would also rewind the feed
+        // to its first page and replay it forever. Fail the tick instead and
+        // keep the last good state until the control plane makes sense again.
+        anyhow::ensure!(
+            next_cursor > cursor,
+            "snapshot delta carried {} record(s) without advancing cursor {cursor} (next_cursor {next_cursor})",
+            page.records.len()
+        );
         let records = parse_records(page.records)?;
         let applied = self.apply_delta(records, next_cursor);
         tracing::info!(
@@ -790,6 +799,43 @@ mod tests {
 
         assert_eq!(store.state.read().unwrap().cursor, 3);
         assert_eq!(cp.snapshot_cursors(), vec![0, 40, 0]);
+    }
+
+    /// `next_cursor` defaults to zero, so a page that omits it while carrying
+    /// records would both apply them and rewind the cursor to the start of the
+    /// feed — a first-page replay loop that never ends. Bootstrap already
+    /// guards this; the delta path must too.
+    #[tokio::test]
+    async fn a_delta_that_does_not_advance_the_cursor_is_refused() {
+        let cp = MockControlPlane::spawn().await;
+        cp.push_page(0, page(vec![key_record("k1", 5)], 5, Some("e1"), Some(5)));
+        let store = store_for(&cp, None).await;
+        store.run_tick().await;
+        assert_eq!(store.state.read().unwrap().cursor, 5);
+
+        cp.push_page(
+            5,
+            serde_json::json!({
+                "records": [key_record("k2", 6)],
+                "epoch": "e1",
+                "head_seq": 6,
+            }),
+        );
+        store.run_tick().await;
+
+        assert_eq!(
+            store.state.read().unwrap().cursor,
+            5,
+            "an unusable page must leave the cursor where it was"
+        );
+        assert!(
+            store.get("k2").is_none(),
+            "and must not apply the records that came with it"
+        );
+        assert!(
+            store.get("k1").is_some(),
+            "the last good state keeps serving"
+        );
     }
 
     #[tokio::test]
