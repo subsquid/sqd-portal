@@ -26,10 +26,6 @@ const MAX_BOOTSTRAP_PAGES: usize = 10_000;
 /// costs a rate-limited lookup rather than unbounded memory.
 const NEGATIVE_CACHE_CAPACITY: usize = 4096;
 
-/// Floor on how long the snapshot may go unconfirmed before that stops being
-/// routine. Deployments with a long sync interval get five intervals instead.
-const MIN_STALENESS_THRESHOLD: Duration = Duration::from_secs(60);
-
 /// The portal's view of the control plane's key set: a full snapshot pulled at
 /// startup and kept current by cursor-paged deltas. A sync failure never drops
 /// the served state — the last good snapshot keeps answering until the control
@@ -39,12 +35,10 @@ pub struct SnapshotStore {
     state: RwLock<State>,
     ready: AtomicBool,
     sync_interval: Duration,
-    /// Wall-clock second of the last sync the control plane answered.
+    /// Wall-clock second of the last sync the control plane answered. Every
+    /// failed tick reports the distance from it, so a feed that has been down
+    /// for hours does not read like one that missed a single tick.
     last_success: AtomicU64,
-    /// Latches once an episode of staleness has been reported, so a control
-    /// plane that stays down does not reprint the same ERROR every tick.
-    stale_logged: AtomicBool,
-    staleness_threshold: Duration,
     negative_cache_ttl: Duration,
     negative_cache: Mutex<HashMap<String, Instant>>,
     /// Bounds how many authorize calls may be in flight at once, so a control
@@ -83,8 +77,6 @@ impl SnapshotStore {
             ready: AtomicBool::new(false),
             sync_interval: config.sync_interval(),
             last_success: AtomicU64::new(now_secs()),
-            stale_logged: AtomicBool::new(false),
-            staleness_threshold: (config.sync_interval() * 5).max(MIN_STALENESS_THRESHOLD),
             negative_cache_ttl: config.negative_cache_ttl(),
             negative_cache: Mutex::new(HashMap::new()),
             inflight_permits: Semaphore::new(config.max_inflight_resolves),
@@ -230,7 +222,7 @@ impl SnapshotStore {
             self.bootstrap(None).await
         };
         match result {
-            Ok(()) => self.record_sync_success(),
+            Ok(()) => self.last_success.store(now_secs(), Ordering::Release),
             Err(err) => self.report_sync_failure(&err),
         }
         // Entries an unknown-key flood left behind are never re-queried, so
@@ -238,35 +230,18 @@ impl SnapshotStore {
         self.sweep_negative_cache();
     }
 
-    fn record_sync_success(&self) {
-        self.last_success.store(now_secs(), Ordering::Release);
-        if self.stale_logged.swap(false, Ordering::AcqRel) {
-            tracing::info!("commercial snapshot sync recovered; the key set is current again");
-        }
+    /// Seconds since the last sync the control plane answered.
+    fn stale_for_seconds(&self) -> u64 {
+        now_secs().saturating_sub(self.last_success.load(Ordering::Acquire))
     }
 
     /// A failed tick is routine — fail-static means the last good snapshot
-    /// keeps serving — right up until the served keys are old enough that
-    /// revocations may already have been missed. That crossing is an ERROR,
-    /// logged once per episode rather than on every tick.
+    /// keeps serving — but how long that has been going on is not, so every
+    /// failure carries it. An alert on the age is the operator's job.
     fn report_sync_failure(&self, err: &anyhow::Error) {
-        let stale_for = now_secs().saturating_sub(self.last_success.load(Ordering::Acquire));
-        if stale_for >= self.staleness_threshold.as_secs()
-            && !self.stale_logged.swap(true, Ordering::AcqRel)
-        {
-            tracing::error!(
-                error = %err,
-                stale_for_seconds = stale_for,
-                threshold_seconds = self.staleness_threshold.as_secs(),
-                ready = self.is_ready(),
-                "commercial snapshot is stale; served keys may no longer match the control plane"
-            );
-            return;
-        }
-        // Fail-static: the previously synced snapshot keeps serving.
         tracing::warn!(
             error = %err,
-            stale_for_seconds = stale_for,
+            stale_for_seconds = self.stale_for_seconds(),
             ready = self.is_ready(),
             "commercial snapshot sync failed; serving last known keys"
         );
@@ -642,22 +617,19 @@ mod tests {
         );
     }
 
-    /// Sync failures were warn-only forever, so a feed that had been down for
-    /// days looked exactly like one that had missed a single tick.
+    /// A feed that has been down for days must not read like one that missed a
+    /// single tick, so every failure says how old the served key set is.
     #[tokio::test]
-    async fn sync_failures_escalate_once_the_snapshot_goes_stale() {
+    async fn a_failed_sync_reports_how_long_the_snapshot_has_been_stale() {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![key_record("k1", 1)], 1, Some("e1"), Some(1)));
         let store = store_for(&cp).await;
         store.run_tick().await;
-        assert!(!store.stale_logged.load(Ordering::Acquire));
+        assert_eq!(store.stale_for_seconds(), 0);
 
         cp.fail_snapshots(true);
         store.run_tick().await;
-        assert!(
-            !store.stale_logged.load(Ordering::Acquire),
-            "one missed tick is routine"
-        );
+        assert_eq!(store.stale_for_seconds(), 0, "one missed tick is routine");
 
         // As if the control plane had been unreachable for hours.
         store
@@ -665,35 +637,14 @@ mod tests {
             .store(now_secs() - 10_000, Ordering::Release);
         store.run_tick().await;
         assert!(
-            store.stale_logged.load(Ordering::Acquire),
-            "past the threshold the failure is an error, not a warning"
-        );
-
-        store.run_tick().await;
-        assert!(
-            store.stale_logged.load(Ordering::Acquire),
-            "and it is reported once per episode, not once per tick"
+            store.stale_for_seconds() >= 10_000,
+            "a failure does not refresh the age it reports"
         );
 
         cp.fail_snapshots(false);
         cp.push_page(1, page(vec![], 1, Some("e1"), Some(1)));
         store.run_tick().await;
-        assert!(
-            !store.stale_logged.load(Ordering::Acquire),
-            "a successful sync ends the episode"
-        );
-    }
-
-    #[test]
-    fn the_staleness_threshold_never_drops_below_a_minute() {
-        let mut config = crate::commercial::test_support::offline_config();
-        config.sync_interval_secs = 10;
-        let store = SnapshotStore::new(&config).unwrap();
-        assert_eq!(store.staleness_threshold, Duration::from_secs(60));
-
-        config.sync_interval_secs = 30;
-        let store = SnapshotStore::new(&config).unwrap();
-        assert_eq!(store.staleness_threshold, Duration::from_secs(150));
+        assert_eq!(store.stale_for_seconds(), 0, "a successful sync resets it");
     }
 
     #[tokio::test]
