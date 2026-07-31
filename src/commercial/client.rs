@@ -32,6 +32,12 @@ impl ControlPlaneClient {
         Ok(Self {
             http: reqwest::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
+                // These requests carry the portal's service token and their
+                // answer is the key set itself. Both belong to the configured
+                // control plane and nowhere else, so a redirect is an error
+                // rather than an instruction. `http://` stays legal: local dev
+                // runs the control plane without TLS.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             snapshots_url: endpoint_url(&config.control_plane_url, &SNAPSHOTS_PATH)?,
             authorize_url: endpoint_url(&config.control_plane_url, &AUTHORIZE_PATH)?,
@@ -95,7 +101,42 @@ fn endpoint_url(base: &Url, segments: &[&str]) -> anyhow::Result<Url> {
 
 #[cfg(test)]
 mod tests {
+    use axum::{response::Redirect, routing::get, Json, Router};
+
     use super::*;
+    use crate::commercial::test_support::MockControlPlane;
+
+    /// The feed request carries the portal's service token. A redirect sends
+    /// that request somewhere the operator did not configure, and a redirected
+    /// key set is not the control plane's answer — refuse both.
+    #[tokio::test]
+    async fn the_feed_client_does_not_follow_redirects() {
+        let app = Router::new()
+            .route(
+                "/internal/portal/v1/snapshots",
+                get(|| async { Redirect::temporary("/elsewhere") }),
+            )
+            .route(
+                "/elsewhere",
+                get(|| async { Json(serde_json::json!({ "records": [], "next_cursor": 0 })) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Borrows the mock's service-token plumbing; only the URL differs.
+        let cp = MockControlPlane::spawn().await;
+        let mut config = cp.config(None);
+        config.control_plane_url = format!("http://{addr}").parse().unwrap();
+        let client = ControlPlaneClient::new(&config).unwrap();
+
+        let err = client
+            .fetch_page(0)
+            .await
+            .expect_err("a redirected feed must not be treated as an answer");
+
+        assert!(err.to_string().contains("307"), "got {err}");
+    }
 
     fn url_for(base: &str) -> String {
         endpoint_url(&base.parse().unwrap(), &SNAPSHOTS_PATH)
