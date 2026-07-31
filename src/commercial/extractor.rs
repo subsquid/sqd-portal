@@ -18,9 +18,16 @@ use super::{
 use crate::{network::NetworkClient, types::DatasetId};
 
 /// Token layouts the portal accepts, all of the form `<prefix><key_id>_<secret>`:
-/// the prefix minted by the control plane, plus the legacy prefixes carried by
-/// keys imported from before the portal owned authentication.
-const TOKEN_PREFIXES: [&str; 3] = ["sqd_portal_", "sqd_data_", "prt_"];
+/// the prefix minted by the control plane, plus the legacy prefix carried by
+/// keys imported from before the portal owned authentication. Exactly the set
+/// the control plane issues — a prefix it never mints is not a key.
+const TOKEN_PREFIXES: [&str; 2] = ["sqd_portal_", "prt_"];
+
+/// Both segments mirror the control plane's own `[A-Za-z0-9~-]+`, capped at
+/// what it can mint. A token the control plane could never have issued is
+/// rejected before its key id reaches the negative cache or a log line.
+const MAX_KEY_ID_LEN: usize = 64;
+const MAX_SECRET_LEN: usize = 128;
 
 const QUERY_PARAM: &str = "api_key";
 
@@ -243,14 +250,23 @@ fn parse_token(token: &str) -> Option<Credential> {
     let rest = TOKEN_PREFIXES
         .iter()
         .find_map(|prefix| token.strip_prefix(prefix))?;
+    // `_` is outside the segment charset, so the first one is the separator.
     let (key_id, secret) = rest.split_once('_')?;
-    if key_id.is_empty() || secret.is_empty() {
+    if !is_segment(key_id, MAX_KEY_ID_LEN) || !is_segment(secret, MAX_SECRET_LEN) {
         return None;
     }
     Some(Credential {
         key_id: key_id.to_owned(),
         secret_sha256: sha256_hex(secret),
     })
+}
+
+fn is_segment(segment: &str, max_len: usize) -> bool {
+    !segment.is_empty()
+        && segment.len() <= max_len
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'~' || byte == b'-')
 }
 
 fn sha256_hex(secret: &str) -> String {
@@ -360,6 +376,56 @@ mod tests {
         ] {
             assert!(parse_token(token).is_none(), "{token} must not parse");
         }
+    }
+
+    /// The control plane mints two prefixes. Accepting a third widens what can
+    /// enter the negative cache and the rejection logs for no benefit.
+    #[test]
+    fn rejects_prefixes_the_control_plane_never_mints() {
+        for token in [
+            format!("sqd_data_k1_{SECRET}"),
+            format!("sqd_k1_{SECRET}"),
+            format!("portal_k1_{SECRET}"),
+        ] {
+            assert!(parse_token(&token).is_none(), "{token} must not parse");
+        }
+    }
+
+    /// Both segments mirror the control plane's `[A-Za-z0-9~-]+`, bounded so an
+    /// attacker cannot choose how much memory a rejected token costs.
+    #[test]
+    fn rejects_segments_outside_the_control_plane_charset() {
+        for token in [
+            "sqd_portal_k.1_secret",
+            "sqd_portal_k1_sec.ret",
+            "sqd_portal_k/1_secret",
+            "sqd_portal_k1_sec ret",
+            "sqd_portal_kéy_secret",
+            "prt_k1_sécret",
+            "sqd_portal_k+1_secret",
+        ] {
+            assert!(parse_token(token).is_none(), "{token} must not parse");
+        }
+
+        let credential = parse_token("sqd_portal_a~b-c9_d~e-f0").expect("the CP charset parses");
+        assert_eq!(credential.key_id, "a~b-c9");
+    }
+
+    #[test]
+    fn rejects_segments_longer_than_the_control_plane_can_mint() {
+        let long_id = "a".repeat(MAX_KEY_ID_LEN + 1);
+        assert!(parse_token(&format!("sqd_portal_{long_id}_{SECRET}")).is_none());
+
+        let long_secret = "b".repeat(MAX_SECRET_LEN + 1);
+        assert!(parse_token(&format!("sqd_portal_k1_{long_secret}")).is_none());
+
+        // The caps themselves are still accepted.
+        let at_cap = format!(
+            "sqd_portal_{}_{}",
+            "a".repeat(MAX_KEY_ID_LEN),
+            "b".repeat(MAX_SECRET_LEN)
+        );
+        assert!(parse_token(&at_cap).is_some());
     }
 
     #[test]
