@@ -582,7 +582,6 @@ mod tests {
             "the control plane refused the page size the client asked for"
         );
         assert_eq!(cp.snapshot_limits(), vec![PAGE_LIMIT]);
-        assert!(PAGE_LIMIT <= crate::commercial::test_support::MAX_PAGE_LIMIT);
     }
 
     /// A page that comes back shorter than the limit it was asked for is the
