@@ -565,6 +565,53 @@ mod tests {
         assert_eq!(store.state.read().unwrap().cursor, 0);
     }
 
+    /// The page size is a contract in both directions. The control plane
+    /// refuses a limit it cannot serve rather than quietly serving less — a
+    /// clamped page reads as short, and a short page is how the reader knows
+    /// it has reached the end of the feed — so a `PAGE_LIMIT` raised past what
+    /// the control plane accepts must break here rather than in production.
+    #[tokio::test]
+    async fn the_feed_is_read_at_a_page_size_the_control_plane_accepts() {
+        let cp = MockControlPlane::spawn().await;
+        cp.push_page(0, page(vec![key_record("k1", 1)], 1, "e1", 1));
+        let store = store_for(&cp).await;
+        store.run_tick().await;
+
+        assert!(
+            store.is_ready(),
+            "the control plane refused the page size the client asked for"
+        );
+        assert_eq!(cp.snapshot_limits(), vec![PAGE_LIMIT]);
+        assert!(PAGE_LIMIT <= crate::commercial::test_support::MAX_PAGE_LIMIT);
+    }
+
+    /// A page that comes back shorter than the limit it was asked for is the
+    /// control plane serving less than it was told to: a smaller page size on
+    /// the far side, or something in between truncating. It reads exactly like
+    /// the end of the feed, and only `head_seq` tells the two apart.
+    #[tokio::test]
+    async fn a_page_shorter_than_the_requested_limit_fails_the_bootstrap() {
+        let cp = MockControlPlane::spawn().await;
+        let short = u64::from(PAGE_LIMIT) - 1;
+        let records: Vec<_> = (0..short)
+            .map(|i| key_record(&format!("k{i}"), i + 1))
+            .collect();
+        cp.push_page(0, page(records, short, "e1", 50_000));
+
+        let store = store_for(&cp).await;
+        store.run_tick().await;
+
+        assert!(
+            !store.is_ready(),
+            "a page one record short of the limit, 50k seqs behind the head, is not a snapshot"
+        );
+        assert_eq!(
+            cp.snapshot_cursors(),
+            vec![0],
+            "and the short page still ended the read"
+        );
+    }
+
     /// The same check catches the subtler shape: a page that is short — so the
     /// loop stops — while the head says most of the key set was never sent.
     /// Serving that subset 401s every customer it omits.

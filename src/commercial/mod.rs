@@ -168,6 +168,11 @@ pub mod test_support {
         state: Arc<MockState>,
     }
 
+    /// The largest page the control plane will serve. Asking for more is a
+    /// 400, never a smaller page: a clamped page reads as short, and a short
+    /// page is how the reader knows it has reached the end of the feed.
+    pub const MAX_PAGE_LIMIT: u16 = 1000;
+
     #[derive(Default)]
     struct MockState {
         pages: Mutex<VecDeque<(u64, serde_json::Value)>>,
@@ -175,6 +180,7 @@ pub mod test_support {
         /// answers with once the queue drains do not read as a feed rebuild.
         epoch: Mutex<Option<String>>,
         snapshot_cursors: Mutex<Vec<u64>>,
+        snapshot_limits: Mutex<Vec<u16>>,
         fail_snapshots: Mutex<bool>,
         authorize: Mutex<HashMap<String, serde_json::Value>>,
         authorize_statuses: Mutex<HashMap<String, u16>>,
@@ -184,7 +190,6 @@ pub mod test_support {
     #[derive(Deserialize)]
     struct CursorQuery {
         cursor: u64,
-        #[allow(dead_code)]
         limit: Option<u16>,
     }
 
@@ -225,6 +230,11 @@ pub mod test_support {
 
         pub fn snapshot_cursors(&self) -> Vec<u64> {
             self.state.snapshot_cursors.lock().unwrap().clone()
+        }
+
+        /// The page size each poll asked for.
+        pub fn snapshot_limits(&self) -> Vec<u16> {
+            self.state.snapshot_limits.lock().unwrap().clone()
         }
 
         pub fn fail_snapshots(&self, fail: bool) {
@@ -278,6 +288,11 @@ pub mod test_support {
             return Err(StatusCode::UNAUTHORIZED);
         }
         state.snapshot_cursors.lock().unwrap().push(query.cursor);
+        let limit = query.limit.unwrap_or(MAX_PAGE_LIMIT);
+        state.snapshot_limits.lock().unwrap().push(limit);
+        if limit > MAX_PAGE_LIMIT {
+            return Err(StatusCode::BAD_REQUEST);
+        }
         if *state.fail_snapshots.lock().unwrap() {
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
@@ -285,7 +300,7 @@ pub mod test_support {
         let index = pages
             .iter()
             .position(|(min_cursor, _)| query.cursor >= *min_cursor);
-        let Some(page) = index
+        let Some(mut page) = index
             .and_then(|index| pages.remove(index))
             .map(|(_, page)| page)
         else {
@@ -299,6 +314,10 @@ pub mod test_support {
         };
         if let Some(epoch) = page.get("epoch").and_then(serde_json::Value::as_str) {
             *state.epoch.lock().unwrap() = Some(epoch.to_owned());
+        }
+        // No page is ever longer than the one that was asked for.
+        if let Some(records) = page.get_mut("records").and_then(|r| r.as_array_mut()) {
+            records.truncate(usize::from(limit));
         }
         Ok(Json(page))
     }
