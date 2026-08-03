@@ -102,6 +102,25 @@ fn setup_tracing(json: bool, log_span_durations: bool) {
         .init();
 }
 
+/// States, in one line, whether the data API requires a key. The config is
+/// read inside clap's `value_parser` — before `setup_tracing` — so nothing it
+/// has to say about itself is recorded, and until now an operator could not
+/// tell an authorizing portal from an open one by reading the log at all.
+fn log_authorization_mode(config: &Config) {
+    let Some(commercial) = &config.commercial else {
+        tracing::warn!(
+            "commercial authorization disabled: no `commercial` block in the config, \
+             so the data API is served to anyone who asks"
+        );
+        return;
+    };
+    tracing::info!(
+        portal_id = commercial.portal_id(),
+        enforcement = ?commercial.enforcement,
+        "commercial authorization enabled"
+    );
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -114,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         .then(|| setup_sentry(&args.config, &args));
 
     setup_tracing(args.json_log, args.log_span_durations);
+    log_authorization_mode(&args.config);
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
 

@@ -33,11 +33,8 @@ pub fn build(
 ) -> anyhow::Result<Arc<Gate>> {
     let store = SnapshotStore::new(config)?;
     store.spawn_sync(cancel);
-    tracing::info!(
-        portal_id = config.portal_id(),
-        enforcement = ?config.enforcement,
-        "commercial authorization enabled"
-    );
+    // The mode itself is logged by `log_authorization_mode` at startup, which
+    // covers the disabled case too — this path only exists when it is on.
     Ok(Arc::new(Gate::new(config, store, catalog)))
 }
 

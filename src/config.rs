@@ -152,7 +152,12 @@ pub struct Config {
 
     /// Absent means no authentication at all: the portal serves every request,
     /// exactly as an OSS build does. Present, the data API requires a key.
-    #[serde(default)]
+    ///
+    /// Only an absent key means absent. A key written with nothing under it is
+    /// an operator configuring something, and serde would fold that null into
+    /// `None` — the open portal, the one outcome they cannot have meant — so
+    /// it is refused instead.
+    #[serde(default, deserialize_with = "parse_commercial")]
     pub commercial: Option<CommercialConfig>,
 }
 
@@ -203,6 +208,10 @@ impl Config {
         let file = std::fs::File::open(config_path)?;
         let buf_reader = std::io::BufReader::new(file);
         let deser = serde_yaml::Deserializer::from_reader(buf_reader);
+        // NOTE: this runs inside clap's `value_parser`, before `setup_tracing`,
+        // so these warnings go to a subscriber that does not exist yet. Kept as
+        // is — main logs the authorization mode once tracing is up, which is
+        // the part an operator must not have to infer.
         let mut warn_unknown = |path: serde_ignored::Path| {
             tracing::warn!("ignoring unknown config field: {path}");
         };
@@ -388,6 +397,23 @@ where
     Ok(s.trim_end_matches('/').to_owned())
 }
 
+/// Reached only when the config file actually carries a `commercial` key —
+/// `#[serde(default)]` answers for an absent one without coming here — so a
+/// null arriving at this point was written by hand.
+fn parse_commercial<'de, D>(deserializer: D) -> Result<Option<CommercialConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<CommercialConfig>::deserialize(deserializer)? {
+        Some(config) => Ok(Some(config)),
+        None => Err(serde::de::Error::custom(
+            "commercial: the block is present but empty. Remove the key to run the portal \
+             without authorization, or fill the block in — an empty one would silently serve \
+             the data API to anyone.",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +479,33 @@ sqd_network:
     fn commercial_is_absent_unless_configured() {
         let config: Config = serde_yaml::from_str(MINIMAL_YAML).expect("parse");
         assert!(config.commercial.is_none());
+    }
+
+    /// An operator who wrote the key meant to configure something. serde folds
+    /// an explicit null into `None`, which is the open portal — the single
+    /// outcome nobody typing `commercial:` can have intended — and nothing
+    /// anywhere would have said so.
+    #[test]
+    fn an_empty_commercial_block_is_a_config_error() {
+        let yaml = format!("{MINIMAL_YAML}commercial:\n");
+
+        let err = serde_yaml::from_str::<Config>(&yaml)
+            .expect_err("a null commercial block must not parse as absent");
+        assert!(err.to_string().contains("commercial"), "got {err}");
+
+        // The production path reads through two adapters; both must agree.
+        let deser = serde_yaml::Deserializer::from_str(&yaml);
+        let err = serde_yaml::with::singleton_map_recursive::deserialize::<Config, _>(
+            serde_ignored::Deserializer::new(deser, &mut |_: serde_ignored::Path| {}),
+        )
+        .expect_err("a null commercial block must not parse as absent");
+        assert!(err.to_string().contains("commercial"), "got {err}");
+
+        // A block that is present but has nothing usable in it fails on the
+        // field it is missing, which is the message the operator needs.
+        let err = serde_yaml::from_str::<Config>(&format!("{MINIMAL_YAML}commercial: {{}}\n"))
+            .expect_err("an empty mapping must not parse either");
+        assert!(err.to_string().contains("control_plane_url"), "got {err}");
     }
 
     #[test]
