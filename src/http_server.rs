@@ -1617,6 +1617,48 @@ mod tests {
         "/sql/metadata",
     ];
 
+    /// A router can be mounted into another one without a `.route(` call, and
+    /// those endpoints are invisible to the scan below. Every such call in the
+    /// route table has to be listed here, which is the point: a data route
+    /// arriving through one must be a decision somebody made on purpose.
+    const ALLOWED_COMPOSITION: &[&str] = &[
+        // The Scalar docs UI at `/docs`. It renders the OpenAPI page and
+        // serves no data, so it is deliberately ungated.
+        ".merge(Scalar::with_url(",
+    ];
+
+    /// The composition calls that mount endpoints without naming them in a
+    /// `.route(`, matched with whitespace removed so rustfmt cannot change the
+    /// answer. Returns the ones no entry of `ALLOWED_COMPOSITION` covers.
+    fn unlisted_composition_in(region: &str) -> Vec<String> {
+        const FORMS: &[&str] = &[
+            ".nest(",
+            ".nest_service(",
+            ".merge(",
+            ".route_service(",
+            ".fallback(",
+            ".fallback_service(",
+        ];
+        let compact: String = region.chars().filter(|c| !c.is_whitespace()).collect();
+
+        let mut unlisted = Vec::new();
+        for form in FORMS {
+            let mut rest = compact.as_str();
+            while let Some(index) = rest.find(form) {
+                rest = &rest[index..];
+                let call: String = rest.chars().take(48).collect();
+                if !ALLOWED_COMPOSITION
+                    .iter()
+                    .any(|allowed| call.starts_with(allowed))
+                {
+                    unlisted.push(call);
+                }
+                rest = &rest[form.len()..];
+            }
+        }
+        unlisted
+    }
+
     /// Every `.route(…)` in `run_server`'s table, paired with whether its
     /// method router is wrapped in `gated(`. Read from the source because the
     /// router itself cannot be built without a live `NetworkClient`, and
@@ -1630,9 +1672,19 @@ mod tests {
         let end = SOURCE
             .find("let drain_timeout")
             .expect("the route table ends before the layer stack");
+        let region = &SOURCE[start..end];
+
+        let unlisted = unlisted_composition_in(region);
+        assert!(
+            unlisted.is_empty(),
+            "the route table mounts routers this scan cannot see, so the gating \
+             below says nothing about what they serve: {unlisted:#?}. Classify \
+             each one — gate the data routes it mounts, then add the call to \
+             ALLOWED_COMPOSITION saying why the rest may be served to anyone."
+        );
 
         let mut routes = Vec::new();
-        let mut rest = &SOURCE[start..end];
+        let mut rest = region;
         while let Some(index) = rest.find(".route(") {
             rest = &rest[index + ".route(".len()..];
             let path = rest
