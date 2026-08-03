@@ -44,6 +44,7 @@ use tracing::{instrument, Instrument};
 
 use crate::{
     controller::timeouts::TimeoutManager,
+    metrics::{self, RefusalReason},
     network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult, StreamingNetwork, WorkerLease},
     types::{
         BlockRange, ChunkId, DataChunk, ErrorCode, ExhaustionClass, QueryError, RequestError,
@@ -558,6 +559,7 @@ impl<N: StreamingNetwork> StreamController<N> {
                 // All workers are rate-limited, try to pause and continue streaming
                 let duration = s.until.duration_since(Instant::now());
                 if duration > MAX_IDLE_TIME {
+                    metrics::report_stream_refused(RefusalReason::WorkersPaused);
                     return Poll::Ready(Some(Err(RequestError::BusyFor(duration))));
                 } else {
                     // TODO: fix calculation in case we're polling the same paused slot multiple times
@@ -599,7 +601,7 @@ impl<N: StreamingNetwork> StreamController<N> {
             self.buffer.push_front(chunk_slot);
         }
 
-        self.log_response(chunk_index, &read_range, &result);
+        self.observe_response(chunk_index, &read_range, &result);
         result
     }
 
@@ -608,26 +610,35 @@ impl<N: StreamingNetwork> StreamController<N> {
         response: BufferedResponse,
     ) -> Poll<Option<Result<ResponseChunk, RequestError>>> {
         let result = Poll::Ready(Some(response.result));
-        self.log_response(response.chunk_index, &response.read_range, &result);
+        self.observe_response(response.chunk_index, &response.read_range, &result);
         result
     }
 
-    fn log_response(
+    fn observe_response(
         &mut self,
         chunk_index: usize,
         read_range: &BlockRange,
         result: &Poll<Option<Result<ResponseChunk, RequestError>>>,
     ) {
-        if let Poll::Ready(Some(Ok(bytes))) = result {
-            self.stats
-                .sent_response_chunk(*read_range.end() - *read_range.start() + 1, bytes.len());
-            tracing::trace!(
-                chunk_index,
-                "Writing response blocks {}-{} ({} bytes)",
-                *read_range.start(),
-                *read_range.end(),
-                bytes.len()
-            );
+        match result {
+            Poll::Ready(Some(Ok(bytes))) => {
+                self.stats
+                    .sent_response_chunk(*read_range.end() - *read_range.start() + 1, bytes.len());
+                tracing::trace!(
+                    chunk_index,
+                    "Writing response blocks {}-{} ({} bytes)",
+                    *read_range.start(),
+                    *read_range.end(),
+                    bytes.len()
+                );
+            }
+            // Once per stream, not once per failed chunk: both consumers — `spawn_stream`
+            // and the test collector — stop at the first `Err`, so no later chunk's
+            // refusal is ever surfaced.
+            Poll::Ready(Some(Err(RequestError::RateLimitExceeded))) => {
+                metrics::report_stream_refused(RefusalReason::WorkersRateLimited);
+            }
+            _ => {}
         }
     }
 
@@ -1444,6 +1455,7 @@ mod tests {
         /// other event resolves instantly under the paused clock.
         Slow(u64),
         Retriable,
+        RateLimited,
         /// Never respond. Only used by the cancellation test; including it in
         /// the random generator would (correctly) fail the liveness property,
         /// because a slot whose every attempt hangs waits forever — in
@@ -1573,6 +1585,7 @@ mod tests {
                     QueryEvent::Retriable => {
                         return Err(QueryError::Retriable("scripted failure".to_owned()))
                     }
+                    QueryEvent::RateLimited => return Err(QueryError::RateLimitExceeded),
                     QueryEvent::Full => end,
                     QueryEvent::Slow(ms) => {
                         tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -2018,6 +2031,36 @@ mod tests {
             Some(ErrorCode::RetriesExhausted),
             "one transient attempt means a later retry can still succeed: {:?}",
             mixed_outcome.error
+        );
+    }
+
+    /// A refusal is counted once even when all read-ahead slots fail.
+    #[tokio::test]
+    async fn buffered_rate_limits_count_one_refused_stream() {
+        let scenario = Scenario {
+            n_chunks: 3,
+            streams: vec![StreamSpec { from: 100, to: 399 }],
+            find_worker_script: Vec::new(),
+            query_script: vec![QueryEvent::RateLimited; 3],
+            buffer_size: 3,
+            retries: 0,
+            max_stored_results_per_chunk: 1,
+            max_chunks: None,
+        };
+        let network = ScriptedNetwork::new(
+            scenario.build_chunks(),
+            Vec::new(),
+            scenario.query_script.clone(),
+        );
+        let before = metrics::refused_streams(RefusalReason::WorkersRateLimited);
+
+        let outcome = collect_stream(scenario.request(&scenario.streams[0], 0), network, 0).await;
+
+        assert_eq!(outcome.code, Some(ErrorCode::Overloaded));
+        assert_eq!(
+            metrics::refused_streams(RefusalReason::WorkersRateLimited),
+            before + 1,
+            "three buffered chunk failures still interrupt only one stream"
         );
     }
 
