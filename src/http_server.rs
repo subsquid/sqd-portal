@@ -825,10 +825,13 @@ fn readiness_verdict(
             Some(reason),
         );
     }
-    // A gated portal without the key snapshot answers 401 to every valid key,
-    // which is worse than answering nothing: keep it out of rotation until it
-    // has mirrored the control plane. Ungated portals never reach this.
-    if commercial.is_some_and(|gate| !gate.snapshot_ready()) {
+    // An ENFORCING portal without the key snapshot answers 401 to every valid
+    // key, which is worse than answering nothing: keep it out of rotation until
+    // it has mirrored the control plane. A shadow-mode portal admits everything
+    // regardless of what it knows, so the same snapshot costs it nothing and
+    // failing it here would cause the outage shadow mode exists to avoid.
+    // Ungated portals never reach this.
+    if commercial.is_some_and(|gate| gate.enforcing() && !gate.snapshot_ready()) {
         return (
             NO_KEY_SNAPSHOT,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1748,6 +1751,22 @@ mod tests {
         assert_eq!(
             readiness_verdict(true, Some(&synced), Ok(())).0,
             SHUTTING_DOWN
+        );
+    }
+
+    /// Shadow mode admits every request whatever the snapshot says, so an
+    /// unsynced one costs nothing — and pulling those pods from rotation would
+    /// turn the mode built to make the cutover risk-free into the outage it was
+    /// meant to prevent.
+    #[test]
+    fn readiness_ignores_the_key_snapshot_in_log_only_mode() {
+        use crate::commercial::{test_support::gate_with, Enforcement};
+
+        let empty = gate_with(Enforcement::LogOnly, false);
+
+        assert_eq!(
+            readiness_verdict(false, Some(&empty), Ok(())),
+            (READY, StatusCode::OK, "Ready", None)
         );
     }
 

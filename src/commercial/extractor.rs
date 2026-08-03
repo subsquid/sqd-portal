@@ -104,6 +104,12 @@ impl Gate {
         self.store.is_ready()
     }
 
+    /// Whether this gate turns its verdicts into responses. Shadow mode does
+    /// not, so nothing the snapshot does or does not know can reject a request.
+    pub fn enforcing(&self) -> bool {
+        self.enforcement == Enforcement::Enforce
+    }
+
     async fn decide(
         &self,
         headers: &HeaderMap,
@@ -167,7 +173,7 @@ impl Gate {
     /// Log-only mode records every request; enforcing mode records only the
     /// requests it turns away, since admissions are the hot path.
     fn log(&self, decision: Decision, key_id: Option<&str>, dataset: Option<&str>) {
-        let enforcing = self.enforcement == Enforcement::Enforce;
+        let enforcing = self.enforcing();
         let key_id = key_id.unwrap_or("none");
         let dataset = dataset.unwrap_or("-");
         let portal_id = self.portal_id.as_str();

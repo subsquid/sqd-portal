@@ -148,7 +148,14 @@ pub mod test_support {
 
     /// A gate whose snapshot store has synced, or one that never has.
     pub fn gate_with_readiness(ready: bool) -> Arc<Gate> {
-        let config = offline_config();
+        gate_with(Enforcement::Enforce, ready)
+    }
+
+    pub fn gate_with(enforcement: Enforcement, ready: bool) -> Arc<Gate> {
+        let config = CommercialConfig {
+            enforcement,
+            ..offline_config()
+        };
         let store = SnapshotStore::new(&config).expect("store should build");
         if ready {
             store.install_for_test(Vec::new());
