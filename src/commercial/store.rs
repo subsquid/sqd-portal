@@ -297,6 +297,7 @@ impl SnapshotStore {
         let mut records = Vec::new();
         let mut epoch = fallback_epoch;
         let mut pages = 0usize;
+        let mut head = None;
 
         loop {
             anyhow::ensure!(
@@ -324,6 +325,9 @@ impl SnapshotStore {
             if page.epoch.is_some() {
                 epoch = page.epoch;
             }
+            if page.head_seq.is_some() {
+                head = page.head_seq;
+            }
 
             let page_len = page.records.len();
             records.extend(parse_records(page.records)?);
@@ -337,6 +341,16 @@ impl SnapshotStore {
             );
             cursor = page.next_cursor;
         }
+
+        // A short page is the feed saying "that is all of it", and `head_seq`
+        // is the feed saying how much there is. When they disagree the pages we
+        // read are a subset of the key set — every key past `cursor` would 401
+        // — so this is a failed tick, not a snapshot. The last good one keeps
+        // serving; a portal that has none stays out of rotation.
+        anyhow::ensure!(
+            head.is_none_or(|head| cursor >= head),
+            "snapshot bootstrap ended at cursor {cursor}, short of head {head:?}, after {pages} page(s)"
+        );
 
         let count = records.len();
         self.install(records, cursor, epoch);
@@ -498,6 +512,47 @@ mod tests {
         assert_eq!(store.state.read().unwrap().epoch.as_deref(), Some("e1"));
         assert!(store.get("last").is_some());
         assert_eq!(cp.snapshot_cursors(), vec![0, u64::from(PAGE_LIMIT)]);
+    }
+
+    /// A feed that answers "no records, and I am 500 seqs ahead of you" is not
+    /// describing an empty key set — it is not answering at all. Installing it
+    /// would flip `ready` on a snapshot that knows nobody, so every valid key
+    /// 401s fleet-wide. The tick fails and the store stays unready instead.
+    #[tokio::test]
+    async fn a_bootstrap_that_ends_short_of_the_head_installs_nothing() {
+        let cp = MockControlPlane::spawn().await;
+        cp.push_page(0, page(vec![], 0, Some("e1"), Some(500)));
+
+        let store = store_for(&cp).await;
+        store.run_tick().await;
+
+        assert!(
+            !store.is_ready(),
+            "an empty snapshot 500 seqs behind the head must not install"
+        );
+        assert!(store.state.read().unwrap().records.is_empty());
+        assert_eq!(store.state.read().unwrap().cursor, 0);
+    }
+
+    /// The same check catches the subtler shape: a page that is short — so the
+    /// loop stops — while the head says most of the key set was never sent.
+    /// Serving that subset 401s every customer it omits.
+    #[tokio::test]
+    async fn a_truncated_bootstrap_page_installs_nothing() {
+        let cp = MockControlPlane::spawn().await;
+        let records: Vec<_> = (0..3u64)
+            .map(|i| key_record(&format!("k{i}"), i + 1))
+            .collect();
+        cp.push_page(0, page(records, 3, Some("e1"), Some(5000)));
+
+        let store = store_for(&cp).await;
+        store.run_tick().await;
+
+        assert!(
+            !store.is_ready(),
+            "a 3-record subset of a 5000-seq feed must not install"
+        );
+        assert!(store.get("k0").is_none());
     }
 
     /// Pages read either side of a feed rebuild describe two different key
