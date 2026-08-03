@@ -17,8 +17,10 @@ use super::{
     types::{KeyRecord, SnapshotPage},
 };
 
-/// Guards against a feed that never returns a short page.
-const MAX_BOOTSTRAP_PAGES: usize = 10_000;
+/// Guards against a feed that never returns a short page, and against a delta
+/// drain that never reaches the head it is chasing: either would keep one tick
+/// reading pages forever.
+const MAX_PAGES_PER_TICK: usize = 10_000;
 
 /// Upper bound on remembered "the control plane has never heard of this key"
 /// answers. The ids are attacker-chosen, so the map is capped: past the cap new
@@ -245,49 +247,80 @@ impl SnapshotStore {
         );
     }
 
+    /// Reads the feed forward from the stored cursor until it is caught up.
+    /// One page per tick would make revocation latency proportional to the
+    /// backlog — a deleted 5k-key org keeps working for five ticks — and
+    /// `head_seq` says how far behind the cursor is, so the tick drains it.
     async fn sync_once(&self) -> anyhow::Result<()> {
-        let cursor = self.state.read().unwrap().cursor;
-        let page = self.client.fetch_page(cursor).await?;
+        let start = self.state.read().unwrap().cursor;
+        let mut cursor = start;
+        let mut applied = 0usize;
+        let mut pages = 0usize;
 
-        if let Some(reason) = self.resync_reason(cursor, &page) {
-            match &reason {
-                ResyncReason::EpochChanged { stored, received } => tracing::warn!(
-                    cursor,
-                    stored_epoch = stored,
-                    received_epoch = received,
-                    "commercial snapshot feed epoch changed; resyncing from scratch"
-                ),
-                ResyncReason::HeadRolledBack { cursor, head_seq } => tracing::warn!(
-                    cursor,
-                    head_seq,
-                    "commercial snapshot feed head rolled back; resyncing from scratch"
-                ),
+        loop {
+            anyhow::ensure!(
+                pages < MAX_PAGES_PER_TICK,
+                "snapshot delta exceeded {MAX_PAGES_PER_TICK} pages"
+            );
+            let page = self.client.fetch_page(cursor).await?;
+            pages += 1;
+
+            if let Some(reason) = self.resync_reason(cursor, &page) {
+                // Mid-drain, the pages already applied belong to a history the
+                // feed has just disowned, so only the first page of a tick can
+                // take the resync path. Later ones fail the tick; the next one
+                // starts from a settled cursor and resyncs then.
+                anyhow::ensure!(
+                    pages == 1,
+                    "snapshot feed changed after {} page(s) of a delta drain: {reason:?}",
+                    pages - 1
+                );
+                match &reason {
+                    ResyncReason::EpochChanged { stored, received } => tracing::warn!(
+                        cursor,
+                        stored_epoch = stored,
+                        received_epoch = received,
+                        "commercial snapshot feed epoch changed; resyncing from scratch"
+                    ),
+                    ResyncReason::HeadRolledBack { cursor, head_seq } => tracing::warn!(
+                        cursor,
+                        head_seq,
+                        "commercial snapshot feed head rolled back; resyncing from scratch"
+                    ),
+                }
+                return self.bootstrap().await;
             }
-            return self.bootstrap().await;
+
+            let head = page.head_seq;
+            let page_len = page.records.len();
+            self.observe_epoch(page.epoch);
+            if page_len == 0 {
+                break;
+            }
+
+            let next_cursor = page.next_cursor;
+            // Records without forward movement cannot be trusted: applying such
+            // a page would leave the cursor where it was — or move it backwards
+            // — and replay the same page forever. Fail the tick instead and
+            // keep the last good state until the control plane makes sense
+            // again.
+            anyhow::ensure!(
+                next_cursor > cursor,
+                "snapshot delta carried {page_len} record(s) without advancing cursor {cursor} (next_cursor {next_cursor})"
+            );
+            applied += self.apply_delta(parse_records(page.records)?, next_cursor);
+            cursor = next_cursor;
+
+            // A short page is the feed saying there is no more, and reaching
+            // the head it reported says the same thing.
+            if page_len < usize::from(PAGE_LIMIT) || cursor >= head {
+                break;
+            }
         }
 
-        self.observe_epoch(page.epoch);
-        if page.records.is_empty() {
-            return Ok(());
+        if cursor > start {
+            tracing::info!(applied, pages, cursor, "commercial snapshot delta applied");
         }
-
-        let next_cursor = page.next_cursor;
-        // Records without forward movement cannot be trusted: applying such a
-        // page would leave the cursor where it was — or move it backwards —
-        // and replay the same page forever. Fail the tick instead and keep the
-        // last good state until the control plane makes sense again.
-        anyhow::ensure!(
-            next_cursor > cursor,
-            "snapshot delta carried {} record(s) without advancing cursor {cursor} (next_cursor {next_cursor})",
-            page.records.len()
-        );
-        let records = parse_records(page.records)?;
-        let applied = self.apply_delta(records, next_cursor);
-        tracing::info!(
-            applied,
-            cursor = next_cursor,
-            "commercial snapshot delta applied"
-        );
         Ok(())
     }
 
@@ -301,8 +334,8 @@ impl SnapshotStore {
         // The head the last page read reported: what a complete read reaches.
         let head = loop {
             anyhow::ensure!(
-                pages < MAX_BOOTSTRAP_PAGES,
-                "snapshot bootstrap exceeded {MAX_BOOTSTRAP_PAGES} pages"
+                pages < MAX_PAGES_PER_TICK,
+                "snapshot bootstrap exceeded {MAX_PAGES_PER_TICK} pages"
             );
             let page = self.client.fetch_page(cursor).await?;
             pages += 1;
@@ -630,6 +663,42 @@ mod tests {
 
         assert_eq!(store.state.read().unwrap().cursor, 3);
         assert_eq!(cp.snapshot_cursors(), vec![0, 40, 0]);
+    }
+
+    /// A revocation is live until the reader reaches it, so applying one page
+    /// per tick makes revocation latency ceil(backlog / PAGE_LIMIT) ticks:
+    /// deleting a 5k-key org leaves its last keys working for the better part
+    /// of a minute. `head_seq` says exactly how far behind the reader is, so a
+    /// tick that starts behind catches up inside itself.
+    #[tokio::test]
+    async fn a_delta_drains_the_whole_backlog_in_one_tick() {
+        let limit = u64::from(PAGE_LIMIT);
+        let head = 1 + 3 * limit;
+
+        let cp = MockControlPlane::spawn().await;
+        cp.push_page(0, page(vec![key_record("k0", 1)], 1, "e1", 1));
+        let store = store_for(&cp).await;
+        store.run_tick().await;
+
+        // Three full pages queued behind the reader, and a head that says so.
+        for index in 0..3 {
+            let start = 1 + index * limit;
+            let records: Vec<_> = (0..limit)
+                .map(|i| key_record(&format!("k{}", start + i), start + i + 1))
+                .collect();
+            cp.push_page(start, page(records, start + limit, "e1", head));
+        }
+        store.run_tick().await;
+
+        assert_eq!(
+            store.state.read().unwrap().cursor,
+            head,
+            "one tick must catch up to the head the feed reported"
+        );
+        assert!(
+            store.get(&format!("k{}", 3 * limit)).is_some(),
+            "the last key of the last queued page must be served"
+        );
     }
 
     /// A page carrying records while leaving `next_cursor` where it was would
