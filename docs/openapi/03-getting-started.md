@@ -17,9 +17,3 @@ can tell you if the chain reorged while you were away.
 
 For the full query language — filters, the other chain types, and every selectable field — see the
 [SQD docs](https://beta.docs.sqd.dev/en/portal/evm/overview).
-
-## Running your own portal
-
-This reference is for consuming data from a portal. If you want to operate your own, the
-[project README](https://github.com/subsquid/sqd-portal#initial-configuration) covers configuration and
-deployment.
