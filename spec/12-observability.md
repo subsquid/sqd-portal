@@ -63,6 +63,21 @@ never log-only. (Sampled error reporting to DC-7 complements, never replaces, th
 **OB-10 — Congestion window trace.** Window size, grow/shrink counters — the LIV-8
 witness.
 
+**OB-11 — Admission capacity.** Refusals counted by *which* capacity ran out (stream-slot
+cap, download headroom, worker backoff, worker rate limit), the admission cap itself as a
+gauge, and occupancy as an accumulated time integral rather than a sampled level. Three
+reasons the OB-1 census cannot stand in for these. A slot-cap refusal is decided before
+the stream exists, so it is structurally absent from every stream family; a refusal raised
+mid-stream never reaches a status, since the response is already committed. And a gauge
+read at scrape time cannot witness saturation shorter than the scrape interval — the level
+moves many times between two reads, so a fleet pinned at the cap for seconds leaves no
+trace, which is precisely when clients are being refused. Integrating each admitted-stream
+transition under one serialized clock preserves exact elapsed intervals independently of
+the scrape cadence; a periodic flush bounds publication lag without becoming the source of
+truth. Publishing the cap keeps its literal out of the alert expression. All four
+reasons map to one wire code (IB-5 `overloaded`), and must: the client's move is identical,
+the operator's is not.
+
 ## Property → observable mapping
 
 | Property | Decided by |
@@ -73,7 +88,7 @@ witness.
 | LIV-6 | OB-6 identifier/age |
 | LIV-7 | OB-4 selection counters |
 | LIV-8 | OB-10 |
-| LIV-9 | OB-3 refusal counters |
+| LIV-9 | OB-3 refusal counters, OB-11 saturation integral |
 | LIV-10 | OB-1 gauges at quiescence |
 | LIV-12 | OB-9 |
 | INV-30/31 | OB-1, OB-5 (they are the invariant's subject) |

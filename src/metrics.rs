@@ -1,4 +1,4 @@
-use std::iter;
+use std::{iter, time::Duration};
 
 use prometheus_client::{
     metrics::{
@@ -32,6 +32,30 @@ impl std::fmt::Display for MutexLockMode {
 }
 
 type Labels = Vec<(String, String)>;
+
+/// Capacity that caused an overloaded stream refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefusalReason {
+    /// `max_parallel_streams`: this pod's slot cap.
+    TaskLimit,
+    /// Download headroom, `congestion.headroom_threshold`.
+    Bandwidth,
+    /// Every worker is backing off beyond the stream's wait limit.
+    WorkersPaused,
+    /// Every attempt at a chunk was refused for capacity.
+    WorkersRateLimited,
+}
+
+impl RefusalReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskLimit => "task_limit",
+            Self::Bandwidth => "bandwidth",
+            Self::WorkersPaused => "workers_paused",
+            Self::WorkersRateLimited => "workers_rate_limited",
+        }
+    }
+}
 
 /// Final transport outcome of one logical DC-4 request (ADR-015, OB-4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +113,10 @@ lazy_static::lazy_static! {
 
     pub static ref ACTIVE_STREAMS: Gauge = Default::default();
     pub static ref COMPLETED_STREAMS: Counter = Default::default();
+    static ref REFUSED_STREAMS: Family<Labels, Counter> = Default::default();
+    static ref STREAM_SECONDS: Counter<f64> = Default::default();
+    static ref SATURATED_SECONDS: Counter<f64> = Default::default();
+    pub static ref STREAMS_LIMIT: Gauge = Default::default();
     pub static ref STREAM_DURATIONS: Family<Labels, Histogram> =
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(0.01, 2.0, 20)));
     pub static ref STREAM_BYTES: Family<Labels, Histogram> =
@@ -162,6 +190,50 @@ pub fn hotblocks_requests(outcome: HotblocksRequestOutcome) -> u64 {
     HOTBLOCKS_REQUESTS
         .get_or_create(&hotblocks_request_labels(outcome))
         .get()
+}
+
+/// Count a capacity-based stream refusal.
+pub fn report_stream_refused(reason: RefusalReason) {
+    REFUSED_STREAMS.get_or_create(&refusal_labels(reason)).inc();
+}
+
+fn refusal_labels(reason: RefusalReason) -> Labels {
+    vec![("reason".to_owned(), reason.as_str().to_owned())]
+}
+
+#[cfg(test)]
+pub fn refused_streams(reason: RefusalReason) -> u64 {
+    REFUSED_STREAMS.get_or_create(&refusal_labels(reason)).get()
+}
+
+/// Add occupancy accumulated during one elapsed interval.
+pub fn observe_stream_occupancy(running: usize, limit: usize, elapsed: Duration) {
+    let (stream_seconds, saturated_seconds) = occupancy_increments(running, limit, elapsed);
+    STREAM_SECONDS.inc_by(stream_seconds);
+    if saturated_seconds > 0. {
+        SATURATED_SECONDS.inc_by(saturated_seconds);
+    }
+}
+
+#[cfg(test)]
+pub fn stream_seconds() -> f64 {
+    STREAM_SECONDS.get()
+}
+
+#[cfg(test)]
+pub fn saturated_seconds() -> f64 {
+    SATURATED_SECONDS.get()
+}
+
+/// Return `(stream_seconds, saturated_seconds)` for an interval.
+fn occupancy_increments(running: usize, limit: usize, elapsed: Duration) -> (f64, f64) {
+    let seconds = elapsed.as_secs_f64();
+    // A limit of zero would otherwise read as permanently saturated.
+    let saturated = limit > 0 && running >= limit;
+    (
+        running as f64 * seconds,
+        if saturated { seconds } else { 0. },
+    )
 }
 
 /// Carries the wire's `code`/`type`, prefixed — a bare `type` label says nothing on a
@@ -345,6 +417,26 @@ pub fn register_metrics(registry: &mut Registry) {
         COMPLETED_STREAMS.clone(),
     );
     registry.register(
+        "streams_refused",
+        "Streams turned away for want of capacity, by which capacity ran out",
+        REFUSED_STREAMS.clone(),
+    );
+    registry.register(
+        "stream_seconds",
+        "Cumulative stream-seconds; rate() is the mean number of active streams",
+        STREAM_SECONDS.clone(),
+    );
+    registry.register(
+        "streams_saturated_seconds",
+        "Cumulative seconds with every stream slot taken; rate() is the fraction of time at the cap",
+        SATURATED_SECONDS.clone(),
+    );
+    registry.register(
+        "streams_limit",
+        "Configured max_parallel_streams, so alerts need not hardcode it",
+        STREAMS_LIMIT.clone(),
+    );
+    registry.register(
         "stream_duration_seconds",
         "Durations of completed streams",
         STREAM_DURATIONS.clone(),
@@ -489,6 +581,47 @@ mod tests {
         let labels = labels_for(404, None);
         assert_eq!(get(&labels, "error_code"), Some("unclassified"));
         assert_eq!(get(&labels, "error_type"), Some("invalid_request_error"));
+    }
+
+    #[test]
+    fn occupancy_integrates_to_mean_concurrency() {
+        let interval = Duration::from_millis(100);
+        // One second of wall clock, three of twenty slots taken throughout.
+        let total: f64 = (0..10)
+            .map(|_| occupancy_increments(3, 20, interval).0)
+            .sum();
+        assert!((total - 3.0).abs() < 1e-9, "got {total}");
+    }
+
+    #[test]
+    fn saturation_is_counted_only_at_the_cap() {
+        let interval = Duration::from_millis(100);
+        assert_eq!(occupancy_increments(19, 20, interval).1, 0.);
+        assert_eq!(
+            occupancy_increments(20, 20, interval).1,
+            interval.as_secs_f64()
+        );
+        // A limit of zero is a misconfiguration, not 100% saturation forever.
+        assert_eq!(occupancy_increments(0, 0, interval).1, 0.);
+    }
+
+    /// The `reason` label is as public as a wire code: alerts match on it.
+    #[test]
+    fn refusal_reasons_are_distinct_and_frozen() {
+        use RefusalReason::*;
+
+        let reasons = [
+            (TaskLimit, "task_limit"),
+            (Bandwidth, "bandwidth"),
+            (WorkersPaused, "workers_paused"),
+            (WorkersRateLimited, "workers_rate_limited"),
+        ];
+        for (reason, wire) in reasons {
+            assert_eq!(reason.as_str(), wire);
+        }
+        let distinct: std::collections::HashSet<_> =
+            reasons.iter().map(|(_, wire)| *wire).collect();
+        assert_eq!(distinct.len(), reasons.len());
     }
 
     /// A rolling deploy fails /ready on every pod; that must not read as an api_error.

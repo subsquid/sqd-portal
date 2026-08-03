@@ -159,6 +159,12 @@ async fn main() -> anyhow::Result<()> {
         config.pre_drain_grace_period,
     ));
 
+    tokio::spawn(
+        task_manager
+            .clone()
+            .observe_occupancy(cancellation_token.clone()),
+    );
+
     let (server_res, ()) = tokio::try_join!(
         tokio::spawn(run_server(
             task_manager,
