@@ -154,6 +154,8 @@ pub struct DatasetStateResponse {
             include_str!("../docs/openapi/02-blockchain-forks.md"),
             "\n\n",
             include_str!("../docs/openapi/03-getting-started.md"),
+            "\n\n",
+            include_str!("../docs/openapi/04-errors.md"),
         ),
         version = env!("CARGO_PKG_VERSION"),
     ),
@@ -355,5 +357,38 @@ mod tests {
             ops.iter().all(|op| !has_internal_ext(op)),
             "no surviving op should still carry x-internal when show_internal=true"
         );
+    }
+
+    /// The page is prose: nothing but this ties it to the code vocabulary.
+    #[test]
+    fn every_error_code_and_type_is_documented() {
+        use crate::types::ErrorCode;
+
+        const ERRORS_PAGE: &str = include_str!("../docs/openapi/04-errors.md");
+
+        let description = build_openapi_spec(false)
+            .info
+            .description
+            .expect("info.description carries the prose pages");
+        assert!(
+            description.contains(ERRORS_PAGE),
+            "the errors page is not rendered into the served docs"
+        );
+
+        // Against the page itself, not the whole description: a code named in passing on
+        // another page would otherwise pass for documented.
+        for code in ErrorCode::ALL {
+            // Backticked, so a passing mention does not count as documented.
+            assert!(
+                ERRORS_PAGE.contains(&format!("`{}`", code.as_str())),
+                "error code `{}` is missing from docs/openapi/04-errors.md",
+                code.as_str()
+            );
+            let error_type = code.error_type().as_str();
+            assert!(
+                ERRORS_PAGE.contains(&format!("`{error_type}`")),
+                "error type `{error_type}` is missing from docs/openapi/04-errors.md"
+            );
+        }
     }
 }
