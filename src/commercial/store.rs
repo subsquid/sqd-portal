@@ -404,19 +404,28 @@ impl SnapshotStore {
     }
 
     fn install(&self, records: Vec<KeyRecord>, cursor: u64, epoch: Option<String>) {
-        {
+        // Hashing and allocating the whole key set is the expensive half of an
+        // install, and every request in flight waits behind the write lock, so
+        // the map is built before the lock is taken. Freeing the replaced one
+        // costs about as much, so it is handed out and dropped afterwards; what
+        // remains under the lock is the swap.
+        let records: HashMap<_, _> = records
+            .into_iter()
+            .map(|record| (record.key_id.clone(), Arc::new(record)))
+            .collect();
+        let replaced = {
             let mut state = self.state.write().unwrap();
-            state.records = records
-                .into_iter()
-                .map(|record| (record.key_id.clone(), Arc::new(record)))
-                .collect();
+            let replaced = std::mem::replace(&mut state.records, records);
             state.cursor = cursor;
             state.epoch = epoch;
             state.generation += 1;
-            // Both caches describe the replaced generation.
+            // Both caches describe the replaced generation. Taken in the same
+            // order as every other path takes them: state, then these.
             self.negative_cache.lock().unwrap().clear();
             self.limiter.lock().unwrap().reset();
-        }
+            replaced
+        };
+        drop(replaced);
         self.ready.store(true, Ordering::Release);
     }
 
