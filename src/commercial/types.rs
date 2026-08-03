@@ -60,23 +60,24 @@ impl KeyRecord {
     }
 }
 
-/// Feed page envelope. Every field is optional on the wire so the data plane
-/// tolerates both older and newer control planes.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Feed page envelope. The control plane sends all four fields on every page,
+/// so each one is required here: an answer missing any of them is a broken
+/// answer, not an empty page, and defaulting them would turn any 200 — a wrong
+/// route, a half-deployed replica, a proxy with opinions — into a "successful"
+/// sync that quietly stops delivering revocations. Unknown fields are still
+/// ignored, so a newer control plane keeps working.
+#[derive(Debug, Clone, Deserialize)]
 pub struct SnapshotPage {
-    #[serde(default)]
     pub records: Vec<serde_json::Value>,
 
-    #[serde(default)]
     pub next_cursor: u64,
 
     /// Changing epoch is the only full-resync signal: the feed's history was
     /// rebuilt, so cursors from the previous epoch are meaningless.
-    #[serde(default)]
-    pub epoch: Option<String>,
+    pub epoch: String,
 
-    #[serde(default)]
-    pub head_seq: Option<u64>,
+    /// The feed's newest sequence number: what a complete read reaches.
+    pub head_seq: u64,
 }
 
 #[cfg(test)]
@@ -121,22 +122,37 @@ mod tests {
     }
 
     #[test]
-    fn page_tolerates_absent_and_extra_fields() {
+    fn page_requires_every_envelope_field_and_ignores_extra_ones() {
         let page: SnapshotPage = serde_json::from_value(serde_json::json!({
             "records": [],
             "next_cursor": 12,
+            "epoch": "e1",
+            "head_seq": 12,
             "reset": true,
         }))
         .expect("extra envelope fields must be ignored");
 
         assert_eq!(page.next_cursor, 12);
-        assert_eq!(page.epoch, None);
-        assert_eq!(page.head_seq, None);
+        assert_eq!(page.epoch, "e1");
+        assert_eq!(page.head_seq, 12);
 
-        let empty: SnapshotPage =
-            serde_json::from_value(serde_json::json!({})).expect("absent fields must default");
-        assert!(empty.records.is_empty());
-        assert_eq!(empty.next_cursor, 0);
+        // Each of the four is load-bearing: without it the page cannot be
+        // told apart from a broken answer, so its absence is an error.
+        for missing in ["records", "next_cursor", "epoch", "head_seq"] {
+            let mut body = serde_json::json!({
+                "records": [],
+                "next_cursor": 12,
+                "epoch": "e1",
+                "head_seq": 12,
+            });
+            body.as_object_mut().unwrap().remove(missing);
+            let err = serde_json::from_value::<SnapshotPage>(body)
+                .expect_err("a missing envelope field must not parse");
+            assert!(err.to_string().contains(missing), "got {err}");
+        }
+
+        serde_json::from_value::<SnapshotPage>(serde_json::json!({}))
+            .expect_err("an empty envelope is not an empty page");
     }
 
     #[test]

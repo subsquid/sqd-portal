@@ -220,7 +220,7 @@ impl SnapshotStore {
         let result = if self.is_ready() {
             self.sync_once().await
         } else {
-            self.bootstrap(None).await
+            self.bootstrap().await
         };
         match result {
             Ok(()) => self.last_success.store(now_secs(), Ordering::Release),
@@ -263,7 +263,7 @@ impl SnapshotStore {
                     "commercial snapshot feed head rolled back; resyncing from scratch"
                 ),
             }
-            return self.bootstrap(page.epoch).await;
+            return self.bootstrap().await;
         }
 
         self.observe_epoch(page.epoch);
@@ -272,10 +272,10 @@ impl SnapshotStore {
         }
 
         let next_cursor = page.next_cursor;
-        // Records without forward movement cannot be trusted: `next_cursor`
-        // defaults to zero, so applying such a page would also rewind the feed
-        // to its first page and replay it forever. Fail the tick instead and
-        // keep the last good state until the control plane makes sense again.
+        // Records without forward movement cannot be trusted: applying such a
+        // page would leave the cursor where it was — or move it backwards —
+        // and replay the same page forever. Fail the tick instead and keep the
+        // last good state until the control plane makes sense again.
         anyhow::ensure!(
             next_cursor > cursor,
             "snapshot delta carried {} record(s) without advancing cursor {cursor} (next_cursor {next_cursor})",
@@ -292,14 +292,14 @@ impl SnapshotStore {
     }
 
     /// Re-reads the whole feed from cursor zero and replaces the served state.
-    async fn bootstrap(&self, fallback_epoch: Option<String>) -> anyhow::Result<()> {
+    async fn bootstrap(&self) -> anyhow::Result<()> {
         let mut cursor = 0;
         let mut records = Vec::new();
-        let mut epoch = fallback_epoch;
+        let mut epoch: Option<String> = None;
         let mut pages = 0usize;
-        let mut head = None;
 
-        loop {
+        // The head the last page read reported: what a complete read reaches.
+        let head = loop {
             anyhow::ensure!(
                 pages < MAX_BOOTSTRAP_PAGES,
                 "snapshot bootstrap exceeded {MAX_BOOTSTRAP_PAGES} pages"
@@ -311,36 +311,28 @@ impl SnapshotStore {
             // so a flip mid-bootstrap fails the tick. The next one starts from
             // cursor zero anyway, which is exactly the restart this used to do
             // by hand.
-            let epoch_changed = pages > 1
-                && page
-                    .epoch
-                    .as_ref()
-                    .zip(epoch.as_ref())
-                    .is_some_and(|(received, expected)| received != expected);
             anyhow::ensure!(
-                !epoch_changed,
-                "snapshot epoch changed mid-bootstrap: expected {epoch:?}, received {:?}",
+                epoch
+                    .as_ref()
+                    .is_none_or(|expected| *expected == page.epoch),
+                "snapshot epoch changed mid-bootstrap: expected {epoch:?}, received {}",
                 page.epoch
             );
-            if page.epoch.is_some() {
-                epoch = page.epoch;
-            }
-            if page.head_seq.is_some() {
-                head = page.head_seq;
-            }
 
             let page_len = page.records.len();
+            let head = page.head_seq;
             records.extend(parse_records(page.records)?);
+            epoch = Some(page.epoch);
             if page_len < usize::from(PAGE_LIMIT) {
                 cursor = page.next_cursor;
-                break;
+                break head;
             }
             anyhow::ensure!(
                 page.next_cursor > cursor,
                 "snapshot bootstrap cursor did not advance past {cursor}"
             );
             cursor = page.next_cursor;
-        }
+        };
 
         // A short page is the feed saying "that is all of it", and `head_seq`
         // is the feed saying how much there is. When they disagree the pages we
@@ -348,8 +340,8 @@ impl SnapshotStore {
         // — so this is a failed tick, not a snapshot. The last good one keeps
         // serving; a portal that has none stays out of rotation.
         anyhow::ensure!(
-            head.is_none_or(|head| cursor >= head),
-            "snapshot bootstrap ended at cursor {cursor}, short of head {head:?}, after {pages} page(s)"
+            cursor >= head,
+            "snapshot bootstrap ended at cursor {cursor}, short of head {head}, after {pages} page(s)"
         );
 
         let count = records.len();
@@ -359,25 +351,22 @@ impl SnapshotStore {
     }
 
     fn resync_reason(&self, cursor: u64, page: &SnapshotPage) -> Option<ResyncReason> {
-        if let Some(head_seq) = page.head_seq {
-            if cursor > head_seq {
-                return Some(ResyncReason::HeadRolledBack { cursor, head_seq });
-            }
+        if cursor > page.head_seq {
+            return Some(ResyncReason::HeadRolledBack {
+                cursor,
+                head_seq: page.head_seq,
+            });
         }
-        let received = page.epoch.as_ref()?;
         match self.state.read().unwrap().epoch.clone() {
-            Some(stored) if stored != *received => Some(ResyncReason::EpochChanged {
+            Some(stored) if stored != page.epoch => Some(ResyncReason::EpochChanged {
                 stored,
-                received: received.clone(),
+                received: page.epoch.clone(),
             }),
             _ => None,
         }
     }
 
-    fn observe_epoch(&self, epoch: Option<String>) {
-        let Some(epoch) = epoch else {
-            return;
-        };
+    fn observe_epoch(&self, epoch: String) {
         self.state.write().unwrap().epoch = Some(epoch);
     }
 
@@ -494,10 +483,10 @@ mod tests {
         let first: Vec<_> = (0..PAGE_LIMIT)
             .map(|i| key_record(&format!("k{i}"), u64::from(i) + 1))
             .collect();
-        cp.push_page(0, page(first, u64::from(PAGE_LIMIT), Some("e1"), None));
+        cp.push_page(0, page(first, u64::from(PAGE_LIMIT), "e1", 5000));
         cp.push_page(
             u64::from(PAGE_LIMIT),
-            page(vec![key_record("last", 5000)], 5000, Some("e1"), Some(5000)),
+            page(vec![key_record("last", 5000)], 5000, "e1", 5000),
         );
 
         let store = store_for(&cp).await;
@@ -521,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn a_bootstrap_that_ends_short_of_the_head_installs_nothing() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![], 0, Some("e1"), Some(500)));
+        cp.push_page(0, page(vec![], 0, "e1", 500));
 
         let store = store_for(&cp).await;
         store.run_tick().await;
@@ -543,7 +532,7 @@ mod tests {
         let records: Vec<_> = (0..3u64)
             .map(|i| key_record(&format!("k{i}"), i + 1))
             .collect();
-        cp.push_page(0, page(records, 3, Some("e1"), Some(5000)));
+        cp.push_page(0, page(records, 3, "e1", 5000));
 
         let store = store_for(&cp).await;
         store.run_tick().await;
@@ -564,10 +553,10 @@ mod tests {
         let first: Vec<_> = (0..PAGE_LIMIT)
             .map(|i| key_record(&format!("k{i}"), u64::from(i) + 1))
             .collect();
-        cp.push_page(0, page(first, u64::from(PAGE_LIMIT), Some("e1"), None));
+        cp.push_page(0, page(first, u64::from(PAGE_LIMIT), "e1", 5000));
         cp.push_page(
             u64::from(PAGE_LIMIT),
-            page(vec![key_record("late", 5000)], 5000, Some("e2"), Some(5000)),
+            page(vec![key_record("late", 5000)], 5000, "e2", 5000),
         );
 
         let store = store_for(&cp).await;
@@ -582,20 +571,20 @@ mod tests {
     #[tokio::test]
     async fn delta_upserts_by_sequence_and_advances_the_cursor() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![key_record("k1", 1)], 1, Some("e1"), Some(1)));
+        cp.push_page(0, page(vec![key_record("k1", 1)], 1, "e1", 1));
         let store = store_for(&cp).await;
         store.run_tick().await;
 
         let mut revoked = key_record("k1", 2);
         revoked.status = KeyStatus::Revoked;
-        cp.push_page(1, page(vec![revoked], 2, Some("e1"), Some(2)));
+        cp.push_page(1, page(vec![revoked], 2, "e1", 2));
         store.run_tick().await;
 
         assert_eq!(store.get("k1").unwrap().status, KeyStatus::Revoked);
         assert_eq!(store.state.read().unwrap().cursor, 2);
 
         // An out-of-order replay must not resurrect the older version.
-        cp.push_page(2, page(vec![key_record("k1", 1)], 3, Some("e1"), Some(3)));
+        cp.push_page(2, page(vec![key_record("k1", 1)], 3, "e1", 3));
         store.run_tick().await;
         assert_eq!(store.get("k1").unwrap().status, KeyStatus::Revoked);
         assert_eq!(store.state.read().unwrap().cursor, 3);
@@ -606,12 +595,7 @@ mod tests {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(
             0,
-            page(
-                vec![key_record("old", 1), key_record("k1", 2)],
-                2,
-                Some("e1"),
-                Some(2),
-            ),
+            page(vec![key_record("old", 1), key_record("k1", 2)], 2, "e1", 2),
         );
         let store = store_for(&cp).await;
         store.run_tick().await;
@@ -619,8 +603,8 @@ mod tests {
 
         // The next poll answers with a new epoch; the re-bootstrap that follows
         // starts from cursor zero and no longer publishes `old`.
-        cp.push_page(2, page(vec![], 2, Some("e2"), Some(9)));
-        cp.push_page(0, page(vec![key_record("k1", 9)], 9, Some("e2"), Some(9)));
+        cp.push_page(2, page(vec![], 2, "e2", 9));
+        cp.push_page(0, page(vec![key_record("k1", 9)], 9, "e2", 9));
         store.run_tick().await;
 
         assert!(
@@ -636,41 +620,30 @@ mod tests {
     #[tokio::test]
     async fn cursor_beyond_head_seq_resyncs_from_cursor_zero() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(
-            0,
-            page(vec![key_record("k1", 40)], 40, Some("e1"), Some(40)),
-        );
+        cp.push_page(0, page(vec![key_record("k1", 40)], 40, "e1", 40));
         let store = store_for(&cp).await;
         store.run_tick().await;
 
-        cp.push_page(40, page(vec![], 40, Some("e1"), Some(3)));
-        cp.push_page(0, page(vec![key_record("k1", 3)], 3, Some("e1"), Some(3)));
+        cp.push_page(40, page(vec![], 40, "e1", 3));
+        cp.push_page(0, page(vec![key_record("k1", 3)], 3, "e1", 3));
         store.run_tick().await;
 
         assert_eq!(store.state.read().unwrap().cursor, 3);
         assert_eq!(cp.snapshot_cursors(), vec![0, 40, 0]);
     }
 
-    /// `next_cursor` defaults to zero, so a page that omits it while carrying
-    /// records would both apply them and rewind the cursor to the start of the
-    /// feed — a first-page replay loop that never ends. Bootstrap already
-    /// guards this; the delta path must too.
+    /// A page carrying records while leaving `next_cursor` where it was would
+    /// apply them and then ask for the same page again, forever. Bootstrap
+    /// already guards this; the delta path must too.
     #[tokio::test]
     async fn a_delta_that_does_not_advance_the_cursor_is_refused() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![key_record("k1", 5)], 5, Some("e1"), Some(5)));
+        cp.push_page(0, page(vec![key_record("k1", 5)], 5, "e1", 5));
         let store = store_for(&cp).await;
         store.run_tick().await;
         assert_eq!(store.state.read().unwrap().cursor, 5);
 
-        cp.push_page(
-            5,
-            serde_json::json!({
-                "records": [key_record("k2", 6)],
-                "epoch": "e1",
-                "head_seq": 6,
-            }),
-        );
+        cp.push_page(5, page(vec![key_record("k2", 6)], 5, "e1", 6));
         store.run_tick().await;
 
         assert_eq!(
@@ -688,12 +661,43 @@ mod tests {
         );
     }
 
+    /// The control plane always sends all four envelope fields, so a 200 that
+    /// carries none of them is not an empty page — it is not a page. Read as
+    /// one, every such answer (a wrong route, a half-deployed replica, a proxy
+    /// with opinions) counted as a successful sync: the staleness telemetry
+    /// stayed green while revocations silently stopped arriving.
+    #[tokio::test]
+    async fn an_empty_envelope_is_a_failed_tick_not_an_empty_page() {
+        let cp = MockControlPlane::spawn().await;
+        cp.push_page(0, page(vec![key_record("k1", 1)], 1, "e1", 1));
+        let store = store_for(&cp).await;
+        store.run_tick().await;
+        assert!(store.is_ready());
+
+        // As if the control plane had been answering nothing but `{}` for
+        // hours: a tick that "succeeds" resets the age it reports.
+        store
+            .last_success
+            .store(now_secs() - 10_000, Ordering::Release);
+        cp.push_page(1, serde_json::json!({}));
+        store.run_tick().await;
+
+        assert!(
+            store.stale_for_seconds() >= 10_000,
+            "an empty envelope must not pass for a successful sync"
+        );
+        assert!(
+            store.get("k1").is_some(),
+            "and the last good snapshot keeps serving"
+        );
+    }
+
     /// A feed that has been down for days must not read like one that missed a
     /// single tick, so every failure says how old the served key set is.
     #[tokio::test]
     async fn a_failed_sync_reports_how_long_the_snapshot_has_been_stale() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![key_record("k1", 1)], 1, Some("e1"), Some(1)));
+        cp.push_page(0, page(vec![key_record("k1", 1)], 1, "e1", 1));
         let store = store_for(&cp).await;
         store.run_tick().await;
         assert_eq!(store.stale_for_seconds(), 0);
@@ -713,7 +717,7 @@ mod tests {
         );
 
         cp.fail_snapshots(false);
-        cp.push_page(1, page(vec![], 1, Some("e1"), Some(1)));
+        cp.push_page(1, page(vec![], 1, "e1", 1));
         store.run_tick().await;
         assert_eq!(store.stale_for_seconds(), 0, "a successful sync resets it");
     }
@@ -721,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn sync_failure_keeps_serving_the_last_snapshot() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![key_record("k1", 1)], 1, Some("e1"), Some(1)));
+        cp.push_page(0, page(vec![key_record("k1", 1)], 1, "e1", 1));
         let store = store_for(&cp).await;
         store.run_tick().await;
 
@@ -735,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_records_are_tombstoned_and_unidentifiable_ones_fail_the_page() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![key_record("k1", 1)], 1, Some("e1"), Some(1)));
+        cp.push_page(0, page(vec![key_record("k1", 1)], 1, "e1", 1));
         let store = store_for(&cp).await;
         store.run_tick().await;
         assert_eq!(store.get("k1").unwrap().status, KeyStatus::Active);
@@ -746,6 +750,7 @@ mod tests {
                 "records": [{"key_id": "k1", "seq": 2, "status": 17}],
                 "next_cursor": 2,
                 "epoch": "e1",
+                "head_seq": 2,
             }),
         );
         store.run_tick().await;
@@ -769,6 +774,7 @@ mod tests {
                 }],
                 "next_cursor": 3,
                 "epoch": "e1",
+                "head_seq": 3,
             }),
         );
         store.run_tick().await;
@@ -785,6 +791,7 @@ mod tests {
                 "records": [{"nothing": "identifiable"}],
                 "next_cursor": 4,
                 "epoch": "e1",
+                "head_seq": 4,
             }),
         );
         store.run_tick().await;
@@ -801,7 +808,7 @@ mod tests {
     #[tokio::test]
     async fn an_authorize_answer_with_an_unknown_status_is_rejected_and_not_cached() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
+        cp.push_page(0, page(vec![], 0, "e1", 0));
         cp.authorize_raw(
             "k1",
             serde_json::json!({"key_id": "k1", "seq": 1, "status": "suspended"}),
@@ -817,7 +824,7 @@ mod tests {
     #[tokio::test]
     async fn authorize_on_miss_inserts_the_record() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
+        cp.push_page(0, page(vec![], 0, "e1", 0));
         cp.authorize_with("k1", Some(key_record("k1", 3)));
         let store = store_for(&cp).await;
         store.run_tick().await;
@@ -878,7 +885,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_keys_are_negative_cached() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
+        cp.push_page(0, page(vec![], 0, "e1", 0));
         let store = store_for(&cp).await;
         store.run_tick().await;
 
@@ -894,7 +901,7 @@ mod tests {
     #[tokio::test]
     async fn authorize_is_rate_limited_and_fails_closed() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
+        cp.push_page(0, page(vec![], 0, "e1", 0));
         cp.authorize_with("k1", Some(key_record("k1", 1)));
         let store = store_for(&cp).await;
         store.run_tick().await;
@@ -913,7 +920,7 @@ mod tests {
     #[tokio::test]
     async fn control_plane_errors_during_authorize_fail_closed() {
         let cp = MockControlPlane::spawn().await;
-        cp.push_page(0, page(vec![], 0, Some("e1"), Some(0)));
+        cp.push_page(0, page(vec![], 0, "e1", 0));
         cp.authorize_status("k1", 500);
         let store = store_for(&cp).await;
         store.run_tick().await;

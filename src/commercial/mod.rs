@@ -101,11 +101,13 @@ pub mod test_support {
         }
     }
 
+    /// A well-formed feed page: the control plane sends all four envelope
+    /// fields on every page, and so does this.
     pub fn page(
         records: Vec<KeyRecord>,
         next_cursor: u64,
-        epoch: Option<&str>,
-        head_seq: Option<u64>,
+        epoch: &str,
+        head_seq: u64,
     ) -> serde_json::Value {
         serde_json::json!({
             "records": records,
@@ -172,6 +174,9 @@ pub mod test_support {
     #[derive(Default)]
     struct MockState {
         pages: Mutex<VecDeque<(u64, serde_json::Value)>>,
+        /// Epoch of the last queued page served, so the empty pages this
+        /// answers with once the queue drains do not read as a feed rebuild.
+        epoch: Mutex<Option<String>>,
         snapshot_cursors: Mutex<Vec<u64>>,
         fail_snapshots: Mutex<bool>,
         authorize: Mutex<HashMap<String, serde_json::Value>>,
@@ -283,10 +288,21 @@ pub mod test_support {
         let index = pages
             .iter()
             .position(|(min_cursor, _)| query.cursor >= *min_cursor);
-        let page = index
+        let Some(page) = index
             .and_then(|index| pages.remove(index))
             .map(|(_, page)| page)
-            .unwrap_or_else(|| serde_json::json!({ "records": [], "next_cursor": query.cursor }));
+        else {
+            let epoch = state.epoch.lock().unwrap().clone();
+            return Ok(Json(serde_json::json!({
+                "records": [],
+                "next_cursor": query.cursor,
+                "epoch": epoch.as_deref().unwrap_or("e1"),
+                "head_seq": query.cursor,
+            })));
+        };
+        if let Some(epoch) = page.get("epoch").and_then(serde_json::Value::as_str) {
+            *state.epoch.lock().unwrap() = Some(epoch.to_owned());
+        }
         Ok(Json(page))
     }
 
