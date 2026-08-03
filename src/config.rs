@@ -125,6 +125,12 @@ pub struct Config {
     #[serde(default)]
     pub ignore_deprecated_workers: bool,
 
+    /// Whether to prefer the portal-oriented assignment over the legacy one when both are
+    /// available (`mvcc-chunks` builds only). A runtime kill switch: can be flipped back to
+    /// `false` without a rebuild if `portal_assignment` needs to be reverted.
+    #[serde(default = "default_true")]
+    pub prefer_portal_assignment: bool,
+
     /// Please avoid overriding this value. It may eventually become unsupported.
     #[serde(default = "default_query_size_limit")]
     pub query_size_limit: u64,

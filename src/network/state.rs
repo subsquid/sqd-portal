@@ -101,6 +101,10 @@ impl NetworkState {
         self.dataset_storage.ignore_deprecated_workers();
     }
 
+    pub fn set_prefer_portal_assignment(&mut self, prefer: bool) {
+        self.dataset_storage.set_prefer_portal_assignment(prefer);
+    }
+
     pub async fn try_update_assignment(&self) {
         self.dataset_storage.try_update_assignment().await;
     }
