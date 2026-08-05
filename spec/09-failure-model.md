@@ -75,7 +75,7 @@ unreachable would convert its outage into the Portal's (REQ-54).
 
 | Fault | Required response |
 |---|---|
-| Feed unreachable / timeout / error status | degrade serve-static on the established snapshot + alarm on age (OB-13); no request fails for this reason. Age is exported; the bound on it is still ⚠ (OQ-12, GAP-31) |
+| Feed unreachable / timeout / error status | serve-static on the established snapshot; no request fails for this reason, at any age. Past P-KEY-SNAPSHOT-MAX-AGE the deployment alarms (OB-9/13) and the Portal's own behaviour is unchanged — that is the whole response (closed OQ-12) |
 | Feed answers 200 with a malformed envelope | integrity: fail the tick, keep the snapshot, alarm. Never read as "the key set is empty" — that would silently stop delivering revocations |
 | Record malformed but identifiable | integrity: tombstone the key (fail-closed), count, keep serving everything else |
 | Record unidentifiable | integrity: fail the page; snapshot unchanged |

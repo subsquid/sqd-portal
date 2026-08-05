@@ -159,10 +159,11 @@ plane's answer.
 | Lookup: call fails, times out, or returns an unusable answer | refuse as UPSTREAM-FAILURE; the same credential may succeed after recovery, so this is never BAD-CREDENTIAL |
 | Lookup: answer names a different key than was asked about | discard the answer and refuse as UPSTREAM-FAILURE |
 
-*Degradation.* Fail-static and unbounded today: the established snapshot serves for as
-long as the outage lasts, so a revocation issued during it does not land until the feed
-returns. The age is exported and alarmable (OB-13); what bounds it is still open —
-P-KEY-SNAPSHOT-MAX-AGE ⚠ (OQ-12, GAP-31). Before the
+*Degradation.* Fail-static, and deliberately unbounded: the established snapshot serves
+for as long as the outage lasts, so a revocation issued during it does not land until the
+feed returns. Past P-KEY-SNAPSHOT-MAX-AGE the deployment is alarmed (OB-9) and nothing
+else changes — a staleness rule in the binary would take every replica out of rotation at
+once, since they all read the same feed (closed OQ-12). Before the
 *first* complete bootstrap there is no snapshot to be static about, and an enforcing
 Portal declines readiness instead of refusing every key (INV-31). Nothing survives
 restart (NG5): every replica re-reads the feed from the start on boot, which puts the
@@ -177,7 +178,7 @@ whole key set on the startup path and in every replica's memory (HZ-11).
 | Chain status | DC-5 poll | none (status only) | loading state before first fetch |
 | Worker health map (DEF-12) | per-query outcomes | rolling windows (P-WORKER-ERROR-COOLDOWN / P-WORKER-TIMEOUT-COOLDOWN) | operator debug view |
 | Heads | artifact (archival) / per-request (real-time) | one successful P-ASSIGNMENT-REFRESH cycle / live; archival outage unbounded | response metadata (INV-24) |
-| Key snapshot (DEF-18) | DC-8 feed poll, plus authorize-on-miss for absent keys | LIV-13's page-count-dependent bound while healthy; none during outage today; ⚠ P-KEY-SNAPSHOT-MAX-AGE (OQ-12) | age gauge + sync-failure counters (OB-13) |
+| Key snapshot (DEF-18) | DC-8 feed poll, plus authorize-on-miss for absent keys | LIV-13's page-count-dependent bound while healthy; none during an outage, by decision | age gauge + sync-failure counters (OB-13), alarmed past P-KEY-SNAPSHOT-MAX-AGE (OB-9) |
 | Negative key answers | DC-8 lookup | P-KEY-NEGATIVE-TTL; cleared wholesale by a snapshot rebuild | protected lookup events (OB-13) |
 
 There is no response cache: no client-visible value is ever served from a cache other

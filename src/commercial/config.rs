@@ -35,7 +35,7 @@ pub enum Enforcement {
     Enforce,
     /// Evaluates the full ladder and logs the verdict, then admits regardless —
     /// including requests with no credential at all. Shadow mode for the
-    /// cutover window while the Cloudflare rule is still the real gate.
+    /// cutover window, while something upstream is still the real gate.
     LogOnly,
 }
 

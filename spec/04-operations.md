@@ -126,9 +126,8 @@ an artifact is applied ∧ worker connectivity ≥ P-READY-CONNECTION-RATIO ∧ 
 down ∧ (on a commercial deployment that is *enforcing*, a key snapshot has been
 established — REQ-54) (INV-31). Shadow enforcement adds no such condition: it admits
 regardless of what the snapshot knows, so withholding readiness for it would cause the
-outage shadow mode exists to avoid (REQ-55). Intent (ADR-013 ⚠): also degrade when
-artifact age > P-ASSIGNMENT-MAX-AGE; the key-set analogue,
-P-KEY-SNAPSHOT-MAX-AGE ⚠, is open on OQ-12.
+outage shadow mode exists to avoid (REQ-55). Intent (ADR-013 ⚠): also degrade when artifact age > P-ASSIGNMENT-MAX-AGE. Key-snapshot
+age never degrades readiness — it is alarmed and nothing more (closed OQ-12).
 
 ## OP-9 — Metrics read
 

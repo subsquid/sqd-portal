@@ -1,7 +1,7 @@
 # 13 — Conformance & TDD plan
 
-**Mutable doc.** Statuses as of **2026-08-05** (0.11.9,
-`master@15fcaeeea803b39e4985a7c91dada20203f411ef`). Statuses: **C** covered · **P** partial · **U**
+**Mutable doc.** Statuses as of **2026-08-06** (0.11.9,
+`master@0eca28eb55a17512f5c26e73fba8b944729c38ce`). Statuses: **C** covered · **P** partial · **U**
 unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
 The **Phase-0 harness exists** (`harness/` crate: IB-7 stubs with ledgers — including
 a real p2p worker stub on the pinned transport rev — toy world, reference model, the six
@@ -133,7 +133,7 @@ chunk-boundary records FV-6 licenses.
    unless the upstream sent one (ADR-014); `WWW-Authenticate: Bearer` on every 401; no
    data alongside errors (INV-26, IB-5).
 
-## Traceability matrix — properties (2026-08-05)
+## Traceability matrix — properties (2026-08-06)
 
 | Property | CT | Status | Note |
 |---|---|---|---|
@@ -182,7 +182,7 @@ chunk-boundary records FV-6 licenses.
 | LIV-14 | CT-10 | P | authorize-on-miss is unit-tested, and rate-limited, in-flight-capped and failed lookups each answer the retryable outcome DC-8 requires. The admission bound and the HZ-10 interference case are untested (GAP-33) |
 | DC-8 | CT-10 | P | feed faults are well covered at unit level — non-success status, malformed envelope, missing envelope fields, non-advancing cursor, short-of-head bootstrap, mid-bootstrap epoch flip, redirect refusal. Nothing runs against a stub in the harness, so none of it is CT-2-style fault injection (GAP-33) |
 
-## Acceptance matrix — requirements (2026-08-05)
+## Acceptance matrix — requirements (2026-08-06)
 
 | REQ | Status | Note |
 |---|---|---|
@@ -221,11 +221,11 @@ chunk-boundary records FV-6 licenses.
 | REQ-51 | C | A route that states neither set does not compile, which is the requirement rather than a test of it; a gated route and an open one are asserted end-to-end against the same gate; the OB-12 label set names no route and no dataset |
 | REQ-52 | P | Token grammar, both presentation channels, length caps and the alphabet are unit-tested; digest-only handling is structural. Log/metric non-disclosure is unasserted (INV-38) |
 | REQ-53 | C | Precedence, absent-vs-empty scope, exact matching, alias resolution, and the no-dataset route case are unit-tested, including the earliest-rung-wins corpus and the digestless tombstone, which fails at the secret rung |
-| REQ-54 | P | Fail-closed on unknown keys and fail-static across feed faults are unit-tested, as is readiness withholding before the first snapshot; a spent lookup budget answers OVERLOADED with `Retry-After` and a failed lookup UPSTREAM-FAILURE, both asserted against a snapshot hit through the same outage. Staleness is exported but unbounded (GAP-31) |
+| REQ-54 | C | Fail-closed on unknown keys and fail-static across feed faults are unit-tested, as is readiness withholding before the first snapshot; a spent lookup budget answers OVERLOADED with `Retry-After` and a failed lookup UPSTREAM-FAILURE, both asserted against a snapshot hit through the same outage. Staleness is exported and alarmed rather than acted on, which is the ratified behaviour (closed OQ-12) |
 | REQ-55 | P | Shadow mode is asserted to admit the whole rejection corpus, record ordinary verdicts, not withhold readiness, and project valid, invalid and indeterminate onto one neutral public series. End-to-end coverage through a stub world is missing (GAP-33) |
 | REQ-56 | C | Absent configuration is asserted to install no middleware even on a route that asked for it, an empty block fails startup naming the missing field through both deserializer paths, and the mode is logged once at startup |
 
-## Gap register — 2026-08-05
+## Gap register — 2026-08-06
 
 Priorities: P0 blocks the program · P1 active production risk · P2 correctness hole
 with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
@@ -258,12 +258,19 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-26 | No aggregate deadline bounds a worker attempt: connect is a 10 s crate default (P-WORKER-CONNECT-TIMEOUT, not operator-bound), first byte 60 s, and the body is read in 1 s-stall-bounded reads with no total bound — DC-1's single "request deadline P-TRANSPORT-TIMEOUT" is not what runs, and the transport's `request_timeout` is set but unused on this path | DC-1, REQ-22, HZ-2 | P2 | stub worker trickles a body at just under the per-read stall bound indefinitely; assert the attempt is bounded |
 | GAP-27 | Penalty classification diverges from ADR-004's cost rationale: an instant stream reset (the worker's documented flood-shed posture) draws the 300 s timeout-class cooldown plus a congestion signal, and integrity penalties are split (bad signature 300 s vs undecodable/wrong-range 30 s) though DC-1 treats them as one class — a brief worker-side flood can push the whole pool to AllUnavailable | REQ-41, DC-1, LIV-7 | P2 | CT-2: instant-reset injector; assert the cooldown class matches observed cost and the pool recovers within the error-cooldown window |
 
-| GAP-30 | The OB-12 decision counter and the OB-13 snapshot families exist and are non-disclosing, but nothing aggregates them into the view a cutover is actually run from: refusal rate by code against admitted traffic, and snapshot age against a threshold OQ-12 has not set | OB-12, OB-13 (presentation only) | P3 | build the dashboard, and the age alarm once OQ-12 names a threshold |
-| GAP-31 | Key-snapshot staleness is exported but still unbounded. `commercial_key_snapshot_age_seconds` climbs through a control-plane outage and sync failures are counted by cause, so the outage is visible; nothing degrades, because what an enforcing Portal should do once its key set is older than P-KEY-SNAPSHOT-MAX-AGE is undecided. Revocations issued during an outage still do not land. The GAP-2 shape, minus the invisibility | REQ-54, INV-31 ⚠, OB-13 (ADR-016, OQ-12) | P2 | ratify P-KEY-SNAPSHOT-MAX-AGE via OQ-12, then test the degradation |
+| GAP-30 | The OB-12 decision counter and the OB-13 snapshot families exist and are non-disclosing, but nothing consumes them: no dashboard shows refusal rate by code against admitted traffic, and the OB-9 alarm on snapshot age past P-KEY-SNAPSHOT-MAX-AGE is unconfigured. Both live in the monitoring stack, not the binary | OB-9, OB-12, OB-13 (presentation only) | P3 | wire the age alarm, then build the cutover dashboard |
 | GAP-32 | **Accepted residual.** A key id absent from the snapshot may take longer than a hit, and under lookup pressure receives retryable OVERLOADED/UPSTREAM-FAILURE where a present id with a wrong secret receives BAD-CREDENTIAL — so the accurate retry contract does reveal snapshot membership. Accepted rather than closed: collapsing both onto one outcome means refusing valid keys during a control-plane blip, which REQ-54 forbids. Public metrics do not amplify it, and a test pins that | INV-39 | P3 | revisit only if the timing channel is shown to be exploitable at scale |
 | GAP-33 | CT-10 has no harness: DC-8 has no stub in `harness/`, so every claim in the CT-10 row set is unit-tested inside the crate rather than driven black-box. Nothing exercises a concurrent rebuild against an in-flight lookup (INV-6's race), zero serving-dependency calls and one bounded DC-8 call under refusal (INV-14), verdict determinism across replicas (INV-15), secret/non-oracle disclosure in emitted signals (INV-38/39), or HZ-10's interference with legitimate new keys. All the phase-1 constants are hard-coded rather than operator-bound (15 §commercial) | CT-10, DC-8, INV-6/14/15/38/39, HZ-10 | P1 | build the DC-8 stub per IB-7; the cheapest first case is INV-14's call-ledger assertion, which needs only the stub's ledger |
 
 ### Closed findings
+
+- **GAP-31** (closed 2026-08-06): key-snapshot staleness was unbounded and unexported. The
+  age gauge, the cursor/head/epoch series and the sync-failure counters landed with OB-13,
+  and the age climbs through an outage rather than freezing, so the alarm OB-9 now lists
+  has something to fire on. The bound itself was ratified as an *alert* threshold rather
+  than a code path (900 s, closed OQ-12): a staleness rule in the binary would pull the
+  whole fleet from rotation at once, since every replica reads the same feed, and REQ-54
+  promises the opposite outright.
 
 - **GAP-29** (closed 2026-08-05): authorization refusals were built outside the ADR-011
   envelope, so they carried no `ErrorCode` and the middleware every routed response passes

@@ -490,11 +490,12 @@ Deliberately left open — tests and clients must not pin these:
 | OQ-7 | A stream body without a first block silently defaults to block 0, while the API description marks it required — reject instead? | REQ-7 | portal team |
 | OQ-9 | Ratify a global P-BUFFERED-BYTES-BUDGET and its accounting/admission semantics. | REQ-27, GAP-17 | portal team |
 | OQ-10 | Ratify the draft SLO target parameters and their benchmark gating policy. | 11 SLO table | portal team |
-| OQ-12 | Ratify P-KEY-SNAPSHOT-MAX-AGE and what an enforcing Portal does once its key set is older than it — decline readiness (the ADR-013 answer for assignments) or keep serving and alarm only? Revocation latency and a control-plane outage pull in opposite directions. | REQ-54, GAP-31, ADR-016 | portal team |
 | OQ-13 | Should a dataset-scoped key be able to use the SQL surface, which names its datasets in the body rather than the path? Today such a key is refused there outright (REQ-53), which is fail-closed but makes the surface unusable for exactly the customers most likely to be scoped. | REQ-53, OP-10 | portal team |
 | OQ-11 | REQ-40's fleet-cutover premise assumes workers also honor `effective_from`; workers currently apply assignments immediately (recorded in the worker suite's open questions, `worker-rs/spec/02`), so each publication opens a window of routing to reshuffling workers (transient `no_workers`/`retries_exhausted` churn). Size the window for worker convergence, or have workers delay too? | REQ-40, REQ-41 | network team |
 
 Closed: **OQ-6** (should the clamp-bypassing debug stream variant be exposed unconditionally,
 or gated behind an operator flag?) — resolved by ADR-014: the variant is gated behind an
-operator flag and disabled by default (GAP-21 until implemented). OQ numbers are never
-recycled.
+operator flag and disabled by default (GAP-21 until implemented). **OQ-12** (what does an
+enforcing Portal do once its key set is older than P-KEY-SNAPSHOT-MAX-AGE?) — resolved by
+ADR-016: it keeps serving and alarms, and the parameter is an alert threshold rather than
+anything the binary reads. OQ numbers are never recycled.

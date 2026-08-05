@@ -67,9 +67,16 @@ outside the 400/404/409/5xx set.
 
 Two properties now need bounds the suite did not previously owe anyone: how long a
 revocation may take to reach a replica (LIV-13) and how stale a snapshot may get before
-the deployment should stop trusting it (P-KEY-SNAPSHOT-MAX-AGE ⚠, OQ-12). Age is
-exported and alarmable; what the Portal should *do* once it is exceeded is the open half.
-Both are the key-set analogue of the assignment-staleness question ADR-013 leaves open,
-and should be ratified together.
+somebody should be woken up (P-KEY-SNAPSHOT-MAX-AGE, 900 s).
+
+Past that age the Portal does nothing — it keeps serving and the deployment alarms
+(closed OQ-12). This is deliberately *not* the ADR-013 answer for assignments, where a
+stale artifact declines readiness, and the difference is worth stating. Every replica
+reads the same feed, so a staleness rule would take the whole fleet out of rotation at
+once, in the one situation where nobody can bring it back: the control plane being down.
+REQ-54 already promises the opposite in as many words. And a revocation that has to land
+*fast* is not served by this mechanism at all — staleness-based readiness punishes every
+customer for one key, and only fires while the control plane is unreachable. If phase 2
+needs guaranteed fast revocation, that is a pushed kill-list, not a timer.
 
 Shapes REQ-50..REQ-56; adds DC-8; retires NG1.

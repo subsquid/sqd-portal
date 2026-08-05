@@ -230,8 +230,10 @@ Ready ⇒ (an artifact is applied ∧ connectivity ≥ P-READY-CONNECTION-RATIO 
 shutting down ∧ (enforcing commercial ⇒ a key snapshot has been established)). A Portal
 that would refuse every valid key is not ready (REQ-54); a shadow-mode one has no such
 conjunct, since it refuses nobody (REQ-55). Shutdown flips readiness before intake stops
-(ADR-005). Intent ⚠: ready also ⇒ artifact age ≤ P-ASSIGNMENT-MAX-AGE (ADR-013, GAP-2),
-and the key-set analogue P-KEY-SNAPSHOT-MAX-AGE ⚠ if OQ-12 ratifies it.
+(ADR-005). Intent ⚠: ready also ⇒ artifact age ≤ P-ASSIGNMENT-MAX-AGE (ADR-013, GAP-2). The key set
+has no such conjunct and will not get one: every replica reads one feed, so age-based
+readiness would empty the fleet during the control-plane outage that caused it (closed
+OQ-12). Key staleness is alarmed instead (OB-9).
 *Why:* orchestrators route by this; a lying probe turns deploys into outages.
 *Check:* CT-2 — drive each conjunct false via stubs; probe.
 

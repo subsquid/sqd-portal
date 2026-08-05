@@ -95,7 +95,7 @@ sync interval — making them operator-bindable is part of closing GAP-33.
 | P-KEY-PAGE-LIMIT | Records requested per feed page; also defines what a "short page" is (DC-8) | 1000 *(fixed)* | 1000 |
 | P-KEY-FETCH-TIMEOUT | Per-page feed and single-key lookup deadline; sync ticks are serialized, and LIV-13 accounts for one such bound per page (DC-8) | 5 s *(fixed)* | 5 s |
 | P-KEY-MAX-PAGES-PER-TICK | Bound on pages read in one drain; larger delta backlogs continue next tick, while an atomic bootstrap must fit inside the bound (DC-8, LIV-5/13) | 10000 *(fixed)* | 10000 |
-| P-KEY-SNAPSHOT-MAX-AGE | ⚠ Max tolerated key-snapshot age before an enforcing Portal degrades (REQ-54, INV-31, OB-13) | **unbounded** — age is exported (OB-13), nothing acts on it | ⚠ ratify via OQ-12 |
+| P-KEY-SNAPSHOT-MAX-AGE | Key-snapshot age at which the deployment is alarmed. An *alert* threshold, not a code path: the Portal exports the age (OB-13) and never acts on it, so nothing is bound in the binary (REQ-54, closed OQ-12) | n/a — nothing reads it | 900 s (~90 missed ticks) |
 | P-KEY-NEGATIVE-TTL | How long a "control plane knows nothing about this key" answer suppresses repeat lookups (DC-8) | 15 s *(fixed)* | 15 s |
 | P-KEY-NEGATIVE-CAPACITY | Cap on remembered negative answers; ids are attacker-chosen, so the map is bounded rather than grown (DC-8, HZ-10) | 4096 *(fixed)* | 4096 |
 | P-KEY-RESOLVE-RATE | Token-bucket rate for authorize-on-miss lookups (DC-8, LIV-14, HZ-10) | 20 /s *(fixed)* | ⚠ one budget serves two opposed purposes — bounding attacker cost and admitting legitimate new keys (HZ-10); ratify via GAP-33 once CT-10 can measure the interference |

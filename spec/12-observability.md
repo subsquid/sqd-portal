@@ -63,7 +63,10 @@ ready, SIGTERM, drain start, exit — the LIV-5/LIV-11 witnesses.
 
 **OB-9 — Alarm states.** Edge events + level reads, reason-coded, for: artifact
 fetch/validation failures (⚠ GAP-1/2), background-loop deaths, usage-log drops,
-signature-verification failures. Alarms are the LIV-12 witness: persistent failure is
+signature-verification failures, and — on a commercial deployment — a key snapshot older
+than P-KEY-SNAPSHOT-MAX-AGE. That last one is the only response to key staleness there
+is: the Portal keeps serving whatever the age (REQ-54), so the alarm is not a warning
+about a degradation to come, it is the degradation being handled. Alarms are the LIV-12 witness: persistent failure is
 never log-only. (Sampled error reporting to DC-7 complements, never replaces, these.)
 
 **OB-10 — Congestion window trace.** Window size, grow/shrink counters — the LIV-8
