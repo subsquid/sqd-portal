@@ -1700,7 +1700,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1145d32e826a7748b69ee8fc62d3e6355ff7f1051df53141e7048162fc90481b"
 dependencies = [
  "data-encoding",
- "syn 2.0.96",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -7733,7 +7733,7 @@ dependencies = [
 [[package]]
 name = "sqd-assignments"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=e9a3434#e9a34341035ac7745b71eb87dabc8501aa434376"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=360bbd4#360bbd4f115b44733dbfbf169bd5011f74cecb65"
 dependencies = [
  "anyhow",
  "crypto_box",
