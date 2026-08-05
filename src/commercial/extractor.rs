@@ -1,7 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use axum::{
-    extract::Request,
+    extract::{MatchedPath, Request},
     http::{header, HeaderMap},
     middleware::Next,
     response::Response,
@@ -13,6 +13,7 @@ use super::{
     config::{CommercialConfig, Enforcement, GatedRoutes},
     evaluate::{self, Decision, LazyDataset, Rejection},
     now_secs,
+    routes::{classify, Gating},
     store::SnapshotStore,
 };
 use crate::{
@@ -268,13 +269,12 @@ impl Gate {
     }
 }
 
-pub async fn middleware(
-    gate: Arc<Gate>,
-    source: DatasetSource,
-    class: RouteClass,
-    req: Request,
-    next: Next,
-) -> Response {
+/// One layer over the whole router. What each route needs is looked up from its
+/// *matched* path — the template, never the client-supplied one.
+pub async fn middleware(gate: Arc<Gate>, req: Request, next: Next) -> Response {
+    let Gating::Gated(source, class) = classify(matched_path(&req)) else {
+        return next.run(req).await;
+    };
     if !gate.gates(class) {
         return next.run(req).await;
     }
@@ -284,6 +284,15 @@ pub async fn middleware(
         (Decision::Reject(rejection), Enforcement::Enforce) => rejection.into_response(),
         _ => next.run(req).await,
     }
+}
+
+/// Falls back to the raw path only if axum did not record a match, which a
+/// `route_layer` should make impossible. Classification is fail-closed either
+/// way, so the fallback cannot open anything.
+fn matched_path(req: &Request) -> &str {
+    req.extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| req.uri().path(), MatchedPath::as_str)
 }
 
 /// A malformed token is a rejection rather than an absent credential: falling
@@ -434,8 +443,15 @@ mod tests {
         (gate, lookups)
     }
 
-    fn app(gate: Arc<Gate>, path: &str, source: DatasetSource) -> Router {
-        app_classed(gate, path, source, RouteClass::Data)
+    /// The middleware reads what a route needs from its matched path, so a test
+    /// router mounts the real path and the table decides the rest.
+    fn app(gate: Arc<Gate>, path: &str) -> Router {
+        Router::new().route(
+            path,
+            post(|| async { "served" }).route_layer(from_fn(move |req, next| {
+                middleware(gate.clone(), req, next)
+            })),
+        )
     }
 
     /// A gate whose metadata routes are closed too, as on a single-tenant
@@ -450,20 +466,6 @@ mod tests {
             gated_routes: GatedRoutes::All,
         });
         (gate, lookups)
-    }
-
-    fn app_classed(
-        gate: Arc<Gate>,
-        path: &str,
-        source: DatasetSource,
-        class: RouteClass,
-    ) -> Router {
-        Router::new().route(
-            path,
-            post(|| async { "served" }).route_layer(from_fn(move |req, next| {
-                middleware(gate.clone(), source, class, req, next)
-            })),
-        )
     }
 
     async fn call(app: Router, request: HttpRequest<Body>) -> (StatusCode, String) {
@@ -636,7 +638,7 @@ mod tests {
     #[tokio::test]
     async fn a_valid_key_is_served_from_header_and_query_alike() {
         let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
-        let app = app(gate, "/datasets/:dataset/stream", DatasetSource::Alias);
+        let app = app(gate, "/datasets/:dataset/stream");
 
         let (status, body) = call(
             app.clone(),
@@ -664,12 +666,7 @@ mod tests {
     #[tokio::test]
     async fn a_metadata_route_is_open_and_free_under_the_data_only_default() {
         let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
-        let app = app_classed(
-            gate,
-            "/datasets/:dataset/metadata",
-            DatasetSource::Absent,
-            RouteClass::Metadata,
-        );
+        let app = app(gate, "/datasets/:dataset/metadata");
 
         let (status, body) = call(
             app,
@@ -693,15 +690,10 @@ mod tests {
     #[tokio::test]
     async fn a_metadata_route_requires_a_key_when_every_route_is_gated() {
         let (gate, _) = metadata_gate(vec![key_record("k1", 1)]).await;
-        let app = app_classed(
-            gate.clone(),
-            "/datasets/:dataset/metadata",
-            DatasetSource::Absent,
-            RouteClass::Metadata,
-        );
+        let anonymous = app(gate.clone(), "/datasets/:dataset/metadata");
 
         let (status, body) = call(
-            app,
+            anonymous,
             request("/datasets/base/metadata")
                 .body(Body::empty())
                 .unwrap(),
@@ -711,14 +703,9 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(error_code(&body), "missing_credential");
 
-        let app = app_classed(
-            gate,
-            "/datasets/:dataset/metadata",
-            DatasetSource::Absent,
-            RouteClass::Metadata,
-        );
+        let authorized = app(gate, "/datasets/:dataset/metadata");
         let (status, body) = call(
-            app,
+            authorized,
             request("/datasets/base/metadata")
                 .header(
                     header::AUTHORIZATION,
@@ -730,6 +717,45 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK, "a valid key opens it: {body}");
+    }
+
+    /// The point of one middleware over a wrapper per route: a route nobody
+    /// classified refuses rather than serves. Forgetting the old wrapper opened
+    /// a route silently; forgetting the table entry closes one loudly.
+    #[tokio::test]
+    async fn a_route_nobody_classified_is_gated() {
+        let (gate, _) = counting_gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
+        let app = app(gate, "/datasets/:dataset/brand-new");
+
+        let (status, body) = call(
+            app,
+            request("/datasets/base/brand-new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error_code(&body), "missing_credential");
+    }
+
+    /// And the one thing the default must not close: a pod that cannot answer
+    /// its own probe leaves rotation, whatever the gate scope (REQ-51).
+    #[tokio::test]
+    async fn the_ops_surface_answers_without_a_key_under_every_scope() {
+        for (gate, _) in [
+            counting_gate(Vec::new(), Enforcement::Enforce).await,
+            metadata_gate(Vec::new()).await,
+        ] {
+            for path in ["/ready", "/metrics", "/api-docs/openapi.json"] {
+                let (status, _) = call(
+                    app(gate.clone(), path),
+                    request(path).body(Body::empty()).unwrap(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{path}");
+            }
+        }
     }
 
     /// Closing the metadata surface must not close the data routes' own
@@ -751,7 +777,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_without_a_key_is_refused_in_the_taxonomy() {
         let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
-        let app = app(gate, "/datasets/:dataset/stream", DatasetSource::Alias);
+        let app = app(gate, "/datasets/:dataset/stream");
 
         let response = app
             .oneshot(
@@ -783,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn a_wrong_secret_is_rejected_before_the_handler_runs() {
         let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
-        let app = app(gate, "/datasets/:dataset/stream", DatasetSource::Alias);
+        let app = app(gate, "/datasets/:dataset/stream");
 
         let (status, body) = call(
             app,
@@ -807,7 +833,6 @@ mod tests {
         let app = app(
             gate(vec![record], Enforcement::Enforce).await,
             "/datasets/:dataset/stream",
-            DatasetSource::Alias,
         );
 
         let response = app
@@ -837,7 +862,6 @@ mod tests {
         let app = app(
             gate(vec![record], Enforcement::Enforce).await,
             "/datasets/:dataset/stream",
-            DatasetSource::Alias,
         );
 
         let (status, _) = call(
@@ -869,7 +893,6 @@ mod tests {
         let app = app(
             gate(vec![record], Enforcement::Enforce).await,
             "/datasets/:dataset_id/query/:worker_id",
-            DatasetSource::EncodedId,
         );
 
         let (status, _) = call(
@@ -889,11 +912,7 @@ mod tests {
     async fn a_route_without_a_dataset_is_closed_to_dataset_scoped_keys() {
         let mut record = key_record("k1", 1);
         record.datasets = Some(vec!["base-mainnet".to_string()]);
-        let app = app(
-            gate(vec![record], Enforcement::Enforce).await,
-            "/sql/query",
-            DatasetSource::Absent,
-        );
+        let app = app(gate(vec![record], Enforcement::Enforce).await, "/sql/query");
 
         let (status, _) = call(
             app,
@@ -914,7 +933,6 @@ mod tests {
         let app = app(
             gate(vec![record], Enforcement::LogOnly).await,
             "/datasets/:dataset/stream",
-            DatasetSource::Alias,
         );
 
         for uri in [

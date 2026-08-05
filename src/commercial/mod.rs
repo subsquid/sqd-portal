@@ -16,11 +16,14 @@ mod client;
 mod config;
 mod evaluate;
 mod extractor;
+mod routes;
 mod store;
 mod types;
 
 pub use config::{CommercialConfig, Enforcement, GatedRoutes};
 pub use extractor::{middleware, DatasetCatalog, DatasetSource, Gate, RouteClass};
+#[cfg(test)]
+pub use routes::{classify as classify_for_test, is_classified as is_classified_for_test, Gating};
 
 use store::SnapshotStore;
 
