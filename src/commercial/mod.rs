@@ -127,8 +127,19 @@ pub mod test_support {
         }
     }
 
-    /// A store that never reaches a control plane, preloaded with `records`.
-    pub fn store_with(records: Vec<KeyRecord>) -> Arc<SnapshotStore> {
+    /// A store preloaded with `records`, backed by a control plane that knows
+    /// nothing else. A miss therefore resolves to the authoritative "no such
+    /// key" — which is a different outcome from a portal that could not reach
+    /// anyone, and tests of the ladder want the former (REQ-54).
+    pub async fn store_with(records: Vec<KeyRecord>) -> Arc<SnapshotStore> {
+        let control_plane = MockControlPlane::spawn().await;
+        let store = SnapshotStore::new(&control_plane.config()).expect("store should build");
+        store.install_for_test(records);
+        store
+    }
+
+    /// A store whose control plane is unreachable, preloaded with `records`.
+    pub fn offline_store(records: Vec<KeyRecord>) -> Arc<SnapshotStore> {
         let store = SnapshotStore::new(&offline_config()).expect("store should build");
         store.install_for_test(records);
         store

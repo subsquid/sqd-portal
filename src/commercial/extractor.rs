@@ -223,8 +223,11 @@ impl Gate {
             portal_id,
             // Shadow mode says what it would have done, since it did not.
             decision = if enforcing { "reject" } else { "would_reject" },
+            // The internal rung, which only this protected axis carries: the
+            // wire and the scrape both coarsen it (INV-39, ADR-017).
             reason = rejection.reason,
-            status = rejection.status.as_u16(),
+            error_code = rejection.code.as_str(),
+            status = rejection.code.status().as_u16(),
             enforcement,
             "commercial authorization"
         );
@@ -340,9 +343,12 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::commercial::{
-        test_support::{key_record, store_with, SECRET, SECRET_SHA256},
-        types::KeyRecord,
+    use crate::{
+        commercial::{
+            test_support::{key_record, store_with, SECRET, SECRET_SHA256},
+            types::KeyRecord,
+        },
+        types::ErrorCode,
     };
 
     const TOKEN: &str = "sqd_portal_k1_theverysecretvalue";
@@ -369,18 +375,18 @@ mod tests {
         }
     }
 
-    fn gate(records: Vec<KeyRecord>, enforcement: Enforcement) -> Arc<Gate> {
-        counting_gate(records, enforcement).0
+    async fn gate(records: Vec<KeyRecord>, enforcement: Enforcement) -> Arc<Gate> {
+        counting_gate(records, enforcement).await.0
     }
 
-    fn counting_gate(
+    async fn counting_gate(
         records: Vec<KeyRecord>,
         enforcement: Enforcement,
     ) -> (Arc<Gate>, Arc<AtomicUsize>) {
         let dataset_id = DatasetId::from_url("s3://base-mainnet");
         let lookups = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Gate {
-            store: store_with(records),
+            store: store_with(records).await,
             catalog: Arc::new(StaticCatalog {
                 aliases: HashMap::from([("base".to_string(), "base-mainnet".to_string())]),
                 ids: HashMap::from([(dataset_id.to_base64(), "base-mainnet".to_string())]),
@@ -399,8 +405,8 @@ mod tests {
 
     /// A gate whose metadata routes are closed too, as on a single-tenant
     /// portal.
-    fn metadata_gate(records: Vec<KeyRecord>) -> (Arc<Gate>, Arc<AtomicUsize>) {
-        let (gate, lookups) = counting_gate(records, Enforcement::Enforce);
+    async fn metadata_gate(records: Vec<KeyRecord>) -> (Arc<Gate>, Arc<AtomicUsize>) {
+        let (gate, lookups) = counting_gate(records, Enforcement::Enforce).await;
         let gate = Arc::new(Gate {
             store: gate.store.clone(),
             catalog: gate.catalog.clone(),
@@ -432,6 +438,18 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).expect("error bodies are the envelope")
+    }
+
+    fn error_code(body: &str) -> String {
+        let body: serde_json::Value = serde_json::from_str(body).expect("the envelope");
+        body["error"]["code"].as_str().expect("a code").to_owned()
     }
 
     fn request(uri: &str) -> axum::http::request::Builder {
@@ -582,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_valid_key_is_served_from_header_and_query_alike() {
-        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce);
+        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
         let app = app(gate, "/datasets/:dataset/stream", DatasetSource::Alias);
 
         let (status, body) = call(
@@ -610,7 +628,7 @@ mod tests {
     /// must cost nothing — no credential parsed, no dataset resolved.
     #[tokio::test]
     async fn a_metadata_route_is_open_and_free_under_the_data_only_default() {
-        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::Enforce);
+        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
         let app = app_classed(
             gate,
             "/datasets/:dataset/metadata",
@@ -639,7 +657,7 @@ mod tests {
     /// customer bought, so it needs the same key the data routes do.
     #[tokio::test]
     async fn a_metadata_route_requires_a_key_when_every_route_is_gated() {
-        let (gate, _) = metadata_gate(vec![key_record("k1", 1)]);
+        let (gate, _) = metadata_gate(vec![key_record("k1", 1)]).await;
         let app = app_classed(
             gate.clone(),
             "/datasets/:dataset/metadata",
@@ -656,7 +674,7 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body, r#"{"message":"API key required"}"#);
+        assert_eq!(error_code(&body), "missing_credential");
 
         let app = app_classed(
             gate,
@@ -681,37 +699,55 @@ mod tests {
 
     /// Closing the metadata surface must not close the data routes' own
     /// behaviour, and must never gate more than the two classes.
-    #[test]
-    fn gating_classes_are_decided_by_the_mode() {
-        let (data_only, _) = counting_gate(Vec::new(), Enforcement::Enforce);
+    #[tokio::test]
+    async fn gating_classes_are_decided_by_the_mode() {
+        let (data_only, _) = counting_gate(Vec::new(), Enforcement::Enforce).await;
         assert!(data_only.gates(RouteClass::Data));
         assert!(!data_only.gates(RouteClass::Metadata));
 
-        let (everything, _) = metadata_gate(Vec::new());
+        let (everything, _) = metadata_gate(Vec::new()).await;
         assert!(everything.gates(RouteClass::Data));
         assert!(everything.gates(RouteClass::Metadata));
     }
 
+    /// GAP-29: the refusal has to arrive in the ADR-011 envelope, or the routed
+    /// middleware rewrites it to 400 `malformed_request` and the client cannot
+    /// tell an invalid key from a malformed query.
     #[tokio::test]
-    async fn a_request_without_a_key_is_rejected_as_json() {
-        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce);
+    async fn a_request_without_a_key_is_refused_in_the_taxonomy() {
+        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
         let app = app(gate, "/datasets/:dataset/stream", DatasetSource::Alias);
 
-        let (status, body) = call(
-            app,
-            request("/datasets/base/stream")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
+        let response = app
+            .oneshot(
+                request("/datasets/base/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body, r#"{"message":"API key required"}"#);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Bearer",
+            "a 401 must name the scheme to retry with"
+        );
+        assert_eq!(
+            response.extensions().get::<ErrorCode>().copied(),
+            Some(ErrorCode::MissingCredential),
+            "the code must reach the middleware, or the metric lies (INV-30)"
+        );
+
+        let body = body_json(response).await;
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(body["error"]["code"], "missing_credential");
+        assert_eq!(body["error"]["message"], "API key required");
     }
 
     #[tokio::test]
     async fn a_wrong_secret_is_rejected_before_the_handler_runs() {
-        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce);
+        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
         let app = app(gate, "/datasets/:dataset/stream", DatasetSource::Alias);
 
         let (status, body) = call(
@@ -724,7 +760,39 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body, r#"{"message":"Invalid API key"}"#);
+        assert_eq!(error_code(&body), "invalid_credential");
+    }
+
+    /// A refusal for want of permission is not a challenge: the credential
+    /// authenticated, so re-presenting it changes nothing.
+    #[tokio::test]
+    async fn a_permission_refusal_carries_no_bearer_challenge() {
+        let mut record = key_record("k1", 1);
+        record.datasets = Some(vec!["base-mainnet".to_string()]);
+        let app = app(
+            gate(vec![record], Enforcement::Enforce).await,
+            "/datasets/:dataset/stream",
+            DatasetSource::Alias,
+        );
+
+        let response = app
+            .oneshot(
+                request(&format!(
+                    "/datasets/ethereum-mainnet/stream?{QUERY_PARAM}={TOKEN}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+        assert_eq!(
+            body_json(response).await["error"]["type"],
+            "permission_error"
+        );
     }
 
     #[tokio::test]
@@ -732,7 +800,7 @@ mod tests {
         let mut record = key_record("k1", 1);
         record.datasets = Some(vec!["base-mainnet".to_string()]);
         let app = app(
-            gate(vec![record], Enforcement::Enforce),
+            gate(vec![record], Enforcement::Enforce).await,
             "/datasets/:dataset/stream",
             DatasetSource::Alias,
         );
@@ -764,7 +832,7 @@ mod tests {
         record.datasets = Some(vec!["base-mainnet".to_string()]);
         let encoded = DatasetId::from_url("s3://base-mainnet").to_base64();
         let app = app(
-            gate(vec![record], Enforcement::Enforce),
+            gate(vec![record], Enforcement::Enforce).await,
             "/datasets/:dataset_id/query/:worker_id",
             DatasetSource::EncodedId,
         );
@@ -787,7 +855,7 @@ mod tests {
         let mut record = key_record("k1", 1);
         record.datasets = Some(vec!["base-mainnet".to_string()]);
         let app = app(
-            gate(vec![record], Enforcement::Enforce),
+            gate(vec![record], Enforcement::Enforce).await,
             "/sql/query",
             DatasetSource::Absent,
         );
@@ -809,7 +877,7 @@ mod tests {
         record.datasets = Some(vec!["nothing-matching".to_string()]);
         record.portal_ids = Some(Vec::new());
         let app = app(
-            gate(vec![record], Enforcement::LogOnly),
+            gate(vec![record], Enforcement::LogOnly).await,
             "/datasets/:dataset/stream",
             DatasetSource::Alias,
         );
@@ -834,7 +902,7 @@ mod tests {
     async fn a_request_that_fails_an_earlier_rung_never_resolves_the_dataset() {
         let mut record = key_record("k1", 1);
         record.datasets = Some(vec!["base-mainnet".to_string()]);
-        let (gate, lookups) = counting_gate(vec![record], Enforcement::Enforce);
+        let (gate, lookups) = counting_gate(vec![record], Enforcement::Enforce).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         for headers in [
@@ -872,7 +940,7 @@ mod tests {
     /// in the ladder needs the request's dataset resolved.
     #[tokio::test]
     async fn an_unscoped_key_does_not_resolve_the_dataset_either() {
-        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::Enforce);
+        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         let decision = gate
@@ -891,7 +959,7 @@ mod tests {
     /// have authenticated, so resolving costs what a real customer costs.
     #[tokio::test]
     async fn log_only_still_resolves_the_dataset_of_an_admitted_request() {
-        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::LogOnly);
+        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::LogOnly).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         gate.decide(&HeaderMap::new(), &uri, DatasetSource::Alias)
@@ -915,7 +983,7 @@ mod tests {
 
     #[tokio::test]
     async fn log_only_still_evaluates_the_full_ladder() {
-        let gate = gate(vec![key_record("k1", 1)], Enforcement::LogOnly);
+        let gate = gate(vec![key_record("k1", 1)], Enforcement::LogOnly).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         let decision = gate

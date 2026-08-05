@@ -1807,6 +1807,61 @@ mod tests {
         assert_eq!(of(RouteGating::AlwaysOpen), ALWAYS_OPEN_ROUTES.to_vec());
     }
 
+    /// GAP-29: the gate and the normalizing middleware are separately correct
+    /// and were jointly wrong. A refusal carrying no `ErrorCode` is an unmatched
+    /// client error to the layer every routed response passes through, so it was
+    /// rewritten to 400 `malformed_request` — the status line the client reads,
+    /// the code the metric counts, and the challenge it never got. Only the two
+    /// stacked together can show that, which is why this test sits here and not
+    /// in `commercial`.
+    #[tokio::test]
+    async fn an_auth_refusal_survives_the_middleware_that_normalizes_client_errors() {
+        use tower::ServiceExt;
+        use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
+
+        use crate::commercial::test_support::gate_with;
+
+        let gate = Some(gate_with(commercial::Enforcement::Enforce, true));
+        let app = Router::new()
+            .route(
+                "/datasets/:dataset/stream",
+                gated(
+                    post(|| async { "served" }),
+                    &gate,
+                    DatasetSource::Alias,
+                    RouteClass::Data,
+                )
+                .endpoint("/stream"),
+            )
+            .route_layer(axum::middleware::from_fn(logging::middleware))
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/datasets/base/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "the refusal must reach the wire as a 401, not a normalized 400"
+        );
+        assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(body["error"]["code"], "missing_credential");
+    }
+
     /// The kill switch: with no `commercial:` block there is no gate, so a data
     /// route is served without any authorization middleware in front of it.
     #[tokio::test]

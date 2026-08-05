@@ -14,6 +14,10 @@ pub enum ErrorType {
     Availability,
     /// An invariant we own was violated.
     Api,
+    /// The credential is absent, unreadable, or does not authenticate (ADR-017).
+    Authentication,
+    /// The credential authenticated but does not cover this request (ADR-017).
+    Permission,
 }
 
 impl ErrorType {
@@ -23,13 +27,17 @@ impl ErrorType {
             Self::RateLimit => "rate_limit_error",
             Self::Availability => "availability_error",
             Self::Api => "api_error",
+            Self::Authentication => "authentication_error",
+            Self::Permission => "permission_error",
         }
     }
 
+    /// Both auth types answer no: retrying with the same credential cannot succeed, and
+    /// a client that treats a refusal as transient produces the storm ADR-012 prevents.
     pub const fn retryable(self) -> bool {
         match self {
             Self::RateLimit | Self::Availability => true,
-            Self::InvalidRequest | Self::Api => false,
+            Self::InvalidRequest | Self::Api | Self::Authentication | Self::Permission => false,
         }
     }
 }
@@ -97,6 +105,20 @@ error_codes! {
         /// Unset by any handler. `api_error` so it pages instead of hiding; `http_labels`
         /// re-types an unclassified 4xx.
         Unclassified => "unclassified",
+
+        // ADR-017. Commercial deployments only; vacuous without a `commercial:` block.
+        MissingCredential => "missing_credential",
+        /// One wire code for four internal reasons — unparseable token, unknown key id,
+        /// wrong secret, digestless record. Distinguishing them would tell a caller which
+        /// of its guesses to keep (INV-39); the operator gets the distinction on the
+        /// protected log axis instead.
+        InvalidCredential => "invalid_credential",
+        /// Only reachable by someone already holding the right secret, so it can be
+        /// specific without leaking anything.
+        RevokedCredential => "revoked_credential",
+        ExpiredCredential => "expired_credential",
+        PortalNotAllowed => "portal_not_allowed",
+        DatasetNotAllowed => "dataset_not_allowed",
     }
 }
 
@@ -117,6 +139,15 @@ impl ErrorCode {
             | Self::NotReady => ErrorType::Availability,
 
             Self::WorkerFailure | Self::Internal | Self::Unclassified => ErrorType::Api,
+
+            // Never `api_error`: turning away an unauthenticated request is the system
+            // working, and must not page.
+            Self::MissingCredential
+            | Self::InvalidCredential
+            | Self::RevokedCredential
+            | Self::ExpiredCredential => ErrorType::Authentication,
+
+            Self::PortalNotAllowed | Self::DatasetNotAllowed => ErrorType::Permission,
         }
     }
 
@@ -141,7 +172,19 @@ impl ErrorCode {
             Self::WorkerFailure | Self::Internal | Self::Unclassified => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            Self::MissingCredential
+            | Self::InvalidCredential
+            | Self::RevokedCredential
+            | Self::ExpiredCredential => StatusCode::UNAUTHORIZED,
+            Self::PortalNotAllowed | Self::DatasetNotAllowed => StatusCode::FORBIDDEN,
         }
+    }
+
+    /// ADR-017: a 401 must name the scheme the client should retry with. Not folded into
+    /// [`Self::status`] because the header is the type's obligation, not the status's —
+    /// a 403 is also a refusal and owes no challenge.
+    pub const fn challenges(self) -> bool {
+        matches!(self.error_type(), ErrorType::Authentication)
     }
 
     /// INV-26: the one class that always owes the client a back-off interval. The value
@@ -167,6 +210,12 @@ impl ErrorCode {
             Self::WorkerFailure => "Worker returned invalid data",
             Self::Internal => "Internal error",
             Self::Unclassified => "Unclassified error",
+            Self::MissingCredential => "API key required",
+            Self::InvalidCredential => "Invalid API key",
+            Self::RevokedCredential => "API key revoked",
+            Self::ExpiredCredential => "API key expired",
+            Self::PortalNotAllowed => "API key is not valid for this portal",
+            Self::DatasetNotAllowed => "API key is not authorized for this dataset",
         }
     }
 
@@ -634,6 +683,27 @@ mod tests {
         assert!(!ErrorCode::Internal.error_type().retryable());
         assert!(!ErrorCode::WorkerFailure.error_type().retryable());
         assert!(!ErrorCode::MalformedRequest.error_type().retryable());
+        // Retrying the same key cannot change the answer (ADR-017).
+        assert!(!ErrorCode::InvalidCredential.error_type().retryable());
+        assert!(!ErrorCode::DatasetNotAllowed.error_type().retryable());
+    }
+
+    /// An auth refusal is the system working. Typing one `api_error` would page the team
+    /// every time a client mistypes its key.
+    #[test]
+    fn no_auth_refusal_pages() {
+        for code in ErrorCode::ALL {
+            let is_auth = matches!(
+                code.error_type(),
+                ErrorType::Authentication | ErrorType::Permission
+            );
+            assert_eq!(
+                is_auth,
+                matches!(code.status().as_u16(), 401 | 403),
+                "{} must be an auth type iff it answers 401/403",
+                code.as_str()
+            );
+        }
     }
 
     /// Only api_error should page, so an unclassified response must land there.
@@ -692,6 +762,12 @@ mod tests {
             (WorkerFailure, 500),
             (Internal, 500),
             (Unclassified, 500),
+            (MissingCredential, 401),
+            (InvalidCredential, 401),
+            (RevokedCredential, 401),
+            (ExpiredCredential, 401),
+            (PortalNotAllowed, 403),
+            (DatasetNotAllowed, 403),
         ];
         for (code, want) in binding {
             assert_eq!(code.status().as_u16(), want, "{}", code.as_str());
@@ -715,6 +791,11 @@ mod tests {
                 "{}",
                 code.as_str()
             );
+        }
+
+        // ADR-017's challenge obligation is likewise an iff, over the 401 rows.
+        for (code, status) in binding {
+            assert_eq!(code.challenges(), status == 401, "{}", code.as_str());
         }
     }
 
@@ -753,6 +834,28 @@ mod tests {
             (WorkerFailure, "worker_failure", "api_error"),
             (Internal, "internal_error", "api_error"),
             (Unclassified, "unclassified", "api_error"),
+            (
+                MissingCredential,
+                "missing_credential",
+                "authentication_error",
+            ),
+            (
+                InvalidCredential,
+                "invalid_credential",
+                "authentication_error",
+            ),
+            (
+                RevokedCredential,
+                "revoked_credential",
+                "authentication_error",
+            ),
+            (
+                ExpiredCredential,
+                "expired_credential",
+                "authentication_error",
+            ),
+            (PortalNotAllowed, "portal_not_allowed", "permission_error"),
+            (DatasetNotAllowed, "dataset_not_allowed", "permission_error"),
         ];
         for (code, want_code, want_type) in expected {
             assert_eq!(code.as_str(), want_code);

@@ -69,6 +69,22 @@ struct State {
     generation: u64,
 }
 
+/// What a key-id lookup established. The last two are not verdicts about the
+/// credential — the portal failed to find out — so they must not be reported as
+/// one: a customer whose key was minted seconds ago would be told to stop
+/// retrying (REQ-54).
+#[derive(Debug, Clone)]
+pub enum Lookup {
+    /// The snapshot held the key, or the control plane answered with it.
+    Found(Arc<KeyRecord>),
+    /// The control plane authoritatively does not know this key id.
+    Unknown,
+    /// The local lookup budget is spent — rate or in-flight cap.
+    Saturated,
+    /// The lookup itself failed.
+    Unavailable,
+}
+
 #[derive(Debug)]
 enum ResyncReason {
     EpochChanged { stored: String, received: String },
@@ -117,6 +133,14 @@ impl SnapshotStore {
         self.install(records, 0, Some("test-epoch".to_string()));
     }
 
+    /// What a burst of misses does to the token bucket, without the burst.
+    #[cfg(test)]
+    pub(crate) fn exhaust_lookup_budget_for_test(&self) {
+        let mut limiter = self.limiter.lock().unwrap();
+        limiter.tokens = 0.0;
+        limiter.last = Instant::now();
+    }
+
     pub fn get(&self, key_id: &str) -> Option<Arc<KeyRecord>> {
         self.state.read().unwrap().records.get(key_id).cloned()
     }
@@ -126,32 +150,37 @@ impl SnapshotStore {
     /// Unknown answers are cached briefly, and the lookups themselves are both
     /// rate limited and capped in flight, so a bad key cannot be used to hammer
     /// the control plane.
-    pub async fn get_or_resolve(&self, key_id: &str) -> Option<Arc<KeyRecord>> {
+    pub async fn get_or_resolve(&self, key_id: &str) -> Lookup {
         if let Some(record) = self.get(key_id) {
-            return Some(record);
+            return Lookup::Found(record);
         }
         if self.negative_cached(key_id) {
-            return None;
+            return Lookup::Unknown;
         }
         let Ok(_permit) = self.inflight_permits.try_acquire() else {
             tracing::warn!(
                 key_id,
+                outcome = "over_inflight_cap",
                 "commercial authorize skipped: too many lookups in flight"
             );
-            return None;
+            return Lookup::Saturated;
         };
 
         self.resolve(key_id).await.unwrap_or_else(|err| {
-            tracing::warn!(key_id, error = %err, "commercial authorize failed; rejecting unknown key");
-            None
+            tracing::warn!(key_id, outcome = "failed", error = %err, "commercial authorize failed");
+            Lookup::Unavailable
         })
     }
 
-    async fn resolve(&self, key_id: &str) -> anyhow::Result<Option<Arc<KeyRecord>>> {
+    async fn resolve(&self, key_id: &str) -> anyhow::Result<Lookup> {
         let generation = self.state.read().unwrap().generation;
         if !self.limiter.lock().unwrap().take() {
-            tracing::warn!(key_id, "commercial authorize rate limited; failing closed");
-            return Ok(None);
+            tracing::warn!(
+                key_id,
+                outcome = "rate_limited",
+                "commercial authorize rate limited"
+            );
+            return Ok(Lookup::Saturated);
         }
 
         match self.client.authorize(key_id).await? {
@@ -162,11 +191,17 @@ impl SnapshotStore {
                     "authorize returned key {} for {key_id}",
                     record.key_id
                 );
-                Ok(self.upsert_resolved(record, generation))
+                // A rebuild that landed mid-lookup discards the record; the
+                // answer was still authoritative, so this stays a miss rather
+                // than becoming a retryable fault.
+                Ok(match self.upsert_resolved(record, generation) {
+                    Some(record) => Lookup::Found(record),
+                    None => Lookup::Unknown,
+                })
             }
             Authorized::Unknown => {
                 self.cache_negative(key_id, generation);
-                Ok(None)
+                Ok(Lookup::Unknown)
             }
         }
     }
@@ -927,8 +962,9 @@ mod tests {
     }
 
     /// The same status on the authorize path is a parse error rather than a
-    /// record, so the key is rejected — and, unlike a "no such key" answer, not
-    /// remembered: the control plane did have something to say.
+    /// record, so the key is refused — and, unlike a "no such key" answer, not
+    /// remembered: the control plane did have something to say. An answer this
+    /// build cannot read is a fault of ours, not a verdict on the credential.
     #[tokio::test]
     async fn an_authorize_answer_with_an_unknown_status_is_rejected_and_not_cached() {
         let cp = MockControlPlane::spawn().await;
@@ -940,8 +976,14 @@ mod tests {
         let store = store_for(&cp).await;
         store.run_tick().await;
 
-        assert!(store.get_or_resolve("k1").await.is_none());
-        assert!(store.get_or_resolve("k1").await.is_none());
+        assert!(matches!(
+            store.get_or_resolve("k1").await,
+            Lookup::Unavailable
+        ));
+        assert!(matches!(
+            store.get_or_resolve("k1").await,
+            Lookup::Unavailable
+        ));
         assert_eq!(cp.authorize_calls().len(), 2);
     }
 
@@ -953,7 +995,10 @@ mod tests {
         let store = store_for(&cp).await;
         store.run_tick().await;
 
-        assert_eq!(store.get_or_resolve("k1").await.unwrap().seq, 3);
+        let Lookup::Found(record) = store.get_or_resolve("k1").await else {
+            panic!("the control plane answered with the record");
+        };
+        assert_eq!(record.seq, 3);
         assert_eq!(cp.authorize_calls(), vec!["k1".to_string()]);
         assert!(
             store.get("k1").is_some(),
@@ -1013,8 +1058,14 @@ mod tests {
         let store = store_for(&cp).await;
         store.run_tick().await;
 
-        assert!(store.get_or_resolve("nope").await.is_none());
-        assert!(store.get_or_resolve("nope").await.is_none());
+        assert!(matches!(
+            store.get_or_resolve("nope").await,
+            Lookup::Unknown
+        ));
+        assert!(matches!(
+            store.get_or_resolve("nope").await,
+            Lookup::Unknown
+        ));
         assert_eq!(
             cp.authorize_calls(),
             vec!["nope".to_string()],
@@ -1022,36 +1073,66 @@ mod tests {
         );
     }
 
+    /// The budget is spent, so the portal never found out. Reporting that as an
+    /// unknown key would tell the holder of a freshly minted key to give up
+    /// (REQ-54).
     #[tokio::test]
-    async fn authorize_is_rate_limited_and_fails_closed() {
+    async fn a_rate_limited_lookup_is_saturation_not_a_verdict() {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![], 0, "e1", 0));
         cp.authorize_with("k1", Some(key_record("k1", 1)));
         let store = store_for(&cp).await;
         store.run_tick().await;
 
-        // What a burst of misses does to the bucket, without the burst.
-        {
-            let mut limiter = store.limiter.lock().unwrap();
-            limiter.tokens = 0.0;
-            limiter.last = Instant::now();
-        }
+        store.exhaust_lookup_budget_for_test();
 
-        assert!(store.get_or_resolve("k1").await.is_none());
+        assert!(matches!(
+            store.get_or_resolve("k1").await,
+            Lookup::Saturated
+        ));
         assert!(cp.authorize_calls().is_empty());
     }
 
+    /// Likewise for the in-flight cap: it is this portal's own budget running
+    /// out, not an answer about the key.
     #[tokio::test]
-    async fn control_plane_errors_during_authorize_fail_closed() {
+    async fn an_over_capped_lookup_is_saturation_too() {
+        let cp = MockControlPlane::spawn().await;
+        cp.push_page(0, page(vec![], 0, "e1", 0));
+        let store = store_for(&cp).await;
+        store.run_tick().await;
+
+        let held = store
+            .inflight_permits
+            .acquire_many(MAX_INFLIGHT_RESOLVES as u32)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.get_or_resolve("k1").await,
+            Lookup::Saturated
+        ));
+        assert!(cp.authorize_calls().is_empty());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn control_plane_errors_during_authorize_are_unavailability() {
         let cp = MockControlPlane::spawn().await;
         cp.push_page(0, page(vec![], 0, "e1", 0));
         cp.authorize_status("k1", 500);
         let store = store_for(&cp).await;
         store.run_tick().await;
 
-        assert!(store.get_or_resolve("k1").await.is_none());
+        assert!(matches!(
+            store.get_or_resolve("k1").await,
+            Lookup::Unavailable
+        ));
         // A server error is not a negative answer, so it must not be cached.
-        assert!(store.get_or_resolve("k1").await.is_none());
+        assert!(matches!(
+            store.get_or_resolve("k1").await,
+            Lookup::Unavailable
+        ));
         assert_eq!(cp.authorize_calls().len(), 2);
     }
 
