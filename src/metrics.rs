@@ -57,6 +57,51 @@ impl RefusalReason {
     }
 }
 
+/// What one evaluation may say on the keyless scrape (OB-12). Coarser than the
+/// ladder: nothing here may exceed what the caller's own response told it, so
+/// two scrapes bracketing a request reveal nothing new (INV-39).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthDecision {
+    /// Enforcing, and the request was served.
+    Admit,
+    /// Enforcing, and this is the code the caller received.
+    Reject(ErrorCode),
+    /// Shadow mode. Valid, invalid and indeterminate share it: all were served.
+    ShadowEvaluated,
+}
+
+impl AuthDecision {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admit => "admit",
+            Self::Reject(_) => "reject",
+            Self::ShadowEvaluated => "shadow_evaluated",
+        }
+    }
+}
+
+/// Why a sync tick failed (OB-13). Separates a control plane that is down from
+/// one answering nonsense — different pages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncFailureCause {
+    /// The feed could not be read at all.
+    Fetch,
+    /// It answered, and the answer contradicted the feed's own contract.
+    Protocol,
+    /// A record on an otherwise well-formed page could not be identified.
+    Parse,
+}
+
+impl SyncFailureCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Protocol => "protocol",
+            Self::Parse => "parse",
+        }
+    }
+}
+
 /// Final transport outcome of one logical DC-4 request (ADR-015, OB-4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HotblocksRequestOutcome {
@@ -141,6 +186,16 @@ lazy_static::lazy_static! {
     static ref KNOWN_CHUNKS: Family<Labels, Gauge> = Default::default();
     static ref LAST_STORAGE_BLOCK: Family<Labels, Gauge> = Default::default();
 
+    // Commercial deployments only: inert without a `commercial:` block.
+    static ref AUTH_DECISIONS: Family<Labels, Counter> = Default::default();
+    static ref KEY_SNAPSHOT_AGE: Gauge = Default::default();
+    static ref KEY_SNAPSHOT_CURSOR: Gauge = Default::default();
+    static ref KEY_SNAPSHOT_HEAD: Gauge = Default::default();
+    static ref KEY_SNAPSHOT_EPOCH: Family<Labels, Gauge> = Default::default();
+    static ref KEY_SNAPSHOT_DELTAS: Counter = Default::default();
+    static ref KEY_SNAPSHOT_REBUILDS: Counter = Default::default();
+    static ref KEY_SNAPSHOT_SYNC_FAILURES: Family<Labels, Counter> = Default::default();
+
     // TODO: add metrics for procedure durations
     static ref MUTEX_HELD_NANOS: Family<Labels, Counter> = Default::default();
     static ref MUTEXES_EXISTING: Family<Labels, Gauge> = Default::default();
@@ -190,6 +245,90 @@ pub fn hotblocks_requests(outcome: HotblocksRequestOutcome) -> u64 {
     HOTBLOCKS_REQUESTS
         .get_or_create(&hotblocks_request_labels(outcome))
         .get()
+}
+
+/// Count one authorization evaluation (OB-12).
+pub fn report_auth_decision(decision: AuthDecision, route_class: &'static str, enforcement: &str) {
+    AUTH_DECISIONS
+        .get_or_create(&auth_decision_labels(decision, route_class, enforcement))
+        .inc();
+}
+
+/// The whole public projection of one evaluation, in one place.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn auth_decision_labels(
+    decision: AuthDecision,
+    route_class: &'static str,
+    enforcement: &str,
+) -> Labels {
+    let mut labels = vec![
+        ("decision".to_owned(), decision.as_str().to_owned()),
+        ("route_class".to_owned(), route_class.to_owned()),
+        ("enforcement".to_owned(), enforcement.to_owned()),
+    ];
+    // Only a refusal carries a code, and only the one the caller received.
+    if let AuthDecision::Reject(code) = decision {
+        labels.push(("error_code".to_owned(), code.as_str().to_owned()));
+        labels.push((
+            "error_type".to_owned(),
+            code.error_type().as_str().to_owned(),
+        ));
+    }
+    labels
+}
+
+#[cfg(test)]
+pub fn auth_decisions(decision: AuthDecision, route_class: &'static str, enforcement: &str) -> u64 {
+    AUTH_DECISIONS
+        .get_or_create(&auth_decision_labels(decision, route_class, enforcement))
+        .get()
+}
+
+/// Snapshot freshness and provenance (OB-13). Called on every tick, failed ones
+/// included, so age keeps climbing through an outage. Resolution is the sync
+/// interval, not the scrape interval.
+pub fn report_key_snapshot(age_seconds: u64, cursor: u64, head_seq: u64, epoch: Option<&str>) {
+    KEY_SNAPSHOT_AGE.set(age_seconds as i64);
+    KEY_SNAPSHOT_CURSOR.set(cursor as i64);
+    KEY_SNAPSHOT_HEAD.set(head_seq as i64);
+    if let Some(epoch) = epoch {
+        let labels = vec![("epoch".to_owned(), epoch.to_owned())];
+        // One series at a time: a rebuild retires the old epoch rather than
+        // leaving a sample behind for every epoch the process has ever seen.
+        if KEY_SNAPSHOT_EPOCH.get_or_create(&labels).get() != 1 {
+            KEY_SNAPSHOT_EPOCH.clear();
+            KEY_SNAPSHOT_EPOCH.get_or_create(&labels).set(1);
+        }
+    }
+}
+
+/// Records applied by a delta tick — not the record count, which would tell a
+/// keyless scraper how many keys exist (OB-13).
+pub fn report_key_snapshot_delta(applied: usize) {
+    KEY_SNAPSHOT_DELTAS.inc_by(applied as u64);
+}
+
+/// A full re-read of the feed — startup, or an epoch flip.
+pub fn report_key_snapshot_rebuild() {
+    KEY_SNAPSHOT_REBUILDS.inc();
+}
+
+pub fn report_key_snapshot_sync_failure(cause: SyncFailureCause) {
+    KEY_SNAPSHOT_SYNC_FAILURES
+        .get_or_create(&vec![("cause".to_owned(), cause.as_str().to_owned())])
+        .inc();
+}
+
+#[cfg(test)]
+pub fn key_snapshot_sync_failures(cause: SyncFailureCause) -> u64 {
+    KEY_SNAPSHOT_SYNC_FAILURES
+        .get_or_create(&vec![("cause".to_owned(), cause.as_str().to_owned())])
+        .get()
+}
+
+#[cfg(test)]
+pub fn key_snapshot_age() -> i64 {
+    KEY_SNAPSHOT_AGE.get()
 }
 
 /// Count a capacity-based stream refusal.
@@ -518,6 +657,46 @@ pub fn register_metrics(registry: &mut Registry) {
         "mutexes_existing",
         "Number of existing mutexes",
         MUTEXES_EXISTING.clone(),
+    );
+    registry.register(
+        "commercial_authorization_decisions",
+        "Authorization evaluations by public outcome; empty unless the portal is configured commercially",
+        AUTH_DECISIONS.clone(),
+    );
+    registry.register(
+        "commercial_key_snapshot_age_seconds",
+        "Seconds since the control plane last answered a key-feed read",
+        KEY_SNAPSHOT_AGE.clone(),
+    );
+    registry.register(
+        "commercial_key_snapshot_cursor",
+        "Feed position the served key snapshot holds",
+        KEY_SNAPSHOT_CURSOR.clone(),
+    );
+    registry.register(
+        "commercial_key_snapshot_head_seq",
+        "Feed head the control plane last reported; the distance from the cursor is the backlog",
+        KEY_SNAPSHOT_HEAD.clone(),
+    );
+    registry.register(
+        "commercial_key_snapshot_epoch",
+        "The feed epoch currently held, as a label; exactly one series at a time",
+        KEY_SNAPSHOT_EPOCH.clone(),
+    );
+    registry.register(
+        "commercial_key_snapshot_delta_records",
+        "Key records applied by delta ticks",
+        KEY_SNAPSHOT_DELTAS.clone(),
+    );
+    registry.register(
+        "commercial_key_snapshot_rebuilds",
+        "Full re-reads of the key feed: startup, and every epoch flip or head rollback",
+        KEY_SNAPSHOT_REBUILDS.clone(),
+    );
+    registry.register(
+        "commercial_key_snapshot_sync_failures",
+        "Failed key-feed sync ticks by cause",
+        KEY_SNAPSHOT_SYNC_FAILURES.clone(),
     );
 }
 

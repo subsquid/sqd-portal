@@ -25,8 +25,7 @@ pub struct Rejection {
     /// rejections share one on purpose.
     pub code: ErrorCode,
     /// Stable label for protected logs. Never sent to the client and never a
-    /// metric label — four of these collapse onto `invalid_credential`, and
-    /// splitting them anywhere a client can read would undo that (INV-39).
+    /// metric label: four of these collapse onto `invalid_credential` (INV-39).
     pub reason: &'static str,
 }
 
@@ -49,10 +48,9 @@ const INVALID_SECRET: Rejection = Rejection::new(ErrorCode::InvalidCredential, "
 /// (REQ-53).
 const NO_DIGEST: Rejection = Rejection::new(ErrorCode::InvalidCredential, "no_digest");
 const REVOKED: Rejection = Rejection::new(ErrorCode::RevokedCredential, "revoked");
-/// A tombstone is digestless, so it cannot earn the specific `revoked` answer —
-/// that would confirm a guessed key id exists. The operator's need for the
-/// distinction is real and is met here, on `reason`, which only protected logs
-/// see (ADR-017).
+/// A tombstone is digestless, so it cannot earn the specific `revoked` answer:
+/// that would confirm a guessed key id exists. The operator keeps the
+/// distinction on `reason`, which only protected logs see (ADR-017).
 const REVOKED_TOMBSTONE: Rejection =
     Rejection::new(ErrorCode::InvalidCredential, "revoked_tombstone");
 const EXPIRED: Rejection = Rejection::new(ErrorCode::ExpiredCredential, "expired");
@@ -176,10 +174,8 @@ fn evaluate_record<F: Fn() -> Option<String>>(
 }
 
 impl Rejection {
-    /// Answers in the ADR-011 envelope, so the routed middleware leaves the
-    /// status alone and the response counts on the error-code axis as what it
-    /// is. Built outside it, the same refusal is rewritten to 400
-    /// `malformed_request` — the whole of GAP-29.
+    /// The envelope is what keeps the routed middleware from rewriting this to
+    /// 400 `malformed_request` (GAP-29).
     pub fn into_response(self) -> Response {
         let mut response = coded_response(self.code, self.code.default_message());
         let headers = response.headers_mut();

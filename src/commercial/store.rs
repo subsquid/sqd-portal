@@ -16,6 +16,7 @@ use super::{
     now_secs,
     types::{KeyRecord, SnapshotPage},
 };
+use crate::metrics::{self, SyncFailureCause};
 
 /// Guards against a feed that never returns a short page, and against a delta
 /// drain that never reaches the head it is chasing: either would keep one tick
@@ -54,6 +55,10 @@ pub struct SnapshotStore {
     /// failed tick reports the distance from it, so a feed that has been down
     /// for hours does not read like one that missed a single tick.
     last_success: AtomicU64,
+    /// Feed head the control plane last reported. Outside `State` because it
+    /// describes the feed, not the snapshot: a tick that fails after reading a
+    /// page still learned how far behind the cursor is.
+    head_seq: AtomicU64,
     negative_cache: Mutex<HashMap<String, Instant>>,
     inflight_permits: Semaphore,
     limiter: Mutex<RateLimiter>,
@@ -69,10 +74,9 @@ struct State {
     generation: u64,
 }
 
-/// What a key-id lookup established. The last two are not verdicts about the
-/// credential — the portal failed to find out — so they must not be reported as
-/// one: a customer whose key was minted seconds ago would be told to stop
-/// retrying (REQ-54).
+/// What a key-id lookup established. The last two are not verdicts — the portal
+/// failed to find out — and reporting them as one tells the holder of a
+/// just-minted key to stop retrying (REQ-54).
 #[derive(Debug, Clone)]
 pub enum Lookup {
     /// The snapshot held the key, or the control plane answered with it.
@@ -83,6 +87,45 @@ pub enum Lookup {
     Saturated,
     /// The lookup itself failed.
     Unavailable,
+}
+
+/// A failed tick and what kind of failure it was: unreachable and answering
+/// nonsense are different pages (OB-13).
+#[derive(Debug)]
+struct SyncError {
+    cause: SyncFailureCause,
+    error: anyhow::Error,
+}
+
+impl From<anyhow::Error> for SyncError {
+    /// Everything that propagates with `?` here comes off the wire.
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            cause: SyncFailureCause::Fetch,
+            error,
+        }
+    }
+}
+
+/// A page whose records cannot be read at all, as opposed to one that reads
+/// fine and says something impossible.
+fn parse_failure(error: anyhow::Error) -> SyncError {
+    SyncError {
+        cause: SyncFailureCause::Parse,
+        error,
+    }
+}
+
+/// `anyhow::ensure!` for a feed that contradicts its own contract.
+macro_rules! ensure_protocol {
+    ($condition:expr, $($arg:tt)*) => {
+        if !$condition {
+            return Err(SyncError {
+                cause: SyncFailureCause::Protocol,
+                error: anyhow::anyhow!($($arg)*),
+            });
+        }
+    };
 }
 
 #[derive(Debug)]
@@ -105,6 +148,7 @@ impl SnapshotStore {
             ready: AtomicBool::new(false),
             sync_interval: config.sync_interval(),
             last_success: AtomicU64::new(now_secs()),
+            head_seq: AtomicU64::new(0),
             negative_cache: Mutex::new(HashMap::new()),
             inflight_permits: Semaphore::new(MAX_INFLIGHT_RESOLVES),
             limiter: Mutex::new(RateLimiter::new(RESOLVE_RATE_PER_SEC)),
@@ -191,9 +235,8 @@ impl SnapshotStore {
                     "authorize returned key {} for {key_id}",
                     record.key_id
                 );
-                // A rebuild that landed mid-lookup discards the record; the
-                // answer was still authoritative, so this stays a miss rather
-                // than becoming a retryable fault.
+                // A rebuild landing mid-lookup discards the record, but the
+                // answer was authoritative: a miss, not a retryable fault.
                 Ok(match self.upsert_resolved(record, generation) {
                     Some(record) => Lookup::Found(record),
                     None => Lookup::Unknown,
@@ -261,8 +304,11 @@ impl SnapshotStore {
         };
         match result {
             Ok(()) => self.last_success.store(now_secs(), Ordering::Release),
-            Err(err) => self.report_sync_failure(&err),
+            Err(failure) => self.report_sync_failure(&failure),
         }
+        // After the outcome either way, so the age keeps climbing through an
+        // outage rather than freezing at the last good tick (GAP-31).
+        self.publish_freshness();
     }
 
     /// Seconds since the last sync the control plane answered.
@@ -270,12 +316,27 @@ impl SnapshotStore {
         now_secs().saturating_sub(self.last_success.load(Ordering::Acquire))
     }
 
+    fn publish_freshness(&self) {
+        let (cursor, epoch) = {
+            let state = self.state.read().unwrap();
+            (state.cursor, state.epoch.clone())
+        };
+        metrics::report_key_snapshot(
+            self.stale_for_seconds(),
+            cursor,
+            self.head_seq.load(Ordering::Acquire),
+            epoch.as_deref(),
+        );
+    }
+
     /// A failed tick is routine — fail-static means the last good snapshot
     /// keeps serving — but how long that has been going on is not, so every
     /// failure carries it. An alert on the age is the operator's job.
-    fn report_sync_failure(&self, err: &anyhow::Error) {
+    fn report_sync_failure(&self, failure: &SyncError) {
+        metrics::report_key_snapshot_sync_failure(failure.cause);
         tracing::warn!(
-            error = %err,
+            error = %failure.error,
+            cause = failure.cause.as_str(),
             stale_for_seconds = self.stale_for_seconds(),
             ready = self.is_ready(),
             "commercial snapshot sync failed; serving last known keys"
@@ -286,26 +347,27 @@ impl SnapshotStore {
     /// One page per tick would make revocation latency proportional to the
     /// backlog — a deleted 5k-key org keeps working for five ticks — and
     /// `head_seq` says how far behind the cursor is, so the tick drains it.
-    async fn sync_once(&self) -> anyhow::Result<()> {
+    async fn sync_once(&self) -> Result<(), SyncError> {
         let start = self.state.read().unwrap().cursor;
         let mut cursor = start;
         let mut applied = 0usize;
         let mut pages = 0usize;
 
         loop {
-            anyhow::ensure!(
+            ensure_protocol!(
                 pages < MAX_PAGES_PER_TICK,
                 "snapshot delta exceeded {MAX_PAGES_PER_TICK} pages"
             );
             let page = self.client.fetch_page(cursor).await?;
             pages += 1;
+            self.head_seq.store(page.head_seq, Ordering::Release);
 
             if let Some(reason) = self.resync_reason(cursor, &page) {
                 // Mid-drain, the pages already applied belong to a history the
                 // feed has just disowned, so only the first page of a tick can
                 // take the resync path. Later ones fail the tick; the next one
                 // starts from a settled cursor and resyncs then.
-                anyhow::ensure!(
+                ensure_protocol!(
                     pages == 1,
                     "snapshot feed changed after {} page(s) of a delta drain: {reason:?}",
                     pages - 1
@@ -339,11 +401,14 @@ impl SnapshotStore {
             // — and replay the same page forever. Fail the tick instead and
             // keep the last good state until the control plane makes sense
             // again.
-            anyhow::ensure!(
+            ensure_protocol!(
                 next_cursor > cursor,
                 "snapshot delta carried {page_len} record(s) without advancing cursor {cursor} (next_cursor {next_cursor})"
             );
-            applied += self.apply_delta(parse_records(page.records)?, next_cursor);
+            applied += self.apply_delta(
+                parse_records(page.records).map_err(parse_failure)?,
+                next_cursor,
+            );
             cursor = next_cursor;
 
             // A short page is the feed saying there is no more, and reaching
@@ -354,13 +419,14 @@ impl SnapshotStore {
         }
 
         if cursor > start {
+            metrics::report_key_snapshot_delta(applied);
             tracing::info!(applied, pages, cursor, "commercial snapshot delta applied");
         }
         Ok(())
     }
 
     /// Re-reads the whole feed from cursor zero and replaces the served state.
-    async fn bootstrap(&self) -> anyhow::Result<()> {
+    async fn bootstrap(&self) -> Result<(), SyncError> {
         let mut cursor = 0;
         let mut records = Vec::new();
         let mut epoch: Option<String> = None;
@@ -368,18 +434,19 @@ impl SnapshotStore {
 
         // The head the last page read reported: what a complete read reaches.
         let head = loop {
-            anyhow::ensure!(
+            ensure_protocol!(
                 pages < MAX_PAGES_PER_TICK,
                 "snapshot bootstrap exceeded {MAX_PAGES_PER_TICK} pages"
             );
             let page = self.client.fetch_page(cursor).await?;
             pages += 1;
+            self.head_seq.store(page.head_seq, Ordering::Release);
 
             // Pages from two epochs do not compose into a snapshot of either,
             // so a flip mid-bootstrap fails the tick. The next one starts from
             // cursor zero anyway, which is exactly the restart this used to do
             // by hand.
-            anyhow::ensure!(
+            ensure_protocol!(
                 epoch
                     .as_ref()
                     .is_none_or(|expected| *expected == page.epoch),
@@ -389,13 +456,13 @@ impl SnapshotStore {
 
             let page_len = page.records.len();
             let head = page.head_seq;
-            records.extend(parse_records(page.records)?);
+            records.extend(parse_records(page.records).map_err(parse_failure)?);
             epoch = Some(page.epoch);
             if page_len < usize::from(PAGE_LIMIT) {
                 cursor = page.next_cursor;
                 break head;
             }
-            anyhow::ensure!(
+            ensure_protocol!(
                 page.next_cursor > cursor,
                 "snapshot bootstrap cursor did not advance past {cursor}"
             );
@@ -407,13 +474,14 @@ impl SnapshotStore {
         // read are a subset of the key set — every key past `cursor` would 401
         // — so this is a failed tick, not a snapshot. The last good one keeps
         // serving; a portal that has none stays out of rotation.
-        anyhow::ensure!(
+        ensure_protocol!(
             cursor >= head,
             "snapshot bootstrap ended at cursor {cursor}, short of head {head}, after {pages} page(s)"
         );
 
         let count = records.len();
         self.install(records, cursor, epoch);
+        metrics::report_key_snapshot_rebuild();
         tracing::info!(count, cursor, "commercial snapshot bootstrap applied");
         Ok(())
     }

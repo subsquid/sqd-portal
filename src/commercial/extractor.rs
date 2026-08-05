@@ -15,7 +15,11 @@ use super::{
     now_secs,
     store::SnapshotStore,
 };
-use crate::{network::NetworkClient, types::DatasetId};
+use crate::{
+    metrics::{self, AuthDecision},
+    network::NetworkClient,
+    types::DatasetId,
+};
 
 /// Token layouts the portal accepts, all of the form `<prefix><key_id>_<secret>`:
 /// the prefix minted by the control plane, plus the legacy prefix carried by
@@ -86,6 +90,17 @@ pub enum RouteClass {
     /// Describes the portal or its datasets: lists, heads, heights, state,
     /// worker inventory, docs.
     Metadata,
+}
+
+impl RouteClass {
+    /// The class, not the route: a series per path would name the datasets
+    /// `all` exists to hide (REQ-51).
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::Metadata => "metadata",
+        }
+    }
 }
 
 pub struct Gate {
@@ -194,6 +209,26 @@ impl Gate {
         }
     }
 
+    /// OB-12's public half: the wire code and nothing finer. Shadow mode served
+    /// every request, so one neutral series covers all its verdicts.
+    fn count(&self, decision: Decision, class: RouteClass) {
+        metrics::report_auth_decision(
+            self.public_outcome(decision),
+            class.as_str(),
+            self.enforcement.as_str(),
+        );
+    }
+
+    /// Split out so the non-disclosure property is a pure function two cases
+    /// can be compared through.
+    fn public_outcome(&self, decision: Decision) -> AuthDecision {
+        match (self.enforcement, decision) {
+            (Enforcement::LogOnly, _) => AuthDecision::ShadowEvaluated,
+            (_, Decision::Admit) => AuthDecision::Admit,
+            (_, Decision::Reject(rejection)) => AuthDecision::Reject(rejection.code),
+        }
+    }
+
     /// Log-only mode records every request; enforcing mode records only the
     /// requests it turns away, since admissions are the hot path.
     fn log(&self, decision: Decision, key_id: Option<&str>, dataset: Option<&str>) {
@@ -201,7 +236,7 @@ impl Gate {
         let key_id = key_id.unwrap_or("none");
         let dataset = dataset.unwrap_or("-");
         let portal_id = self.portal_id.as_str();
-        let enforcement = if enforcing { "enforce" } else { "log_only" };
+        let enforcement = self.enforcement.as_str();
 
         let Decision::Reject(rejection) = decision else {
             if !enforcing {
@@ -223,8 +258,7 @@ impl Gate {
             portal_id,
             // Shadow mode says what it would have done, since it did not.
             decision = if enforcing { "reject" } else { "would_reject" },
-            // The internal rung, which only this protected axis carries: the
-            // wire and the scrape both coarsen it (INV-39, ADR-017).
+            // The internal rung; the wire and the scrape both coarsen it.
             reason = rejection.reason,
             error_code = rejection.code.as_str(),
             status = rejection.code.status().as_u16(),
@@ -245,6 +279,7 @@ pub async fn middleware(
         return next.run(req).await;
     }
     let decision = gate.decide(req.headers(), req.uri(), source).await;
+    gate.count(decision, class);
     match (decision, gate.enforcement) {
         (Decision::Reject(rejection), Enforcement::Enforce) => rejection.into_response(),
         _ => next.run(req).await,
@@ -991,5 +1026,140 @@ mod tests {
             .await;
 
         assert!(matches!(decision, Decision::Reject(_)));
+    }
+
+    /// Everything two keyless scrapes bracketing one request could see change.
+    /// Compared between cases rather than sampled: the families are global, so
+    /// a timing test would race the rest of the binary.
+    fn public_projection(
+        gate: &Gate,
+        decision: Decision,
+        class: RouteClass,
+    ) -> Vec<(String, String)> {
+        metrics::auth_decision_labels(
+            gate.public_outcome(decision),
+            class.as_str(),
+            gate.enforcement.as_str(),
+        )
+    }
+
+    /// INV-39 on the keyless metrics surface. The unauthenticated rungs share
+    /// `invalid_credential` on the wire, so they must share a series: one that
+    /// split them is an enumeration oracle with a scrape interval attached.
+    #[tokio::test]
+    async fn a_scrape_cannot_tell_an_unknown_key_from_a_wrong_secret() {
+        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
+        let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
+
+        let mut projections = Vec::new();
+        for token in [
+            // Known id, wrong secret.
+            "Bearer sqd_portal_k1_wrong".to_string(),
+            // An id the snapshot has never held, and the control plane
+            // authoritatively does not know.
+            format!("Bearer sqd_portal_guessed_{SECRET}"),
+            // A token the portal cannot even parse.
+            "Bearer sqd_portal_nonsense".to_string(),
+        ] {
+            let decision = gate
+                .decide(&header_map(&token), &uri, DatasetSource::Alias)
+                .await;
+            projections.push((
+                decision,
+                public_projection(&gate, decision, RouteClass::Data),
+            ));
+        }
+
+        let reasons: Vec<_> = projections
+            .iter()
+            .map(|(decision, _)| match decision {
+                Decision::Reject(rejection) => rejection.reason,
+                Decision::Admit => "admit",
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            ["invalid_secret", "unknown_key", "malformed_credential"],
+            "three distinct rungs, or the test proves nothing"
+        );
+
+        let first = &projections[0].1;
+        assert!(
+            first.contains(&("error_code".to_owned(), "invalid_credential".to_owned())),
+            "{first:?}"
+        );
+        for (decision, projection) in &projections {
+            assert_eq!(
+                projection, first,
+                "{decision:?} is publicly distinguishable: {projection:?}"
+            );
+        }
+    }
+
+    /// Shadow mode served all of these, so its scrape must not say which was
+    /// which — publishing the would-be verdict is the oracle enforcement is not
+    /// (REQ-55).
+    #[tokio::test]
+    async fn a_shadow_scrape_says_only_that_a_request_was_evaluated() {
+        let mut scoped = key_record("k2", 1);
+        scoped.datasets = Some(vec!["nothing-matching".to_string()]);
+        let gate = gate(vec![key_record("k1", 1), scoped], Enforcement::LogOnly).await;
+        let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
+
+        let mut projections = Vec::new();
+        for headers in [
+            // Would admit.
+            header_map(&format!("Bearer {TOKEN}")),
+            // Would refuse: no credential.
+            HeaderMap::new(),
+            // Would refuse: scoped to another dataset.
+            header_map(&format!("Bearer sqd_portal_k2_{SECRET}")),
+        ] {
+            let decision = gate.decide(&headers, &uri, DatasetSource::Alias).await;
+            projections.push(public_projection(&gate, decision, RouteClass::Data));
+        }
+
+        for projection in &projections {
+            assert_eq!(projection, &projections[0], "{projection:?}");
+            assert!(
+                projection.contains(&("decision".to_owned(), "shadow_evaluated".to_owned())),
+                "{projection:?}"
+            );
+            assert!(
+                !projection.iter().any(|(name, _)| name == "error_code"),
+                "a shadow verdict must not reach the keyless scrape: {projection:?}"
+            );
+        }
+    }
+
+    /// An enforced refusal is not silent, though, or the cutover is blind. Goes
+    /// through the counter to prove the wiring; asserts a floor rather than an
+    /// exact delta, since the family is shared.
+    #[tokio::test]
+    async fn an_enforced_refusal_is_counted_under_the_code_the_client_received() {
+        let mut record = key_record("k1", 1);
+        record.expires_at = Some(1);
+        let gate = gate(vec![record], Enforcement::Enforce).await;
+        let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
+
+        let expired = || {
+            metrics::auth_decisions(
+                AuthDecision::Reject(ErrorCode::ExpiredCredential),
+                RouteClass::Data.as_str(),
+                Enforcement::Enforce.as_str(),
+            )
+        };
+        let before = expired();
+
+        let decision = gate
+            .decide(
+                &header_map(&format!("Bearer {TOKEN}")),
+                &uri,
+                DatasetSource::Alias,
+            )
+            .await;
+        gate.count(decision, RouteClass::Data);
+
+        assert!(expired() > before, "the refusal must reach the scrape");
     }
 }

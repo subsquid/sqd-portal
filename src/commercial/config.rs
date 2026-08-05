@@ -59,6 +59,17 @@ pub enum Enforcement {
     LogOnly,
 }
 
+impl Enforcement {
+    /// The value the log field and the OB-12 label both carry, so they cannot
+    /// drift into two spellings of the same mode.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::LogOnly => "log_only",
+        }
+    }
+}
+
 impl CommercialConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.service_token()?;
