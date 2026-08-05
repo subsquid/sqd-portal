@@ -8,6 +8,8 @@ Liveness claims hold only under a declared environment:
   correct responses within P-TRANSPORT-TIMEOUT and is not rate-limiting.
 - **Healthy publisher/registry:** DC-2/DC-3 fetches succeed within their deadlines.
 - **Healthy real-time source:** DC-4 answers within its deadlines.
+- **Healthy control plane:** DC-8 feed reads and lookups succeed within their deadlines.
+  Vacuous on a Portal with no commercial configuration.
 - **Adequate resources:** census below P-MAX-STREAMS, congestion utilization below
   P-HEADROOM-THRESHOLD, memory within P-MEMORY-BUDGET.
 - **Patient supervisor:** the orchestrator's kill grace P-KILL-GRACE exceeds
@@ -45,11 +47,15 @@ by endpoint. Check: CT-6 under S3.
 P-NO-DATA-DELAY + slack — bounded above as well as below (the throttle must not hold
 connections indefinitely). Witness: OB-3. Check: CT-1 timing.
 
-**LIV-5 — Startup bound, accept/ready decoupled.** From process start with healthy
-publisher: the listener accepts connections early (probes answerable while loading),
-and readiness is achieved within P-STARTUP-BOUND ⚠, dominated by the artifact
-download. Startup never blocks on the real-time source or chain RPC. Witness: OB-8
-lifecycle timestamps. Check: CT-2 cold-start scenario (S5).
+**LIV-5 — Startup bound, accept/ready decoupled.** From process start with a healthy
+publisher — and, for an enforcing commercial deployment, a healthy control plane whose
+initial snapshot is `K ≤ P-KEY-MAX-PAGES-PER-TICK` pages — the listener accepts
+connections early (probes answerable while loading). Readiness is achieved within the
+artifact fetch time + `K × P-KEY-FETCH-TIMEOUT` + snapshot-apply time + scheduling slack;
+a supported deployment sizes the feed so that sum is ≤ P-STARTUP-BOUND ⚠. Neither
+startup input is assumed to dominate the other. Startup never blocks on the real-time
+source or chain RPC. Witness: OB-8 lifecycle timestamps. Check: CT-2/CT-10 cold-start
+scenario (S5), including a multi-page key set and an unavailable control plane.
 
 **LIV-6 — Artifact convergence.** A newly published artifact (effective time passed)
 is applied within P-ASSIGNMENT-REFRESH + fetch time; routing reflects it for all new
@@ -82,6 +88,30 @@ INV-30 audit.
 **LIV-11 — Shutdown bound.** SIGTERM ⇒ readiness flips immediately; process exits
 within P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT + slack, regardless of client behavior
 (ADR-005). Witness: OB-8/OB-5. Check: CT-2 — shutdown under load with stalled readers.
+
+**LIV-13 — Revocation convergence.** Healthy control plane, commercial deployment ⇒ a
+key revoked at the control plane stops being served by every replica after the pending
+pages through that record have been read. For `N` such pages and
+`M = P-KEY-MAX-PAGES-PER-TICK`, a conservative time bound is
+`ceil(N / M) × P-KEY-SYNC-INTERVAL + N × P-KEY-FETCH-TIMEOUT` plus snapshot-apply and
+scheduling slack; when `N ≤ M`, one tick drains the backlog. Convergence is therefore
+bounded but not independent of backlog size. It is per replica and needs no coordination
+— each mirrors the same feed independently. Witness: OB-13 snapshot age/cursor against
+the feed's head; per-request lookup details remain off the keyless metrics surface. Check:
+CT-10 — with a test-small `M ≥ 2`, revoke one key, a bulk of P-KEY-PAGE-LIMIT + 1, and
+a backlog of `M + 1` pages; assert one-, one-, and two-cycle convergence respectively.
+
+**LIV-14 — New-key admission.** Healthy control plane ⇒ a key minted after the last
+successful tick is served without waiting for the next one: a snapshot miss resolves
+directly against the control plane (DC-8), so admission latency for a fresh key is one
+lookup, not up to P-KEY-SYNC-INTERVAL. The bound holds only within the lookup budget —
+P-KEY-RESOLVE-RATE and P-KEY-RESOLVE-INFLIGHT — and outside it the key is refused as
+OVERLOADED with a retry hint until the next tick rather than delayed or mislabeled as an
+invalid credential (HZ-10). A failed lookup is UPSTREAM-FAILURE and likewise retryable.
+Witness: protected OB-13 lookup events plus the control-plane stub ledger. Check: CT-10 —
+mint a key between ticks; assert it is served, that saturation returns OVERLOADED, and
+that a control-plane failure returns UPSTREAM-FAILURE before the same credential succeeds
+after recovery.
 
 **LIV-12 — No silent infinite retry.** Any divergence converges or alarms: chunk
 attempts are bounded by 1 + retries, then surface RETRIES-EXHAUSTED (WORKER-FAILURE

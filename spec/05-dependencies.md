@@ -7,7 +7,8 @@ otherwise need.
 
 **The no-undeclared-dependencies rule.** Every network or system interaction of the
 Portal appears in this document. Any interaction not listed here observed in operation
-is a conformance violation (INV-37).
+is a conformance violation (INV-37). DC-8 is conditional on commercial configuration:
+observing it on a Portal without one is the same violation (REQ-56).
 
 ## DC-1 — Archival workers
 
@@ -113,6 +114,59 @@ never delays or fails serving.
 *Role.* Sampled error/trace reports (P-ERROR-SAMPLE-RATE).
 *Contract.* Fire-and-forget; failure has no client-visible effect.
 
+## DC-8 — Control plane (key feed)
+
+Exists only on a commercial deployment (REQ-56); on any other the Portal opens no
+connection to it and this contract is vacuous.
+
+*Role.* Publishes the key set the Portal mirrors (DEF-17, DEF-18) and answers direct
+lookups for a single key; the source of every authorization decision (OP-11).
+*Call contract.* Two interactions, both authenticated with a portal-held service
+credential and neither following redirects — a redirected request carries that credential
+somewhere the operator did not configure, and a redirected key set is not the control
+plane's answer.
+
+1. *Feed read* — a background loop only, never on a request path. Polls every
+   P-KEY-SYNC-INTERVAL, reading pages of at most P-KEY-PAGE-LIMIT records forward from
+   the held cursor with a per-page deadline P-KEY-FETCH-TIMEOUT. Ticks are serialized; a
+   slow drain never overlaps the next poll. One tick drains up to
+   P-KEY-MAX-PAGES-PER-TICK rather than applying exactly one page; a larger backlog
+   continues on the next tick, and the resulting convergence bound is LIV-13's function
+   of page count. A page that carries records without advancing the cursor, or a short
+   page whose cursor remains below the head the feed reports, is a broken answer, not an
+   empty one — it fails the tick.
+2. *Direct lookup (authorize-on-miss)* — on the request path, and only for a key the
+   snapshot does not hold, so a key minted seconds ago works before the next tick
+   (LIV-14). Bounded by P-KEY-RESOLVE-RATE and at most P-KEY-RESOLVE-INFLIGHT concurrent
+   calls; a negative answer is remembered for P-KEY-NEGATIVE-TTL across at most
+   P-KEY-NEGATIVE-CAPACITY entries. Every bound is a fail-*closed* bound: exceeding one
+   produces an immediate OVERLOADED response with a retry hint, never a delay or an
+   admission (HZ-10).
+
+*Error mapping.* No control-plane fault ever reaches a client as itself.
+
+| Fault | Own class / action |
+|---|---|
+| Feed unreachable, timeout, or non-success status | keep serving the established snapshot; alarm on age (OB-13). Never fails a request by itself (REQ-54) |
+| Feed envelope missing a required field | treat as a broken answer, not an empty page — fail the tick, keep the snapshot. A 200 from a wrong route or a half-deployed replica must not read as "the key set is now empty", which would quietly stop delivering revocations |
+| Record malformed but identifiable | tombstone that key (DEF-17): it stops authenticating, and the older version it replaces does not survive |
+| Record unidentifiable | fail the page; keep the snapshot |
+| Record status this build predates | tombstone — an unknown status is fail-closed by the same path as any other unusable record |
+| Epoch change, or reported head below the held cursor | the cursor's history is gone: rebuild the snapshot from the start rather than advance (DEF-18) |
+| Epoch change *mid-drain* | fail the tick; pages from two epochs compose into a snapshot of neither |
+| Lookup: key unknown | refuse the request (BAD-CREDENTIAL); remember the answer for P-KEY-NEGATIVE-TTL |
+| Lookup: rate/concurrency bound reached | refuse immediately as OVERLOADED with `Retry-After` ≥ P-RETRY-AFTER-MIN; never queue or claim the credential is bad |
+| Lookup: call fails, times out, or returns an unusable answer | refuse as UPSTREAM-FAILURE; the same credential may succeed after recovery, so this is never BAD-CREDENTIAL |
+| Lookup: answer names a different key than was asked about | discard the answer and refuse as UPSTREAM-FAILURE |
+
+*Degradation.* Fail-static and unbounded today: the established snapshot serves for as
+long as the outage lasts, so a revocation issued during it does not land until the feed
+returns (GAP-31). Intent bounds this at P-KEY-SNAPSHOT-MAX-AGE ⚠ (OQ-12). Before the
+*first* complete bootstrap there is no snapshot to be static about, and an enforcing
+Portal declines readiness instead of refusing every key (INV-31). Nothing survives
+restart (NG5): every replica re-reads the feed from the start on boot, which puts the
+whole key set on the startup path and in every replica's memory (HZ-11).
+
 ## Caches & refreshed snapshots (lifecycle)
 
 | Snapshot | Refreshed by | Staleness bound | Staleness visible? |
@@ -122,6 +176,8 @@ never delays or fails serving.
 | Chain status | DC-5 poll | none (status only) | loading state before first fetch |
 | Worker health map (DEF-12) | per-query outcomes | rolling windows (P-WORKER-ERROR-COOLDOWN / P-WORKER-TIMEOUT-COOLDOWN) | operator debug view |
 | Heads | artifact (archival) / per-request (real-time) | one successful P-ASSIGNMENT-REFRESH cycle / live; archival outage unbounded | response metadata (INV-24) |
+| Key snapshot (DEF-18) | DC-8 feed poll, plus authorize-on-miss for absent keys | LIV-13's page-count-dependent bound while healthy; none during outage today; ⚠ P-KEY-SNAPSHOT-MAX-AGE (OQ-12) | intent: age gauge + alarm (OB-13, GAP-31) |
+| Negative key answers | DC-8 lookup | P-KEY-NEGATIVE-TTL; cleared wholesale by a snapshot rebuild | protected lookup events (OB-13) |
 
 There is no response cache: no client-visible value is ever served from a cache other
 than these declared snapshots.

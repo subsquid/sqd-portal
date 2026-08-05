@@ -32,6 +32,9 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
 | head / finalized head | Highest available block / highest finalized block of a dataset |
 | data frontier | Highest block servable for a request right now (archival head or real-time head) |
 | stream | One request/response pair; may end early at any time and be resumed by a follow-up request |
+| API key | A credential a client presents: a public key id plus a secret the Portal only ever sees as a digest (DEF-16) |
+| key snapshot | The Portal's in-memory mirror of the control plane's key set, refreshed by cursor-paged deltas (DEF-18) |
+| gated route | A route that requires a key on a commercial deployment; which routes are gated is the operator's gate scope (DEF-19) |
 
 ## Actors
 
@@ -45,6 +48,7 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
 | Real-time source | Serves head/stream requests for recent blocks; proxied per request | outbound |
 | Chain RPC + contracts | On-chain registry: epoch, stake, compute units, worker set | outbound |
 | Error-reporting sink | Receives sampled error/trace reports | outbound |
+| Control plane | Mints and revokes API keys; publishes the key feed the Portal mirrors (DC-8). Present only on a commercial deployment | outbound |
 
 ## Design goals
 
@@ -56,13 +60,14 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
 | G4 | Be a good network citizen: self-regulate bandwidth, spread load across workers, account for usage | REQ-40..REQ-44, ADR-006, ADR-004 |
 | G5 | Operable: truthful readiness, observable behavior, forgiving configuration | REQ-23, REQ-24, REQ-30..REQ-33 |
 | G6 | Robust against hostile clients and flaky upstreams | REQ-21, REQ-22, REQ-25, REQ-26 |
+| G7 | Commercial access is decided by the Portal, not by whatever sits in front of it — and only where an operator asked for it | REQ-50..REQ-56, ADR-016, ADR-017 |
 
 ## Non-goals
 
 | Non-goal | Rationale |
 |---|---|
-| NG1 — No per-request authentication or authorization | The Portal runs behind a trusted perimeter; any per-client policy (identity, tiers, head lag) originates upstream of it (ADR-009). A Portal reachable directly by untrusted clients has no client-level defenses beyond input validation. |
-| NG2 — No per-client quotas or fairness | All capacity limits are global. One client can exhaust shared capacity; isolation between clients is not promised. |
+| ~~NG1~~ — *retired by ADR-016.* Per-request authentication is now an opt-in capability (REQ-50..REQ-56). A Portal without commercial configuration still authenticates nothing and has no client-level defenses beyond input validation; that is a deployment choice, no longer a property of the system. Other per-client policy (tiers, head lag) still originates upstream (ADR-009). |
+| NG2 — No per-client quotas or fairness | All capacity limits are global. One client can exhaust shared capacity; isolation between clients is not promised. **An authenticated key is no exception:** admission (REQ-50) decides whether a request is served, never how much of the shared capacity it may take. Quota and metering are explicitly out of scope for ADR-016. |
 | NG3 — No head subscription or long-poll | Clients poll. A request beyond the frontier gets a throttled empty response (REQ-5), never a held-open wait for new blocks. |
 | NG4 — No cross-source splicing within one response | Each response is served entirely by one source (archival or real-time). Crossing the boundary is the client's follow-up request (REQ-4). |
 | NG5 — No durable local state | Restart amnesia is by design: everything is refetched or relearned. There is nothing to back up or recover. |
@@ -73,12 +78,13 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
 
 | Actor | Verified | Trusted | Must never be able to cause |
 |---|---|---|---|
-| Data consumer | Query syntax, size caps, parameter ranges | Nothing | Crash/wedge the process, corrupt another stream, bypass operator caps (REQ-21) |
+| Data consumer | Query syntax, size caps, parameter ranges; on a commercial deployment, the presented credential against the mirrored key set (REQ-50) | Nothing | Crash/wedge the process, corrupt another stream, bypass operator caps (REQ-21); on a commercial deployment, reach a gated route without a key that covers it (INV-14), or learn from a completed credential verdict or keyless metrics which key ids exist (INV-39; authorize-on-miss residual: GAP-32) |
 | Archival worker | Response signature (when enabled, REQ-43); response size cap; result range plausibility | Data content within its signed response | Process crash, unbounded memory, permanently poisoning the worker pool (penalties decay, REQ-41) |
 | Assignment publisher | Transfer integrity only — structural validity is currently **trusted, not verified** (ADR-002, GAP-1) | Artifact correctness | *Intent:* crash or false readiness via a corrupt artifact (REQ-26) — presently not enforced |
 | Real-time source | Streamed success data and public headers; errors normalized by ADR-011 | Data content, conflict responses | Stalling a client past bounded deadlines (REQ-22) |
 | Chain RPC | Nothing beyond transport | Status values | Any effect on data serving — status only (REQ-25) |
-| Operator | Config validity at startup | Fully | — |
+| Control plane | Transport integrity and feed-envelope well-formedness; an unparseable key record is fail-closed, never dropped (INV-6) | The key set it publishes: status, scopes, expiry, and the secret digest | Admit a request the published key set does not cover; open the data API by going silent — an outage freezes the snapshot, it never empties it (REQ-54, FM table) |
+| Operator | Config validity at startup | Fully | Configure a commercial block that silently serves everything (REQ-56) |
 
 ## Lifecycle at a glance
 
@@ -94,7 +100,9 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
                                              └── proxy ──▶ real-time source
 ```
 
-- **Request lifecycle:** validate → clamp to operator bounds → route by range → serve
-  from one source → end (complete, empty, or truncated) → client resumes (REQ-2).
-- **Process lifecycle:** start → fetch catalog + first assignment → ready → serve ⟲
-  refresh world view → SIGTERM → advertise not-ready, drain two-phase (REQ-24) → exit.
+- **Request lifecycle:** *authorize, where the route is gated (REQ-50)* → validate →
+  clamp to operator bounds → route by range → serve from one source → end (complete,
+  empty, or truncated) → client resumes (REQ-2).
+- **Process lifecycle:** start → fetch catalog + first assignment *(+ mirror the key set,
+  where commercial)* → ready → serve ⟲ refresh world view → SIGTERM → advertise
+  not-ready, drain two-phase (REQ-24) → exit.
