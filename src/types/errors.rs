@@ -32,8 +32,7 @@ impl ErrorType {
         }
     }
 
-    /// Both auth types answer no: retrying with the same credential cannot succeed, and
-    /// a client that treats a refusal as transient produces the storm ADR-012 prevents.
+    /// Both auth types answer no: the same credential cannot start working.
     pub const fn retryable(self) -> bool {
         match self {
             Self::RateLimit | Self::Availability => true,
@@ -108,13 +107,11 @@ error_codes! {
 
         // ADR-017. Commercial deployments only; vacuous without a `commercial:` block.
         MissingCredential => "missing_credential",
-        /// One wire code for four internal reasons — unparseable token, unknown key id,
-        /// wrong secret, digestless record. Distinguishing them would tell a caller which
-        /// of its guesses to keep (INV-39); the operator gets the distinction on the
-        /// protected log axis instead.
+        /// One code for four rungs — unparseable, unknown id, wrong secret, no digest.
+        /// Splitting them tells a caller which guess to keep (INV-39); the operator gets
+        /// the distinction in the protected log.
         InvalidCredential => "invalid_credential",
-        /// Only reachable by someone already holding the right secret, so it can be
-        /// specific without leaking anything.
+        /// Reachable only with the right secret, so it can be specific.
         RevokedCredential => "revoked_credential",
         ExpiredCredential => "expired_credential",
         PortalNotAllowed => "portal_not_allowed",
@@ -140,8 +137,7 @@ impl ErrorCode {
 
             Self::WorkerFailure | Self::Internal | Self::Unclassified => ErrorType::Api,
 
-            // Never `api_error`: turning away an unauthenticated request is the system
-            // working, and must not page.
+            // Never `api_error`: an auth refusal is the system working, and must not page.
             Self::MissingCredential
             | Self::InvalidCredential
             | Self::RevokedCredential
@@ -180,9 +176,8 @@ impl ErrorCode {
         }
     }
 
-    /// ADR-017: a 401 must name the scheme the client should retry with. Not folded into
-    /// [`Self::status`] because the header is the type's obligation, not the status's —
-    /// a 403 is also a refusal and owes no challenge.
+    /// ADR-017: a 401 names the scheme to retry with. The obligation is the type's, not
+    /// the status's — a 403 is a refusal too and owes no challenge.
     pub const fn challenges(self) -> bool {
         matches!(self.error_type(), ErrorType::Authentication)
     }
@@ -688,8 +683,7 @@ mod tests {
         assert!(!ErrorCode::DatasetNotAllowed.error_type().retryable());
     }
 
-    /// An auth refusal is the system working. Typing one `api_error` would page the team
-    /// every time a client mistypes its key.
+    /// Typing one `api_error` would page the team on every mistyped key.
     #[test]
     fn no_auth_refusal_pages() {
         for code in ErrorCode::ALL {

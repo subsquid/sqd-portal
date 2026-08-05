@@ -98,7 +98,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
    [15-parameters.md](15-parameters.md) and the SLO table (11); close the open questions
    in [02-requirements.md](02-requirements.md). ADR-016 and ADR-017 are a pair: the
    first makes the Portal refuse requests on identity grounds, the second gives those
-   refusals somewhere to live in the error taxonomy — adopting the first without the
-   second is what GAP-29 records.
+   refusals somewhere to live in the error taxonomy. Both are implemented; what is left
+   is the ratification.
 3. **Burn down the gap register** in [13-conformance.md](13-conformance.md) in priority
    order — failing test first, fix second, matrices updated in the same change.

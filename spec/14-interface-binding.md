@@ -168,8 +168,9 @@ outcome already disclosed (OB-1/12/13, INV-39).
 *Interaction with the envelope.* An auth refusal is emitted in the IB-5 envelope with the
 codes above. It must reach the client with the status IB-5 binds to its code — a refusal
 carrying no code is normalized onto `malformed_request` at 400 by the same rule that
-catches framework rejections, which would erase the distinction this rule exists to make
-(GAP-29).
+catches framework rejections, which would erase the distinction this rule exists to make.
+Emitting through the envelope is what prevents that, and CT-5 pins it behind the real
+middleware stack rather than at the gate alone.
 
 **IB-8 — Versioning rule.** Any change to this binding (route, code, header, schema,
 taxonomy) updates this file and the interface-conformance class CT-5 in the same

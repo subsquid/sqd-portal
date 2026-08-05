@@ -57,16 +57,15 @@ impl RefusalReason {
     }
 }
 
-/// What one evaluation may say on the keyless scrape (OB-12). Coarser than the
-/// ladder: nothing here may exceed what the caller's own response told it, so
-/// two scrapes bracketing a request reveal nothing new (INV-39).
+/// What one evaluation may say on the keyless scrape (OB-12). Never more than
+/// the caller's own response told it (INV-39).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthDecision {
     /// Enforcing, and the request was served.
     Admit,
     /// Enforcing, and this is the code the caller received.
     Reject(ErrorCode),
-    /// Shadow mode. Valid, invalid and indeterminate share it: all were served.
+    /// Shadow mode: valid, invalid and indeterminate alike, since all were served.
     ShadowEvaluated,
 }
 
@@ -80,8 +79,7 @@ impl AuthDecision {
     }
 }
 
-/// Why a sync tick failed (OB-13). Separates a control plane that is down from
-/// one answering nonsense — different pages.
+/// Why a sync tick failed (OB-13): down and answering nonsense are different pages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncFailureCause {
     /// The feed could not be read at all.
@@ -285,16 +283,14 @@ pub fn auth_decisions(decision: AuthDecision, route_class: &'static str, enforce
 }
 
 /// Snapshot freshness and provenance (OB-13). Called on every tick, failed ones
-/// included, so age keeps climbing through an outage. Resolution is the sync
-/// interval, not the scrape interval.
+/// included, so age climbs through an outage instead of freezing.
 pub fn report_key_snapshot(age_seconds: u64, cursor: u64, head_seq: u64, epoch: Option<&str>) {
     KEY_SNAPSHOT_AGE.set(age_seconds as i64);
     KEY_SNAPSHOT_CURSOR.set(cursor as i64);
     KEY_SNAPSHOT_HEAD.set(head_seq as i64);
     if let Some(epoch) = epoch {
         let labels = vec![("epoch".to_owned(), epoch.to_owned())];
-        // One series at a time: a rebuild retires the old epoch rather than
-        // leaving a sample behind for every epoch the process has ever seen.
+        // One series at a time, or every epoch ever seen leaves a sample behind.
         if KEY_SNAPSHOT_EPOCH.get_or_create(&labels).get() != 1 {
             KEY_SNAPSHOT_EPOCH.clear();
             KEY_SNAPSHOT_EPOCH.get_or_create(&labels).set(1);
@@ -302,8 +298,7 @@ pub fn report_key_snapshot(age_seconds: u64, cursor: u64, head_seq: u64, epoch: 
     }
 }
 
-/// Records applied by a delta tick — not the record count, which would tell a
-/// keyless scraper how many keys exist (OB-13).
+/// Records applied, not the record count: that would say how many keys exist.
 pub fn report_key_snapshot_delta(applied: usize) {
     KEY_SNAPSHOT_DELTAS.inc_by(applied as u64);
 }

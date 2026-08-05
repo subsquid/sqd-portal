@@ -62,8 +62,7 @@ structured logs (OB-12) — which no client can read. The keyless metrics surfac
 deliberately keeps the same coarsening as the wire. The remaining codes are only reachable
 by someone already holding the right secret, so they can be specific without leaking
 anything (INV-39). A digestless revoked or malformed tombstone cannot establish that fact
-and therefore remains `invalid_credential`; the current #143 implementation differs
-(GAP-34).
+and therefore remains `invalid_credential`, keeping its own reason on the protected axis.
 
 `api_error` keeps its meaning: an auth refusal is never an `api_error` and must never
 page. The Portal turning away an unauthenticated request is the system working.
@@ -78,5 +77,4 @@ retryable and does it page?", and both new ones answer no to both.
 The `code` vocabulary is public API twice over (wire field and metric label), so these
 names are frozen on first release, per ADR-011.
 
-Amends ADR-011; required by ADR-016. GAP-29 tracks the current implementation, which
-emits an envelope that predates this vocabulary and is consequently rewritten to 400.
+Amends ADR-011; required by ADR-016.

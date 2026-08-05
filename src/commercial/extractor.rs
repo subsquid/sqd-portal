@@ -1096,6 +1096,51 @@ mod tests {
         }
     }
 
+    /// GAP-32, the accepted residual. Under lookup pressure a snapshot miss and
+    /// a snapshot hit answer differently — retryable congestion versus a
+    /// credential verdict — so the wire does reveal membership there. That is
+    /// REQ-54's accurate retry contract, and the alternative is refusing valid
+    /// keys during a control-plane blip.
+    ///
+    /// What must not happen is the scrape amplifying it: the counter carries
+    /// the code the caller already received and nothing about the lookup.
+    #[tokio::test]
+    async fn a_saturated_lookup_is_publicly_indistinguishable_from_any_overload() {
+        let gate = gate(Vec::new(), Enforcement::Enforce).await;
+        gate.store.exhaust_lookup_budget_for_test();
+        let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
+
+        let decision = gate
+            .decide(
+                &header_map(&format!("Bearer sqd_portal_minted-just-now_{SECRET}")),
+                &uri,
+                DatasetSource::Alias,
+            )
+            .await;
+
+        let Decision::Reject(rejection) = decision else {
+            panic!("a spent budget refuses");
+        };
+        assert_eq!(rejection.reason, "lookup_saturated");
+
+        let projection = public_projection(&gate, decision, RouteClass::Data);
+        assert_eq!(
+            projection,
+            metrics::auth_decision_labels(
+                AuthDecision::Reject(ErrorCode::Overloaded),
+                RouteClass::Data.as_str(),
+                Enforcement::Enforce.as_str(),
+            ),
+            "the scrape must say only what the 529 said"
+        );
+        assert!(
+            !projection
+                .iter()
+                .any(|(_, value)| value.contains("lookup") || value.contains("snapshot")),
+            "no lookup detail may reach a keyless scrape: {projection:?}"
+        );
+    }
+
     /// Shadow mode served all of these, so its scrape must not say which was
     /// which — publishing the would-be verdict is the oracle enforcement is not
     /// (REQ-55).

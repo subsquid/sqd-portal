@@ -68,8 +68,9 @@ outside the 400/404/409/5xx set.
 
 Two properties now need bounds the suite did not previously owe anyone: how long a
 revocation may take to reach a replica (LIV-13) and how stale a snapshot may get before
-the deployment should stop trusting it (P-KEY-SNAPSHOT-MAX-AGE ⚠, GAP-31). Both are
-the key-set analogue of the assignment-staleness question ADR-013 leaves open, and
-should be ratified together.
+the deployment should stop trusting it (P-KEY-SNAPSHOT-MAX-AGE ⚠, OQ-12). Age is
+exported and alarmable; what the Portal should *do* once it is exceeded is the open half.
+Both are the key-set analogue of the assignment-staleness question ADR-013 leaves open,
+and should be ratified together.
 
 Shapes REQ-50..REQ-56; adds DC-8; retires NG1.

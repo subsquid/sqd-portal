@@ -283,11 +283,13 @@ assert the specific reasons appear only for correct-secret requests; bracket eve
 under both enforcement modes with metrics scrapes and assert no public series reveals the
 internal reason or lookup path beyond the response that case received. In shadow mode,
 where every case is admitted, their authorization projections are identical.
-*Known deviation:* a snapshot miss may consult the control plane while a hit answers
+*Accepted deviation:* a snapshot miss may consult the control plane while a hit answers
 locally, so timing differs; if that lookup cannot run or answer, its retryable
 OVERLOADED/UPSTREAM-FAILURE response also differs from a hit's BAD-CREDENTIAL. The
-residual reveals snapshot membership under lookup pressure, but public metrics must not
-amplify it beyond the response the caller already received (GAP-32).
+residual reveals snapshot membership under lookup pressure, and is accepted because the
+alternative — collapsing both onto one outcome — means refusing valid keys during a
+control-plane blip, which REQ-54 forbids. Public metrics do not amplify it: the counter
+carries the code the caller already received and nothing about the lookup.
 
 ## Recovery (40–44)
 

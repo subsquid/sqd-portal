@@ -78,7 +78,7 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
 
 | Actor | Verified | Trusted | Must never be able to cause |
 |---|---|---|---|
-| Data consumer | Query syntax, size caps, parameter ranges; on a commercial deployment, the presented credential against the mirrored key set (REQ-50) | Nothing | Crash/wedge the process, corrupt another stream, bypass operator caps (REQ-21); on a commercial deployment, reach a gated route without a key that covers it (INV-14), or learn from a completed credential verdict or keyless metrics which key ids exist (INV-39; authorize-on-miss residual: GAP-32) |
+| Data consumer | Query syntax, size caps, parameter ranges; on a commercial deployment, the presented credential against the mirrored key set (REQ-50) | Nothing | Crash/wedge the process, corrupt another stream, bypass operator caps (REQ-21); on a commercial deployment, reach a gated route without a key that covers it (INV-14), or learn from a completed credential verdict or keyless metrics which key ids exist (INV-39; accepted authorize-on-miss residual: GAP-32) |
 | Archival worker | Response signature (when enabled, REQ-43); response size cap; result range plausibility | Data content within its signed response | Process crash, unbounded memory, permanently poisoning the worker pool (penalties decay, REQ-41) |
 | Assignment publisher | Transfer integrity only — structural validity is currently **trusted, not verified** (ADR-002, GAP-1) | Artifact correctness | *Intent:* crash or false readiness via a corrupt artifact (REQ-26) — presently not enforced |
 | Real-time source | Streamed success data and public headers; errors normalized by ADR-011 | Data content, conflict responses | Stalling a client past bounded deadlines (REQ-22) |

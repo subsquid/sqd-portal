@@ -99,12 +99,14 @@ protected structured logs. No metric label or request-synchronous counter may le
 client bracket two keyless scrapes and learn more than its response revealed (INV-39,
 ADR-017). Auth refusals in enforcing mode must still be distinguishable from every other
 refusal on the OB-3 error-code axis — an auth 401 counted as `malformed_request` is a lying
-metric (INV-30, GAP-29). None of this exists yet (GAP-30).
+metric (INV-30). Implemented as `commercial_authorization_decisions`.
 
 **OB-13 — Key snapshot freshness and provenance.** Commercial deployments only.
-Snapshot age since the last successful feed read (a gauge — the LIV-13 and GAP-31
-witness), the held cursor, last reported head and epoch, applied-delta and rebuild
-counters, and sync failures by cause. These public values change on background feed
+Snapshot age since the last successful feed read (a gauge — the LIV-13 witness), the held
+cursor, last reported head and epoch, applied-delta and rebuild counters, and sync
+failures by cause. Implemented as the `commercial_key_snapshot_*` families; age is
+republished at the end of every tick, failed ones included, so it climbs through an
+outage rather than freezing, and its resolution is the sync interval. These public values change on background feed
 activity, not synchronously with one presented key. Record count and authorize-on-miss
 outcomes are omitted from the keyless scrape: either can reveal whether an
 attacker-chosen id caused a lookup or inserted a record. Lookup outcomes instead emit
