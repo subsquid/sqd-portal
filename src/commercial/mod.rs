@@ -19,8 +19,8 @@ mod extractor;
 mod store;
 mod types;
 
-pub use config::{CommercialConfig, Enforcement};
-pub use extractor::{middleware, DatasetCatalog, DatasetSource, Gate};
+pub use config::{CommercialConfig, Enforcement, GatedRoutes};
+pub use extractor::{middleware, DatasetCatalog, DatasetSource, Gate, RouteClass};
 
 use store::SnapshotStore;
 
@@ -122,6 +122,7 @@ pub mod test_support {
             service_token_env: service_token_env(),
             portal_id: "portal-premium-eu".to_string(),
             enforcement: Enforcement::Enforce,
+            gated_routes: GatedRoutes::Data,
             sync_interval_secs: 10,
         }
     }
@@ -214,6 +215,7 @@ pub mod test_support {
                 service_token_env: service_token_env(),
                 portal_id: "portal-premium-eu".to_string(),
                 enforcement: Enforcement::Enforce,
+                gated_routes: GatedRoutes::Data,
                 sync_interval_secs: 10,
             }
         }

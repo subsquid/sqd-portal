@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use url::form_urlencoded;
 
 use super::{
-    config::{CommercialConfig, Enforcement},
+    config::{CommercialConfig, Enforcement, GatedRoutes},
     evaluate::{self, Decision, LazyDataset, Rejection},
     now_secs,
     store::SnapshotStore,
@@ -76,11 +76,24 @@ pub enum DatasetSource {
     Absent,
 }
 
+/// What kind of answer a route gives, which decides whether the `data`-only
+/// mode gates it. Data routes are always gated; metadata routes only under
+/// `gated_routes: all`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteClass {
+    /// Serves blocks, query results or block lookups.
+    Data,
+    /// Describes the portal or its datasets: lists, heads, heights, state,
+    /// worker inventory, docs.
+    Metadata,
+}
+
 pub struct Gate {
     store: Arc<SnapshotStore>,
     catalog: Arc<dyn DatasetCatalog>,
     portal_id: String,
     enforcement: Enforcement,
+    gated_routes: GatedRoutes,
 }
 
 impl Gate {
@@ -94,6 +107,17 @@ impl Gate {
             catalog,
             portal_id: config.portal_id(),
             enforcement: config.enforcement,
+            gated_routes: config.gated_routes,
+        }
+    }
+
+    /// Whether this route needs a key at all. A metadata route on a shared
+    /// portal does not, and must then cost exactly what it costs today: the
+    /// middleware returns before reading the credential or the dataset.
+    pub fn gates(&self, class: RouteClass) -> bool {
+        match class {
+            RouteClass::Data => true,
+            RouteClass::Metadata => self.gated_routes == GatedRoutes::All,
         }
     }
 
@@ -210,9 +234,13 @@ impl Gate {
 pub async fn middleware(
     gate: Arc<Gate>,
     source: DatasetSource,
+    class: RouteClass,
     req: Request,
     next: Next,
 ) -> Response {
+    if !gate.gates(class) {
+        return next.run(req).await;
+    }
     let decision = gate.decide(req.headers(), req.uri(), source).await;
     match (decision, gate.enforcement) {
         (Decision::Reject(rejection), Enforcement::Enforce) => rejection.into_response(),
@@ -360,15 +388,39 @@ mod tests {
             }),
             portal_id: PORTAL.to_string(),
             enforcement,
+            gated_routes: GatedRoutes::Data,
         });
         (gate, lookups)
     }
 
     fn app(gate: Arc<Gate>, path: &str, source: DatasetSource) -> Router {
+        app_classed(gate, path, source, RouteClass::Data)
+    }
+
+    /// A gate whose metadata routes are closed too, as on a single-tenant
+    /// portal.
+    fn metadata_gate(records: Vec<KeyRecord>) -> (Arc<Gate>, Arc<AtomicUsize>) {
+        let (gate, lookups) = counting_gate(records, Enforcement::Enforce);
+        let gate = Arc::new(Gate {
+            store: gate.store.clone(),
+            catalog: gate.catalog.clone(),
+            portal_id: gate.portal_id.clone(),
+            enforcement: gate.enforcement,
+            gated_routes: GatedRoutes::All,
+        });
+        (gate, lookups)
+    }
+
+    fn app_classed(
+        gate: Arc<Gate>,
+        path: &str,
+        source: DatasetSource,
+        class: RouteClass,
+    ) -> Router {
         Router::new().route(
             path,
             post(|| async { "served" }).route_layer(from_fn(move |req, next| {
-                middleware(gate.clone(), source, req, next)
+                middleware(gate.clone(), source, class, req, next)
             })),
         )
     }
@@ -552,6 +604,92 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The default: a shared portal's dataset list is public, and asking for it
+    /// must cost nothing — no credential parsed, no dataset resolved.
+    #[tokio::test]
+    async fn a_metadata_route_is_open_and_free_under_the_data_only_default() {
+        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::Enforce);
+        let app = app_classed(
+            gate,
+            "/datasets/:dataset/metadata",
+            DatasetSource::Absent,
+            RouteClass::Metadata,
+        );
+
+        let (status, body) = call(
+            app,
+            request("/datasets/base/metadata")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "served");
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            0,
+            "an ungated route must not do gate work"
+        );
+    }
+
+    /// A single-tenant portal: the metadata surface says which datasets that
+    /// customer bought, so it needs the same key the data routes do.
+    #[tokio::test]
+    async fn a_metadata_route_requires_a_key_when_every_route_is_gated() {
+        let (gate, _) = metadata_gate(vec![key_record("k1", 1)]);
+        let app = app_classed(
+            gate.clone(),
+            "/datasets/:dataset/metadata",
+            DatasetSource::Absent,
+            RouteClass::Metadata,
+        );
+
+        let (status, body) = call(
+            app,
+            request("/datasets/base/metadata")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, r#"{"message":"API key required"}"#);
+
+        let app = app_classed(
+            gate,
+            "/datasets/:dataset/metadata",
+            DatasetSource::Absent,
+            RouteClass::Metadata,
+        );
+        let (status, body) = call(
+            app,
+            request("/datasets/base/metadata")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer sqd_portal_k1_{SECRET}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "a valid key opens it: {body}");
+    }
+
+    /// Closing the metadata surface must not close the data routes' own
+    /// behaviour, and must never gate more than the two classes.
+    #[test]
+    fn gating_classes_are_decided_by_the_mode() {
+        let (data_only, _) = counting_gate(Vec::new(), Enforcement::Enforce);
+        assert!(data_only.gates(RouteClass::Data));
+        assert!(!data_only.gates(RouteClass::Metadata));
+
+        let (everything, _) = metadata_gate(Vec::new());
+        assert!(everything.gates(RouteClass::Data));
+        assert!(everything.gates(RouteClass::Metadata));
     }
 
     #[tokio::test]

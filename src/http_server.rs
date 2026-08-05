@@ -27,7 +27,7 @@ use tower_http::request_id::{
 };
 use utoipa_scalar::{Scalar, Servable as _};
 
-use crate::commercial::{self, DatasetSource, Gate};
+use crate::commercial::{self, DatasetSource, Gate, RouteClass};
 use crate::datasets::DatasetConfig;
 use crate::endpoints::{
     block_number_by_timestamp::get_blocknumber_by_timestamp,
@@ -88,13 +88,26 @@ fn cors_layer() -> CorsLayer {
 /// Wraps a data route in the commercial authorization gate. Without a
 /// `commercial:` block there is no gate and the route is returned untouched,
 /// so an OSS portal runs no extra middleware at all.
-fn gated(route: MethodRouter, gate: &Option<Arc<Gate>>, source: DatasetSource) -> MethodRouter {
+fn gated(
+    route: MethodRouter,
+    gate: &Option<Arc<Gate>>,
+    source: DatasetSource,
+    class: RouteClass,
+) -> MethodRouter {
     let Some(gate) = gate.clone() else {
         return route;
     };
     route.route_layer(axum::middleware::from_fn(move |req, next| {
-        commercial::middleware(gate.clone(), source, req, next)
+        commercial::middleware(gate.clone(), source, class, req, next)
     }))
+}
+
+/// A metadata route: gated only where the metadata surface is itself
+/// confidential (`gated_routes: all`, i.e. single-tenant portals). Under the
+/// default the middleware returns before doing any work, so these routes
+/// behave exactly as they do with no commercial block at all.
+fn gated_metadata(route: MethodRouter, gate: &Option<Arc<Gate>>) -> MethodRouter {
+    gated(route, gate, DatasetSource::Absent, RouteClass::Metadata)
 }
 
 #[allow(deprecated)]
@@ -116,8 +129,14 @@ pub async fn run_server(
     tracing::info!("Starting HTTP server listening on {addr}");
     let app = Router::new()
         // Portal status
-        .route("/status", get(get_status).endpoint("/status"))
-        .route("/datasets", get(get_datasets).endpoint("/datasets"))
+        .route(
+            "/status",
+            gated_metadata(get(get_status), &commercial_gate).endpoint("/status"),
+        )
+        .route(
+            "/datasets",
+            gated_metadata(get(get_datasets), &commercial_gate).endpoint("/datasets"),
+        )
         // Streaming data
         .route(
             "/datasets/:dataset/archival-stream",
@@ -125,6 +144,7 @@ pub async fn run_server(
                 post(run_archival_stream_restricted),
                 &commercial_gate,
                 DatasetSource::Alias,
+                RouteClass::Data,
             )
             .endpoint("/archival-stream"),
         )
@@ -134,6 +154,7 @@ pub async fn run_server(
                 post(run_archival_stream),
                 &commercial_gate,
                 DatasetSource::Alias,
+                RouteClass::Data,
             )
             .endpoint("/archival-stream/debug"),
         )
@@ -143,35 +164,45 @@ pub async fn run_server(
                 post(run_finalized_stream),
                 &commercial_gate,
                 DatasetSource::Alias,
+                RouteClass::Data,
             )
             .endpoint("/finalized-stream"),
         )
         .route(
             "/datasets/:dataset/stream",
-            gated(post(run_stream), &commercial_gate, DatasetSource::Alias).endpoint("/stream"),
+            gated(
+                post(run_stream),
+                &commercial_gate,
+                DatasetSource::Alias,
+                RouteClass::Data,
+            )
+            .endpoint("/stream"),
         )
         // Getting head
         .route(
             "/datasets/:dataset/archival-head",
-            get(get_archival_head).endpoint("/archival-head"),
+            gated_metadata(get(get_archival_head), &commercial_gate).endpoint("/archival-head"),
         )
         .route(
             "/datasets/:dataset/finalized-head",
-            get(get_finalized_head).endpoint("/finalized-head"),
+            gated_metadata(get(get_finalized_head), &commercial_gate).endpoint("/finalized-head"),
         )
-        .route("/datasets/:dataset/head", get(get_head).endpoint("/head"))
+        .route(
+            "/datasets/:dataset/head",
+            gated_metadata(get(get_head), &commercial_gate).endpoint("/head"),
+        )
         // Dataset info
         .route(
             "/datasets/:dataset/state",
-            get(get_dataset_state).endpoint("/state"),
+            gated_metadata(get(get_dataset_state), &commercial_gate).endpoint("/state"),
         )
         .route(
             "/datasets/:dataset",
-            get(get_dataset_metadata).endpoint("/dataset"),
+            gated_metadata(get(get_dataset_metadata), &commercial_gate).endpoint("/dataset"),
         )
         .route(
             "/datasets/:dataset/metadata",
-            get(get_dataset_metadata).endpoint("/metadata"),
+            gated_metadata(get(get_dataset_metadata), &commercial_gate).endpoint("/metadata"),
         )
         .route(
             "/datasets/:dataset/timestamps/:timestamp/block",
@@ -179,17 +210,18 @@ pub async fn run_server(
                 get(get_blocknumber_by_timestamp),
                 &commercial_gate,
                 DatasetSource::Alias,
+                RouteClass::Data,
             )
             .endpoint("/timestamps/block"),
         )
         // Backward compatibility routes
         .route(
             "/datasets/:dataset/finalized-stream/height",
-            get(get_finalized_stream_height).endpoint("/height"),
+            gated_metadata(get(get_finalized_stream_height), &commercial_gate).endpoint("/height"),
         )
         .route(
             "/datasets/:dataset/archival-stream/height",
-            get(get_archival_stream_height).endpoint("/height"),
+            gated_metadata(get(get_archival_stream_height), &commercial_gate).endpoint("/height"),
         )
         .route(
             "/datasets/:dataset_id/query/:worker_id",
@@ -197,25 +229,26 @@ pub async fn run_server(
                 post(execute_query),
                 &commercial_gate,
                 DatasetSource::EncodedId,
+                RouteClass::Data,
             )
             .endpoint("/query"),
         )
         .route(
             "/datasets/:dataset/height",
-            get(get_height).endpoint("/height"),
+            gated_metadata(get(get_height), &commercial_gate).endpoint("/height"),
         )
         .route(
             "/datasets/:dataset/:start_block/worker",
-            get(get_worker).endpoint("/worker"),
+            gated_metadata(get(get_worker), &commercial_gate).endpoint("/worker"),
         )
         // Internal routes
         .route(
             "/debug/workers",
-            get(get_all_workers).endpoint("/debug/workers"),
+            gated_metadata(get(get_all_workers), &commercial_gate).endpoint("/debug/workers"),
         )
         .route(
             "/datasets/:dataset/:block/debug",
-            get(get_debug_block).endpoint("/block/debug"),
+            gated_metadata(get(get_debug_block), &commercial_gate).endpoint("/block/debug"),
         )
         .route("/metrics", get(get_metrics))
         .route("/ready", get(get_readiness))
@@ -231,9 +264,18 @@ pub async fn run_server(
     let app = app
         .route(
             "/sql/query",
-            gated(post(sql_query), &commercial_gate, DatasetSource::Absent).endpoint("/sql/query"),
+            gated(
+                post(sql_query),
+                &commercial_gate,
+                DatasetSource::Absent,
+                RouteClass::Data,
+            )
+            .endpoint("/sql/query"),
         )
-        .route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
+        .route(
+            "/sql/metadata",
+            gated_metadata(get(sql_metadata), &commercial_gate).endpoint("/sql/metadata"),
+        );
 
     let drain_timeout = config.drain_timeout;
 
@@ -1593,10 +1635,11 @@ mod tests {
         "/sql/query",
     ];
 
-    /// Routes that deliberately answer without a key: portal and dataset
-    /// metadata, heads and heights, ops probes, and the debug surface. A route
-    /// belongs here only if serving it to anyone is intended.
-    const UNGATED_ROUTES: &[&str] = &[
+    /// Routes describing the portal or its datasets. On a shared portal these
+    /// answer without a key; on a single-tenant portal (`gated_routes: all`)
+    /// they do not, because the list itself says which datasets that customer
+    /// bought.
+    const GATED_METADATA_ROUTES: &[&str] = &[
         "/status",
         "/datasets",
         "/datasets/:dataset/archival-head",
@@ -1611,11 +1654,13 @@ mod tests {
         "/datasets/:dataset/:start_block/worker",
         "/debug/workers",
         "/datasets/:dataset/:block/debug",
-        "/metrics",
-        "/ready",
-        "/api-docs/openapi.json",
         "/sql/metadata",
     ];
+
+    /// Served to anyone on every portal, in either mode. Probes must answer
+    /// without a key or the pod leaves rotation on its own readiness check;
+    /// the API schema is identical on every deployment and names no dataset.
+    const ALWAYS_OPEN_ROUTES: &[&str] = &["/metrics", "/ready", "/api-docs/openapi.json"];
 
     /// A router can be mounted into another one without a `.route(` call, and
     /// those endpoints are invisible to the scan below. Every such call in the
@@ -1664,7 +1709,18 @@ mod tests {
     /// router itself cannot be built without a live `NetworkClient`, and
     /// because the question — "did someone add a route and forget?" — is about
     /// the table as written.
-    fn routes_in_source() -> Vec<(String, bool)> {
+    /// How a route in the router literal is wrapped.
+    #[derive(Debug, PartialEq, Eq)]
+    enum RouteGating {
+        /// Always requires a key when the portal is commercial.
+        Data,
+        /// Requires a key only under `gated_routes: all`.
+        Metadata,
+        /// Never requires a key: ops probes and static API schema.
+        AlwaysOpen,
+    }
+
+    fn routes_in_source() -> Vec<(String, RouteGating)> {
         const SOURCE: &str = include_str!("http_server.rs");
         let start = SOURCE
             .find("let app = Router::new()")
@@ -1709,29 +1765,46 @@ mod tests {
                     None
                 })
                 .expect("balanced parentheses in a route call");
-            routes.push((path, rest[..end].contains("gated(")));
+            // `gated_metadata(` does not contain `gated(`, so order does not
+            // matter here — but check the more specific wrapper first anyway.
+            let body = &rest[..end];
+            let class = if body.contains("gated_metadata(") {
+                RouteGating::Metadata
+            } else if body.contains("gated(") {
+                RouteGating::Data
+            } else {
+                RouteGating::AlwaysOpen
+            };
+            routes.push((path, class));
             rest = &rest[end..];
         }
         routes
     }
 
-    /// The regression insurance: a new route has to be classified. Gate it, or
-    /// state in `UNGATED_ROUTES` that serving it to anyone is intended.
+    /// The regression insurance: a new route has to be classified. Wrap it in
+    /// `gated(...)` if it serves data, `gated_metadata(...)` if it describes
+    /// the portal, and only leave it bare — listed in `ALWAYS_OPEN_ROUTES` —
+    /// if serving it to anyone on every deployment is intended.
     #[test]
     fn the_route_table_matches_the_checked_in_gating() {
         let routes = routes_in_source();
         assert_eq!(
             routes.len(),
-            GATED_DATA_ROUTES.len() + UNGATED_ROUTES.len(),
+            GATED_DATA_ROUTES.len() + GATED_METADATA_ROUTES.len() + ALWAYS_OPEN_ROUTES.len(),
             "a route was added or removed without updating this test: {routes:#?}"
         );
 
-        let (gated, ungated): (Vec<_>, Vec<_>) = routes.into_iter().partition(|(_, gated)| *gated);
-        let gated: Vec<_> = gated.into_iter().map(|(path, _)| path).collect();
-        let ungated: Vec<_> = ungated.into_iter().map(|(path, _)| path).collect();
+        let of = |wanted: RouteGating| {
+            routes
+                .iter()
+                .filter(|(_, class)| *class == wanted)
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>()
+        };
 
-        assert_eq!(gated, GATED_DATA_ROUTES.to_vec());
-        assert_eq!(ungated, UNGATED_ROUTES.to_vec());
+        assert_eq!(of(RouteGating::Data), GATED_DATA_ROUTES.to_vec());
+        assert_eq!(of(RouteGating::Metadata), GATED_METADATA_ROUTES.to_vec());
+        assert_eq!(of(RouteGating::AlwaysOpen), ALWAYS_OPEN_ROUTES.to_vec());
     }
 
     /// The kill switch: with no `commercial:` block there is no gate, so a data
@@ -1742,7 +1815,12 @@ mod tests {
 
         let app = Router::new().route(
             "/datasets/:dataset/stream",
-            gated(post(|| async { "served" }), &None, DatasetSource::Alias),
+            gated(
+                post(|| async { "served" }),
+                &None,
+                DatasetSource::Alias,
+                RouteClass::Data,
+            ),
         );
 
         let response = app
