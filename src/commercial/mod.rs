@@ -20,10 +20,9 @@ mod routes;
 mod store;
 mod types;
 
-pub use config::{CommercialConfig, Enforcement, GatedRoutes};
-pub use extractor::{middleware, DatasetCatalog, DatasetSource, Gate, RouteClass};
-#[cfg(test)]
-pub use routes::{classify as classify_for_test, is_classified as is_classified_for_test, Gating};
+pub use config::{CommercialConfig, Enforcement};
+pub use extractor::{DatasetCatalog, Gate};
+pub use routes::{AuthExt, Gated};
 
 use store::SnapshotStore;
 
@@ -125,7 +124,6 @@ pub mod test_support {
             service_token_env: service_token_env(),
             portal_id: "portal-premium-eu".to_string(),
             enforcement: Enforcement::Enforce,
-            gated_routes: GatedRoutes::Data,
             sync_interval_secs: 10,
         }
     }
@@ -152,10 +150,6 @@ pub mod test_support {
 
     impl DatasetCatalog for NoCatalog {
         fn canonical_name(&self, _alias: &str) -> Option<String> {
-            None
-        }
-
-        fn canonical_name_for_id(&self, _id: &crate::types::DatasetId) -> Option<String> {
             None
         }
     }
@@ -229,7 +223,6 @@ pub mod test_support {
                 service_token_env: service_token_env(),
                 portal_id: "portal-premium-eu".to_string(),
                 enforcement: Enforcement::Enforce,
-                gated_routes: GatedRoutes::Data,
                 sync_interval_secs: 10,
             }
         }

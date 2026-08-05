@@ -34,7 +34,7 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
 | stream | One request/response pair; may end early at any time and be resumed by a follow-up request |
 | API key | A credential a client presents: a public key id plus a secret the Portal only ever sees as a digest (DEF-16) |
 | key snapshot | The Portal's in-memory mirror of the control plane's key set, refreshed by cursor-paged deltas (DEF-18) |
-| gated route | A route that requires a key on a commercial deployment; which routes are gated is the operator's gate scope (DEF-19) |
+| gated route | A route that requires a key on a commercial deployment: block delivery, queries and block lookups (DEF-19) |
 
 ## Actors
 
@@ -70,6 +70,7 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
 | NG2 — No per-client quotas or fairness | All capacity limits are global. One client can exhaust shared capacity; isolation between clients is not promised. **An authenticated key is no exception:** admission (REQ-50) decides whether a request is served, never how much of the shared capacity it may take. Quota and metering are explicitly out of scope for ADR-016. |
 | NG3 — No head subscription or long-poll | Clients poll. A request beyond the frontier gets a throttled empty response (REQ-5), never a held-open wait for new blocks. |
 | NG4 — No cross-source splicing within one response | Each response is served entirely by one source (archival or real-time). Crossing the boundary is the client's follow-up request (REQ-4). |
+| NG6 — No catalog privacy | Which datasets a Portal serves is public on every deployment: the catalog, heads, heights and worker inventory answer without a credential whatever the commercial configuration says. Gating that surface as a second scope was considered and rejected: it makes every route's classification a decision, and the contract is simpler when the catalog is public everywhere. Revisit if a deployment ever needs the catalog closed. |
 | NG5 — No durable local state | Restart amnesia is by design: everything is refetched or relearned. There is nothing to back up or recover. |
 | NG6 — SQL surface plans, never executes | The experimental SQL endpoints return a routing plan (which workers hold which chunks); execution happens elsewhere (REQ-15). |
 | NG7 — Deprecated endpoints are unspecified | Legacy routes (worker lookup, height, direct worker query) exist for migration only; their behavior must not be pinned by new clients or tests. |

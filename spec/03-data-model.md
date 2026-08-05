@@ -171,12 +171,11 @@ exceeds the held one. An epoch change, or a feed head below the held cursor, mea
 history the cursor refers to no longer exists, and the snapshot is rebuilt from the start
 rather than advanced. Nothing about the snapshot survives restart (NG5).
 
-**DEF-19 — Route class and gate scope.** Every route carries exactly one class: **data**
-(delivers blocks, query results, or block lookups), **metadata** (describes the Portal or
-its datasets), or **always-open** (readiness, metrics, the served API schema). The
-operator's **gate scope** — `data` or `all` — selects which classes require a credential:
-`data` gates the data class, `all` gates data and metadata. Always-open is gated under
-neither (REQ-51). The classification is a property of the route, not of the request.
+**DEF-19 — Gated route.** A route that requires a credential on a commercial deployment:
+those delivering blocks, query results, or block lookups. Every other route answers
+without one (NG6). Which it is, is a property of the route rather than of the request or
+of the configuration, and is stated where the route is declared — a route that states
+neither does not compile (REQ-51).
 
 **DEF-20 — Authorization verdict.** The outcome of evaluating DEF-16 against DEF-17 for
 one request: **admit**, or **reject** carrying the first failed rung of REQ-53's ladder.

@@ -10,7 +10,7 @@ use axum::{
     http::{header, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Extension, RequestExt, Router,
+    Extension, RequestExt,
 };
 use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
@@ -27,7 +27,7 @@ use tower_http::request_id::{
 };
 use utoipa_scalar::{Scalar, Servable as _};
 
-use crate::commercial::{self, Gate};
+use crate::commercial::{AuthExt, Gate, Gated};
 use crate::datasets::DatasetConfig;
 use crate::endpoints::{
     block_number_by_timestamp::get_blocknumber_by_timestamp,
@@ -85,20 +85,6 @@ fn cors_layer() -> CorsLayer {
         .expose_headers(EXPOSED_HEADERS)
 }
 
-/// Installs the commercial authorization gate over every route, which decides
-/// per matched path what it needs. Without a `commercial:` block the router is
-/// returned untouched, so an OSS portal runs no extra middleware at all.
-fn with_gate(app: Router, gate: &Option<Arc<Gate>>) -> Router {
-    let Some(gate) = gate.clone() else {
-        return app;
-    };
-    // `route_layer`, not `layer`: an unmatched path must stay a 404 rather than
-    // become the gate's problem.
-    app.route_layer(axum::middleware::from_fn(move |req, next| {
-        commercial::middleware(gate.clone(), req, next)
-    }))
-}
-
 #[allow(deprecated)]
 pub async fn run_server(
     task_manager: Arc<TaskManager>,
@@ -116,104 +102,132 @@ pub async fn run_server(
     let cors = cors_layer();
 
     tracing::info!("Starting HTTP server listening on {addr}");
-    let app = Router::new()
+    let app = Gated::new(commercial_gate.clone())
         // Portal status
-        .route("/status", get(get_status).endpoint("/status"))
-        .route("/datasets", get(get_datasets).endpoint("/datasets"))
+        .route("/status", get(get_status).endpoint("/status").no_auth())
+        .route(
+            "/datasets",
+            get(get_datasets).endpoint("/datasets").no_auth(),
+        )
         // Streaming data
         .route(
             "/datasets/:dataset/archival-stream",
-            post(run_archival_stream_restricted).endpoint("/archival-stream"),
+            post(run_archival_stream_restricted)
+                .endpoint("/archival-stream")
+                .auth(),
         )
         .route(
             "/datasets/:dataset/archival-stream/debug",
-            post(run_archival_stream).endpoint("/archival-stream/debug"),
+            post(run_archival_stream)
+                .endpoint("/archival-stream/debug")
+                .auth(),
         )
         .route(
             "/datasets/:dataset/finalized-stream",
-            post(run_finalized_stream).endpoint("/finalized-stream"),
+            post(run_finalized_stream)
+                .endpoint("/finalized-stream")
+                .auth(),
         )
         .route(
             "/datasets/:dataset/stream",
-            post(run_stream).endpoint("/stream"),
+            post(run_stream).endpoint("/stream").auth(),
         )
         // Getting head
         .route(
             "/datasets/:dataset/archival-head",
-            get(get_archival_head).endpoint("/archival-head"),
+            get(get_archival_head).endpoint("/archival-head").no_auth(),
         )
         .route(
             "/datasets/:dataset/finalized-head",
-            get(get_finalized_head).endpoint("/finalized-head"),
+            get(get_finalized_head)
+                .endpoint("/finalized-head")
+                .no_auth(),
         )
-        .route("/datasets/:dataset/head", get(get_head).endpoint("/head"))
+        .route(
+            "/datasets/:dataset/head",
+            get(get_head).endpoint("/head").no_auth(),
+        )
         // Dataset info
         .route(
             "/datasets/:dataset/state",
-            get(get_dataset_state).endpoint("/state"),
+            get(get_dataset_state).endpoint("/state").no_auth(),
         )
         .route(
             "/datasets/:dataset",
-            get(get_dataset_metadata).endpoint("/dataset"),
+            get(get_dataset_metadata).endpoint("/dataset").no_auth(),
         )
         .route(
             "/datasets/:dataset/metadata",
-            get(get_dataset_metadata).endpoint("/metadata"),
+            get(get_dataset_metadata).endpoint("/metadata").no_auth(),
         )
         .route(
             "/datasets/:dataset/timestamps/:timestamp/block",
-            get(get_blocknumber_by_timestamp).endpoint("/timestamps/block"),
+            get(get_blocknumber_by_timestamp)
+                .endpoint("/timestamps/block")
+                .auth(),
         )
         // Backward compatibility routes
         .route(
             "/datasets/:dataset/finalized-stream/height",
-            get(get_finalized_stream_height).endpoint("/height"),
+            get(get_finalized_stream_height)
+                .endpoint("/height")
+                .no_auth(),
         )
         .route(
             "/datasets/:dataset/archival-stream/height",
-            get(get_archival_stream_height).endpoint("/height"),
+            get(get_archival_stream_height)
+                .endpoint("/height")
+                .no_auth(),
         )
         .route(
             "/datasets/:dataset_id/query/:worker_id",
-            post(execute_query).endpoint("/query"),
+            post(execute_query).endpoint("/query").auth(),
         )
         .route(
             "/datasets/:dataset/height",
-            get(get_height).endpoint("/height"),
+            get(get_height).endpoint("/height").no_auth(),
         )
         .route(
             "/datasets/:dataset/:start_block/worker",
-            get(get_worker).endpoint("/worker"),
+            get(get_worker).endpoint("/worker").no_auth(),
         )
         // Internal routes
         .route(
             "/debug/workers",
-            get(get_all_workers).endpoint("/debug/workers"),
+            get(get_all_workers).endpoint("/debug/workers").no_auth(),
         )
         .route(
             "/datasets/:dataset/:block/debug",
-            get(get_debug_block).endpoint("/block/debug"),
+            get(get_debug_block).endpoint("/block/debug").no_auth(),
         )
-        .route("/metrics", get(get_metrics))
-        .route("/ready", get(get_readiness))
-        .route("/api-docs/openapi.json", get(serve_openapi_spec))
-        .merge(
-            Scalar::with_url("/docs", openapi_spec.clone())
-                .custom_html(include_str!("../docs/openapi/scalar_template.html")),
-        )
-        .layer(Extension(Arc::new(openapi_spec)));
+        // Ops probes and the served schema: never gated, or a pod that cannot
+        // answer its own readiness check leaves rotation.
+        .route("/metrics", get(get_metrics).no_auth())
+        .route("/ready", get(get_readiness).no_auth())
+        .route("/api-docs/openapi.json", get(serve_openapi_spec).no_auth());
 
     // SQL Query Engine
     #[cfg(feature = "sql")]
     let app = app
-        .route("/sql/query", post(sql_query).endpoint("/sql/query"))
-        .route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
+        .route("/sql/query", post(sql_query).endpoint("/sql/query").auth())
+        .route(
+            "/sql/metadata",
+            get(sql_metadata).endpoint("/sql/metadata").no_auth(),
+        );
+
+    let app = app
+        .merge_ungated(
+            "the Scalar docs UI renders the same schema on every deployment",
+            Scalar::with_url("/docs", openapi_spec.clone())
+                .custom_html(include_str!("../docs/openapi/scalar_template.html"))
+                .into(),
+        )
+        .into_router()
+        .layer(Extension(Arc::new(openapi_spec)));
 
     let drain_timeout = config.drain_timeout;
 
-    // Added first, so it sits inside the logging layer: a refusal has to be
-    // logged and counted like any other response.
-    let app = with_gate(app, &commercial_gate)
+    let app = app
         .route_layer(axum::middleware::from_fn(logging::middleware))
         .layer(sentry_tower::NewSentryLayer::new_from_top())
         .layer(RequestDecompressionLayer::new())
@@ -1556,111 +1570,6 @@ mod tests {
         );
     }
 
-    /// Served to anyone on every portal, in either mode. Probes must answer
-    /// without a key or the pod leaves rotation on its own readiness check;
-    /// the API schema is identical on every deployment and names no dataset.
-    const ALWAYS_OPEN_ROUTES: &[&str] = &["/metrics", "/ready", "/api-docs/openapi.json"];
-
-    /// A router can be mounted into another one without a `.route(` call, and
-    /// those endpoints are invisible to the scan below. Every such call in the
-    /// route table has to be listed here, which is the point: a data route
-    /// arriving through one must be a decision somebody made on purpose.
-    const ALLOWED_COMPOSITION: &[&str] = &[
-        // The Scalar docs UI at `/docs`. It renders the OpenAPI page and
-        // serves no data, so it is deliberately ungated.
-        ".merge(Scalar::with_url(",
-    ];
-
-    /// The composition calls that mount endpoints without naming them in a
-    /// `.route(`, matched with whitespace removed so rustfmt cannot change the
-    /// answer. Returns the ones no entry of `ALLOWED_COMPOSITION` covers.
-    fn unlisted_composition_in(region: &str) -> Vec<String> {
-        const FORMS: &[&str] = &[
-            ".nest(",
-            ".nest_service(",
-            ".merge(",
-            ".route_service(",
-            ".fallback(",
-            ".fallback_service(",
-        ];
-        let compact: String = region.chars().filter(|c| !c.is_whitespace()).collect();
-
-        let mut unlisted = Vec::new();
-        for form in FORMS {
-            let mut rest = compact.as_str();
-            while let Some(index) = rest.find(form) {
-                rest = &rest[index..];
-                let call: String = rest.chars().take(48).collect();
-                if !ALLOWED_COMPOSITION
-                    .iter()
-                    .any(|allowed| call.starts_with(allowed))
-                {
-                    unlisted.push(call);
-                }
-                rest = &rest[form.len()..];
-            }
-        }
-        unlisted
-    }
-
-    /// Every path in `run_server`'s route table. Read from the source because
-    /// the router cannot be built without a live `NetworkClient`, and the
-    /// question is about the table as written.
-    fn routes_in_source() -> Vec<String> {
-        const SOURCE: &str = include_str!("http_server.rs");
-        let start = SOURCE
-            .find("let app = Router::new()")
-            .expect("the route table starts at the router literal");
-        let end = SOURCE
-            .find("let drain_timeout")
-            .expect("the route table ends before the layer stack");
-        let region = &SOURCE[start..end];
-
-        let unlisted = unlisted_composition_in(region);
-        assert!(
-            unlisted.is_empty(),
-            "the route table mounts routers this scan cannot see, so the gating \
-             below says nothing about what they serve: {unlisted:#?}. Classify \
-             each one in `commercial::routes`, then add the call to \
-             ALLOWED_COMPOSITION saying why the rest may be served to anyone."
-        );
-
-        let mut routes = Vec::new();
-        let mut rest = region;
-        while let Some(index) = rest.find(".route(") {
-            rest = &rest[index + ".route(".len()..];
-            routes.push(
-                rest.split('"')
-                    .nth(1)
-                    .expect("a route's first argument is its path literal")
-                    .to_owned(),
-            );
-        }
-        routes
-    }
-
-    /// The regression insurance. A new route that nobody classified is gated as
-    /// data by default, so it fails closed at runtime — but it fails *here*
-    /// first, which is where a mistake is cheap to fix.
-    #[test]
-    fn every_route_is_classified() {
-        for path in routes_in_source() {
-            if ALWAYS_OPEN_ROUTES.contains(&path.as_str()) {
-                assert_eq!(
-                    commercial::classify_for_test(&path),
-                    commercial::Gating::Open,
-                    "{path} is meant to answer without a key"
-                );
-                continue;
-            }
-            assert!(
-                commercial::is_classified_for_test(&path),
-                "{path} is not in commercial::routes, so it would be gated as an \
-                 anonymous data route. Classify it."
-            );
-        }
-    }
-
     /// GAP-29: the gate and the normalizing middleware are separately correct
     /// and were jointly wrong. A refusal carrying no `ErrorCode` is an unmatched
     /// client error to the layer every routed response passes through, so it was
@@ -1675,16 +1584,15 @@ mod tests {
 
         use crate::commercial::test_support::gate_with;
 
-        let gate = Some(gate_with(commercial::Enforcement::Enforce, true));
-        let app = with_gate(
-            Router::new().route(
+        let gate = Some(gate_with(crate::commercial::Enforcement::Enforce, true));
+        let app = Gated::new(gate)
+            .route(
                 "/datasets/:dataset/stream",
-                post(|| async { "served" }).endpoint("/stream"),
-            ),
-            &gate,
-        )
-        .route_layer(axum::middleware::from_fn(logging::middleware))
-        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+                post(|| async { "served" }).endpoint("/stream").auth(),
+            )
+            .into_router()
+            .route_layer(axum::middleware::from_fn(logging::middleware))
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
 
         let response = app
             .oneshot(
@@ -1712,18 +1620,19 @@ mod tests {
         assert_eq!(body["error"]["code"], "missing_credential");
     }
 
-    /// The kill switch: with no `commercial:` block `with_gate` hands the
-    /// router back untouched, so an OSS build carries no layer at all.
+    /// The kill switch: with no `commercial:` block the gate is never
+    /// installed, so an OSS build carries no layer at all.
     #[tokio::test]
     async fn no_route_carries_authorization_without_a_commercial_config() {
         use tower::ServiceExt;
 
-        let app = with_gate(
-            Router::new()
-                .route("/datasets/:dataset/stream", post(|| async { "served" }))
-                .route("/datasets", get(|| async { "served" })),
-            &None,
-        );
+        let app = Gated::new(None)
+            .route(
+                "/datasets/:dataset/stream",
+                post(|| async { "served" }).auth(),
+            )
+            .route("/datasets", get(|| async { "served" }).no_auth())
+            .into_router();
 
         for (method, uri) in [
             ("POST", "/datasets/ethereum-mainnet/stream"),

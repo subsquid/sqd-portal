@@ -5,18 +5,14 @@ as a failure (INV-30): **lying metrics are failures**. Cardinality of every labe
 family is bounded (intent — GAP-6): labels come from closed sets (endpoint, class,
 outcome, dataset) — per-worker labels must be bounded or evicted. `/metrics` is a
 keyless, client-readable surface (IB-9), so commercial deployments apply an additional
-confidentiality rule: under gate scope `all`, no public series carries a dataset identity;
-under either scope, no public series exposes an internal authorization rung or lookup
+confidentiality rule: no public series exposes an internal authorization rung or lookup
 detail beyond the client-visible wire outcome (INV-39).
 
 **OB-1 — State gauges.** Active streams (census), in-flight congestion permits and
 window size, open leases (or an equivalent worker-busy gauge), known workers, known
-chunks and highest block per dataset. At quiescence each equals modeled truth. On an
-`all`-scope commercial deployment, the public scrape aggregates additive dataset gauges
-and omits the dataset label; a per-dataset value with no truthful aggregate, such as
-highest block, is omitted. Per-dataset state remains available only through authenticated
-metadata/operator routes and protected logs. A keyless metrics scrape must not reconstruct
-the catalog that `all` exists to hide (REQ-51).
+chunks and highest block per dataset. At quiescence each equals modeled truth. Dataset
+identities are public on every deployment (NG6), so the scrape carries them as it always
+has.
 
 **OB-2 — Progress heartbeat.** Per active stream: periodic progress (coverage cursor,
 bytes) at P-HEARTBEAT-INTERVAL, plus time-to-first-byte per response. Distinguishes
@@ -90,7 +86,7 @@ the operator's is not.
 
 **OB-12 — Authorization decisions.** Commercial deployments only. In enforcing mode,
 every completed verdict (DEF-20) is counted on the public scrape by decision × actual
-**wire code** (or success) × route class × enforcement mode; a lookup that produced no
+**wire code** (or success) × enforcement mode; a lookup that produced no
 verdict is counted only by the OVERLOADED or UPSTREAM-FAILURE code actually returned. The
 four internal reasons sharing `invalid_credential` are deliberately one public label
 value. In `log_only`, every request increments the same neutral `shadow_evaluated` public

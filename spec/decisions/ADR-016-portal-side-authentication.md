@@ -41,14 +41,13 @@ when — the operator configures it to.
    the verdict it would have returned or an indeterminate lookup that prevented one, and
    admits regardless (REQ-55) — the cutover is a config change with a measured blast
    radius, not a leap.
-5. **Two gate scopes.** `data` gates streams, queries and block lookups and leaves
-   metadata public — correct for the shared portal, where the catalog is public knowledge.
-   `all` closes metadata too, for single-tenant portals where the catalog is the
-   disclosure (REQ-51). Readiness, metrics and the API schema are never gated in either
-   mode: a pod that cannot answer its own probe leaves rotation, and existing scrapers do
-   not need a customer key. The keyless metrics representation is correspondingly
-   constrained: no dataset identities under `all`, and no internal auth rung or lookup
-   detail beyond the public wire outcome under either scope (OB-1/12/13).
+5. **One gated surface.** Streams, queries and block lookups need a key; the catalog,
+   heads, heights, probes and the API schema do not, on every deployment (REQ-51).
+   Gating the catalog as a second scope was considered and rejected: it makes every
+   route's classification a decision (NG6). Each route states which set it is in
+   where it is declared, so there is no default to forget. The keyless metrics
+   representation stays constrained regardless: no internal auth rung or lookup detail
+   beyond the public wire outcome (OB-12/13).
 
 **NG1 is retired** and replaced by a narrower non-goal: the Portal still performs no
 per-client quota, metering, or rate limiting (NG2 unchanged) — an admitted key streams

@@ -24,28 +24,8 @@ pub struct CommercialConfig {
     #[serde(default)]
     pub enforcement: Enforcement,
 
-    #[serde(default)]
-    pub gated_routes: GatedRoutes,
-
     #[serde(default = "default_sync_interval_secs")]
     pub sync_interval_secs: u64,
-}
-
-/// Which routes require a key. On a shared portal only the data routes do —
-/// the dataset list and heads are public knowledge there. On a single-tenant
-/// portal the metadata surface itself is confidential: it says which datasets
-/// that customer has, so `All` closes it too.
-///
-/// Ops probes (`/ready`, `/metrics`) are never gated in either mode; a portal
-/// that cannot answer its own liveness checks leaves rotation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GatedRoutes {
-    /// Streams, queries and block lookups. Metadata stays public.
-    #[default]
-    Data,
-    /// Everything a client can ask for, metadata included.
-    All,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]

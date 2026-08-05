@@ -1,7 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use axum::{
-    extract::{MatchedPath, Request},
+    extract::Request,
     http::{header, HeaderMap},
     middleware::Next,
     response::Response,
@@ -10,16 +10,14 @@ use sha2::{Digest, Sha256};
 use url::form_urlencoded;
 
 use super::{
-    config::{CommercialConfig, Enforcement, GatedRoutes},
+    config::{CommercialConfig, Enforcement},
     evaluate::{self, Decision, LazyDataset, Rejection},
     now_secs,
-    routes::{classify, Gating},
     store::SnapshotStore,
 };
 use crate::{
     metrics::{self, AuthDecision},
     network::NetworkClient,
-    types::DatasetId,
 };
 
 /// Token layouts the portal accepts, all of the form `<prefix><key_id>_<secret>`:
@@ -57,50 +55,11 @@ impl fmt::Debug for Credential {
 /// resolved before it can be matched.
 pub trait DatasetCatalog: Send + Sync {
     fn canonical_name(&self, alias: &str) -> Option<String>;
-    fn canonical_name_for_id(&self, id: &DatasetId) -> Option<String>;
 }
 
 impl DatasetCatalog for NetworkClient {
     fn canonical_name(&self, alias: &str) -> Option<String> {
         self.dataset(alias).map(|dataset| dataset.default_name)
-    }
-
-    fn canonical_name_for_id(&self, id: &DatasetId) -> Option<String> {
-        self.datasets().read().default_name(id).map(str::to_owned)
-    }
-}
-
-/// How the dataset under request is named in the route's path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DatasetSource {
-    /// `/datasets/:dataset/…` — a name or an alias.
-    Alias,
-    /// `/datasets/:dataset_id/query/:worker_id` — a base64 dataset id.
-    EncodedId,
-    /// The route names no dataset, so a dataset-scoped key cannot use it.
-    Absent,
-}
-
-/// What kind of answer a route gives, which decides whether the `data`-only
-/// mode gates it. Data routes are always gated; metadata routes only under
-/// `gated_routes: all`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RouteClass {
-    /// Serves blocks, query results or block lookups.
-    Data,
-    /// Describes the portal or its datasets: lists, heads, heights, state,
-    /// worker inventory, docs.
-    Metadata,
-}
-
-impl RouteClass {
-    /// The class, not the route: a series per path would name the datasets
-    /// `all` exists to hide (REQ-51).
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Data => "data",
-            Self::Metadata => "metadata",
-        }
     }
 }
 
@@ -109,7 +68,6 @@ pub struct Gate {
     catalog: Arc<dyn DatasetCatalog>,
     portal_id: String,
     enforcement: Enforcement,
-    gated_routes: GatedRoutes,
 }
 
 impl Gate {
@@ -123,17 +81,6 @@ impl Gate {
             catalog,
             portal_id: config.portal_id(),
             enforcement: config.enforcement,
-            gated_routes: config.gated_routes,
-        }
-    }
-
-    /// Whether this route needs a key at all. A metadata route on a shared
-    /// portal does not, and must then cost exactly what it costs today: the
-    /// middleware returns before reading the credential or the dataset.
-    pub fn gates(&self, class: RouteClass) -> bool {
-        match class {
-            RouteClass::Data => true,
-            RouteClass::Metadata => self.gated_routes == GatedRoutes::All,
         }
     }
 
@@ -150,16 +97,18 @@ impl Gate {
         self.enforcement == Enforcement::Enforce
     }
 
+    /// A route whose path does not name the dataset cannot be checked against
+    /// a dataset-scoped key, and refuses it (REQ-53).
     async fn decide(
         &self,
         headers: &HeaderMap,
         uri: &axum::http::Uri,
-        source: DatasetSource,
+        names_dataset: bool,
     ) -> Decision {
         // Deferred on purpose: canonicalization interns the name in a
         // process-wide pool and clones the dataset config, so it must stay
         // behind authentication. Only the dataset rung calls this.
-        let dataset = LazyDataset::new(|| self.dataset_for(uri.path(), source));
+        let dataset = LazyDataset::new(|| self.dataset_for(uri.path(), names_dataset));
         let credential = match credential_from_request(headers, uri.query()) {
             Ok(credential) => credential,
             Err(rejection) => {
@@ -192,32 +141,24 @@ impl Gate {
         decision
     }
 
-    fn dataset_for(&self, path: &str, source: DatasetSource) -> Option<String> {
-        let raw = dataset_path_segment(path)?;
-        match source {
-            DatasetSource::Absent => None,
-            DatasetSource::Alias => Some(
-                self.catalog
-                    .canonical_name(raw)
-                    .unwrap_or_else(|| raw.to_owned()),
-            ),
-            DatasetSource::EncodedId => Some(
-                DatasetId::from_base64(raw)
-                    .ok()
-                    .and_then(|id| self.catalog.canonical_name_for_id(&id))
-                    .unwrap_or_else(|| raw.to_owned()),
-            ),
+    /// Keys carry canonical names, so an alias is resolved first. An
+    /// unresolvable one is compared as written and simply fails to match.
+    fn dataset_for(&self, path: &str, names_dataset: bool) -> Option<String> {
+        if !names_dataset {
+            return None;
         }
+        let raw = dataset_path_segment(path)?;
+        Some(
+            self.catalog
+                .canonical_name(raw)
+                .unwrap_or_else(|| raw.to_owned()),
+        )
     }
 
     /// OB-12's public half: the wire code and nothing finer. Shadow mode served
     /// every request, so one neutral series covers all its verdicts.
-    fn count(&self, decision: Decision, class: RouteClass) {
-        metrics::report_auth_decision(
-            self.public_outcome(decision),
-            class.as_str(),
-            self.enforcement.as_str(),
-        );
+    fn count(&self, decision: Decision) {
+        metrics::report_auth_decision(self.public_outcome(decision), self.enforcement.as_str());
     }
 
     /// Split out so the non-disclosure property is a pure function two cases
@@ -269,30 +210,19 @@ impl Gate {
     }
 }
 
-/// One layer over the whole router. What each route needs is looked up from its
-/// *matched* path — the template, never the client-supplied one.
-pub async fn middleware(gate: Arc<Gate>, req: Request, next: Next) -> Response {
-    let Gating::Gated(source, class) = classify(matched_path(&req)) else {
-        return next.run(req).await;
-    };
-    if !gate.gates(class) {
-        return next.run(req).await;
-    }
-    let decision = gate.decide(req.headers(), req.uri(), source).await;
-    gate.count(decision, class);
+/// Installed by `Gated::route` on the routes that declared `.auth()`.
+pub(super) async fn middleware(
+    gate: Arc<Gate>,
+    names_dataset: bool,
+    req: Request,
+    next: Next,
+) -> Response {
+    let decision = gate.decide(req.headers(), req.uri(), names_dataset).await;
+    gate.count(decision);
     match (decision, gate.enforcement) {
         (Decision::Reject(rejection), Enforcement::Enforce) => rejection.into_response(),
         _ => next.run(req).await,
     }
-}
-
-/// Falls back to the raw path only if axum did not record a match, which a
-/// `route_layer` should make impossible. Classification is fail-closed either
-/// way, so the fallback cannot open anything.
-fn matched_path(req: &Request) -> &str {
-    req.extensions()
-        .get::<MatchedPath>()
-        .map_or_else(|| req.uri().path(), MatchedPath::as_str)
 }
 
 /// A malformed token is a rejection rather than an absent credential: falling
@@ -401,7 +331,6 @@ mod tests {
     #[derive(Default)]
     struct StaticCatalog {
         aliases: HashMap<String, String>,
-        ids: HashMap<String, String>,
         /// Counts every canonicalization, so a test can prove which rungs of
         /// the ladder pay for one.
         lookups: Arc<AtomicUsize>,
@@ -411,11 +340,6 @@ mod tests {
         fn canonical_name(&self, alias: &str) -> Option<String> {
             self.lookups.fetch_add(1, Ordering::Relaxed);
             self.aliases.get(alias).cloned()
-        }
-
-        fn canonical_name_for_id(&self, id: &DatasetId) -> Option<String> {
-            self.lookups.fetch_add(1, Ordering::Relaxed);
-            self.ids.get(&id.to_base64()).cloned()
         }
     }
 
@@ -427,45 +351,28 @@ mod tests {
         records: Vec<KeyRecord>,
         enforcement: Enforcement,
     ) -> (Arc<Gate>, Arc<AtomicUsize>) {
-        let dataset_id = DatasetId::from_url("s3://base-mainnet");
         let lookups = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Gate {
             store: store_with(records).await,
             catalog: Arc::new(StaticCatalog {
                 aliases: HashMap::from([("base".to_string(), "base-mainnet".to_string())]),
-                ids: HashMap::from([(dataset_id.to_base64(), "base-mainnet".to_string())]),
                 lookups: lookups.clone(),
             }),
             portal_id: PORTAL.to_string(),
             enforcement,
-            gated_routes: GatedRoutes::Data,
         });
         (gate, lookups)
     }
 
-    /// The middleware reads what a route needs from its matched path, so a test
-    /// router mounts the real path and the table decides the rest.
+    /// A gated route at `path`, reading the dataset off it as `Gated::route` does.
     fn app(gate: Arc<Gate>, path: &str) -> Router {
+        let names_dataset = path.starts_with("/datasets/:dataset/");
         Router::new().route(
             path,
             post(|| async { "served" }).route_layer(from_fn(move |req, next| {
-                middleware(gate.clone(), req, next)
+                middleware(gate.clone(), names_dataset, req, next)
             })),
         )
-    }
-
-    /// A gate whose metadata routes are closed too, as on a single-tenant
-    /// portal.
-    async fn metadata_gate(records: Vec<KeyRecord>) -> (Arc<Gate>, Arc<AtomicUsize>) {
-        let (gate, lookups) = counting_gate(records, Enforcement::Enforce).await;
-        let gate = Arc::new(Gate {
-            store: gate.store.clone(),
-            catalog: gate.catalog.clone(),
-            portal_id: gate.portal_id.clone(),
-            enforcement: gate.enforcement,
-            gated_routes: GatedRoutes::All,
-        });
-        (gate, lookups)
     }
 
     async fn call(app: Router, request: HttpRequest<Body>) -> (StatusCode, String) {
@@ -661,116 +568,6 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// The default: a shared portal's dataset list is public, and asking for it
-    /// must cost nothing — no credential parsed, no dataset resolved.
-    #[tokio::test]
-    async fn a_metadata_route_is_open_and_free_under_the_data_only_default() {
-        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
-        let app = app(gate, "/datasets/:dataset/metadata");
-
-        let (status, body) = call(
-            app,
-            request("/datasets/base/metadata")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, "served");
-        assert_eq!(
-            lookups.load(Ordering::Relaxed),
-            0,
-            "an ungated route must not do gate work"
-        );
-    }
-
-    /// A single-tenant portal: the metadata surface says which datasets that
-    /// customer bought, so it needs the same key the data routes do.
-    #[tokio::test]
-    async fn a_metadata_route_requires_a_key_when_every_route_is_gated() {
-        let (gate, _) = metadata_gate(vec![key_record("k1", 1)]).await;
-        let anonymous = app(gate.clone(), "/datasets/:dataset/metadata");
-
-        let (status, body) = call(
-            anonymous,
-            request("/datasets/base/metadata")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(error_code(&body), "missing_credential");
-
-        let authorized = app(gate, "/datasets/:dataset/metadata");
-        let (status, body) = call(
-            authorized,
-            request("/datasets/base/metadata")
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer sqd_portal_k1_{SECRET}"),
-                )
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK, "a valid key opens it: {body}");
-    }
-
-    /// The point of one middleware over a wrapper per route: a route nobody
-    /// classified refuses rather than serves. Forgetting the old wrapper opened
-    /// a route silently; forgetting the table entry closes one loudly.
-    #[tokio::test]
-    async fn a_route_nobody_classified_is_gated() {
-        let (gate, _) = counting_gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
-        let app = app(gate, "/datasets/:dataset/brand-new");
-
-        let (status, body) = call(
-            app,
-            request("/datasets/base/brand-new")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(error_code(&body), "missing_credential");
-    }
-
-    /// And the one thing the default must not close: a pod that cannot answer
-    /// its own probe leaves rotation, whatever the gate scope (REQ-51).
-    #[tokio::test]
-    async fn the_ops_surface_answers_without_a_key_under_every_scope() {
-        for (gate, _) in [
-            counting_gate(Vec::new(), Enforcement::Enforce).await,
-            metadata_gate(Vec::new()).await,
-        ] {
-            for path in ["/ready", "/metrics", "/api-docs/openapi.json"] {
-                let (status, _) = call(
-                    app(gate.clone(), path),
-                    request(path).body(Body::empty()).unwrap(),
-                )
-                .await;
-                assert_eq!(status, StatusCode::OK, "{path}");
-            }
-        }
-    }
-
-    /// Closing the metadata surface must not close the data routes' own
-    /// behaviour, and must never gate more than the two classes.
-    #[tokio::test]
-    async fn gating_classes_are_decided_by_the_mode() {
-        let (data_only, _) = counting_gate(Vec::new(), Enforcement::Enforce).await;
-        assert!(data_only.gates(RouteClass::Data));
-        assert!(!data_only.gates(RouteClass::Metadata));
-
-        let (everything, _) = metadata_gate(Vec::new()).await;
-        assert!(everything.gates(RouteClass::Data));
-        assert!(everything.gates(RouteClass::Metadata));
-    }
-
     /// GAP-29: the refusal has to arrive in the ADR-011 envelope, or the routed
     /// middleware rewrites it to 400 `malformed_request` and the client cannot
     /// tell an invalid key from a malformed query.
@@ -885,29 +682,8 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
-    #[tokio::test]
-    async fn a_dataset_scoped_key_matches_a_base64_dataset_id() {
-        let mut record = key_record("k1", 1);
-        record.datasets = Some(vec!["base-mainnet".to_string()]);
-        let encoded = DatasetId::from_url("s3://base-mainnet").to_base64();
-        let app = app(
-            gate(vec![record], Enforcement::Enforce).await,
-            "/datasets/:dataset_id/query/:worker_id",
-        );
-
-        let (status, _) = call(
-            app,
-            request(&format!(
-                "/datasets/{encoded}/query/worker?{QUERY_PARAM}={TOKEN}"
-            ))
-            .body(Body::empty())
-            .unwrap(),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-    }
-
+    /// REQ-53: `/sql/query` names its datasets in the body, so a scoped key
+    /// cannot be checked there and is refused (OQ-13).
     #[tokio::test]
     async fn a_route_without_a_dataset_is_closed_to_dataset_scoped_keys() {
         let mut record = key_record("k1", 1);
@@ -968,7 +744,7 @@ mod tests {
             // A known key presenting the wrong secret.
             header_map("Bearer sqd_portal_k1_wrong"),
         ] {
-            let decision = gate.decide(&headers, &uri, DatasetSource::Alias).await;
+            let decision = gate.decide(&headers, &uri, true).await;
             assert!(matches!(decision, Decision::Reject(_)));
         }
         assert_eq!(
@@ -979,11 +755,7 @@ mod tests {
 
         // The dataset rung itself still resolves, exactly once.
         let decision = gate
-            .decide(
-                &header_map(&format!("Bearer {TOKEN}")),
-                &uri,
-                DatasetSource::Alias,
-            )
+            .decide(&header_map(&format!("Bearer {TOKEN}")), &uri, true)
             .await;
         assert_eq!(decision, Decision::Admit);
         assert_eq!(lookups.load(Ordering::Relaxed), 1);
@@ -997,11 +769,7 @@ mod tests {
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         let decision = gate
-            .decide(
-                &header_map(&format!("Bearer {TOKEN}")),
-                &uri,
-                DatasetSource::Alias,
-            )
+            .decide(&header_map(&format!("Bearer {TOKEN}")), &uri, true)
             .await;
 
         assert_eq!(decision, Decision::Admit);
@@ -1015,8 +783,7 @@ mod tests {
         let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::LogOnly).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
-        gate.decide(&HeaderMap::new(), &uri, DatasetSource::Alias)
-            .await;
+        gate.decide(&HeaderMap::new(), &uri, true).await;
         assert_eq!(
             lookups.load(Ordering::Relaxed),
             0,
@@ -1024,11 +791,7 @@ mod tests {
         );
 
         let decision = gate
-            .decide(
-                &header_map(&format!("Bearer {TOKEN}")),
-                &uri,
-                DatasetSource::Alias,
-            )
+            .decide(&header_map(&format!("Bearer {TOKEN}")), &uri, true)
             .await;
         assert_eq!(decision, Decision::Admit);
         assert_eq!(lookups.load(Ordering::Relaxed), 1);
@@ -1039,9 +802,7 @@ mod tests {
         let gate = gate(vec![key_record("k1", 1)], Enforcement::LogOnly).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
-        let decision = gate
-            .decide(&HeaderMap::new(), &uri, DatasetSource::Alias)
-            .await;
+        let decision = gate.decide(&HeaderMap::new(), &uri, true).await;
 
         assert!(matches!(decision, Decision::Reject(_)));
     }
@@ -1049,16 +810,8 @@ mod tests {
     /// Everything two keyless scrapes bracketing one request could see change.
     /// Compared between cases rather than sampled: the families are global, so
     /// a timing test would race the rest of the binary.
-    fn public_projection(
-        gate: &Gate,
-        decision: Decision,
-        class: RouteClass,
-    ) -> Vec<(String, String)> {
-        metrics::auth_decision_labels(
-            gate.public_outcome(decision),
-            class.as_str(),
-            gate.enforcement.as_str(),
-        )
+    fn public_projection(gate: &Gate, decision: Decision) -> Vec<(String, String)> {
+        metrics::auth_decision_labels(gate.public_outcome(decision), gate.enforcement.as_str())
     }
 
     /// INV-39 on the keyless metrics surface. The unauthenticated rungs share
@@ -1079,13 +832,8 @@ mod tests {
             // A token the portal cannot even parse.
             "Bearer sqd_portal_nonsense".to_string(),
         ] {
-            let decision = gate
-                .decide(&header_map(&token), &uri, DatasetSource::Alias)
-                .await;
-            projections.push((
-                decision,
-                public_projection(&gate, decision, RouteClass::Data),
-            ));
+            let decision = gate.decide(&header_map(&token), &uri, true).await;
+            projections.push((decision, public_projection(&gate, decision)));
         }
 
         let reasons: Vec<_> = projections
@@ -1132,7 +880,7 @@ mod tests {
             .decide(
                 &header_map(&format!("Bearer sqd_portal_minted-just-now_{SECRET}")),
                 &uri,
-                DatasetSource::Alias,
+                true,
             )
             .await;
 
@@ -1141,12 +889,11 @@ mod tests {
         };
         assert_eq!(rejection.reason, "lookup_saturated");
 
-        let projection = public_projection(&gate, decision, RouteClass::Data);
+        let projection = public_projection(&gate, decision);
         assert_eq!(
             projection,
             metrics::auth_decision_labels(
                 AuthDecision::Reject(ErrorCode::Overloaded),
-                RouteClass::Data.as_str(),
                 Enforcement::Enforce.as_str(),
             ),
             "the scrape must say only what the 529 said"
@@ -1178,8 +925,8 @@ mod tests {
             // Would refuse: scoped to another dataset.
             header_map(&format!("Bearer sqd_portal_k2_{SECRET}")),
         ] {
-            let decision = gate.decide(&headers, &uri, DatasetSource::Alias).await;
-            projections.push(public_projection(&gate, decision, RouteClass::Data));
+            let decision = gate.decide(&headers, &uri, true).await;
+            projections.push(public_projection(&gate, decision));
         }
 
         for projection in &projections {
@@ -1208,20 +955,15 @@ mod tests {
         let expired = || {
             metrics::auth_decisions(
                 AuthDecision::Reject(ErrorCode::ExpiredCredential),
-                RouteClass::Data.as_str(),
                 Enforcement::Enforce.as_str(),
             )
         };
         let before = expired();
 
         let decision = gate
-            .decide(
-                &header_map(&format!("Bearer {TOKEN}")),
-                &uri,
-                DatasetSource::Alias,
-            )
+            .decide(&header_map(&format!("Bearer {TOKEN}")), &uri, true)
             .await;
-        gate.count(decision, RouteClass::Data);
+        gate.count(decision);
 
         assert!(expired() > before, "the refusal must reach the scrape");
     }

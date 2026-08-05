@@ -529,45 +529,6 @@ sqd_network:
             commercial.enforcement,
             crate::commercial::Enforcement::LogOnly
         );
-        assert_eq!(
-            commercial.gated_routes,
-            crate::commercial::GatedRoutes::Data,
-            "omitting gated_routes must leave the metadata surface public"
-        );
-    }
-
-    /// Single-tenant portals close the metadata surface too; the value has to
-    /// survive the production deserializer, and a typo must not silently open
-    /// it back up.
-    #[test]
-    fn gated_routes_all_parses_and_unknown_values_are_refused() {
-        let block = |routes: &str| {
-            format!(
-                "{MINIMAL_YAML}commercial:\n  \
-                 control_plane_url: https://cp.example/\n  \
-                 service_token_env: PORTAL_CP_TOKEN\n  \
-                 portal_id: portal-premium-eu\n  \
-                 gated_routes: {routes}\n"
-            )
-        };
-        let parse = |yaml: String| -> Result<Config, serde_yaml::Error> {
-            let deser = serde_yaml::Deserializer::from_str(&yaml);
-            serde_yaml::with::singleton_map_recursive::deserialize(
-                serde_ignored::Deserializer::new(deser, &mut |_: serde_ignored::Path| {}),
-            )
-        };
-
-        let config = parse(block("all")).expect("parse");
-        assert_eq!(
-            config.commercial.expect("commercial block").gated_routes,
-            crate::commercial::GatedRoutes::All
-        );
-
-        let err = parse(block("everything")).expect_err("an unknown mode must not parse");
-        assert!(
-            err.to_string().contains("gated_routes"),
-            "the error should name the field: {err}"
-        );
     }
 
     #[test]

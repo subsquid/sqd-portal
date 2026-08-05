@@ -116,8 +116,7 @@ resolve (OP-5) uses the same envelope and code vocabulary.
 `not_ready` envelope (OB-5). `/metrics`: OpenMetrics; families under the `portal_` prefix
 with a constant portal-identity label. On commercial deployments the keyless scrape obeys
 12's confidentiality rule: no internal auth rung or lookup detail beyond the public wire
-outcome under either gate scope, and no dataset identity under `all`. `/status`, `/state`,
-`/debug/*`: bodies explicitly unstable (REQ-14).
+outcome. `/status`, `/state`, `/debug/*`: bodies explicitly unstable (REQ-14).
 
 **IB-7 — Input-side binding (what harness stubs implement).** Worker stub (DC-1): the
 peer-to-peer query protocol — signed query in, sized/compressed result or typed error
@@ -150,20 +149,18 @@ P-KEY-ID-MAX-LEN and P-KEY-SECRET-MAX-LEN. A token outside this grammar is refus
 `invalid_credential` without a lookup — it is not something the control plane could have
 issued (REQ-52).
 
-*Gated surface.* Every route in IB-2 carries exactly one class (DEF-19). Under gate scope
-`data`, the gated set is the stream routes, the timestamp-to-block lookup, the direct
-worker query, and the SQL query plan. Under `all`, it additionally includes every
-metadata route: the catalog, per-dataset metadata and state, all head and height
-variants, `/status`, the worker lookup and the debug surfaces. `/ready`, `/metrics` and
-`/api-docs/openapi.json` are gated under neither, and the docs UI is deliberately open
-because it serves the same schema on every deployment and names no dataset. A route whose
-class is unstated is a build failure, not an ungated route (REQ-51).
+*Gated surface.* The gated set is the stream routes, the timestamp-to-block lookup, the
+direct worker query, and the SQL query plan (DEF-19). Every other route in IB-2 answers
+without a credential on every deployment (NG6): the catalog, per-dataset metadata and
+state, all head and height variants, `/status`, the worker lookup, the debug surfaces,
+`/ready`, `/metrics`, `/api-docs/openapi.json` and the docs UI. A route that states
+neither does not compile (REQ-51).
 
 Because `/metrics` is deliberately keyless, its commercial representation is part of the
-authorization boundary rather than an exemption from it: it must not reveal a dataset
-identity under `all`, an internal authorization rung, a key-record count, or whether one
-request hit the snapshot or invoked authorize-on-miss beyond what that request's own wire
-outcome already disclosed (OB-1/12/13, INV-39).
+authorization boundary rather than an exemption from it: it must not reveal an internal
+authorization rung, a key-record count, or whether one request hit the snapshot or invoked
+authorize-on-miss beyond what that request's own wire outcome already disclosed
+(OB-12/13, INV-39).
 
 *Interaction with the envelope.* An auth refusal is emitted in the IB-5 envelope with the
 codes above. It must reach the client with the status IB-5 binds to its code — a refusal

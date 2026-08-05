@@ -1,180 +1,159 @@
-//! The authorization surface, keyed by axum's matched path.
+//! How a route says whether it needs a key.
 //!
-//! One table rather than a wrapper per route, so the gate is a single
-//! `route_layer` and the router reads like a router. The default is what makes
-//! that safe: a matched path absent from both lists below is gated as a data
-//! route naming no dataset — the most closed classification there is. Adding a
-//! route and forgetting it refuses traffic, which is noticed; the wrapper it
-//! replaced could be forgotten into serving traffic, which is not.
+//! Both [`AuthExt`] methods return a [`Classified`], and [`Gated::route`] takes
+//! nothing else — so a route that says neither does not compile. A wrapper you
+//! can forget to write is open by omission.
 
-use super::{DatasetSource, RouteClass};
+use std::sync::Arc;
 
-/// Every route a key can be required for, and how it names its dataset.
-const CLASSIFIED: &[(&str, DatasetSource, RouteClass)] = &[
-    // Data: blocks, query results, block lookups.
-    (
-        "/datasets/:dataset/archival-stream",
-        DatasetSource::Alias,
-        RouteClass::Data,
-    ),
-    (
-        "/datasets/:dataset/archival-stream/debug",
-        DatasetSource::Alias,
-        RouteClass::Data,
-    ),
-    (
-        "/datasets/:dataset/finalized-stream",
-        DatasetSource::Alias,
-        RouteClass::Data,
-    ),
-    (
-        "/datasets/:dataset/stream",
-        DatasetSource::Alias,
-        RouteClass::Data,
-    ),
-    (
-        "/datasets/:dataset/timestamps/:timestamp/block",
-        DatasetSource::Alias,
-        RouteClass::Data,
-    ),
-    (
-        "/datasets/:dataset_id/query/:worker_id",
-        DatasetSource::EncodedId,
-        RouteClass::Data,
-    ),
-    ("/sql/query", DatasetSource::Absent, RouteClass::Data),
-    // Metadata: what the portal and its datasets are. Public on a shared
-    // portal, confidential on a single-tenant one — `gated_routes` decides.
-    ("/status", DatasetSource::Absent, RouteClass::Metadata),
-    ("/datasets", DatasetSource::Absent, RouteClass::Metadata),
-    (
-        "/datasets/:dataset",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    (
-        "/datasets/:dataset/metadata",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    (
-        "/datasets/:dataset/state",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    (
-        "/datasets/:dataset/head",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    (
-        "/datasets/:dataset/archival-head",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    (
-        "/datasets/:dataset/finalized-head",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    (
-        "/datasets/:dataset/height",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    (
-        "/datasets/:dataset/archival-stream/height",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    (
-        "/datasets/:dataset/finalized-stream/height",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    (
-        "/datasets/:dataset/:start_block/worker",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    (
-        "/datasets/:dataset/:block/debug",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    (
-        "/debug/workers",
-        DatasetSource::Absent,
-        RouteClass::Metadata,
-    ),
-    ("/sql/metadata", DatasetSource::Absent, RouteClass::Metadata),
-];
+use axum::{routing::MethodRouter, Router};
 
-/// Never gated, under either scope: ops probes and the served schema. A pod
-/// that cannot answer its own readiness check leaves rotation, and existing
-/// scrapers hold no customer key (REQ-51).
-const ALWAYS_OPEN: &[&str] = &["/ready", "/metrics", "/api-docs/openapi.json", "/docs"];
+use super::{extractor, Gate};
 
-/// What the gate does with a matched path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Gating {
-    Open,
-    Gated(DatasetSource, RouteClass),
+/// A method router that has declared whether it needs a key.
+pub struct Classified {
+    router: MethodRouter,
+    gated: bool,
 }
 
-pub fn classify(matched_path: &str) -> Gating {
-    if ALWAYS_OPEN.contains(&matched_path) {
-        return Gating::Open;
+/// Declared at the route, like [`endpoint`].
+///
+/// [`endpoint`]: crate::utils::logging::MethodRouterExt::endpoint
+pub trait AuthExt {
+    /// Needs a key on a commercial deployment.
+    fn auth(self) -> Classified;
+
+    /// Served to anyone. Spelled out, not defaulted: leaving a route open
+    /// should be a sentence somebody wrote.
+    fn no_auth(self) -> Classified;
+}
+
+impl AuthExt for MethodRouter {
+    fn auth(self) -> Classified {
+        Classified {
+            router: self,
+            gated: true,
+        }
     }
-    CLASSIFIED
-        .iter()
-        .find(|(path, ..)| *path == matched_path)
-        .map_or(
-            // Unlisted: the most closed classification, so a forgotten route
-            // fails loudly rather than serving.
-            Gating::Gated(DatasetSource::Absent, RouteClass::Data),
-            |(_, source, class)| Gating::Gated(*source, *class),
-        )
+
+    fn no_auth(self) -> Classified {
+        Classified {
+            router: self,
+            gated: false,
+        }
+    }
 }
 
-/// Whether the path is listed at all, as opposed to falling through to the
-/// closed default. Only `http_server`'s route-table test needs the distinction.
-#[cfg(test)]
-pub fn is_classified(matched_path: &str) -> bool {
-    CLASSIFIED.iter().any(|(path, ..)| *path == matched_path)
+/// A router whose only way to add a route demands that the route say so.
+pub struct Gated {
+    router: Router,
+    gate: Option<Arc<Gate>>,
+}
+
+impl Gated {
+    /// Without a `commercial:` block there is no gate and nothing is wrapped.
+    pub fn new(gate: Option<Arc<Gate>>) -> Self {
+        Self {
+            router: Router::new(),
+            gate,
+        }
+    }
+
+    pub fn route(mut self, path: &str, classified: Classified) -> Self {
+        let Classified { router, gated } = classified;
+        let router = match (self.gate.clone(), gated) {
+            (Some(gate), true) => {
+                let dataset = dataset_param(path);
+                router.route_layer(axum::middleware::from_fn(move |req, next| {
+                    extractor::middleware(gate.clone(), dataset, req, next)
+                }))
+            }
+            _ => router,
+        };
+        self.router = self.router.route(path, router);
+        self
+    }
+
+    /// A router mounted whole. Nothing inside passes through [`Self::route`],
+    /// so its routes answer without a key — hence the reason argument.
+    pub fn merge_ungated(mut self, _why: &'static str, other: Router) -> Self {
+        self.router = self.router.merge(other);
+        self
+    }
+
+    pub fn into_router(self) -> Router {
+        self.router
+    }
+}
+
+/// Whether the path names the requested dataset. Where it does not, a
+/// dataset-scoped key cannot be checked and is refused (REQ-53, OQ-13).
+fn dataset_param(path: &str) -> bool {
+    let mut segments = path.trim_start_matches('/').split('/');
+    matches!(
+        (segments.next(), segments.next()),
+        (Some("datasets"), Some(":dataset"))
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        routing::get,
+    };
+    use tower::ServiceExt;
 
-    #[test]
-    fn an_unlisted_route_is_gated_as_data() {
+    use super::*;
+    use crate::commercial::{test_support::gate_with, Enforcement};
+
+    async fn status(gate: Option<Arc<Gate>>, classified: Classified) -> StatusCode {
+        Gated::new(gate)
+            .route("/probe", classified)
+            .into_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_gated_route_needs_a_key_and_an_open_one_does_not() {
+        let gate = Some(gate_with(Enforcement::Enforce, true));
+
+        let gated = status(gate.clone(), get(|| async { "served" }).auth()).await;
+        assert_eq!(gated, StatusCode::UNAUTHORIZED);
+
+        let open = status(gate, get(|| async { "served" }).no_auth()).await;
+        assert_eq!(open, StatusCode::OK);
+    }
+
+    /// The kill switch: with no `commercial:` block the gate is never
+    /// installed, so an OSS build runs no authorization middleware at all.
+    #[tokio::test]
+    async fn nothing_is_gated_without_a_commercial_config() {
         assert_eq!(
-            classify("/datasets/:dataset/something-new"),
-            Gating::Gated(DatasetSource::Absent, RouteClass::Data)
+            status(None, get(|| async { "served" }).auth()).await,
+            StatusCode::OK
         );
     }
 
     #[test]
-    fn the_ops_surface_is_open() {
-        for path in ALWAYS_OPEN {
-            assert_eq!(classify(path), Gating::Open, "{path}");
-        }
-    }
+    fn only_a_dataset_segment_counts_as_naming_one() {
+        assert!(dataset_param("/datasets/:dataset/stream"));
+        assert!(dataset_param(
+            "/datasets/:dataset/timestamps/:timestamp/block"
+        ));
 
-    /// A duplicate would make the earlier entry win silently, and the two could
-    /// disagree on the class.
-    #[test]
-    fn every_path_is_listed_once() {
-        let mut paths: Vec<_> = CLASSIFIED
-            .iter()
-            .map(|(path, ..)| *path)
-            .chain(ALWAYS_OPEN.iter().copied())
-            .collect();
-        let total = paths.len();
-        paths.sort_unstable();
-        paths.dedup();
-        assert_eq!(paths.len(), total, "a route is classified twice");
+        assert!(!dataset_param("/sql/query"));
+        assert!(!dataset_param("/datasets"));
+        assert!(!dataset_param("/metrics"));
+        assert!(!dataset_param("/datasets/:other/stream"));
     }
 }

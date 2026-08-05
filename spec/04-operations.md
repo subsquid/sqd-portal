@@ -148,9 +148,9 @@ gated route (DEF-19) of a commercial deployment, and does not exist at all on an
 (REQ-56). It is listed as an operation because it has a contract, a failure mapping, and
 tests of its own.
 
-*Pre.* The route's class is gated under the operator's gate scope. An ungated route skips
-this operation entirely and costs exactly what it costs on a non-commercial deployment —
-the credential is not read and the dataset is not resolved.
+*Pre.* The route is a gated one (DEF-19). An ungated route skips this operation entirely
+and costs exactly what it costs on a non-commercial deployment — the credential is not
+read and the dataset is not resolved.
 
 *Effect.* Reads the key snapshot (DEF-18). On a snapshot miss, and only then, it may
 consult the control plane directly (DC-8), under that contract's rate and concurrency

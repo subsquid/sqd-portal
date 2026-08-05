@@ -115,7 +115,7 @@ chunk-boundary records FV-6 licenses.
 | CT-7 | Soak/endurance: S4 churn for hours; leak & cardinality audits | HZ-1/5/6, INV-30, SLI-5 |
 | CT-8 | Isolation/noisy-neighbor: S6 | INV-35 |
 | CT-9 | Fuzz, both surfaces: client inputs and stub responses (payloads, artifacts) | INV-36, FM-1, GAP-1 |
-| CT-10 | Authorization: credential corpus × gate scope × enforcement mode against a control-plane stub; feed-fault/convergence cases; bracketed metrics scrapes proving no catalog or key-id side channel, including neutral shadow-mode projection | INV-6/10/14/15/38/39, INV-31, LIV-13/14, REQ-50..REQ-56, DC-8, IB-9, HZ-10 |
+| CT-10 | Authorization: credential corpus × enforcement mode against a control-plane stub; feed-fault/convergence cases; bracketed metrics scrapes proving no catalog or key-id side channel, including neutral shadow-mode projection | INV-6/10/14/15/38/39, INV-31, LIV-13/14, REQ-50..REQ-56, DC-8, IB-9, HZ-10 |
 
 ## Structural validators (kind-agnostic, applied to every response)
 
@@ -218,12 +218,12 @@ chunk-boundary records FV-6 licenses.
 | REQ-43 | P | Positive path exercised by the smoke (signed stub responses verified and delivered); CT-2 now drives the rejection path — a wrongly-signed response is not delivered and the attempt is retried elsewhere, meeting the acceptance criterion. Integrity failures are counted per worker but raise no OB-9 alarm state (GAP-24) |
 | REQ-44 | U | — |
 | REQ-50 | P | The ladder and every rung are unit-tested, a source-scanning test forces each route in the table to be classified or fail the build, and CT-5 pins the refusal behind the real middleware stack: 401, `authentication_error`/`missing_credential`, `WWW-Authenticate: Bearer`. The zero-serving-call and bounded-DC-8-call claims lack a harness (GAP-33) |
-| REQ-51 | P | Both gate scopes are tested at the route-classification level, the always-open set is pinned end-to-end under both scopes, an unclassified route is asserted to be gated rather than served, and the OB-12 label set carries route *class* rather than path, so no series names a dataset. Whether an `all`-scope deployment refuses each metadata route end-to-end is untested (GAP-33) |
+| REQ-51 | C | A route that states neither set does not compile, which is the requirement rather than a test of it; a gated route and an open one are asserted end-to-end against the same gate; the OB-12 label set names no route and no dataset |
 | REQ-52 | P | Token grammar, both presentation channels, length caps and the alphabet are unit-tested; digest-only handling is structural. Log/metric non-disclosure is unasserted (INV-38) |
 | REQ-53 | C | Precedence, absent-vs-empty scope, exact matching, alias resolution, and the no-dataset route case are unit-tested, including the earliest-rung-wins corpus and the digestless tombstone, which fails at the secret rung |
 | REQ-54 | P | Fail-closed on unknown keys and fail-static across feed faults are unit-tested, as is readiness withholding before the first snapshot; a spent lookup budget answers OVERLOADED with `Retry-After` and a failed lookup UPSTREAM-FAILURE, both asserted against a snapshot hit through the same outage. Staleness is exported but unbounded (GAP-31) |
 | REQ-55 | P | Shadow mode is asserted to admit the whole rejection corpus, record ordinary verdicts, not withhold readiness, and project valid, invalid and indeterminate onto one neutral public series. End-to-end coverage through a stub world is missing (GAP-33) |
-| REQ-56 | C | Absent configuration is asserted to install no middleware on either route class, an empty block fails startup naming the missing field through both deserializer paths, and the mode is logged once at startup |
+| REQ-56 | C | Absent configuration is asserted to install no middleware even on a route that asked for it, an empty block fails startup naming the missing field through both deserializer paths, and the mode is logged once at startup |
 
 ## Gap register — 2026-08-05
 

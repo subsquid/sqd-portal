@@ -377,25 +377,20 @@ call for any of them; only a snapshot miss may call the DC-8 lookup, and only an
 authenticated dataset-scoped case may canonicalize the dataset. A valid unscoped key is
 served exactly as the same request is served on a non-commercial deployment.
 
-**REQ-51 — Gate scope is an operator choice with a closed set of modes.** [MUST]
-The operator selects which surface requires a key: `data` gates block delivery, queries,
-and block lookups while leaving metadata public; `all` additionally gates every route
-that describes the Portal or its datasets. Readiness, metrics, and the served API schema
-are never gated under either mode. Because metrics are client-readable, their public
-families never expose dataset identities under `all`, nor any internal authorization
-reason or lookup detail beyond the client-visible wire outcome under either mode
-(OB-12/13). An unrecognized mode is a startup error, never a fallback to the more
-permissive one.
-*Acceptance:* under `data`, a keyless metadata read succeeds and a keyless stream is
-refused; under `all`, both are refused; under both, `/ready`, `/metrics` and the API
-schema answer without a credential. A route added to the surface without being classified
-fails the build, and — should it reach a running Portal anyway — is gated as an anonymous
-data route rather than served. A keyless scrape under
-`all` names no dataset of the served catalog in any series or label; and under either
-mode, two keyless scrapes bracketing each case of REQ-50's corpus differ only in ways
-that case's own response already disclosed — no series distinguishes the four
-`invalid_credential` reasons from each other, nor a snapshot hit from an
-authorize-on-miss.
+**REQ-51 — The gated surface is fixed, and every route states whether it is in it.** [MUST]
+Block delivery, queries and block lookups require a credential. Everything else — the
+catalog, per-dataset metadata and state, heads and heights, the worker and debug lookups,
+readiness, metrics and the served API schema — answers without one, on every deployment
+(NG6). A route is in one set or the other because it says so at the point it is declared;
+there is no default, so a route that says nothing does not compile. Because metrics are
+client-readable, their public families never expose an internal authorization reason or
+lookup detail beyond the client-visible wire outcome (OB-12/13).
+*Acceptance:* a keyless metadata read succeeds and a keyless stream is refused;
+`/ready`, `/metrics` and the API schema answer without a credential. A route added
+without stating which set it is in fails to compile. Two keyless scrapes bracketing each
+case of REQ-50's acceptance corpus differ only in ways that case's own response already
+disclosed — no series distinguishes the four `invalid_credential` reasons from each
+other, nor a snapshot hit from an authorize-on-miss.
 
 **REQ-52 — Credential presentation.** [MUST]
 A credential is presented either as an HTTP bearer token or as a query parameter, the

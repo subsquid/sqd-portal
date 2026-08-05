@@ -246,22 +246,17 @@ pub fn hotblocks_requests(outcome: HotblocksRequestOutcome) -> u64 {
 }
 
 /// Count one authorization evaluation (OB-12).
-pub fn report_auth_decision(decision: AuthDecision, route_class: &'static str, enforcement: &str) {
+pub fn report_auth_decision(decision: AuthDecision, enforcement: &str) {
     AUTH_DECISIONS
-        .get_or_create(&auth_decision_labels(decision, route_class, enforcement))
+        .get_or_create(&auth_decision_labels(decision, enforcement))
         .inc();
 }
 
 /// The whole public projection of one evaluation, in one place.
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) fn auth_decision_labels(
-    decision: AuthDecision,
-    route_class: &'static str,
-    enforcement: &str,
-) -> Labels {
+pub(crate) fn auth_decision_labels(decision: AuthDecision, enforcement: &str) -> Labels {
     let mut labels = vec![
         ("decision".to_owned(), decision.as_str().to_owned()),
-        ("route_class".to_owned(), route_class.to_owned()),
         ("enforcement".to_owned(), enforcement.to_owned()),
     ];
     // Only a refusal carries a code, and only the one the caller received.
@@ -276,9 +271,9 @@ pub(crate) fn auth_decision_labels(
 }
 
 #[cfg(test)]
-pub fn auth_decisions(decision: AuthDecision, route_class: &'static str, enforcement: &str) -> u64 {
+pub fn auth_decisions(decision: AuthDecision, enforcement: &str) -> u64 {
     AUTH_DECISIONS
-        .get_or_create(&auth_decision_labels(decision, route_class, enforcement))
+        .get_or_create(&auth_decision_labels(decision, enforcement))
         .get()
 }
 
