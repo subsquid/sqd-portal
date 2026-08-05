@@ -137,11 +137,12 @@ injectors for the CT-2 matrix.
 **IB-9 — Authorization binding.** Commercial deployments only (REQ-56); on any other
 deployment nothing in this rule is observable.
 
-*Presentation.* A credential is accepted as `Authorization: Bearer <token>` or as the
-`api_key` query parameter, in that precedence. The query channel exists because some
-browser transports cannot set headers on every request; operators should assume a token
-presented that way is recorded by intermediaries and access logs, which is a property of
-URLs, not of this binding.
+*Presentation.* A credential is accepted as `Authorization: Bearer <token>` and nowhere
+else. A query-string channel is deliberately not offered: it would exist to serve
+transports that cannot set headers, and this binding has none — every gated route is POST
+but the timestamp lookup, and `fetch` sets headers on both. What it would have is a secret
+in a URL, which browser history, `Referer` and every intermediary's access log record
+outside this system's reach.
 
 *Token grammar.* `<prefix><key_id>_<secret>`, where the prefix is one the control plane
 mints, the two segments draw from `[A-Za-z0-9~-]`, and their lengths are at most

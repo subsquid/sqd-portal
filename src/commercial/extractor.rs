@@ -7,7 +7,6 @@ use axum::{
     response::Response,
 };
 use sha2::{Digest, Sha256};
-use url::form_urlencoded;
 
 use super::{
     config::{CommercialConfig, Enforcement},
@@ -31,8 +30,6 @@ const TOKEN_PREFIXES: [&str; 2] = ["sqd_portal_", "prt_"];
 /// rejected before its key id reaches the negative cache or a log line.
 const MAX_KEY_ID_LEN: usize = 64;
 const MAX_SECRET_LEN: usize = 128;
-
-const QUERY_PARAM: &str = "api_key";
 
 /// A presented key, reduced to what the ladder needs. The secret itself is
 /// discarded at parse time; only its digest travels further.
@@ -109,7 +106,7 @@ impl Gate {
         // process-wide pool and clones the dataset config, so it must stay
         // behind authentication. Only the dataset rung calls this.
         let dataset = LazyDataset::new(|| self.dataset_for(uri.path(), names_dataset));
-        let credential = match credential_from_request(headers, uri.query()) {
+        let credential = match credential_from_request(headers) {
             Ok(credential) => credential,
             Err(rejection) => {
                 self.log(Decision::Reject(rejection), None, None);
@@ -225,17 +222,15 @@ pub(super) async fn middleware(
     }
 }
 
+/// The bearer header is the only channel. A query parameter would put the secret
+/// in a URL, and a URL reaches browser history, `Referer` and the access log of
+/// every proxy in front of the Portal — none of which this system can see or
+/// clear (IB-9).
+///
 /// A malformed token is a rejection rather than an absent credential: falling
 /// back to "no key presented" would hide typos behind a different error.
-fn credential_from_request(
-    headers: &HeaderMap,
-    query: Option<&str>,
-) -> Result<Option<Credential>, Rejection> {
-    let token = match bearer_token(headers)? {
-        Some(token) => Some(token),
-        None => query_token(query),
-    };
-    let Some(token) = token else {
+fn credential_from_request(headers: &HeaderMap) -> Result<Option<Credential>, Rejection> {
+    let Some(token) = bearer_token(headers)? else {
         return Ok(None);
     };
 
@@ -255,14 +250,6 @@ fn bearer_token(headers: &HeaderMap) -> Result<Option<String>, Rejection> {
         return Err(evaluate::MALFORMED);
     }
     Ok(Some(token.to_owned()))
-}
-
-/// Browser SDKs cannot set headers on every transport, so the key may also
-/// arrive as a query parameter.
-fn query_token(query: Option<&str>) -> Option<String> {
-    form_urlencoded::parse(query?.as_bytes())
-        .find(|(key, _)| key == QUERY_PARAM)
-        .map(|(_, value)| value.into_owned())
 }
 
 fn parse_token(token: &str) -> Option<Credential> {
@@ -498,30 +485,41 @@ mod tests {
     }
 
     #[test]
-    fn credentials_come_from_the_header_or_the_query_parameter() {
+    fn a_credential_comes_from_the_bearer_header() {
         let mut headers = HeaderMap::new();
-        assert_eq!(credential_from_request(&headers, None), Ok(None));
-
-        let from_query = credential_from_request(&headers, Some(&format!("{QUERY_PARAM}={TOKEN}")))
-            .unwrap()
-            .expect("query credential");
-        assert_eq!(from_query.key_id, "k1");
+        assert_eq!(credential_from_request(&headers), Ok(None));
 
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("bearer {TOKEN}")).unwrap(),
         );
-        let from_header = credential_from_request(&headers, None)
+        let credential = credential_from_request(&headers)
             .unwrap()
             .expect("header credential");
-        assert_eq!(from_header, from_query);
+        assert_eq!(credential.key_id, "k1");
+    }
 
-        // The header wins, and its own malformation is not papered over by a
-        // valid query parameter.
-        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer"));
-        assert!(
-            credential_from_request(&headers, Some(&format!("{QUERY_PARAM}={TOKEN}"))).is_err()
-        );
+    /// The secret must never reach a URL: a URL lands in browser history, in
+    /// `Referer`, and in the access log of every proxy in front of the Portal,
+    /// none of which this system can see or clear. Re-adding the channel would
+    /// otherwise be a one-line change nobody notices.
+    #[tokio::test]
+    async fn a_token_in_the_query_string_is_not_a_credential() {
+        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
+        let app = app(gate, "/datasets/:dataset/stream");
+
+        for query in ["api_key", "apikey", "key", "token", "access_token"] {
+            let (status, body) = call(
+                app.clone(),
+                request(&format!("/datasets/base/stream?{query}={TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{query}");
+            assert_eq!(error_code(&body), "missing_credential", "{query}");
+        }
     }
 
     #[test]
@@ -536,7 +534,7 @@ mod tests {
             let mut headers = HeaderMap::new();
             headers.insert(header::AUTHORIZATION, value.clone());
             assert!(
-                credential_from_request(&headers, None).is_err(),
+                credential_from_request(&headers).is_err(),
                 "{value:?} must be rejected"
             );
         }
@@ -557,15 +555,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "served");
-
-        let (status, _) = call(
-            app,
-            request(&format!("/datasets/base/stream?{QUERY_PARAM}={TOKEN}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
     }
 
     /// GAP-29: the refusal has to arrive in the ADR-011 envelope, or the routed
@@ -634,11 +623,10 @@ mod tests {
 
         let response = app
             .oneshot(
-                request(&format!(
-                    "/datasets/ethereum-mainnet/stream?{QUERY_PARAM}={TOKEN}"
-                ))
-                .body(Body::empty())
-                .unwrap(),
+                request("/datasets/ethereum-mainnet/stream")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -663,7 +651,8 @@ mod tests {
 
         let (status, _) = call(
             app.clone(),
-            request(&format!("/datasets/base/stream?{QUERY_PARAM}={TOKEN}"))
+            request("/datasets/base/stream")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -672,11 +661,10 @@ mod tests {
 
         let (status, _) = call(
             app,
-            request(&format!(
-                "/datasets/ethereum-mainnet/stream?{QUERY_PARAM}={TOKEN}"
-            ))
-            .body(Body::empty())
-            .unwrap(),
+            request("/datasets/ethereum-mainnet/stream")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -692,7 +680,8 @@ mod tests {
 
         let (status, _) = call(
             app,
-            request(&format!("/sql/query?{QUERY_PARAM}={TOKEN}"))
+            request("/sql/query")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -711,15 +700,26 @@ mod tests {
             "/datasets/:dataset/stream",
         );
 
-        for uri in [
-            "/datasets/base/stream".to_string(),
-            format!("/datasets/base/stream?{QUERY_PARAM}={TOKEN}"),
-            format!("/datasets/base/stream?{QUERY_PARAM}=garbage"),
-            "/datasets/base/stream?api_key=sqd_portal_unknown_secret".to_string(),
+        for token in [
+            // No credential at all.
+            None,
+            // A valid one the ladder refuses on both scope rungs.
+            Some(format!("Bearer {TOKEN}")),
+            // Unparseable.
+            Some("Bearer garbage".to_string()),
+            // A well-formed token naming a key the portal does not know.
+            Some(format!("Bearer sqd_portal_unknown_{SECRET}")),
         ] {
-            let (status, body) =
-                call(app.clone(), request(&uri).body(Body::empty()).unwrap()).await;
-            assert_eq!(status, StatusCode::OK, "{uri} must be admitted in log_only");
+            let mut builder = request("/datasets/base/stream");
+            if let Some(token) = &token {
+                builder = builder.header(header::AUTHORIZATION, token);
+            }
+            let (status, body) = call(app.clone(), builder.body(Body::empty()).unwrap()).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{token:?} must be admitted in log_only"
+            );
             assert_eq!(body, "served");
         }
     }

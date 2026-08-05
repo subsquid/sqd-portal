@@ -393,15 +393,19 @@ disclosed — no series distinguishes the four `invalid_credential` reasons from
 other, nor a snapshot hit from an authorize-on-miss.
 
 **REQ-52 — Credential presentation.** [MUST]
-A credential is presented either as an HTTP bearer token or as a query parameter, the
-latter because some browser transports cannot set headers. Only tokens in a form the
-control plane can actually mint are accepted; anything else is refused as an invalid
-credential without being looked up (INV-39). The secret itself is never logged, stored,
-echoed, or compared other than as a digest, in constant time (INV-38).
-*Acceptance:* a valid key is accepted through either channel and refused when its token
-is truncated, over-long, carries an unknown prefix, or contains bytes outside the minted
-alphabet; no log record, metric label, error body, or stored value produced by any of
-these contains the secret.
+A credential is presented as an HTTP bearer token, and by no other channel. In particular
+it is never read from the query string: that puts the secret in a URL, and a URL is
+recorded by browser history, by `Referer` on every outbound request from a page, and by
+the access log of every intermediary in front of the Portal — none of which this system
+can see, reach, or clear. Only tokens in a form the control plane can actually mint are
+accepted; anything else is refused as an invalid credential without being looked up
+(INV-39). The secret itself is never logged, stored, echoed, or compared other than as a
+digest, in constant time (INV-38).
+*Acceptance:* a valid key is accepted through the header and refused when its token is
+truncated, over-long, carries an unknown prefix, or contains bytes outside the minted
+alphabet; the same token in a query parameter is not a credential at all and the request
+is refused as though none were presented; no log record, metric label, error body, or
+stored value produced by any of these contains the secret.
 
 **REQ-53 — The ladder has a fixed precedence.** [MUST]
 Authorization evaluates in one order — credential present → key known → secret matches →

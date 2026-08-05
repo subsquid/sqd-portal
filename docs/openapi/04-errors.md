@@ -95,8 +95,9 @@ make the same credential work.
 
 ### Presenting a key
 
-On a portal that requires one, send the key as `Authorization: Bearer <key>`, or as an `api_key`
-query parameter where your transport cannot set headers. Every 401 carries
+On a portal that requires one, send the key as `Authorization: Bearer <key>`. That is the only
+channel — a key in the query string is ignored, because a URL ends up in browser history, in
+`Referer`, and in the logs of every proxy along the way. Every 401 carries
 `WWW-Authenticate: Bearer`.
 
 ### Browser clients
