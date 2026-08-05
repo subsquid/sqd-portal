@@ -1837,6 +1837,31 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// The same for the routes that only the `all` mode gates: without a
+    /// `commercial:` block `gated_metadata` hands the route back untouched, so
+    /// an OSS build carries no layer on them either.
+    #[tokio::test]
+    async fn metadata_routes_carry_no_authorization_without_a_commercial_config() {
+        use tower::ServiceExt;
+
+        let app = Router::new().route(
+            "/datasets",
+            gated_metadata(get(|| async { "served" }), &None),
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/datasets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     /// A gated portal that has not mirrored the control plane's key set knows
     /// no keys, so it answers 401 to every valid one. Serving that is worse
     /// than serving nothing: it must stay out of rotation until the first sync
