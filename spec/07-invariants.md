@@ -3,7 +3,8 @@
 Scope tags: `[state]` holds in every observable state · `[transition]` across
 consecutive states · `[response]` for every response · `[recovery]` across restart.
 Bands: structural 1–9 · operation legality 10–19 · response semantics 20–29 ·
-reporting 30–34 · isolation 35–39 · recovery 40–44. *Check* names the test class
+reporting 30–34 · isolation 35–39 · recovery 40–44. Access-control invariants sit in
+the band their scope puts them in, not in one of their own. *Check* names the test class
 (CT-n, [13-conformance.md](13-conformance.md)).
 
 ## Structural (1–9)
@@ -47,13 +48,30 @@ admitted stream decrements exactly once at its end.
 *Why:* census drift silently shrinks (or unbounds) global capacity.
 *Check:* CT-3 — concurrent admit/finish/disconnect storm; compare census to truth.
 
+**INV-6 — Key snapshot coherence.** [transition]
+Every read of the key snapshot (DEF-18) sees exactly one generation: a rebuild replaces
+the record set wholesale and is never partially observable, and a direct lookup that
+began under an earlier generation never inserts its answer into a later one. Within a
+generation a key only moves forward — a delta applies a record only if its sequence
+exceeds the held one, so a replayed or reordered page cannot resurrect a revoked key.
+A record that cannot be used is held as a tombstone, never dropped (DEF-17).
+*Why:* the two ways a mirror silently un-revokes a key are applying a stale record over a
+newer one, and letting an in-flight lookup write into a snapshot that has since been
+rebuilt beneath it.
+*Check:* CT-10 — feed stub replays and reorders pages, and flips epoch while a lookup is
+in flight; assert no key regresses and no answer lands in the wrong generation.
+
 ## Operation legality (10–19)
 
-**INV-10 — Validation precedes work.** [response]
-A request failing DEF-7 validation triggers no dependency call and no shared-state
-mutation beyond metrics.
-*Why:* invalid input must be free to reject — no amplification channel.
-*Check:* CT-4 — invalid-request corpus against dependency stubs; assert zero calls.
+**INV-10 — Validation precedes serving work.** [response]
+A request failing DEF-7 validation triggers no serving-dependency call and no shared-state
+mutation beyond authorization caches and observability. Because OP-11 precedes operation
+validation, a syntactically valid credential naming a snapshot-miss key may already have
+made the one bounded DC-8 lookup INV-14 permits; no other dependency exception exists.
+*Why:* invalid input must be cheap to reject and must never buy the work that serves it;
+the earlier authorization exception has its own explicit bounds.
+*Check:* CT-4/CT-10 — invalid-request corpus against dependency stubs; assert zero
+serving-dependency calls and at most the one DC-8 lookup for a snapshot miss.
 
 **INV-11 — Clamping.** [response]
 Effective tuning = min(requested, operator cap) with defaults for absent values; no
@@ -77,6 +95,34 @@ Every routed stream/timestamp response is served entirely by one serving source
 Pre-routing validation, alias, and admission failures have no source marker.
 *Why:* silent source mixing breaks continuation and fork semantics at the seam.
 *Check:* CT-5 — marker vs stub ledger (which stub actually served).
+
+**INV-14 — Authorization precedes work.** [response]
+On a gated route (DEF-19), a request that does not pass OP-11 causes no serving-dependency
+call, no handler execution, no stream-census admission, and no shared-state mutation
+beyond the snapshot's own caches and authorization observability. A snapshot miss may
+make the one bounded DC-8 lookup OP-11 declares. Dataset canonicalization is itself work:
+it happens only for a credential that has already authenticated and only where the key's
+scope requires it (REQ-53). On an ungated route, or a Portal with no commercial
+configuration, no part of this runs.
+*Why:* an unauthenticated request must not be able to buy unbounded or serving-path work.
+The one attacker-reachable exception — authorize-on-miss — has explicit rate,
+concurrency, cache, and deadline bounds so the gate does not become an open cost amplifier.
+*Check:* CT-10 — keyless and bad-key corpus against every gated route with dependency
+stubs and a counting catalog; assert zero serving-dependency calls, a DC-8 call only for
+a snapshot miss, and canonicalization only after authentication on the dataset rung.
+
+**INV-15 — Verdict determinism.** [response]
+The authorization verdict (DEF-20) is a pure function of (credential, key record, portal
+identity, requested dataset, current time). It never depends on load, capacity, prior
+requests, or which replica served, and the ladder's precedence (REQ-53) is total: a
+request failing several rungs always reports the earliest. Two replicas holding the same
+record state and evaluating at the same time return the same verdict for the same request;
+a local generation counter alone does not establish equivalent state.
+*Why:* a verdict that varies with load is an availability bug wearing an authorization
+costume, and a precedence that varies makes the refusal reason — the operator's only
+diagnostic — untrustworthy.
+*Check:* CT-10 — the multi-failure corpus of REQ-53 against a fixed snapshot, replayed
+under saturation and on a second replica; assert identical verdicts.
 
 ## Response semantics (20–29)
 
@@ -181,8 +227,11 @@ through them).
 
 **INV-31 — Readiness honesty.** [state]
 Ready ⇒ (an artifact is applied ∧ connectivity ≥ P-READY-CONNECTION-RATIO ∧ not
-shutting down). Shutdown flips readiness before intake stops (ADR-005). Intent ⚠:
-ready also ⇒ artifact age ≤ P-ASSIGNMENT-MAX-AGE (ADR-013, GAP-2).
+shutting down ∧ (enforcing commercial ⇒ a key snapshot has been established)). A Portal
+that would refuse every valid key is not ready (REQ-54); a shadow-mode one has no such
+conjunct, since it refuses nobody (REQ-55). Shutdown flips readiness before intake stops
+(ADR-005). Intent ⚠: ready also ⇒ artifact age ≤ P-ASSIGNMENT-MAX-AGE (ADR-013, GAP-2),
+and the key-set analogue P-KEY-SNAPSHOT-MAX-AGE ⚠ if OQ-12 ratifies it.
 *Why:* orchestrators route by this; a lying probe turns deploys into outages.
 *Check:* CT-2 — drive each conjunct false via stubs; probe.
 
@@ -202,9 +251,43 @@ serving task (which truncate only that stream, FM-1).
 *Check:* CT-4/CT-9 — fuzz all client surfaces; process liveness probe.
 
 **INV-37 — Declared side effects only.** [state]
-The Portal's only external interactions are those declared in 05 (DC-1..DC-7).
+The Portal's only external interactions are those declared in 05 (DC-1..DC-8; DC-8 only
+where the operator configured it — REQ-56).
 *Why:* undeclared calls are unbudgeted failure modes and security surface.
 *Check:* CT-2 — harness observes all egress; anything not stub-addressed fails.
+
+**INV-38 — Credential confidentiality.** [state]
+A presented secret exists only as the digest the request parser reduces it to. No log
+record, metric label, span field, error body, stored value, or outbound request ever
+carries the secret, and comparison against the published digest completes in time
+independent of how many leading bytes matched.
+*Why:* an API key that reaches a log line has been disclosed to everyone with log access,
+and a comparison that exits early lets a wrong secret be refined byte by byte from
+response timing — the digest would then be no better than the secret itself.
+*Check:* CT-10 — drive the full corpus with a marked secret; grep every emitted log,
+metric, span, and body for it; assert the comparison is the constant-time one by
+construction.
+
+**INV-39 — No enumeration oracle.** [response]
+On every completed credential verdict, an unparseable token, an authoritatively unknown
+key id, a known key id with a wrong secret, and a digestless tombstone are
+indistinguishable to the client: same status, same code, same body (ADR-017). The reasons
+that *are* distinguishable — revoked, expired, wrong portal, wrong dataset — are reachable
+only by a client already holding the correct secret. The distinction survives on the
+internal axis only, in protected structured logs — never as a label or
+request-synchronous counter on the keyless metrics surface (OB-12/13).
+*Why:* telling a caller that a key id exists turns the endpoint into a key-id oracle, and
+the whole point of a public key id plus a secret is that the id alone is worthless.
+*Check:* CT-10 — assert the four responses are byte-identical apart from the request id;
+assert the specific reasons appear only for correct-secret requests; bracket every case
+under both enforcement modes with metrics scrapes and assert no public series reveals the
+internal reason or lookup path beyond the response that case received. In shadow mode,
+where every case is admitted, their authorization projections are identical.
+*Known deviation:* a snapshot miss may consult the control plane while a hit answers
+locally, so timing differs; if that lookup cannot run or answer, its retryable
+OVERLOADED/UPSTREAM-FAILURE response also differs from a hit's BAD-CREDENTIAL. The
+residual reveals snapshot membership under lookup pressure, but public metrics must not
+amplify it beyond the response the caller already received (GAP-32).
 
 ## Recovery (40–44)
 
@@ -220,5 +303,6 @@ window) may change only routing, timing, and coverage extent per INV-28.
 Structural validators (13 §validators) enforce INV-20/21/25 on every response for
 free. The dependency-fault matrix (CT-2) owns INV-2/23/25/31/37/40. Concurrency swarms
 (CT-3) own INV-1/3/4/5/12/28/30/35. The fuzz corpus (CT-4/9) owns INV-10/36. Interface
-conformance (CT-5) owns INV-13/24/26. Every response in every class re-checks the
-`[response]` band via the validators.
+conformance (CT-5) owns INV-13/24/26. Authorization (CT-10) shares INV-10 and owns
+INV-6/14/15/38/39. Every response in every class re-checks the `[response]` band via the
+validators.

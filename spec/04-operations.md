@@ -29,6 +29,7 @@ capacity limits (stream census, congestion window, worker health). Restated as I
 | OP-8 Readiness probe | naturally idempotent | trivial |
 | OP-9 Metrics read | naturally idempotent | trivial |
 | OP-10 SQL route plan | naturally idempotent | trivial |
+| OP-11 Request authorization | naturally idempotent | trivial (no upstream work is started before it succeeds) |
 
 Every operation is safe to retry; the Portal maintains no dedup keys (client retries
 are new requests).
@@ -37,11 +38,12 @@ are new requests).
 
 *Pre.* In order: (1) resolve alias → dataset, else NOT-FOUND; (2) parse tuning
 parameters, reject zero/unparsable as BAD-REQUEST; (3) decode and validate the query
-per DEF-7, else BAD-REQUEST — **no dependency call happens before validation completes
-(INV-10)**; (4) clamp tuning to operator caps (INV-11); (5) admission: if the stream
-census is at P-MAX-STREAMS or congestion utilization exceeds P-HEADROOM-THRESHOLD,
-refuse OVERLOADED with a retry hint (INV-12) — admission is checked before any
-upstream work.
+per DEF-7, else BAD-REQUEST — **no serving-dependency call happens before validation
+completes**; OP-11's bounded authentication lookup may already have occurred on a
+snapshot miss (INV-10/14); (4) clamp tuning to operator caps (INV-11); (5) admission: if
+the stream census is at P-MAX-STREAMS or congestion utilization exceeds
+P-HEADROOM-THRESHOLD, refuse OVERLOADED with a retry hint (INV-12) — admission is checked
+before any upstream work.
 
 *Effect.* In real-time mode with validation enabled, a parent hash whose height is at
 or below the frontier is validated before any emptiness decision — conflict detection
@@ -121,7 +123,12 @@ of the conformance surface beyond existence and freshness.
 
 *Effect.* Pure read of local state — never calls a dependency. *Post.* Ready iff:
 an artifact is applied ∧ worker connectivity ≥ P-READY-CONNECTION-RATIO ∧ not shutting
-down (INV-31). Intent (ADR-013 ⚠): also degrade when artifact age > P-ASSIGNMENT-MAX-AGE.
+down ∧ (on a commercial deployment that is *enforcing*, a key snapshot has been
+established — REQ-54) (INV-31). Shadow enforcement adds no such condition: it admits
+regardless of what the snapshot knows, so withholding readiness for it would cause the
+outage shadow mode exists to avoid (REQ-55). Intent (ADR-013 ⚠): also degrade when
+artifact age > P-ASSIGNMENT-MAX-AGE; the key-set analogue,
+P-KEY-SNAPSHOT-MAX-AGE ⚠, is open on OQ-12.
 
 ## OP-9 — Metrics read
 
@@ -133,6 +140,38 @@ gauge honesty per INV-30.
 *Pre.* Plan decode, else BAD-REQUEST. *Effect.* Applied artifact + embedded schemas;
 no data queries. *Post.* A routing plan naming only workers present in the applied
 artifact; no rows (NG6). Experimental: shape unspecified beyond this.
+
+## OP-11 — Request authorization
+
+Not a client-callable operation: an admission step that runs before OP-1..OP-10 on every
+gated route (DEF-19) of a commercial deployment, and does not exist at all on any other
+(REQ-56). It is listed as an operation because it has a contract, a failure mapping, and
+tests of its own.
+
+*Pre.* The route's class is gated under the operator's gate scope. An ungated route skips
+this operation entirely and costs exactly what it costs on a non-commercial deployment —
+the credential is not read and the dataset is not resolved.
+
+*Effect.* Reads the key snapshot (DEF-18). On a snapshot miss, and only then, it may
+consult the control plane directly (DC-8), under that contract's rate and concurrency
+bounds; a lookup it is not allowed to make is an immediate OVERLOADED outcome, not a
+delay or a BAD-CREDENTIAL claim, and a failed lookup is UPSTREAM-FAILURE. It resolves the
+requested dataset to a canonical name **only** for a key that is dataset-scoped and has
+already authenticated — the one rung that needs it — so an unauthenticated request cannot
+buy that work (INV-14). No serving dependency is consulted, and no shared state is
+mutated beyond the snapshot's own caches and authorization observability.
+
+*Post.* Admit, and the request proceeds to its operation unchanged; reject with the first
+failed rung of REQ-53's ladder, mapped to its DEF-10 row; or fail before a verdict with
+OVERLOADED/UPSTREAM-FAILURE when a required lookup could not run or answer. Any such
+outcome is terminal while enforcing: no handler runs, no stream slot is taken, and no
+serving dependency is called. Under shadow enforcement the verdict or indeterminate
+lookup outcome is recorded and the request proceeds regardless (REQ-55).
+
+*Timing.* The rejection path is O(1) in request size and consults no dependency in the
+snapshot-hit and syntactically-invalid cases (PF-7). The evaluation itself is a pure
+function (INV-15); only snapshot-miss resolution may wait on its DC-8 deadline, and local
+lookup saturation refuses immediately as OVERLOADED rather than queuing.
 
 ## Concurrency
 

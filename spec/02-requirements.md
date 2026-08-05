@@ -1,8 +1,8 @@
 # 02 — Requirements
 
 Bands: 1–9 core data delivery · 10–16 discovery & metadata · 20–29 robustness &
-overload · 30–34 operability · 40–44 network integration. Gaps in numbering are
-reserved; additions never renumber. Acceptance status lives in
+overload · 30–34 operability · 40–44 network integration · 50–56 commercial access
+control. Gaps in numbering are reserved; additions never renumber. Acceptance status lives in
 [13-conformance.md](13-conformance.md), not here.
 
 ## Core data delivery (1–9)
@@ -354,6 +354,114 @@ bounded (queue of P-LOGS-QUEUE); under pressure logs are dropped rather than eve
 delaying or failing data serving.
 *Acceptance:* saturating the log queue never blocks a stream; drops are observable.
 
+## Commercial access control (50–56)
+
+This band applies only to a Portal the operator has configured commercially (REQ-56).
+On any other deployment every requirement here is vacuous: there is no gate, no key set,
+and no control-plane dependency. Admission decided here is binary — it never shapes how
+much capacity an admitted request may consume (NG2).
+
+**REQ-50 — Gated routes require a valid key.** [MUST]
+On a commercial deployment, every request to a gated route (DEF-19) is authorized before
+any other work: the presented credential (DEF-16) must resolve to a key record (DEF-17)
+that authenticates, is active, is unexpired, and covers this portal and the requested
+dataset. A request that fails any of these is refused in the DEF-10 taxonomy and reaches
+no handler or serving dependency. OP-11 may make its one declared control-plane lookup on
+a snapshot miss, and may canonicalize a dataset only after the credential has
+authenticated and only when its dataset scope requires that name (INV-14).
+*Acceptance:* against a gated route, a request with no credential, an unparseable token,
+an unknown key id, a wrong secret, a revoked key retaining its digest, a digestless
+tombstone, an expired key, a key scoped to another portal, and a key scoped to another
+dataset each receive the refusal ADR-017 binds to it; no serving-dependency stub records a
+call for any of them; only a snapshot miss may call the DC-8 lookup, and only an
+authenticated dataset-scoped case may canonicalize the dataset. A valid unscoped key is
+served exactly as the same request is served on a non-commercial deployment.
+
+**REQ-51 — Gate scope is an operator choice with a closed set of modes.** [MUST]
+The operator selects which surface requires a key: `data` gates block delivery, queries,
+and block lookups while leaving metadata public; `all` additionally gates every route
+that describes the Portal or its datasets. Readiness, metrics, and the served API schema
+are never gated under either mode. Because metrics are client-readable, their public
+families never expose dataset identities under `all`, nor any internal authorization
+reason or lookup detail beyond the client-visible wire outcome under either mode
+(OB-12/13). An unrecognized mode is a startup error, never a fallback to the more
+permissive one.
+*Acceptance:* under `data`, a keyless metadata read succeeds and a keyless stream is
+refused; under `all`, both are refused; under both, `/ready`, `/metrics` and the API
+schema answer without a credential. A route added to the surface without being
+classified fails the build rather than defaulting to ungated. A keyless scrape under
+`all` names no dataset of the served catalog in any series or label; and under either
+mode, two keyless scrapes bracketing each case of REQ-50's corpus differ only in ways
+that case's own response already disclosed — no series distinguishes the four
+`invalid_credential` reasons from each other, nor a snapshot hit from an
+authorize-on-miss.
+
+**REQ-52 — Credential presentation.** [MUST]
+A credential is presented either as an HTTP bearer token or as a query parameter, the
+latter because some browser transports cannot set headers. Only tokens in a form the
+control plane can actually mint are accepted; anything else is refused as an invalid
+credential without being looked up (INV-39). The secret itself is never logged, stored,
+echoed, or compared other than as a digest, in constant time (INV-38).
+*Acceptance:* a valid key is accepted through either channel and refused when its token
+is truncated, over-long, carries an unknown prefix, or contains bytes outside the minted
+alphabet; no log record, metric label, error body, or stored value produced by any of
+these contains the secret.
+
+**REQ-53 — The ladder has a fixed precedence.** [MUST]
+Authorization evaluates in one order — credential present → key known → secret matches →
+not revoked → not expired → portal allowed → dataset allowed — and reports the first rung
+that fails. A record carrying no secret digest — including a tombstone — cannot establish
+that the caller holds the secret, so it fails at `secret matches` as BAD-CREDENTIAL rather
+than disclosing the later revoked rung. Absent scope means unrestricted (a key with no
+portal list is valid on any portal; a key with no dataset list covers every dataset); an
+empty scope list means nothing, not everything. A dataset-scoped key may not use a route
+that names no dataset.
+*Acceptance:* a key failing several rungs at once reports the earliest — a digestless
+tombstone that is also revoked reports the secret rung, not the revoked one; a null scope
+list admits where an empty list refuses; a dataset-scoped key is refused on a route with
+no dataset; scope matching is exact, with aliases resolved to canonical names first, and
+never by prefix or wildcard. The no-dataset case makes the SQL surface unusable for every
+dataset-scoped key, which is fail-closed but may not be the intent — OQ-13.
+
+**REQ-54 — Fail closed on the key, fail static on the feed.** [MUST]
+A key the Portal cannot positively establish as valid is refused. A control-plane outage
+does not invalidate any snapshot hit: the last good snapshot keeps answering. A snapshot
+miss that cannot be resolved because the lookup budget is exhausted is refused as
+OVERLOADED; one that cannot be resolved because the lookup failed is refused as
+UPSTREAM-FAILURE. Neither is mislabeled as a non-retryable bad credential. A malformed or
+unrecognized feed record becomes a non-authenticating tombstone rather than being skipped.
+Where a snapshot has never been established, an enforcing Portal declines readiness
+instead of serving refusals (INV-31).
+*Acceptance:* with the control plane stopped, previously valid keys keep being served and
+previously revoked keys keep being refused; a fresh valid key absent from the snapshot
+receives retryable UPSTREAM-FAILURE rather than BAD-CREDENTIAL; a snapshot miss denied by
+the local lookup budget receives OVERLOADED with `Retry-After`; a record carrying a status
+this build does not recognize is refused; a Portal started with the control plane already
+unreachable never reports ready while enforcing.
+
+**REQ-55 — Shadow enforcement.** [MUST]
+The operator may attempt the full ladder without acting on it: every available verdict is
+recorded in protected structured observability, and a snapshot miss whose lookup cannot
+produce a verdict is recorded there as indeterminate. Every request is admitted regardless
+— including requests presenting no credential at all. Shadow mode never refuses, never
+withholds readiness for a reason only enforcement would care about, and never projects
+the would-be verdict onto the keyless metrics surface (OB-12).
+*Acceptance:* in shadow mode every request of REQ-50's acceptance corpus is served, each
+having recorded the verdict enforcement would have returned or the lookup outcome that
+prevented one; valid, invalid, and indeterminate cases all increment the same neutral
+public shadow counter; a shadow-mode Portal whose key set has never synced still reports
+ready.
+
+**REQ-56 — Open by default, never open by accident.** [MUST]
+Absent commercial configuration the Portal authorizes nothing, opens no control-plane
+dependency, and installs no authorization middleware. Configuration that is present but
+carries no settings is a startup error: the one outcome an operator writing it cannot
+have intended is the open portal. Which mode is in effect is stated once at startup.
+*Acceptance:* with no commercial configuration, gated routes are served without a
+credential and no control-plane call is ever made; an empty commercial block fails
+startup naming the field it lacks; startup output states whether authorization is on and,
+if so, in which enforcement mode.
+
 ## Explicitly unspecified
 
 Deliberately left open — tests and clients must not pin these:
@@ -368,6 +476,11 @@ Deliberately left open — tests and clients must not pin these:
   offer); negotiation mechanics beyond the binding's contract.
 - Worker identity, ranking internals, and how throughput is measured (REQ-41 pins
   outcomes, not scores).
+- The shape of a key id or secret beyond the acceptance grammar (REQ-52), and the
+  control plane's own issuance, rotation, and organization model — the Portal mirrors a
+  key set, it does not define one.
+- Which internal rejection reason underlies a given `invalid_credential` response: the
+  three are deliberately indistinguishable to a client (INV-39, ADR-017).
 
 ## Open questions
 
@@ -381,6 +494,8 @@ Deliberately left open — tests and clients must not pin these:
 | OQ-7 | A stream body without a first block silently defaults to block 0, while the API description marks it required — reject instead? | REQ-7 | portal team |
 | OQ-9 | Ratify a global P-BUFFERED-BYTES-BUDGET and its accounting/admission semantics. | REQ-27, GAP-17 | portal team |
 | OQ-10 | Ratify the draft SLO target parameters and their benchmark gating policy. | 11 SLO table | portal team |
+| OQ-12 | Ratify P-KEY-SNAPSHOT-MAX-AGE and what an enforcing Portal does once its key set is older than it — decline readiness (the ADR-013 answer for assignments) or keep serving and alarm only? Revocation latency and a control-plane outage pull in opposite directions. | REQ-54, GAP-31, ADR-016 | portal team |
+| OQ-13 | Should a dataset-scoped key be able to use the SQL surface, which names its datasets in the body rather than the path? Today such a key is refused there outright (REQ-53), which is fail-closed but makes the surface unusable for exactly the customers most likely to be scoped. | REQ-53, OP-10 | portal team |
 | OQ-11 | REQ-40's fleet-cutover premise assumes workers also honor `effective_from`; workers currently apply assignments immediately (recorded in the worker suite's open questions, `worker-rs/spec/02`), so each publication opens a window of routing to reshuffling workers (transient `no_workers`/`retries_exhausted` churn). Size the window for worker convergence, or have workers delay too? | REQ-40, REQ-41 | network team |
 
 Closed: **OQ-6** (should the clamp-bypassing debug stream variant be exposed unconditionally,

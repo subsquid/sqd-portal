@@ -53,7 +53,7 @@ register ([13-conformance.md](13-conformance.md)), and seed the regression gates
 | SLI-4 | any | ≥ P-SLO-AVAILABILITY monthly ⚠ |
 | SLI-5 | S1/S4 | ≤ P-SLO-MEMORY-HEADROOM ⚠ |
 | SLI-6 | S1 | ≥ P-SLO-COMPLETION-INTEGRITY ⚠ |
-| readiness time | S5 | ≤ P-STARTUP-BOUND ⚠ (dominated by the artifact download, LIV-5) |
+| readiness time | S5 | ≤ P-STARTUP-BOUND ⚠ (artifact fetch + enforcing-commercial key bootstrap, LIV-5) |
 | shutdown time | any | ≤ P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT + slack (hard, LIV-11) |
 
 ## Resource-bound requirements
@@ -74,18 +74,31 @@ consumption within its buffer bound; it never grows unbounded queues anywhere
 new work (INV-12), never by degrading admitted work past its liveness bounds or by
 process death (FM: memory row).
 
-**PF-4 — Refresh budget, two-sided.** Background refreshes (artifact, catalog, chain)
-must complete within their intervals (keep-up) **and** must not consume more than a
-bounded share of serving resources while doing so — an artifact apply must not stall
-request routing beyond a scheduling pause (HZ-5).
+**PF-4 — Refresh budget, two-sided.** Background refreshes (artifact, catalog, chain,
+key feed where commercial) must complete within their declared convergence bounds
+(keep-up) **and** must not consume more than a bounded share of serving resources while
+doing so — an artifact or key-snapshot apply must not stall request routing beyond a
+scheduling pause (HZ-5/HZ-11).
 
-**PF-5 — Startup work scheduling.** Startup-critical work (artifact fetch) is
-prioritized; nothing else on the startup path may push readiness past
-P-STARTUP-BOUND (LIV-5).
+**PF-5 — Startup work scheduling.** Startup-critical work (artifact fetch and, on an
+enforcing commercial deployment, complete key bootstrap) is prioritized; nothing else on
+the startup path may push readiness past P-STARTUP-BOUND (LIV-5).
 
-**PF-6 — Refusal cheapness.** The refusal path allocates O(1) work and memory per
-refused request — surviving S3 requires refusals to be at least an order of magnitude
-cheaper than admissions.
+**PF-6 — Refusal cheapness.** Every refusal allocates O(1) work and memory per request.
+Locally decidable refusals are at least an order of magnitude cheaper than serving an
+admission. A snapshot-miss refusal may spend PF-7's one deadline-bounded DC-8 lookup; it
+is benchmarked separately and never waits in an unbounded queue.
+
+**PF-7 — Authorization cheapness.** On a commercial deployment, an authorization refusal
+costs O(1) in request size and performs no dependency call on a snapshot hit or
+syntactically invalid token. A snapshot miss may spend one deadline-bounded DC-8 lookup;
+an authenticated dataset-scoped key may spend one canonicalization at the dataset rung.
+Neither cost is reachable by a keyless, malformed-token, or wrong-secret hit request
+(INV-14). An ungated route costs exactly what it costs on a non-commercial deployment:
+the gate returns before reading the credential. The common admitted path adds one snapshot
+hash lookup under a read lock; miss and scoped-key benchmarks are measured separately.
+Rationale: the gate is the first thing every request meets and the only thing an
+unauthenticated flood reaches, so each attacker-reachable cost needs its own bound.
 
 ## Hazard register
 
@@ -103,6 +116,8 @@ defects live in the gap register (13).
 | HZ-7 | Usage-log queue drops silently at P-LOGS-QUEUE | accounting fidelity (REQ-44) | drop counter vs stub-sink ledger |
 | HZ-8 | Chain RPC calls carry no explicit deadline | LIV-3 for the status loop | stalled-RPC stub; loop aliveness (GAP-18) |
 | HZ-9 | Congestion waiter queue is unbounded | PF-1 under S3 | waiter census at saturation |
+| HZ-10 | Authorize-on-miss is keyed on attacker-chosen ids: a flood of distinct unknown keys drains P-KEY-RESOLVE-RATE and fills the P-KEY-NEGATIVE-CAPACITY map, and every bound is fail-closed — so the traffic that exhausts the budget also denies *newly minted legitimate keys* with retryable OVERLOADED until the next sync tick lands them in the snapshot | LIV-14, REQ-50 | CT-10: saturate with distinct unknown ids, then present a key minted since the last tick; assert OVERLOADED + hint and measure admission delay against P-KEY-SYNC-INTERVAL |
+| HZ-11 | The snapshot is a per-replica in-memory map of the entire key set, rebuilt from the feed on every start and on every epoch change; nothing bounds how large the control plane may let it grow | PF-1, LIV-5 (startup) | RSS and time-to-ready against a feed stub serving a key set at the projected ceiling |
 
 ## Benchmarking requirements
 

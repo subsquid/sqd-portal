@@ -101,6 +101,8 @@ additional public values.
 | `rate_limit_error` | yes, after hint | Capacity is exhausted |
 | `availability_error` | yes | Data or a dependency is temporarily unavailable |
 | `api_error` | no | A Portal-owned invariant failed; page |
+| `authentication_error` | no | The credential is absent, unreadable, or does not authenticate (ADR-017) |
+| `permission_error` | no | The credential authenticated but does not cover this request (ADR-017) |
 
 | Spec outcome | Wire `type` / `code` | Meaning |
 |---|---|---|
@@ -114,14 +116,78 @@ additional public values.
 | NOT-READY | `availability_error` / `not_ready` | Readiness probe declines traffic |
 | WORKER-FAILURE | `api_error` / `worker_failure` | Worker results violated an owned integrity invariant and rerouting was exhausted (DC-1) |
 | INTERNAL | `api_error` / `internal_error` or `unclassified` | Portal invariant failed or a failure escaped classification |
+| NO-CREDENTIAL | `authentication_error` / `missing_credential` | A gated route was reached with no credential (REQ-50) |
+| BAD-CREDENTIAL | `authentication_error` / `invalid_credential` | The token is unparseable, names no known key, its secret does not match, or the held record has no digest — one code for all four, by design (INV-39) |
+| REVOKED | `authentication_error` / `revoked_credential` | The key authenticated but the control plane has withdrawn it |
+| EXPIRED | `authentication_error` / `expired_credential` | The key authenticated but its expiry has passed |
+| WRONG-PORTAL | `permission_error` / `portal_not_allowed` | The key is scoped to portals not including this one |
+| WRONG-DATASET | `permission_error` / `dataset_not_allowed` | The key is scoped to datasets not including the requested one, or the route names no dataset and the key is dataset-scoped |
 
 EMPTY is deliberately absent: a bodyless poll result is the correct answer to a range
 that is not produced yet (INV-27), not a failure, so it carries no `type` and no `code`.
 It is bound by IB-4 and observed as `status="204"`, which is exactly what a code on it
 would have restated.
 
+The last six rows exist only on a commercial deployment (REQ-56) and are never
+`api_error`: refusing an unauthenticated request is the system working, and must not
+page (ADR-017). None of them is retryable and none carries a retry hint.
+
 Exact statuses and envelope exceptions are fixed by IB-5. No dependency-specific body
 or code extends this set.
+
+## Access control (commercial deployments only)
+
+Every definition in this section is vacuous on a Portal with no commercial
+configuration: nothing constructs these objects and no route consults them (REQ-56).
+
+**DEF-16 — Credential.** What a client presents: the pair (**key id**, **secret**). The
+key id is public and identifies a key record; the secret is proof of holding it. The
+Portal handles the secret only as a digest — it is reduced to one at the moment the
+request is parsed and the original is discarded, so no later stage can log, store, or
+echo what it never received (INV-38). A credential is *well-formed* iff it is presented
+through a channel IB-9 names and both segments fall within the grammar the control plane
+can mint; anything else is an invalid credential and is refused as BAD-CREDENTIAL without
+a lookup. NO-CREDENTIAL is reserved for a gated request that presents neither channel.
+
+**DEF-17 — Key record.** The control plane's statement about one key: (key id; **status**
+∈ {active, revoked}; **sequence**, a feed position that only ever moves forward; an
+optional secret digest; **portal scope**; **dataset scope**; optional expiry). A usable
+active record carries a digest. A record without one cannot prove which caller holds its
+secret and therefore authenticates nobody; on the request path it maps to BAD-CREDENTIAL,
+not the more specific REVOKED outcome (REQ-53, INV-39). A scope is either
+*absent*, meaning unrestricted, or a list matched exactly — an empty list therefore
+matches nothing, and the two are never conflated (REQ-53). A record whose status this
+build does not recognize, or which fails to parse while still naming its key, is not
+dropped: it becomes a **tombstone** — a record with no usable digest that authenticates
+nobody — because dropping it would leave an older, possibly usable version of that key
+in service (REQ-54).
+
+**DEF-18 — Key snapshot.** The Portal's in-memory mirror of the control plane's key set:
+(records by key id; a **cursor**, the feed position read so far; an **epoch**, the
+identity of the feed's history; a **generation**, incremented by every wholesale
+replacement). The snapshot is established by reading the feed from its start and kept
+current by cursor-paged deltas (DC-8). A delta applies a record only if its sequence
+exceeds the held one. An epoch change, or a feed head below the held cursor, means the
+history the cursor refers to no longer exists, and the snapshot is rebuilt from the start
+rather than advanced. Nothing about the snapshot survives restart (NG5).
+
+**DEF-19 — Route class and gate scope.** Every route carries exactly one class: **data**
+(delivers blocks, query results, or block lookups), **metadata** (describes the Portal or
+its datasets), or **always-open** (readiness, metrics, the served API schema). The
+operator's **gate scope** — `data` or `all` — selects which classes require a credential:
+`data` gates the data class, `all` gates data and metadata. Always-open is gated under
+neither (REQ-51). The classification is a property of the route, not of the request.
+
+**DEF-20 — Authorization verdict.** The outcome of evaluating DEF-16 against DEF-17 for
+one request: **admit**, or **reject** carrying the first failed rung of REQ-53's ladder.
+The verdict is a pure function of (credential, key record, portal identity, requested
+dataset, current time) — it consults no capacity, no load, and no prior request (INV-15).
+A snapshot miss may fail before a verdict exists: lookup-budget exhaustion is OVERLOADED
+and lookup failure is UPSTREAM-FAILURE (DC-8), both retryable system outcomes rather than
+claims about the credential. A verdict is separately *acted on* or not, per the
+enforcement mode (REQ-55): shadow mode discards a verdict when one exists, and records an
+indeterminate lookup when one does not. The rung is the internal reason; what reaches the
+client is the DEF-10 row it maps to, which is deliberately coarser (INV-39).
 
 ## Shared state (the frame of the stateless shape)
 
@@ -135,9 +201,10 @@ request: no sessions, no per-client identity, no response cache.
 in-memory and reset by restart: (a) the applied artifact (DEF-4) and catalog snapshots;
 (b) the **worker health map** — per worker: open-lease count, error/timeout cooldown
 marks, backoff-until, throughput estimate; (c) the **congestion window** (DEF-13);
-(d) the **stream census** (count of active streams, monotone stream sequence). Shared
-adaptive state may influence *admission, worker choice, coverage extent, and timing* —
-never record content (INV-28).
+(d) the **stream census** (count of active streams, monotone stream sequence); and, on a
+commercial deployment, (e) the key snapshot, negative-answer cache, and lookup limiters
+(DEF-18, DC-8). Shared adaptive state may influence *admission, worker choice, coverage
+extent, and timing* — never record content (INV-28).
 
 **DEF-13 — Congestion window.** An adaptive bound on concurrent chunk-body downloads,
 within [P-CONGESTION-MIN-WINDOW, P-CONGESTION-MAX-WINDOW]; grows additively on success,
@@ -159,6 +226,7 @@ and the dataset map. Static per process lifetime.
 | Artifact publication | New assignment artifact (DEF-4) | Routing world changed | Polled every P-ASSIGNMENT-REFRESH; at-least-once; deduplicated by identifier |
 | Catalog update | Dataset catalog/metadata | Served-dataset set changed | Polled every P-DATASETS-REFRESH; last-write-wins |
 | Chain status update | Epoch, stake, compute units, worker registry | Accounting/status only | Polled every P-CHAIN-REFRESH; never affects serving (REQ-25) |
+| Key-set delta | Key records past the held cursor (DEF-17) | The served key set changed | Polled every P-KEY-SYNC-INTERVAL; ordered by sequence; applied only forward; epoch change forces a rebuild (DC-8) |
 
 ## Operation summary
 
@@ -176,6 +244,7 @@ Semantics in [04-operations.md](04-operations.md).
 | OP-8 | Readiness probe | Can this instance serve correctly now |
 | OP-9 | Metrics read | Observability snapshot (12) |
 | OP-10 | SQL route plan | Experimental: relational plan → worker/chunk routing |
+| OP-11 | Request authorization | Admission step preceding OP-1..OP-10 on a commercial deployment (REQ-50) |
 
 ## Terminology cross-reference (codebase → spec)
 
@@ -193,3 +262,8 @@ Semantics in [04-operations.md](04-operations.md).
 | `BaseBlockMismatch`, `previousBlocks` | CONFLICT (DEF-9, DEF-10) |
 | hotblocks | Real-time source (DC-4) |
 | `x-sqd-data-source` | Serving source marker (DEF-6) |
+| commercial block / gate | Commercial configuration, authorization gate (REQ-56, DEF-19) |
+| snapshot store, feed cursor/epoch | Key snapshot (DEF-18) |
+| ladder, rung | REQ-53's ordered precedence; the rung is DEF-20's internal reason |
+| `log_only` / `enforce` | Shadow and enforcing modes (REQ-55) |
+| authorize-on-miss | Bounded direct lookup for a key absent from the snapshot (DC-8) |
