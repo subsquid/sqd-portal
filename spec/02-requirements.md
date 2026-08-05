@@ -388,8 +388,9 @@ reason or lookup detail beyond the client-visible wire outcome under either mode
 permissive one.
 *Acceptance:* under `data`, a keyless metadata read succeeds and a keyless stream is
 refused; under `all`, both are refused; under both, `/ready`, `/metrics` and the API
-schema answer without a credential. A route added to the surface without being
-classified fails the build rather than defaulting to ungated. A keyless scrape under
+schema answer without a credential. A route added to the surface without being classified
+fails the build, and — should it reach a running Portal anyway — is gated as an anonymous
+data route rather than served. A keyless scrape under
 `all` names no dataset of the served catalog in any series or label; and under either
 mode, two keyless scrapes bracketing each case of REQ-50's corpus differ only in ways
 that case's own response already disclosed — no series distinguishes the four
