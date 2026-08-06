@@ -36,9 +36,10 @@ impl Rejection {
 }
 
 /// Unknown key and wrong secret answer identically: telling a caller that a key
-/// id exists turns the endpoint into an enumeration oracle. The remaining 401s
-/// are only reachable by someone holding the right secret, so they can be
-/// specific.
+/// id exists turns the endpoint into an enumeration oracle. The remaining codes
+/// are only reachable by someone holding the right secret — and they share the
+/// status of the ones that are not, so the status line never says the secret
+/// was correct.
 const MISSING_CREDENTIAL: Rejection =
     Rejection::new(ErrorCode::MissingCredential, "missing_credential");
 const UNKNOWN_KEY: Rejection = Rejection::new(ErrorCode::InvalidCredential, "unknown_key");
@@ -178,13 +179,11 @@ impl Rejection {
     /// 400 `malformed_request` (GAP-29).
     pub fn into_response(self) -> Response {
         let mut response = coded_response(self.code, self.code.default_message());
-        let headers = response.headers_mut();
-        if self.code.challenges() {
-            headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-        }
         // Only the two lookup outcomes reach this; no auth verdict is retryable.
         if self.code.requires_hint() {
-            headers.insert(header::RETRY_AFTER, RETRY_AFTER_FLOOR.into());
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, RETRY_AFTER_FLOOR.into());
         }
         response
     }
@@ -249,14 +248,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_1_no_credential_is_401() {
+    async fn rule_1_no_credential_is_refused() {
         let decision = decide(key_record("k1", 1), None, Some("ethereum-mainnet")).await;
 
         assert_eq!(reason(decision), "missing_credential");
     }
 
     #[tokio::test]
-    async fn rule_2_unknown_key_is_401() {
+    async fn rule_2_unknown_key_is_refused() {
         let store = store_with(vec![key_record("k1", 1)]).await;
         let credential = credential("other", SECRET_SHA256);
 
@@ -324,7 +323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_3_secret_mismatch_is_401() {
+    async fn rule_3_secret_mismatch_is_refused() {
         let wrong = credential("k1", &"0".repeat(64));
 
         let decision = decide(key_record("k1", 1), Some(&wrong), Some("ethereum-mainnet")).await;
@@ -448,7 +447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_5_expiry_is_401_only_once_past() {
+    async fn rule_5_expiry_refuses_only_once_past() {
         let mut record = key_record("k1", 1);
         record.expires_at = Some(NOW + 1);
         assert_eq!(

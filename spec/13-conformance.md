@@ -130,7 +130,7 @@ chunk-boundary records FV-6 licenses.
    selected (retention-gap case). Pre-routing failures have no source marker.
 6. Errors: type/code ∈ DEF-10; a hint on every OVERLOADED — on proxied ones too,
    preserved or injected at the floor — never on DATA-UNAVAILABLE, and on no other class
-   unless the upstream sent one (ADR-014); `WWW-Authenticate: Bearer` on every 401; no
+   unless the upstream sent one (ADR-014); one status across every credential refusal; no
    data alongside errors (INV-26, IB-5).
 
 ## Traceability matrix — properties (2026-08-06)
@@ -217,7 +217,7 @@ chunk-boundary records FV-6 licenses.
 | REQ-42 | P | Scheduler units; headroom refusal untested (INV-4, LIV-8), and its observable — shrink cause, download utilization, headroom-refusal counter (OB-7) — is unasserted |
 | REQ-43 | P | Positive path exercised by the smoke (signed stub responses verified and delivered); CT-2 now drives the rejection path — a wrongly-signed response is not delivered and the attempt is retried elsewhere, meeting the acceptance criterion. Integrity failures are counted per worker but raise no OB-9 alarm state (GAP-24) |
 | REQ-44 | U | — |
-| REQ-50 | P | The ladder and every rung are unit-tested, a source-scanning test forces each route in the table to be classified or fail the build, and CT-5 pins the refusal behind the real middleware stack: 401, `authentication_error`/`missing_credential`, `WWW-Authenticate: Bearer`. The zero-serving-call and bounded-DC-8-call claims lack a harness (GAP-33) |
+| REQ-50 | P | The ladder and every rung are unit-tested, a source-scanning test forces each route in the table to be classified or fail the build, and CT-5 pins the refusal behind the real middleware stack: 403, `authentication_error`/`missing_credential`. The zero-serving-call and bounded-DC-8-call claims lack a harness (GAP-33) |
 | REQ-51 | C | A route that states neither set does not compile, which is the requirement rather than a test of it; a gated route and an open one are asserted end-to-end against the same gate; the OB-12 label set names no route and no dataset |
 | REQ-52 | P | Token grammar, both presentation channels, length caps and the alphabet are unit-tested; digest-only handling is structural. Log/metric non-disclosure is unasserted (INV-38) |
 | REQ-53 | C | Precedence, absent-vs-empty scope, exact matching, alias resolution, and the no-dataset route case are unit-tested, including the earliest-rung-wins corpus and the digestless tombstone, which fails at the secret rung |
@@ -274,9 +274,9 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 
 - **GAP-29** (closed 2026-08-05): authorization refusals were built outside the ADR-011
   envelope, so they carried no `ErrorCode` and the middleware every routed response passes
-  through rewrote them to 400 `malformed_request`. No 401 or 403 reached the wire, no
-  Bearer challenge was emitted, and every refusal counted as a client query error. ADR-017's
-  two types and six codes are implemented and CT-5 pins an unauthenticated request behind
+  through rewrote them to 400 `malformed_request`. No 403 reached the wire and every refusal
+  counted as a client query error. ADR-017's two types and six codes are implemented and
+  CT-5 pins an unauthenticated request behind
   the *real* middleware stack — the only place the defect was visible, since the gate and
   the normalizer were each correct alone.
 - **GAP-34** (closed 2026-08-05): rate and in-flight exhaustion and control-plane errors

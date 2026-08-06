@@ -815,7 +815,7 @@ fn readiness_verdict(
             Some(reason),
         );
     }
-    // An ENFORCING portal without the key snapshot answers 401 to every valid
+    // An ENFORCING portal without the key snapshot refuses every valid
     // key, which is worse than answering nothing: keep it out of rotation until
     // it has mirrored the control plane. A shadow-mode portal admits everything
     // regardless of what it knows, so the same snapshot costs it nothing and
@@ -1607,10 +1607,9 @@ mod tests {
 
         assert_eq!(
             response.status(),
-            StatusCode::UNAUTHORIZED,
-            "the refusal must reach the wire as a 401, not a normalized 400"
+            StatusCode::FORBIDDEN,
+            "the refusal must reach the wire as a 403, not a normalized 400"
         );
-        assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
 
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1655,7 +1654,7 @@ mod tests {
     }
 
     /// A gated portal that has not mirrored the control plane's key set knows
-    /// no keys, so it answers 401 to every valid one. Serving that is worse
+    /// no keys, so it refuses every valid one. Serving that is worse
     /// than serving nothing: it must stay out of rotation until the first sync
     /// (or a fresh disk cache) lands.
     #[test]

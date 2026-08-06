@@ -471,7 +471,7 @@ impl SnapshotStore {
 
         // A short page is the feed saying "that is all of it", and `head_seq`
         // is the feed saying how much there is. When they disagree the pages we
-        // read are a subset of the key set — every key past `cursor` would 401
+        // read are a subset of the key set — every key past `cursor` would be refused
         // — so this is a failed tick, not a snapshot. The last good one keeps
         // serving; a portal that has none stays out of rotation.
         ensure_protocol!(
@@ -651,7 +651,7 @@ mod tests {
     /// A feed that answers "no records, and I am 500 seqs ahead of you" is not
     /// describing an empty key set — it is not answering at all. Installing it
     /// would flip `ready` on a snapshot that knows nobody, so every valid key
-    /// 401s fleet-wide. The tick fails and the store stays unready instead.
+    /// refusals fleet-wide. The tick fails and the store stays unready instead.
     #[tokio::test]
     async fn a_bootstrap_that_ends_short_of_the_head_installs_nothing() {
         let cp = MockControlPlane::spawn().await;
@@ -716,7 +716,7 @@ mod tests {
 
     /// The same check catches the subtler shape: a page that is short — so the
     /// loop stops — while the head says most of the key set was never sent.
-    /// Serving that subset 401s every customer it omits.
+    /// Serving that subset refuses every customer it omits.
     #[tokio::test]
     async fn a_truncated_bootstrap_page_installs_nothing() {
         let cp = MockControlPlane::spawn().await;

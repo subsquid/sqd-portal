@@ -62,10 +62,10 @@ portal never returns them.
 | `worker_failure` | `api_error` | 500 | A worker returned something that cannot be right. |
 | `internal_error` | `api_error` | 500 | An invariant the portal owns was violated. |
 | `unclassified` | `api_error` | 5xx | An error that escaped classification. Always a bug — please report it. |
-| `missing_credential` | `authentication_error` | 401 | No API key was presented. |
-| `invalid_credential` | `authentication_error` | 401 | The key is unreadable, unknown, or its secret does not match. The portal does not say which — telling you that a key id exists would help someone guessing them. |
-| `revoked_credential` | `authentication_error` | 401 | The key was revoked. |
-| `expired_credential` | `authentication_error` | 401 | The key is past its expiry. |
+| `missing_credential` | `authentication_error` | 403 | No API key was presented. |
+| `invalid_credential` | `authentication_error` | 403 | The key is unreadable, unknown, or its secret does not match. The portal does not say which — telling you that a key id exists would help someone guessing them. |
+| `revoked_credential` | `authentication_error` | 403 | The key was revoked. |
+| `expired_credential` | `authentication_error` | 403 | The key is past its expiry. |
 | `portal_not_allowed` | `permission_error` | 403 | The key is not valid on this portal. |
 | `dataset_not_allowed` | `permission_error` | 403 | The key does not cover the requested dataset — including a dataset-scoped key on a route that names no dataset. |
 
@@ -95,10 +95,10 @@ make the same credential work.
 
 ### Presenting a key
 
-On a portal that requires one, send the key as `Authorization: Bearer <key>`. That is the only
-channel — a key in the query string is ignored, because a URL ends up in browser history, in
-`Referer`, and in the logs of every proxy along the way. Every 401 carries
-`WWW-Authenticate: Bearer`.
+On a portal that requires one, send the key as `Authorization: Bearer <key>`.
+
+Every credential problem answers **403** — no key, wrong key, revoked, expired, or out of scope
+alike. The `code` says which; the status deliberately does not.
 
 ### Browser clients
 

@@ -104,6 +104,8 @@ additional public values.
 | `authentication_error` | no | The credential is absent, unreadable, or does not authenticate (ADR-017) |
 | `permission_error` | no | The credential authenticated but does not cover this request (ADR-017) |
 
+Both credential types answer 403, so the status never distinguishes them (ADR-017).
+
 | Spec outcome | Wire `type` / `code` | Meaning |
 |---|---|---|
 | BAD-REQUEST | `invalid_request_error` / `malformed_request` or `method_not_allowed` | DEF-7 violation, bad parameter, or a verb the surface does not serve |

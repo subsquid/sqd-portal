@@ -168,18 +168,16 @@ impl ErrorCode {
             Self::WorkerFailure | Self::Internal | Self::Unclassified => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            // One status for all six, against RFC 9110's 401/403 split: that
+            // split falls exactly where the secret was proven, so it would put
+            // "your guess was correct" on the status line (ADR-017, INV-39).
             Self::MissingCredential
             | Self::InvalidCredential
             | Self::RevokedCredential
-            | Self::ExpiredCredential => StatusCode::UNAUTHORIZED,
-            Self::PortalNotAllowed | Self::DatasetNotAllowed => StatusCode::FORBIDDEN,
+            | Self::ExpiredCredential
+            | Self::PortalNotAllowed
+            | Self::DatasetNotAllowed => StatusCode::FORBIDDEN,
         }
-    }
-
-    /// ADR-017: a 401 names the scheme to retry with. The obligation is the type's, not
-    /// the status's — a 403 is a refusal too and owes no challenge.
-    pub const fn challenges(self) -> bool {
-        matches!(self.error_type(), ErrorType::Authentication)
     }
 
     /// INV-26: the one class that always owes the client a back-off interval. The value
@@ -693,8 +691,8 @@ mod tests {
             );
             assert_eq!(
                 is_auth,
-                matches!(code.status().as_u16(), 401 | 403),
-                "{} must be an auth type iff it answers 401/403",
+                code.status() == StatusCode::FORBIDDEN,
+                "{} must be an auth type iff it answers 403",
                 code.as_str()
             );
         }
@@ -756,10 +754,10 @@ mod tests {
             (WorkerFailure, 500),
             (Internal, 500),
             (Unclassified, 500),
-            (MissingCredential, 401),
-            (InvalidCredential, 401),
-            (RevokedCredential, 401),
-            (ExpiredCredential, 401),
+            (MissingCredential, 403),
+            (InvalidCredential, 403),
+            (RevokedCredential, 403),
+            (ExpiredCredential, 403),
             (PortalNotAllowed, 403),
             (DatasetNotAllowed, 403),
         ];
@@ -785,11 +783,6 @@ mod tests {
                 "{}",
                 code.as_str()
             );
-        }
-
-        // ADR-017's challenge obligation is likewise an iff, over the 401 rows.
-        for (code, status) in binding {
-            assert_eq!(code.challenges(), status == 401, "{}", code.as_str());
         }
     }
 

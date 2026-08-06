@@ -57,7 +57,7 @@ unrestricted. Those are later phases and are deliberately out of this decision.
 
 The Portal gains a dependency it can be down without (DC-8) and a readiness precondition
 it cannot serve without: an *enforcing* portal that has never mirrored the key set knows
-no keys, so it would answer 401 to every valid one, and must stay out of rotation until
+no keys, so it would refuse every valid one, and must stay out of rotation until
 the first sync lands (INV-31). A shadow-mode portal has no such precondition, since it
 admits regardless.
 

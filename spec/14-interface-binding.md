@@ -5,7 +5,7 @@ encodings — as *observable contract*, still no internals. **Anything not speci
 here is unspecified: clients and tests must not pin it** (IB-8).
 
 **IB-1 — Transport generalities.** HTTP/1.1+; permissive CORS (any origin/method/
-header), exposing `Retry-After`, `WWW-Authenticate`, `x-request-id` and the `x-sqd-*`
+header), exposing `Retry-After`, `x-request-id` and the `x-sqd-*`
 stream metadata —
 allowing an origin does not make a response header readable, and the CORS-safelisted set
 contains none of ours, so a browser client would otherwise see the status and nothing
@@ -88,17 +88,18 @@ closed mapping is:
 | `api_error` / `worker_failure` | 500 | envelope |
 | `api_error` / `internal_error` | 500 | envelope |
 | `api_error` / `unclassified` | contextual 5xx | envelope; must be counted and investigated |
-| `authentication_error` / `missing_credential` | 401 | envelope; `WWW-Authenticate: Bearer`; no `Retry-After` |
-| `authentication_error` / `invalid_credential` | 401 | envelope; `WWW-Authenticate: Bearer`; identical byte-for-byte apart from the request id whether the token was unparseable, named an unknown key, carried a wrong secret, or named a digestless tombstone (INV-39) |
-| `authentication_error` / `revoked_credential` | 401 | envelope; `WWW-Authenticate: Bearer` |
-| `authentication_error` / `expired_credential` | 401 | envelope; `WWW-Authenticate: Bearer` |
+| `authentication_error` / `missing_credential` | 403 | envelope; no `Retry-After`, no challenge |
+| `authentication_error` / `invalid_credential` | 403 | envelope; identical byte-for-byte apart from the request id whether the token was unparseable, named an unknown key, carried a wrong secret, or named a digestless tombstone (INV-39) |
+| `authentication_error` / `revoked_credential` | 403 | envelope |
+| `authentication_error` / `expired_credential` | 403 | envelope |
 | `permission_error` / `portal_not_allowed` | 403 | envelope |
 | `permission_error` / `dataset_not_allowed` | 403 | envelope |
 
 The last six rows appear only on a commercial deployment (REQ-56) and only on a gated
 route (IB-9). None is retryable and none carries a retry hint: retrying with the same
 credential cannot succeed, and treating an auth refusal as transient reproduces the
-ADR-012 refusal storm. Every 401 carries the Bearer challenge HTTP requires. None is an
+ADR-012 refusal storm. All six share one status, so the status line never reveals that a
+presented secret was the right one (ADR-017); none carries a challenge. None is an
 `api_error`, so none pages. A snapshot miss that could not be resolved is not one of these
 six rows: lookup-budget exhaustion maps to retryable `overloaded`, and lookup failure to
 retryable `upstream_unavailable` (DC-8).

@@ -82,7 +82,7 @@ impl Gate {
     }
 
     /// Whether the portal has mirrored the control plane's key set yet. A gated
-    /// portal that has not knows no keys, so it would answer 401 to every valid
+    /// portal that has not knows no keys, so it would refuse every valid
     /// one — it belongs out of rotation until this turns true.
     pub fn snapshot_ready(&self) -> bool {
         self.store.is_ready()
@@ -517,7 +517,7 @@ mod tests {
             )
             .await;
 
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{query}");
+            assert_eq!(status, StatusCode::FORBIDDEN, "{query}");
             assert_eq!(error_code(&body), "missing_credential", "{query}");
         }
     }
@@ -574,11 +574,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            response.headers()[header::WWW_AUTHENTICATE],
-            "Bearer",
-            "a 401 must name the scheme to retry with"
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response.headers().contains_key(header::WWW_AUTHENTICATE),
+            "a 403 defines no challenge, and one here would re-add a status-line \
+             distinction between credential failures"
         );
         assert_eq!(
             response.extensions().get::<ErrorCode>().copied(),
@@ -606,14 +606,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(error_code(&body), "invalid_credential");
     }
 
-    /// A refusal for want of permission is not a challenge: the credential
-    /// authenticated, so re-presenting it changes nothing.
+    /// Every credential refusal shares one status, so the status line cannot say
+    /// whether the secret was right (INV-39).
     #[tokio::test]
-    async fn a_permission_refusal_carries_no_bearer_challenge() {
+    async fn a_scope_refusal_is_indistinguishable_from_a_bad_secret_by_status() {
         let mut record = key_record("k1", 1);
         record.datasets = Some(vec!["base-mainnet".to_string()]);
         let app = app(

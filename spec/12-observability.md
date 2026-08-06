@@ -97,7 +97,7 @@ outcome: the would-be verdict and an indeterminate lookup are distinguishable on
 protected structured logs. No metric label or request-synchronous counter may let a
 client bracket two keyless scrapes and learn more than its response revealed (INV-39,
 ADR-017). Auth refusals in enforcing mode must still be distinguishable from every other
-refusal on the OB-3 error-code axis — an auth 401 counted as `malformed_request` is a lying
+refusal on the OB-3 error-code axis — an auth refusal counted as `malformed_request` is a lying
 metric (INV-30). Implemented as `commercial_authorization_decisions`.
 
 **OB-13 — Key snapshot freshness and provenance.** Commercial deployments only.

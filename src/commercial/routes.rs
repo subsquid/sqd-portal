@@ -128,7 +128,7 @@ mod tests {
         let gate = Some(gate_with(Enforcement::Enforce, true));
 
         let gated = status(gate.clone(), get(|| async { "served" }).auth()).await;
-        assert_eq!(gated, StatusCode::UNAUTHORIZED);
+        assert_eq!(gated, StatusCode::FORBIDDEN);
 
         let open = status(gate, get(|| async { "served" }).no_auth()).await;
         assert_eq!(open, StatusCode::OK);

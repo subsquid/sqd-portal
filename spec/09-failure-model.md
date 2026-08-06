@@ -81,7 +81,7 @@ unreachable would convert its outage into the Portal's (REQ-54).
 | Record unidentifiable | integrity: fail the page; snapshot unchanged |
 | Record with an unrecognized status | fail-closed tombstone — a status this build predates must never admit traffic |
 | Feed epoch change / head below cursor | mask: rebuild the snapshot from the start (DEF-18); mid-drain, fail the tick and rebuild on the next |
-| No snapshot ever established, enforcing | fail-safe: decline readiness (INV-31) — leave rotation rather than 401 every valid key |
+| No snapshot ever established, enforcing | fail-safe: decline readiness (INV-31) — leave rotation rather than refuse every valid key |
 | No snapshot ever established, shadow mode | mask: admit everything, stay ready (REQ-55) |
 | Lookup rate-limited or over the in-flight cap | fail-safe: refuse immediately as OVERLOADED with a retry hint; never admit, queue, or claim the credential is invalid (HZ-10) |
 | Lookup unavailable, times out, or returns an unusable answer | fail-safe: refuse as UPSTREAM-FAILURE; the unchanged credential may succeed after recovery |
