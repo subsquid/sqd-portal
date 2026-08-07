@@ -35,6 +35,20 @@ impl RequestSigner {
         self.keypair.public().to_peer_id()
     }
 
+    /// The raw 32-byte Ed25519 public key, base64. This — not the peer id — is
+    /// what the control plane registers against `portal_id`: a peer id wraps the
+    /// key in protobuf inside a multihash, so verifying one means depending on a
+    /// libp2p implementation, while these 32 bytes go straight into any standard
+    /// library's Ed25519 verifier.
+    pub fn public_key_base64(&self) -> anyhow::Result<String> {
+        let key = self
+            .keypair
+            .public()
+            .try_into_ed25519()
+            .map_err(|_| anyhow::anyhow!("the portal's identity key is not Ed25519"))?;
+        Ok(BASE64.encode(key.to_bytes()))
+    }
+
     /// The three headers the control plane needs to rebuild and check the
     /// binding. `timestamp_secs` is passed in rather than read here so the
     /// canonical form stays a pure function of its inputs.
@@ -148,6 +162,48 @@ mod tests {
             canonical("portal-premium-eu", 1_800_000_000, "POST", "/x", b""),
             "sqd-portal-v1\nportal-premium-eu\n1800000000\nPOST\n/x\n\
              e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// A fixed vector the other side of this contract can be tested against
+    /// without running the portal. Ed25519 over the canonical string, raw
+    /// 64-byte signature, base64; the public key is the raw 32 bytes, base64.
+    /// Node verifies it with no dependencies:
+    ///
+    /// ```js
+    /// const key = crypto.createPublicKey({ format: 'jwk', key: {
+    ///   kty: 'OKP', crv: 'Ed25519',
+    ///   x: Buffer.from(PUBLIC_KEY_B64, 'base64').toString('base64url'),
+    /// }});
+    /// crypto.verify(null, Buffer.from(canonical), key, Buffer.from(sig, 'base64'));
+    /// ```
+    #[test]
+    fn the_wire_format_matches_its_published_vector() {
+        use sqd_network_transport::Keypair;
+
+        let keypair = Keypair::ed25519_from_bytes([7u8; 32]).expect("a 32-byte seed");
+        let signer = RequestSigner::new(keypair, "portal-premium-eu".to_string());
+        let body = br#"{"credential":"sqd_portal_k1_theverysecretvalue"}"#;
+
+        assert_eq!(
+            signer.public_key_base64().unwrap(),
+            "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw="
+        );
+        assert_eq!(
+            canonical(
+                "portal-premium-eu",
+                1_800_000_000,
+                "POST",
+                "/internal/portal/v1/exchange",
+                body
+            ),
+            "sqd-portal-v1\nportal-premium-eu\n1800000000\nPOST\n\
+             /internal/portal/v1/exchange\n\
+             30650daa6d3b90517f572c1154da8fcfb1ebf678003a3e74eaa7a33826d6dd56"
+        );
+        assert_eq!(
+            signature_of(&signer, body, 1_800_000_000),
+            "/ThgFiJAgcGa7dKAE/EOMDYaL/myOdX2BIlz6RT66ziWZtzCFrFbQ6e9hcvV0zsb0A0bYhyC5GK6Kj6EU36eCA=="
         );
     }
 

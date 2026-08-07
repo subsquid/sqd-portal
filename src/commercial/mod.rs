@@ -40,9 +40,13 @@ pub fn build(
     catalog: Arc<dyn DatasetCatalog>,
 ) -> anyhow::Result<Arc<Gate>> {
     let signer = config.signer(keypair)?;
+    // The public key, not the peer id: this is the value that goes into the
+    // control plane's registration for this portal, and it is logged so an
+    // operator can read it off a running replica rather than derive it.
     tracing::info!(
         portal_id = config.portal_id(),
         peer_id = %signer.peer_id(),
+        public_key = signer.public_key_base64()?,
         "commercial exchange signing identity"
     );
     let cache = GrantCache::new(
