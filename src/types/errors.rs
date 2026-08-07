@@ -14,6 +14,10 @@ pub enum ErrorType {
     Availability,
     /// An invariant we own was violated.
     Api,
+    /// The credential is absent, unreadable, or does not authenticate (ADR-011).
+    Authentication,
+    /// The credential authenticated but does not cover this request (ADR-011).
+    Permission,
 }
 
 impl ErrorType {
@@ -23,13 +27,16 @@ impl ErrorType {
             Self::RateLimit => "rate_limit_error",
             Self::Availability => "availability_error",
             Self::Api => "api_error",
+            Self::Authentication => "authentication_error",
+            Self::Permission => "permission_error",
         }
     }
 
+    /// Both auth types answer no: the same credential cannot start working.
     pub const fn retryable(self) -> bool {
         match self {
             Self::RateLimit | Self::Availability => true,
-            Self::InvalidRequest | Self::Api => false,
+            Self::InvalidRequest | Self::Api | Self::Authentication | Self::Permission => false,
         }
     }
 }
@@ -97,6 +104,18 @@ error_codes! {
         /// Unset by any handler. `api_error` so it pages instead of hiding; `http_labels`
         /// re-types an unclassified 4xx.
         Unclassified => "unclassified",
+
+        // ADR-011. Commercial deployments only; vacuous without a `commercial:` block.
+        MissingCredential => "missing_credential",
+        /// One code for four rungs — unparseable, unknown id, wrong secret, no digest.
+        /// Splitting them tells a caller which guess to keep (INV-39); the operator gets
+        /// the distinction in the protected log.
+        InvalidCredential => "invalid_credential",
+        /// Reachable only with the right secret, so it can be specific.
+        RevokedCredential => "revoked_credential",
+        ExpiredCredential => "expired_credential",
+        PortalNotAllowed => "portal_not_allowed",
+        DatasetNotAllowed => "dataset_not_allowed",
     }
 }
 
@@ -117,6 +136,14 @@ impl ErrorCode {
             | Self::NotReady => ErrorType::Availability,
 
             Self::WorkerFailure | Self::Internal | Self::Unclassified => ErrorType::Api,
+
+            // Never `api_error`: an auth refusal is the system working, and must not page.
+            Self::MissingCredential
+            | Self::InvalidCredential
+            | Self::RevokedCredential
+            | Self::ExpiredCredential => ErrorType::Authentication,
+
+            Self::PortalNotAllowed | Self::DatasetNotAllowed => ErrorType::Permission,
         }
     }
 
@@ -141,6 +168,15 @@ impl ErrorCode {
             Self::WorkerFailure | Self::Internal | Self::Unclassified => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            // One status for all six, against RFC 9110's 401/403 split: that
+            // split falls exactly where the secret was proven, so it would put
+            // "your guess was correct" on the status line (ADR-011, INV-39).
+            Self::MissingCredential
+            | Self::InvalidCredential
+            | Self::RevokedCredential
+            | Self::ExpiredCredential
+            | Self::PortalNotAllowed
+            | Self::DatasetNotAllowed => StatusCode::FORBIDDEN,
         }
     }
 
@@ -167,6 +203,12 @@ impl ErrorCode {
             Self::WorkerFailure => "Worker returned invalid data",
             Self::Internal => "Internal error",
             Self::Unclassified => "Unclassified error",
+            Self::MissingCredential => "API key required",
+            Self::InvalidCredential => "Invalid API key",
+            Self::RevokedCredential => "API key revoked",
+            Self::ExpiredCredential => "API key expired",
+            Self::PortalNotAllowed => "API key is not valid for this portal",
+            Self::DatasetNotAllowed => "API key is not authorized for this dataset",
         }
     }
 
@@ -634,6 +676,26 @@ mod tests {
         assert!(!ErrorCode::Internal.error_type().retryable());
         assert!(!ErrorCode::WorkerFailure.error_type().retryable());
         assert!(!ErrorCode::MalformedRequest.error_type().retryable());
+        // Retrying the same key cannot change the answer (ADR-011).
+        assert!(!ErrorCode::InvalidCredential.error_type().retryable());
+        assert!(!ErrorCode::DatasetNotAllowed.error_type().retryable());
+    }
+
+    /// Typing one `api_error` would page the team on every mistyped key.
+    #[test]
+    fn no_auth_refusal_pages() {
+        for code in ErrorCode::ALL {
+            let is_auth = matches!(
+                code.error_type(),
+                ErrorType::Authentication | ErrorType::Permission
+            );
+            assert_eq!(
+                is_auth,
+                code.status() == StatusCode::FORBIDDEN,
+                "{} must be an auth type iff it answers 403",
+                code.as_str()
+            );
+        }
     }
 
     /// Only api_error should page, so an unclassified response must land there.
@@ -692,6 +754,12 @@ mod tests {
             (WorkerFailure, 500),
             (Internal, 500),
             (Unclassified, 500),
+            (MissingCredential, 403),
+            (InvalidCredential, 403),
+            (RevokedCredential, 403),
+            (ExpiredCredential, 403),
+            (PortalNotAllowed, 403),
+            (DatasetNotAllowed, 403),
         ];
         for (code, want) in binding {
             assert_eq!(code.status().as_u16(), want, "{}", code.as_str());
@@ -753,6 +821,28 @@ mod tests {
             (WorkerFailure, "worker_failure", "api_error"),
             (Internal, "internal_error", "api_error"),
             (Unclassified, "unclassified", "api_error"),
+            (
+                MissingCredential,
+                "missing_credential",
+                "authentication_error",
+            ),
+            (
+                InvalidCredential,
+                "invalid_credential",
+                "authentication_error",
+            ),
+            (
+                RevokedCredential,
+                "revoked_credential",
+                "authentication_error",
+            ),
+            (
+                ExpiredCredential,
+                "expired_credential",
+                "authentication_error",
+            ),
+            (PortalNotAllowed, "portal_not_allowed", "permission_error"),
+            (DatasetNotAllowed, "dataset_not_allowed", "permission_error"),
         ];
         for (code, want_code, want_type) in expected {
             assert_eq!(code.as_str(), want_code);

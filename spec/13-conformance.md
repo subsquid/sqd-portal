@@ -3,12 +3,11 @@
 **Mutable doc.** Statuses as of **2026-08-07** (0.12.1,
 `master@e9a1878f863c4d87615bcf21ba1ef79fdf649385`). Statuses: **C** covered · **P** partial ·
 **U** unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
-**The commercial band (REQ-50..56, DC-8, OP-11 and the invariants scoped to them) is
-specified and unimplemented at this baseline** — the binary carries no authorization code at
-all, so every row in that band is `U` and no deployment is affected by any of it. One entry,
-GAP-35, tracks the whole band; the per-row notes say what each will need rather than what
-covers it. Splitting the specification from its implementation is deliberate: the wire
-contract binds another team, and it is cheaper to argue with before code exists than after.
+**The commercial band (REQ-50..56, DC-8, OP-11 and the invariants scoped to them) has
+landed and is CT-10-covered on its request path.** A deployment with no `commercial:` block
+is still unaffected by any of it, and CT-10 pins that too. What is *not* covered is every
+row whose claim is about time — grant renewal, hard expiry, denial TTL, renewal spread —
+which needs a clock the harness does not yet have (GAP-33).
 The **Phase-0 harness exists** (`harness/` crate: IB-7 stubs with ledgers — including
 a real p2p worker stub on the pinned transport rev — toy world, reference model, the six
 validators, client driver, quiescence-gated gauge audit; CT-1 smoke green — GAP-14
@@ -23,8 +22,13 @@ server was rewritten (stream-based accept with silent drop at buffer capacity); 
 speaks the portal's older pinned rev, so the production server's drop paths are not
 exercised — re-verify on the next dependency bump. `ct2_worker_faults` covers the worker-fault reroute rows and the
 exhaustion split; the rest of CT-2 and CT-3..CT-9 remain to be built per the build order.
-Coverage outside those two classes is still inline unit tests.
-Both suites run on every pull request: the harness is a separate crate, so it needs a
+**CT-10 exists**: a DC-8 control-plane stub that verifies the exchange signature for real
+rather than trusting the headers, with a ledger of every credential it was asked about and
+the fault rows of DC-8's error table as injectors. `ct10_authorization` drives four
+portals — enforcing, shadow, no commercial block, and one whose exchange budget is small
+enough to saturate — because the properties differ by configuration rather than by request.
+Coverage outside those three classes is still inline unit tests.
+All three suites run on every pull request: the harness is a separate crate, so it needs a
 build of the portal and a job of its own — a status this document cites has to be one
 something re-checks.
 
@@ -179,14 +183,14 @@ chunk-boundary records FV-6 licenses.
 | FM-2 | CT-2 | P | the DC-4 replay classifier is unit-tested on both sides of the transient/integrity line (clean close, reset, the two non-replay exclusions — ADR-015). Worker-side classification now exists and is CT-2-tested: wrong-range and bad-signature responses are integrity — discarded, rerouted, never delivered — and all-integrity exhaustion is a distinguishable outcome from transient exhaustion. Corrupt artifact (GAP-1) is still untested; the *taxonomy* of both exhaustion outcomes is inside GAP-16 |
 | FM-3 | CT-2/3 | U | per-dependency confinement never exercised: no outage tests (REQ-25), no isolation swarm (INV-35) |
 | SLI-1..SLI-6 | CT-6 | U | no benchmarks; baselines from incidents only |
-| INV-6 | CT-10 | U | needs grant-cache coherence: fingerprint-only reach, the hard-expiry stop, no stale answer overwriting a fresh one, a denial surviving an in-flight exchange (GAP-35) |
-| INV-14 | CT-10 | U | needs zero serving-dependency calls, one exchange per fingerprint under a burst, none for a malformed token or a cached grant, canonicalization only on the dataset rung of an authenticated request (GAP-35) |
-| INV-15 | CT-10 | U | needs ladder precedence, determinism under saturation, and the bound on per-replica grant divergence (GAP-35) |
-| INV-38 | CT-10 | U | needs the secret's single egress — the exchange and nothing else — and constant-time fingerprint comparison, proved by grepping every emitted signal for a marked secret (GAP-35) |
-| INV-39 | CT-10 | U | needs the unauthenticated rungs answering one wire code with one public metric projection, and shadow mode projecting every verdict onto one neutral series (GAP-35) |
-| LIV-13 | CT-10 | U | needs convergence at `refresh_after` + one exchange with the control plane healthy, and at `expires_at` with it stopped — the second is the one carrying the security claim (GAP-35) |
-| LIV-14 | CT-10 | U | needs a freshly minted key served on its first request, and budget saturation answering retryable overload rather than a verdict (GAP-35) |
-| DC-8 | CT-10 | U | needs the exchange contract entire: signature, deadline, single-flight, lifetime cap, denial-evicts, outage grace, and every unusable answer failing rather than denying (GAP-35) |
+| INV-6 | CT-10 | P | fingerprint-only reach is CT-10-covered: a burst on one credential costs one exchange and a second request on a cached grant costs none. The hard-expiry stop, no stale answer overwriting a fresh one, and a denial surviving an in-flight exchange all turn on time and remain unwritten (GAP-33) |
+| INV-14 | CT-10 | P | CT-10 asserts all four call-ledger claims against the stub ledgers: a refused request reaches no worker and no real-time source, a burst of eight on one fingerprint costs one exchange, an ungrammatical token and an absent one cost none, and a cached grant costs none. Canonicalization confined to the dataset rung is not separately observable black-box |
+| INV-15 | CT-10 | P | ladder precedence is CT-10-covered end to end — absent before malformed, malformed before exchange, denial before scope — and each denial reason reaches its own wire code. Determinism under saturation and the per-replica divergence bound are untested |
+| INV-38 | CT-10 | P | CT-10 greps the whole portal log and the whole scrape for every secret the stub recorded receiving, after driving admissions, denials and failed exchanges — the egress is the exchange and nothing else. The audit guards itself: it fails if no credential travelled, or if the log and scrape it reads carry no authorization activity. Constant-time fingerprint comparison is not observable black-box |
+| INV-39 | CT-10 | P | CT-10 asserts an unknown key and a wrong secret return byte-identical bodies at one status, that no internal rung name reaches the scrape, that no key id does, and that shadow mode publishes only `shadow_evaluated` with no code and no exchange counters. A strict bracketed-scrape delta between the two credential cases is not yet driven |
+| LIV-13 | CT-10 | U | needs convergence at `refresh_after` + one exchange with the control plane healthy, and at `expires_at` with it stopped — the second is the one carrying the security claim. Both need a clock the harness does not have (GAP-33) |
+| LIV-14 | CT-10 | C | CT-10 serves a freshly minted key on the request that presents it, and drives a burst of distinct credentials against a bounded budget: the refusals are `overloaded` with a usable hint, never a verdict about a key |
+| DC-8 | CT-10 | P | the stub verifies the signing contract for real — one of each header, an attributable portal, bounded skew, Ed25519 over the canonical binding — and CT-10 asserts the portal never trips it, then that an unattributable portal fails every exchange as `upstream_unavailable`. Deadline, single-flight and the lifetime cap are covered, as is every unusable answer failing rather than denying: 500, 503, 404, a truncated grant, an unknown claims version and an answer about another key all reach the client as retryable. Denial-evicts and outage grace need a clock (GAP-33) |
 
 ## Acceptance matrix — requirements (2026-08-07)
 
@@ -223,13 +227,13 @@ chunk-boundary records FV-6 licenses.
 | REQ-42 | P | Scheduler units; headroom refusal untested (INV-4, LIV-8), and its observable — shrink cause, download utilization, headroom-refusal counter (OB-7) — is unasserted |
 | REQ-43 | P | Positive path exercised by the smoke (signed stub responses verified and delivered); CT-2 now drives the rejection path — a wrongly-signed response is not delivered and the attempt is retried elsewhere, meeting the acceptance criterion. Integrity failures are counted per worker but raise no OB-9 alarm state (GAP-24) |
 | REQ-44 | U | — |
-| REQ-50 | U | Specified, not implemented (GAP-35) |
-| REQ-51 | U | Specified, not implemented (GAP-35) |
-| REQ-52 | U | Specified, not implemented (GAP-35) |
-| REQ-53 | U | Specified, not implemented (GAP-35) |
-| REQ-54 | U | Specified, not implemented (GAP-35) |
-| REQ-55 | U | Specified, not implemented (GAP-35) |
-| REQ-56 | U | Specified, not implemented (GAP-35) |
+| REQ-50 | P | CT-10 drives the acceptance corpus whole: no credential, an unparseable token, an unknown key, a wrong secret, a revoked key, an expired key, a key scoped to another portal and one scoped to another dataset each get the refusal ADR-011 binds to it, no serving-dependency stub records a call, and the control-plane ledger shows at most one exchange per request and none for a cache hit or a token outside the grammar. A valid unscoped key is served the same 40 blocks the non-commercial fixture serves. Canonicalization confined to the authenticated dataset rung is not observable black-box |
+| REQ-51 | P | CT-10 asserts a keyless stream is refused while the catalog, per-dataset metadata and state, both heads, `/status`, `/ready`, `/metrics` and the schema all answer without one. A route declaring neither does not compile, which `Gated::route`'s signature enforces and the router unit tests pin. The bracketing rule is covered by its consequences — byte-identical bodies for the reasons sharing `invalid_credential`, and no key id or internal rung anywhere in the scrape — rather than by a strict two-scrape delta |
+| REQ-52 | P | CT-10 accepts a valid key through the header and refuses the truncated, over-long, unknown-prefix and outside-alphabet forms, none of which reaches an exchange; the same token in a query parameter is refused as though none were presented. No log record, metric label or error body carries the secret — the response check runs on every response the suite reads, and the log and scrape are grepped whole. Constant-time fingerprint matching is not observable black-box |
+| REQ-53 | P | The ladder's order is driven end to end — absent before malformed, malformed before any exchange, the control plane's four rungs each reporting their own code, and dataset scope read from the returned grant and evaluated last. An empty dataset list is distinguished from an absent one, and an alias resolves to its canonical name before matching. The combined case, a key both revoked and scoped elsewhere, is untested |
+| REQ-54 | P | Every way an exchange can fail to produce a verdict — 500, 503, 404, a truncated grant, an unknown claims version, an answer about another key, and the deadline — reaches the client as retryable `upstream_unavailable`, never as a claim about the credential. An over-cap lifetime is honoured, shortened and counted. The grace rules are the untested half: serving through an outage and stopping at `expires_at` both need a clock (GAP-33) |
+| REQ-55 | P | CT-10 runs a shadow portal: a request with no credential, one with an ungrammatical token and one the control plane denies are all served, the verdict enforcement would have returned is in the protected log, and the keyless scrape carries only the neutral `shadow_evaluated` series with no code and no exchange counters. The control-plane ledger shows it exchanging on the same cache-miss rule enforcement uses — once, for the only request that presented something to exchange. Indeterminate exchange outcomes are not separately driven |
+| REQ-56 | P | CT-10 runs a portal with no `commercial:` block: gated routes are served without a credential, a credential presented anyway is not a reason to refuse, and no authorization series appears in the scrape at all. The empty-block startup error is unit-tested in `commercial::config` rather than here, and the startup mode line is logged but not asserted |
 
 ## Gap register — 2026-08-07
 
@@ -264,10 +268,9 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-26 | No aggregate deadline bounds a worker attempt: connect is a 10 s crate default (P-WORKER-CONNECT-TIMEOUT, not operator-bound), first byte 60 s, and the body is read in 1 s-stall-bounded reads with no total bound — DC-1's single "request deadline P-TRANSPORT-TIMEOUT" is not what runs, and the transport's `request_timeout` is set but unused on this path | DC-1, REQ-22, HZ-2 | P2 | stub worker trickles a body at just under the per-read stall bound indefinitely; assert the attempt is bounded |
 | GAP-27 | Penalty classification diverges from ADR-004's cost rationale: an instant stream reset (the worker's documented flood-shed posture) draws the 300 s timeout-class cooldown plus a congestion signal, and integrity penalties are split (bad signature 300 s vs undecodable/wrong-range 30 s) though DC-1 treats them as one class — a brief worker-side flood can push the whole pool to AllUnavailable | REQ-41, DC-1, LIV-7 | P2 | CT-2: instant-reset injector; assert the cooldown class matches observed cost and the pool recovers within the error-cooldown window |
 
-| GAP-30 | Nothing consumes the authorization signals OB-12/13 require, and none of OB-9's three commercial alarms exists: no dashboard shows refusal rate by code against admitted traffic, and grace admissions — the only warning before the `expires_at` cliff, and the whole window an operator has to act in — has no alarm rule. Lives in the monitoring stack, not the binary, so it does not block GAP-35 but must not trail it into production either | OB-9, OB-12, OB-13 (presentation only) | P2 | alarm on the grace counter first, then build the cutover dashboard |
+| GAP-30 | Nothing consumes the authorization signals OB-12/13 require, and none of OB-9's three commercial alarms exists: no dashboard shows refusal rate by code against admitted traffic, and grace admissions — the only warning before the `expires_at` cliff, and the whole window an operator has to act in — has no alarm rule. Lives in the monitoring stack, not the binary, so it did not block the authorization path landing, but must not trail it into production either | OB-9, OB-12, OB-13 (presentation only) | P2 | alarm on the grace counter first, then build the cutover dashboard |
 | GAP-32 | **Accepted residual.** A credential with no cached grant costs an exchange and so answers more slowly than a cached one. In enforcing mode, under exchange pressure it receives retryable OVERLOADED/UPSTREAM-FAILURE where a cached credential receives BAD-CREDENTIAL, so the accurate retry contract also reveals cache membership in the response; shadow mode admits both and keeps the same neutral public projection. Accepted rather than closed: collapsing the enforcing outcomes means answering a dependency failure with a claim about the key, which REQ-54 forbids. It is not a key-id oracle — the cache is keyed on the whole credential, so an unknown id and a wrong secret miss identically — and public metrics do not amplify it | INV-39 | P3 | revisit only if the channel is shown to be exploitable at scale |
-| GAP-33 | CT-10 has no harness: DC-8 has no stub in `harness/` and none of the CT-10 row set is driven black-box. Distinct from GAP-35 — that one is the implementation, this one is the means of proving it. A ledger is what the claims need: zero serving-dependency calls under refusal (INV-14) and the secret's single egress (INV-38) are otherwise structural rather than asserted, and verdict determinism across replicas (INV-15), a retired generation completing after its successor (INV-6), LIV-13's clock and HZ-10's interference with legitimate uncached keys have nothing to run against | CT-10, DC-8, INV-6/14/15/38, HZ-10 | P1 | build the DC-8 exchange stub per IB-7; the cheapest first case is INV-14's call-ledger assertion, which needs only the stub's ledger |
-| GAP-35 | The commercial band is specification only at this baseline: the binary contains no authorization code, so REQ-50..56, DC-8, OP-11, INV-6/14/15/38/39 and LIV-13/14 are all unmet by absence rather than by defect. A deployment without commercial configuration is unaffected, but the wire contract binds another component, so the specification is deliberately ahead of the code | REQ-50..56, DC-8, OP-11, INV-6/14/15/38/39, LIV-13/14, OB-12/13 | P1 | ratify the authorization path, then land it failing-test-first against the GAP-33 stub. LIV-13's `expires_at` convergence with the control plane stopped is the case to write first — it carries the security claim the retired mirror could not make |
+| GAP-33 | CT-10's harness exists and its request-path rows are driven black-box, but every row whose claim is about *time* is still unwritten: LIV-13's convergence at `refresh_after` and at `expires_at` with the control plane stopped, a retired generation completing after its successor (INV-6), the denial TTL and the grace window, and HZ-12's renewal spread. All of them need either a controllable clock or a run long enough to cross a real one, and the stub has neither | CT-10, DC-8, INV-6, LIV-13, HZ-12 | P2 | give the control-plane stub a settable clock offset, or drive the cases with second-scale lifetimes; `expires_at` convergence with the control plane stopped is the one carrying the security claim |
 
 ### Closed findings
 
@@ -323,11 +326,11 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 
 ## Build order
 
-- **Phase 1 — P1 gaps, failing tests first:** GAP-1/2/4/16/17/23/33/35 tests
+- **Phase 1 — P1 gaps, failing tests first:** GAP-1/2/4/16/17/23 tests
   red → fixes; GAP-3 probe + heap profile → refresh-copy fix. GAP-23 already has its
-  failing case parked in `ct2_worker_faults`'s known-violated list. GAP-35 waits on the
-  ratification it names, and GAP-33's stub is worth building first either way — an
-  implementation landing without it is one whose properties nothing can check.
+  failing case parked in `ct2_worker_faults`'s known-violated list. The authorization
+  band is done: the path landed and CT-10 checks it, which is the order that mattered —
+  an implementation landing without a harness is one whose properties nothing can check.
 - **Phase 2 — correctness core:** full CT-1 oracle diffing; the rest of the CT-2 fault
   matrix (DC-2/DC-3/DC-4 injectors, kill/restart) on the `Fixture` + worker-injector
   scaffolding; CT-4 corpus; burn down P2 gaps.

@@ -47,6 +47,27 @@ const TAXONOMY: &[(&str, &str, &[u16])] = &[
     ("worker_failure", "api_error", &[500]),
     ("internal_error", "api_error", &[500]),
     ("unclassified", "api_error", &[]),
+    // The six auth rungs (IB-9). All 403, so the status line never tells a
+    // guesser which guess to keep; the code separates them for whoever already
+    // holds the key.
+    ("missing_credential", "authentication_error", &[403]),
+    ("invalid_credential", "authentication_error", &[403]),
+    ("revoked_credential", "authentication_error", &[403]),
+    ("expired_credential", "authentication_error", &[403]),
+    ("portal_not_allowed", "permission_error", &[403]),
+    ("dataset_not_allowed", "permission_error", &[403]),
+];
+
+/// The auth rungs, which IB-5 binds to *no* retry hint: retrying with the same
+/// credential cannot succeed, and treating a refusal as transient reproduces the
+/// ADR-012 storm.
+const UNRETRYABLE: &[&str] = &[
+    "missing_credential",
+    "invalid_credential",
+    "revoked_credential",
+    "expired_credential",
+    "portal_not_allowed",
+    "dataset_not_allowed",
 ];
 
 pub fn validate_stream(world: &ToyWorld, req: &StreamReq, expect: &Expect, d: &Decoded) -> Verdict {
@@ -278,6 +299,11 @@ pub fn validate_error(d: &Decoded) -> Verdict {
         "no_workers" if hint.is_some() => {
             v.err(format!(
                 "validator6: no_workers must carry no hint, got {hint:?}"
+            ));
+        }
+        code if UNRETRYABLE.contains(&code) && hint.is_some() => {
+            v.err(format!(
+                "validator6: {code} is not retryable and must carry no hint, got {hint:?}"
             ));
         }
         _ => {}

@@ -95,6 +95,7 @@ async fn ct1_smoke() -> anyhow::Result<()> {
         registry_port: harness::free_tcp_port(),
         hotblocks_port: harness::free_tcp_port(),
         http_port: harness::free_tcp_port(),
+        control_plane_port: None,
     };
     // The portal pre-leases 1 + retries distinct workers per chunk, so the
     // toy network runs two stub workers. Readiness then also genuinely gates
@@ -148,7 +149,7 @@ async fn ct1_smoke() -> anyhow::Result<()> {
         .map(|(id, port)| format!("{} /ip4/127.0.0.1/udp/{port}/quic-v1", id.peer_id))
         .collect::<Vec<_>>()
         .join(",");
-    let config = portal::write_config(&scratch, &world, &endpoints)?;
+    let config = portal::write_config(&scratch, &world, &endpoints, None)?;
     let mut portal_proc = portal::spawn(
         &scratch,
         &config,

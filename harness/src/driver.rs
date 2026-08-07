@@ -96,11 +96,30 @@ pub async fn stream(
     query: &Value,
     request_id: &str,
 ) -> anyhow::Result<Decoded> {
-    let resp = client
+    stream_as(client, base, alias, endpoint, query, request_id, None).await
+}
+
+/// The same request with a credential presented the one way IB-9 accepts one.
+/// `authorization` is the whole header value, so a test can send a scheme the
+/// binding does not offer.
+pub async fn stream_as(
+    client: &reqwest::Client,
+    base: &str,
+    alias: &str,
+    endpoint: &str,
+    query: &Value,
+    request_id: &str,
+    authorization: Option<&str>,
+) -> anyhow::Result<Decoded> {
+    let mut request = client
         .post(format!("{base}/datasets/{alias}/{endpoint}"))
         .header("accept-encoding", "gzip")
         .header("content-type", "application/json")
-        .header("x-request-id", request_id)
+        .header("x-request-id", request_id);
+    if let Some(value) = authorization {
+        request = request.header("authorization", value);
+    }
+    let resp = request
         .body(query.to_string())
         .send()
         .await
@@ -109,11 +128,18 @@ pub async fn stream(
 }
 
 pub async fn get(client: &reqwest::Client, url: &str) -> anyhow::Result<Decoded> {
-    let resp = client
-        .get(url)
-        .header("accept-encoding", "gzip")
-        .send()
-        .await
-        .context("get request")?;
+    get_as(client, url, None).await
+}
+
+pub async fn get_as(
+    client: &reqwest::Client,
+    url: &str,
+    authorization: Option<&str>,
+) -> anyhow::Result<Decoded> {
+    let mut request = client.get(url).header("accept-encoding", "gzip");
+    if let Some(value) = authorization {
+        request = request.header("authorization", value);
+    }
+    let resp = request.send().await.context("get request")?;
     decode(resp).await
 }

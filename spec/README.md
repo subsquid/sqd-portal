@@ -95,7 +95,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 2. **Ratify or reject proposed ADR-013** and the ⚠ targets in
    [15-parameters.md](15-parameters.md) and the SLO table (11); close the open questions
    in [02-requirements.md](02-requirements.md). The commercial band (REQ-50..REQ-56, DC-8)
-   is partly landed: the error contract ADR-011 carries is implemented, while the
-   authorization path behind it remains specification-only at this baseline (GAP-35).
+   has landed, error contract and authorization path both, and CT-10 covers its request
+   path; what remains is the time-dependent half (GAP-33).
 3. **Burn down the gap register** in [13-conformance.md](13-conformance.md) in priority
    order — failing test first, fix second, matrices updated in the same change.
