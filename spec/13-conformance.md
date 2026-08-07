@@ -1,8 +1,14 @@
 # 13 — Conformance & TDD plan
 
-**Mutable doc.** Statuses as of **2026-08-05** (0.11.9,
-`master@15fcaeeea803b39e4985a7c91dada20203f411ef`). Statuses: **C** covered · **P** partial · **U**
-unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
+**Mutable doc.** Statuses as of **2026-08-07** (0.12.1,
+`master@e9a1878f863c4d87615bcf21ba1ef79fdf649385`). Statuses: **C** covered · **P** partial ·
+**U** unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
+**The commercial band (REQ-50..56, DC-8, OP-11 and the invariants scoped to them) is
+specified and unimplemented at this baseline** — the binary carries no authorization code at
+all, so every row in that band is `U` and no deployment is affected by any of it. One entry,
+GAP-35, tracks the whole band; the per-row notes say what each will need rather than what
+covers it. Splitting the specification from its implementation is deliberate: the wire
+contract binds another team, and it is cheaper to argue with before code exists than after.
 The **Phase-0 harness exists** (`harness/` crate: IB-7 stubs with ledgers — including
 a real p2p worker stub on the pinned transport rev — toy world, reference model, the six
 validators, client driver, quiescence-gated gauge audit; CT-1 smoke green — GAP-14
@@ -115,7 +121,7 @@ chunk-boundary records FV-6 licenses.
 | CT-7 | Soak/endurance: S4 churn for hours; leak & cardinality audits | HZ-1/5/6, INV-30, SLI-5 |
 | CT-8 | Isolation/noisy-neighbor: S6 | INV-35 |
 | CT-9 | Fuzz, both surfaces: client inputs and stub responses (payloads, artifacts) | INV-36, FM-1, GAP-1 |
-| CT-10 | Authorization: credential corpus × gate scope × enforcement mode against a control-plane stub; feed-fault/convergence cases; bracketed metrics scrapes proving no catalog or key-id side channel, including neutral shadow-mode projection | INV-6/10/14/15/38/39, INV-31, LIV-13/14, REQ-50..REQ-56, DC-8, IB-9, HZ-10 |
+| CT-10 | Authorization: credential corpus × enforcement mode against a control-plane stub; exchange-fault, lifetime and convergence cases (denial mid-grant, a retired timed-out generation completing after its successor, over-cap lifetime, unreadable claims version, outage across `refresh_after` and `expires_at`); bracketed metrics scrapes proving no key-id side channel, including neutral shadow-mode projection | INV-6/10/14/15/38/39, INV-31, LIV-13/14, REQ-50..REQ-56, DC-8, IB-9, HZ-10/12/13 |
 
 ## Structural validators (kind-agnostic, applied to every response)
 
@@ -130,10 +136,10 @@ chunk-boundary records FV-6 licenses.
    selected (retention-gap case). Pre-routing failures have no source marker.
 6. Errors: type/code ∈ DEF-10; a hint on every OVERLOADED — on proxied ones too,
    preserved or injected at the floor — never on DATA-UNAVAILABLE, and on no other class
-   unless the upstream sent one (ADR-014); `WWW-Authenticate: Bearer` on every 401; no
+   unless the upstream sent one (ADR-014); one status across every credential refusal; no
    data alongside errors (INV-26, IB-5).
 
-## Traceability matrix — properties (2026-08-05)
+## Traceability matrix — properties (2026-08-07)
 
 | Property | CT | Status | Note |
 |---|---|---|---|
@@ -156,13 +162,13 @@ chunk-boundary records FV-6 licenses.
 | INV-28 | CT-3 | U | — |
 | INV-29 | CT-1 | P | boundary emission asserted by the CT-1 selective-tail resume on both sources; the network multi-chunk case exercises the per-chunk granularity FV-6 licenses. Interior boundary records are not audited, and the EMPTY case (no block evaluated) is untested. Boundary pinning is a worker-engine behavior — re-prove before adopting new engine/format fields on a dependency bump |
 | INV-30 | CT-3/7 | U | gauge accounting was a past defect class |
-| INV-31 | CT-2 | P | shutdown flip e2e-tested; other conjuncts not; *known-violated* on staleness intent (GAP-2) |
+| INV-31 | CT-2 | P | shutdown flip e2e-tested; other conjuncts not; *known-violated* on staleness intent (GAP-2). The spec states that commercial configuration adds no conjunct, which at this baseline is vacuously true |
 | INV-35 | CT-8 | U | — |
 | INV-36 | CT-4/9 | P | three crash regressions covered — the third, a worker reporting a last block past the queried range, panicked the stream task via an inverted continuation range; latent panic (GAP-5) |
 | INV-37 | CT-2 | U | — |
 | INV-40 | CT-2 | U | — |
 | LIV-1..LIV-4 | CT-1/2/6 | U | stall budget unmeasured |
-| LIV-5, LIV-6 | CT-2 | U | startup bound unmeasured (S5), including enforcing-commercial key bootstrap |
+| LIV-5, LIV-6 | CT-2 | U | startup bound unmeasured (S5); no commercial term to measure at this baseline |
 | LIV-7 | CT-2 | P | CT-2 waits for the pool to serve again between fault cases and after exhaustion; a latched penalty fails the run. Cooldown *durations* are unmeasured |
 | LIV-8 | CT-6 | P | regrowth unit-tested at scheduler level |
 | LIV-9 | CT-6 | U | — |
@@ -173,16 +179,16 @@ chunk-boundary records FV-6 licenses.
 | FM-2 | CT-2 | P | the DC-4 replay classifier is unit-tested on both sides of the transient/integrity line (clean close, reset, the two non-replay exclusions — ADR-015). Worker-side classification now exists and is CT-2-tested: wrong-range and bad-signature responses are integrity — discarded, rerouted, never delivered — and all-integrity exhaustion is a distinguishable outcome from transient exhaustion. Corrupt artifact (GAP-1) is still untested; the *taxonomy* of both exhaustion outcomes is inside GAP-16 |
 | FM-3 | CT-2/3 | U | per-dependency confinement never exercised: no outage tests (REQ-25), no isolation swarm (INV-35) |
 | SLI-1..SLI-6 | CT-6 | U | no benchmarks; baselines from incidents only |
-| INV-6 | CT-10 | P | PR #143 unit-tests forward-only sequence application, generation-guarded lookup insertion, wholesale rebuild on epoch change and head rollback, and tombstoning of malformed and unknown-status records. No harness stub exists, so nothing exercises a *concurrent* rebuild against an in-flight lookup — the race the generation counter is there for |
-| INV-14 | CT-10 | P | a counting catalog proves canonicalization happens only on the dataset rung of an authenticated request, and the ungated path is asserted to read neither credential nor dataset. Zero serving-dependency calls and the one-DC-8-call-on-miss bound are not asserted against stubs, because CT-10 has no harness (GAP-33) |
-| INV-15 | CT-10 | P | ladder precedence and the multi-failure corpus are unit-tested at the evaluate layer; determinism under saturation and across replicas is untested |
-| INV-38 | CT-10 | P | constant-time comparison is used and unit-tested for equality semantics; the credential's debug rendering redacts the secret. No test greps emitted logs, metrics, or spans for a marked secret, and the query-parameter channel puts the secret in a URL that intermediaries may record (IB-9) |
-| INV-39 | CT-10 | P | unknown key and wrong secret are asserted to return the same reason; the *response* identity and metrics non-disclosure are not asserted end-to-end, the timing channel is a known deviation (GAP-32), and digestless tombstones currently expose `revoked` (GAP-34) |
-| LIV-13 | CT-10 | P | one tick is unit-tested to drain a multi-page backlog; convergence itself is not measured against a clock, and the `M + 1`-page two-cycle boundary is untested |
-| LIV-14 | CT-10 | P | authorize-on-miss is unit-tested including the rate-limited and in-flight-capped refusals, but both currently collapse onto BAD-CREDENTIAL rather than the retryable outcomes DC-8 requires; the admission bound and HZ-10 interference case are untested (GAP-34) |
-| DC-8 | CT-10 | P | feed faults are well covered at unit level — non-success status, malformed envelope, missing envelope fields, non-advancing cursor, short-of-head bootstrap, mid-bootstrap epoch flip, redirect refusal. Nothing runs against a stub in the harness, so none of it is CT-2-style fault injection (GAP-33) |
+| INV-6 | CT-10 | U | needs grant-cache coherence: fingerprint-only reach, the hard-expiry stop, no stale answer overwriting a fresh one, a denial surviving an in-flight exchange (GAP-35) |
+| INV-14 | CT-10 | U | needs zero serving-dependency calls, one exchange per fingerprint under a burst, none for a malformed token or a cached grant, canonicalization only on the dataset rung of an authenticated request (GAP-35) |
+| INV-15 | CT-10 | U | needs ladder precedence, determinism under saturation, and the bound on per-replica grant divergence (GAP-35) |
+| INV-38 | CT-10 | U | needs the secret's single egress — the exchange and nothing else — and constant-time fingerprint comparison, proved by grepping every emitted signal for a marked secret (GAP-35) |
+| INV-39 | CT-10 | U | needs the unauthenticated rungs answering one wire code with one public metric projection, and shadow mode projecting every verdict onto one neutral series (GAP-35) |
+| LIV-13 | CT-10 | U | needs convergence at `refresh_after` + one exchange with the control plane healthy, and at `expires_at` with it stopped — the second is the one carrying the security claim (GAP-35) |
+| LIV-14 | CT-10 | U | needs a freshly minted key served on its first request, and budget saturation answering retryable overload rather than a verdict (GAP-35) |
+| DC-8 | CT-10 | U | needs the exchange contract entire: signature, deadline, single-flight, lifetime cap, denial-evicts, outage grace, and every unusable answer failing rather than denying (GAP-35) |
 
-## Acceptance matrix — requirements (2026-08-05)
+## Acceptance matrix — requirements (2026-08-07)
 
 | REQ | Status | Note |
 |---|---|---|
@@ -217,15 +223,15 @@ chunk-boundary records FV-6 licenses.
 | REQ-42 | P | Scheduler units; headroom refusal untested (INV-4, LIV-8), and its observable — shrink cause, download utilization, headroom-refusal counter (OB-7) — is unasserted |
 | REQ-43 | P | Positive path exercised by the smoke (signed stub responses verified and delivered); CT-2 now drives the rejection path — a wrongly-signed response is not delivered and the attempt is retried elsewhere, meeting the acceptance criterion. Integrity failures are counted per worker but raise no OB-9 alarm state (GAP-24) |
 | REQ-44 | U | — |
-| REQ-50 | P | The ladder and every rung are unit-tested, and a source-scanning test forces each route in the table to be classified or fail the build. **Known-violated on the wire**: the refusal carries no taxonomy code, so the middleware rewrites it to 400 `malformed_request` and the client never sees a 401 or 403 (GAP-29). The zero-serving-call and bounded-DC-8-call claims lack a harness (GAP-33) |
-| REQ-51 | P | Both gate scopes are tested at the route-classification level, and the always-open set is pinned. Whether an `all`-scope deployment actually refuses each metadata route end-to-end, and whether keyless metrics omit every dataset identity and unsafe auth projection, are untested (GAP-30/33) |
-| REQ-52 | P | Token grammar, both presentation channels, length caps and the alphabet are unit-tested; digest-only handling is structural. Log/metric non-disclosure is unasserted (INV-38) |
-| REQ-53 | P | Precedence, absent-vs-empty scope, exact matching, alias resolution, and the no-dataset route case are unit-tested, including the earliest-rung-wins corpus. **Known-violated for digestless tombstones:** #143 returns `revoked` before a secret can match (GAP-34) |
-| REQ-54 | P | Fail-closed on unknown keys and fail-static across feed faults are unit-tested, as is readiness withholding before the first snapshot. Lookup budget/failure currently collapses onto non-retryable BAD-CREDENTIAL instead of OVERLOADED/UPSTREAM-FAILURE (GAP-34); staleness is unbounded and invisible (GAP-31) |
-| REQ-55 | P | Shadow mode is asserted to admit the whole rejection corpus, record ordinary verdicts, and not withhold readiness. An indeterminate lookup outcome and the identical neutral public projection of valid, invalid, and indeterminate cases are unimplemented or untested (GAP-30/33) |
-| REQ-56 | C | Absent configuration is asserted to install no middleware on either route class, an empty block fails startup naming the missing field through both deserializer paths, and the mode is logged once at startup |
+| REQ-50 | U | Specified, not implemented (GAP-35) |
+| REQ-51 | U | Specified, not implemented (GAP-35) |
+| REQ-52 | U | Specified, not implemented (GAP-35) |
+| REQ-53 | U | Specified, not implemented (GAP-35) |
+| REQ-54 | U | Specified, not implemented (GAP-35) |
+| REQ-55 | U | Specified, not implemented (GAP-35) |
+| REQ-56 | U | Specified, not implemented (GAP-35) |
 
-## Gap register — 2026-08-05
+## Gap register — 2026-08-07
 
 Priorities: P0 blocks the program · P1 active production risk · P2 correctness hole
 with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
@@ -258,14 +264,39 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-26 | No aggregate deadline bounds a worker attempt: connect is a 10 s crate default (P-WORKER-CONNECT-TIMEOUT, not operator-bound), first byte 60 s, and the body is read in 1 s-stall-bounded reads with no total bound — DC-1's single "request deadline P-TRANSPORT-TIMEOUT" is not what runs, and the transport's `request_timeout` is set but unused on this path | DC-1, REQ-22, HZ-2 | P2 | stub worker trickles a body at just under the per-read stall bound indefinitely; assert the attempt is bounded |
 | GAP-27 | Penalty classification diverges from ADR-004's cost rationale: an instant stream reset (the worker's documented flood-shed posture) draws the 300 s timeout-class cooldown plus a congestion signal, and integrity penalties are split (bad signature 300 s vs undecodable/wrong-range 30 s) though DC-1 treats them as one class — a brief worker-side flood can push the whole pool to AllUnavailable | REQ-41, DC-1, LIV-7 | P2 | CT-2: instant-reset injector; assert the cooldown class matches observed cost and the pool recovers within the error-cooldown window |
 
-| GAP-29 | Authorization refusals are emitted outside the ADR-011 envelope, so they carry no `ErrorCode` and the routed middleware normalizes them: a 401 reaches the client as **400 `malformed_request`** with the auth message nested as a JSON string, and a 403 likewise. No 401 or 403 is observable on the wire, clients cannot distinguish an invalid key from a malformed query, every auth refusal lands on the metric as `error_code="malformed_request"`, and no Bearer challenge is emitted — the signals and recovery surface a cutover depends on do not exist. Demonstrated by running the PR #143 gate behind the master middleware stack | REQ-50, IB-5, IB-9, DEF-10, INV-30, OB-12 (ADR-017) | **P0** | CT-5: assert an unauthenticated request to a gated route answers 401 with `authentication_error`/`missing_credential` and `WWW-Authenticate: Bearer`; it fails today at the status line |
-| GAP-30 | Authorization emits no metrics at all: verdicts, snapshot age and sync failures exist only as log lines. OB-12 and OB-13 are unimplemented, so shadow-mode analysis requires protected-log aggregation and a control plane that stopped answering is invisible on a dashboard. The implementation may expose actual enforcement wire codes and a neutral shadow total only: internal rungs, hypothetical shadow verdicts, record count and request-path resolve outcomes stay in protected logs because `/metrics` is keyless | OB-12, OB-13, REQ-55, INV-30, INV-39 | P1 | add the safe decision counter, then bracket scrapes: enforcing unknown-key/wrong-secret cases share a series, while shadow valid/invalid/indeterminate cases all share the neutral series |
-| GAP-31 | Key-snapshot staleness is unbounded and unexported. A control-plane outage freezes the key set indefinitely — revocations issued during it never land — and nothing degrades, alarms, or reports age. Exactly the assignment-staleness hole of GAP-2, on a surface where the stale data is an access-control decision | REQ-54, DC-8, INV-31 ⚠, OB-13 (ADR-016, OQ-12) | P1 | age gauge first; then ratify P-KEY-SNAPSHOT-MAX-AGE via OQ-12 and test the degradation |
-| GAP-32 | INV-39's wire identity holds only while authorize-on-miss can answer authoritatively. A key id absent from the snapshot may take longer than a hit; if its lookup budget is exhausted or the control plane fails, it receives retryable OVERLOADED/UPSTREAM-FAILURE while a present id with a wrong secret receives BAD-CREDENTIAL. The accurate retry contract therefore reveals snapshot membership under lookup pressure. Public metrics must not amplify that accepted residual beyond the outcome the caller already received (OB-12/13) | INV-39 | P2 | decide whether the residual is accepted, or close it by making hits and misses share the lookup-failure outcome; bracketed scrapes must expose no internal detail either way |
-| GAP-33 | CT-10 has no harness: DC-8 has no stub in `harness/`, so every claim in the CT-10 row set is unit-tested inside the crate rather than driven black-box. Nothing exercises a concurrent rebuild against an in-flight lookup (INV-6's race), zero serving-dependency calls and one bounded DC-8 call under refusal (INV-14), verdict determinism across replicas (INV-15), secret/non-oracle disclosure in emitted signals (INV-38/39), or HZ-10's interference with legitimate new keys. All the phase-1 constants are hard-coded rather than operator-bound (15 §commercial) | CT-10, DC-8, INV-6/14/15/38/39, HZ-10 | P1 | build the DC-8 stub per IB-7; the cheapest first case is INV-14's call-ledger assertion, which needs only the stub's ledger |
-| GAP-34 | Snapshot-miss failures and digestless tombstones violate the authorization contract in #143. Rate/in-flight exhaustion and control-plane errors all return `None`, so a valid fresh key receives non-retryable BAD-CREDENTIAL instead of OVERLOADED/UPSTREAM-FAILURE. A revoked or malformed tombstone carries no digest, yet the evaluator returns `revoked` before comparing the presented secret, exposing that the guessed key id exists and violating INV-39's secret-first rule | REQ-53/54, DC-8, INV-39, ADR-017 | P1 | split `get_or_resolve` into authoritative unknown vs overloaded vs unavailable; map the latter two to retryable taxonomy outcomes, and map every digestless record to BAD-CREDENTIAL; CT-10 pins all four paths |
+| GAP-30 | Nothing consumes the authorization signals OB-12/13 require, and none of OB-9's three commercial alarms exists: no dashboard shows refusal rate by code against admitted traffic, and grace admissions — the only warning before the `expires_at` cliff, and the whole window an operator has to act in — has no alarm rule. Lives in the monitoring stack, not the binary, so it does not block GAP-35 but must not trail it into production either | OB-9, OB-12, OB-13 (presentation only) | P2 | alarm on the grace counter first, then build the cutover dashboard |
+| GAP-32 | **Accepted residual.** A credential with no cached grant costs an exchange and so answers more slowly than a cached one. In enforcing mode, under exchange pressure it receives retryable OVERLOADED/UPSTREAM-FAILURE where a cached credential receives BAD-CREDENTIAL, so the accurate retry contract also reveals cache membership in the response; shadow mode admits both and keeps the same neutral public projection. Accepted rather than closed: collapsing the enforcing outcomes means answering a dependency failure with a claim about the key, which REQ-54 forbids. It is not a key-id oracle — the cache is keyed on the whole credential, so an unknown id and a wrong secret miss identically — and public metrics do not amplify it | INV-39 | P3 | revisit only if the channel is shown to be exploitable at scale |
+| GAP-33 | CT-10 has no harness: DC-8 has no stub in `harness/` and none of the CT-10 row set is driven black-box. Distinct from GAP-35 — that one is the implementation, this one is the means of proving it. A ledger is what the claims need: zero serving-dependency calls under refusal (INV-14) and the secret's single egress (INV-38) are otherwise structural rather than asserted, and verdict determinism across replicas (INV-15), a retired generation completing after its successor (INV-6), LIV-13's clock and HZ-10's interference with legitimate uncached keys have nothing to run against | CT-10, DC-8, INV-6/14/15/38, HZ-10 | P1 | build the DC-8 exchange stub per IB-7; the cheapest first case is INV-14's call-ledger assertion, which needs only the stub's ledger |
+| GAP-35 | The commercial band is specification only at this baseline: the binary contains no authorization code, so REQ-50..56, DC-8, OP-11, INV-6/14/15/38/39 and LIV-13/14 are all unmet by absence rather than by defect. A deployment without commercial configuration is unaffected, but the wire contract binds another component, so the specification is deliberately ahead of the code | REQ-50..56, DC-8, OP-11, INV-6/14/15/38/39, LIV-13/14, OB-12/13 | P1 | ratify the authorization path, then land it failing-test-first against the GAP-33 stub. LIV-13's `expires_at` convergence with the control plane stopped is the case to write first — it carries the security claim the retired mirror could not make |
 
 ### Closed findings
+
+- **GAP-31** (closed 2026-08-06; superseded 2026-08-07): key-snapshot staleness was
+  unbounded and unexported, and was closed by exporting an age gauge and alarming on it.
+  The on-demand exchange removed the snapshot, and with it both the defect and its fix: the
+  stale-authorization window is now a deadline the control plane sets on each grant rather
+  than an age a dashboard watches. What the closure argued still holds and is why INV-31
+  reads as it does — a staleness rule in the binary would pull the whole fleet from
+  rotation at once, since every replica shares one authority.
+
+- **GAP-29** (closed 2026-08-05): authorization refusals were built outside the ADR-011
+  envelope, so they carried no `ErrorCode` and the middleware every routed response passes
+  through rewrote them to 400 `malformed_request`. No 403 reached the wire and every refusal
+  counted as a client query error. ADR-011's authentication types and codes are implemented and
+  CT-5 pins an unauthenticated request behind
+  the *real* middleware stack — the only place the defect was visible, since the gate and
+  the normalizer were each correct alone.
+- **GAP-34** (closed 2026-08-05): rate and in-flight exhaustion and control-plane errors
+  all collapsed onto one "no such key" answer, so a key minted seconds earlier was told
+  non-retryably that it was invalid. `Lookup` now separates the authoritative unknown from
+  saturation and from failure, and the latter two answer OVERLOADED and UPSTREAM-FAILURE
+  per REQ-54. The digestless tombstone half is closed too: it answers `invalid_credential`
+  and keeps `revoked_tombstone` on the protected axis, where naming it discloses nothing.
+  Writing the test store's control plane is what exposed the first half — until then the
+  suite's "unknown key" case was really its unreachable-control-plane case. (The tombstone
+  half was made moot by the on-demand exchange, which leaves the Portal holding no records to
+  tombstone; the separation of saturation from failure from denial carries over intact and
+  is the part worth keeping.)
 
 - **Wrong-range worker responses** (closed 2026-07-25): a worker reporting a last block
   past the queried range end produced an inverted continuation range and panicked the
@@ -292,9 +323,11 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 
 ## Build order
 
-- **Phase 1 — P1 gaps, failing tests first:** GAP-1/2/4/16/17/23/29/30/31/33/34 tests
+- **Phase 1 — P1 gaps, failing tests first:** GAP-1/2/4/16/17/23/33/35 tests
   red → fixes; GAP-3 probe + heap profile → refresh-copy fix. GAP-23 already has its
-  failing case parked in `ct2_worker_faults`'s known-violated list.
+  failing case parked in `ct2_worker_faults`'s known-violated list. GAP-35 waits on the
+  ratification it names, and GAP-33's stub is worth building first either way — an
+  implementation landing without it is one whose properties nothing can check.
 - **Phase 2 — correctness core:** full CT-1 oracle diffing; the rest of the CT-2 fault
   matrix (DC-2/DC-3/DC-4 injectors, kill/restart) on the `Fixture` + worker-injector
   scaffolding; CT-4 corpus; burn down P2 gaps.

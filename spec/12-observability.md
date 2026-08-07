@@ -5,18 +5,14 @@ as a failure (INV-30): **lying metrics are failures**. Cardinality of every labe
 family is bounded (intent — GAP-6): labels come from closed sets (endpoint, class,
 outcome, dataset) — per-worker labels must be bounded or evicted. `/metrics` is a
 keyless, client-readable surface (IB-9), so commercial deployments apply an additional
-confidentiality rule: under gate scope `all`, no public series carries a dataset identity;
-under either scope, no public series exposes an internal authorization rung or lookup
+confidentiality rule: no public series exposes an internal authorization rung or exchange
 detail beyond the client-visible wire outcome (INV-39).
 
 **OB-1 — State gauges.** Active streams (census), in-flight congestion permits and
 window size, open leases (or an equivalent worker-busy gauge), known workers, known
-chunks and highest block per dataset. At quiescence each equals modeled truth. On an
-`all`-scope commercial deployment, the public scrape aggregates additive dataset gauges
-and omits the dataset label; a per-dataset value with no truthful aggregate, such as
-highest block, is omitted. Per-dataset state remains available only through authenticated
-metadata/operator routes and protected logs. A keyless metrics scrape must not reconstruct
-the catalog that `all` exists to hide (REQ-51).
+chunks and highest block per dataset. At quiescence each equals modeled truth. Dataset
+identities are public on every deployment (NG8), so the scrape carries them as it always
+has.
 
 **OB-2 — Progress heartbeat.** Per active stream: periodic progress (coverage cursor,
 bytes) at P-HEARTBEAT-INTERVAL, plus time-to-first-byte per response. Distinguishes
@@ -50,9 +46,11 @@ connection fault whose shape the replay classifier stopped recognising. A wedged
 dependency must be visible from the Portal's own metrics alone (REQ-22).
 
 **OB-5 — Readiness reason.** The readiness state as a gauge with a reason code
-(loading / insufficient-connectivity / shutting-down / no-key-snapshot on an enforcing
-commercial deployment / ⚠ stale-artifact — ADR-013, GAP-2), and logged transitions. A
-probe flip is attributable without log archaeology.
+(loading / insufficient-connectivity / shutting-down / ⚠ stale-artifact — ADR-013,
+GAP-2), and logged transitions. A probe flip is attributable without log archaeology.
+Authorization contributes no reason code, in either enforcement mode: it cannot flip this
+probe (INV-31), and a code for a state that cannot occur reads as a promise the gauge
+does not keep.
 
 **OB-6 — Artifact provenance.** Applied artifact identifier and ⚠ age
 (ADR-013/GAP-2), application timestamps, skipped/unchanged fetch counts. A wedged
@@ -67,8 +65,17 @@ ready, SIGTERM, drain start, exit — the LIV-5/LIV-11 witnesses.
 
 **OB-9 — Alarm states.** Edge events + level reads, reason-coded, for: artifact
 fetch/validation failures (⚠ GAP-1/2), background-loop deaths, usage-log drops,
-signature-verification failures. Alarms are the LIV-12 witness: persistent failure is
-never log-only. (Sampled error reporting to DC-7 complements, never replaces, these.)
+signature-verification failures, and — on a commercial deployment — requests being served
+on renewal grace (a grant past `refresh_after` whose renewal is failing or locally
+suppressed), sustained exchange failure, and refused signing headers. The first is the one
+that has to page before the others matter: it is the leading edge of the `expires_at` cliff,
+and the minimum remaining lifetime among affected grants is the whole window an operator
+has to act in (REQ-54, DC-8). The last is a Portal-local misconfiguration — clock, identity,
+or request construction — that fails every exchange at once, and it must not be diagnosed
+as a client-key problem. Alarms are the LIV-12
+witness: persistent failure is never log-only. None of the three commercial ones is emitted
+or configured today (GAP-30). (Sampled error reporting to DC-7 complements, never replaces,
+these.)
 
 **OB-10 — Congestion window trace.** Window size, grow/shrink counters — the LIV-8
 witness.
@@ -90,28 +97,44 @@ the operator's is not.
 
 **OB-12 — Authorization decisions.** Commercial deployments only. In enforcing mode,
 every completed verdict (DEF-20) is counted on the public scrape by decision × actual
-**wire code** (or success) × route class × enforcement mode; a lookup that produced no
+**wire code** (or success) × enforcement mode; an exchange that produced no
 verdict is counted only by the OVERLOADED or UPSTREAM-FAILURE code actually returned. The
-four internal reasons sharing `invalid_credential` are deliberately one public label
+internal reasons sharing `invalid_credential` are deliberately one public label
 value. In `log_only`, every request increments the same neutral `shadow_evaluated` public
-outcome: the would-be verdict and an indeterminate lookup are distinguishable only in
+outcome: the would-be verdict and an indeterminate exchange are distinguishable only in
 protected structured logs. No metric label or request-synchronous counter may let a
 client bracket two keyless scrapes and learn more than its response revealed (INV-39,
-ADR-017). Auth refusals in enforcing mode must still be distinguishable from every other
-refusal on the OB-3 error-code axis — an auth 401 counted as `malformed_request` is a lying
-metric (INV-30, GAP-29). None of this exists yet (GAP-30).
+ADR-011). Auth refusals in enforcing mode must still be distinguishable from every other
+refusal on the OB-3 error-code axis — an auth refusal counted as `malformed_request` is a lying
+metric (INV-30).
 
-**OB-13 — Key snapshot freshness and provenance.** Commercial deployments only.
-Snapshot age since the last successful feed read (a gauge — the LIV-13 and GAP-31
-witness), the held cursor, last reported head and epoch, applied-delta and rebuild
-counters, and sync failures by cause. These public values change on background feed
-activity, not synchronously with one presented key. Record count and authorize-on-miss
-outcomes are omitted from the keyless scrape: either can reveal whether an
-attacker-chosen id caused a lookup or inserted a record. Lookup outcomes instead emit
-protected structured events (resolved, unknown, rate-limited, over the in-flight cap,
-failed), and CT-10 uses those events plus the control-plane stub ledger as the
-LIV-14/HZ-10 witness. A control plane that has stopped answering remains visible publicly
-as monotone age growth without exposing a key id or request path.
+**OB-13 — Grant cache and exchange health.** Commercial deployments only. In enforcing
+mode, the public scrape carries cache occupancy against P-GRANT-CACHE-CAPACITY and the
+eviction rate (the HZ-13 witness); exchange attempts and outcomes by operational class —
+answered, refused by budget, failed — with latency (the LIV-13/LIV-14 and DC-8 capacity
+witnesses); and a count of grants whose offered lifetime was capped. For the cliff it also
+carries a counter of admissions served on renewal grace, the number of grants currently in
+that state, and the minimum time remaining to `expires_at` among them (zero when none are in
+grace). The count says the condition exists and the minimum names the first hard refusal,
+without a key- or dataset-labeled series. None of these carries a key id, a fingerprint, a
+dataset, or a refusal reason finer than the enforcing caller's wire response.
+
+Shadow mode is deliberately different. Its keyless scrape exposes none of the cache,
+exchange-outcome, latency, capping, or grace signals above: `issued` versus `denied`, or a
+grant-cache occupancy change, would reveal the verdict of a request whose response admits
+either way. OB-12's single `shadow_evaluated` outcome is its entire public authorization
+projection. The load and cutover evidence shadow mode exists to gather remains in protected
+per-exchange events and in the control plane's own telemetry.
+
+The enforcing-mode `answered` class deliberately combines grants and denials. The cache is
+keyed on the whole credential (DEF-18), so an unknown key id and a known one presented with
+a wrong secret miss identically and increment the same operational counter. Bracketing two
+scrapes around one's own enforcing request can therefore reveal the accepted
+cache-membership residual that timing already exposes, but never the control plane's
+verdict or either invalid case. Everything finer stays protected: per-exchange events
+(resolved, denied with its rung, rate-limited, over the in-flight cap, failed) go to
+structured logs, and CT-10 uses those plus the control-plane stub ledger as the
+LIV-14/HZ-10 witness.
 
 ## Property → observable mapping
 
@@ -126,8 +149,8 @@ as monotone age growth without exposing a key id or request path.
 | LIV-9 | OB-3 refusal counters, OB-11 saturation integral |
 | LIV-10 | OB-1 gauges at quiescence |
 | LIV-12 | OB-9 |
-| LIV-13, LIV-14 | OB-13 age/cursor; protected lookup events + stub ledger |
-| INV-6, INV-15, INV-39 | protected OB-12 reason logs + public non-disclosure; OB-13 epoch/rebuild counters |
+| LIV-13, LIV-14 | enforcing-mode OB-13 grace deadline and exchange outcomes; protected exchange events + stub ledger in both modes |
+| INV-6, INV-15, INV-39 | protected OB-12 reason logs + public non-disclosure; neutral shadow projection and enforcing-only OB-13 classes |
 | INV-30/31 | OB-1, OB-5 (they are the invariant's subject) |
 | SLI-1..6 | OB-2, OB-3, OB-1 + process RSS |
 
