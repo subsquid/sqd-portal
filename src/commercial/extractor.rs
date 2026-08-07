@@ -9,10 +9,10 @@ use axum::{
 use sha2::{Digest, Sha256};
 
 use super::{
+    cache::GrantCache,
     config::{CommercialConfig, Enforcement},
-    evaluate::{self, Decision, LazyDataset, Rejection},
+    evaluate::{self, Decision, LazyDataset, Rejection, Verdict},
     now_secs,
-    store::SnapshotStore,
 };
 use crate::{
     metrics::{self, AuthDecision},
@@ -27,29 +27,56 @@ const TOKEN_PREFIXES: [&str; 2] = ["sqd_portal_", "prt_"];
 
 /// Both segments mirror the control plane's own `[A-Za-z0-9~-]+`, capped at
 /// what it can mint. A token the control plane could never have issued is
-/// rejected before its key id reaches the negative cache or a log line.
+/// rejected before it reaches the denial cache, a log line, or an exchange.
 const MAX_KEY_ID_LEN: usize = 64;
 const MAX_SECRET_LEN: usize = 128;
 
-/// A presented key, reduced to what the ladder needs. The secret itself is
-/// discarded at parse time; only its digest travels further.
+/// The presented token, held only as far as the exchange that carries it. Its
+/// renderings are redacted so the one way it can be disclosed is by asking for
+/// it (INV-38).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretToken(String);
+
+impl SecretToken {
+    /// Named to be greppable: every call site should be one an audit expects.
+    /// Today there is exactly one, in the exchange request body.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// A presented key, reduced to what the gate needs.
+///
+/// The fingerprint covers the *whole* token, not the key id: it is what the
+/// grant cache is keyed on, and an entry reachable by id alone would admit the
+/// next caller to name that id without proving it holds the secret. It also
+/// means an unknown id and a known id with a wrong secret miss identically,
+/// which is what keeps the cache from becoming an enumeration oracle (INV-39).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     pub key_id: String,
-    pub secret_sha256: String,
+    pub fingerprint: String,
+    pub token: SecretToken,
 }
 
 impl fmt::Debug for Credential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Credential")
             .field("key_id", &self.key_id)
-            .field("secret_sha256", &"<redacted>")
+            .field("fingerprint", &self.fingerprint)
+            .field("token", &self.token)
             .finish()
     }
 }
 
-/// Keys carry canonical dataset names, so an alias in the request URL has to be
-/// resolved before it can be matched.
+/// Grants carry canonical dataset names, so an alias in the request URL has to
+/// be resolved before it can be matched.
 pub trait DatasetCatalog: Send + Sync {
     fn canonical_name(&self, alias: &str) -> Option<String>;
 }
@@ -61,7 +88,7 @@ impl DatasetCatalog for NetworkClient {
 }
 
 pub struct Gate {
-    store: Arc<SnapshotStore>,
+    cache: Arc<GrantCache>,
     catalog: Arc<dyn DatasetCatalog>,
     portal_id: String,
     enforcement: Enforcement,
@@ -70,28 +97,28 @@ pub struct Gate {
 impl Gate {
     pub fn new(
         config: &CommercialConfig,
-        store: Arc<SnapshotStore>,
+        cache: Arc<GrantCache>,
         catalog: Arc<dyn DatasetCatalog>,
     ) -> Self {
         Self {
-            store,
+            cache,
             catalog,
             portal_id: config.portal_id(),
             enforcement: config.enforcement,
         }
     }
 
-    /// Whether the portal has mirrored the control plane's key set yet. A gated
-    /// portal that has not knows no keys, so it would refuse every valid
-    /// one — it belongs out of rotation until this turns true.
-    pub fn snapshot_ready(&self) -> bool {
-        self.store.is_ready()
-    }
-
     /// Whether this gate turns its verdicts into responses. Shadow mode does
-    /// not, so nothing the snapshot does or does not know can reject a request.
+    /// not, so nothing the control plane says can reject a request.
     pub fn enforcing(&self) -> bool {
         self.enforcement == Enforcement::Enforce
+    }
+
+    /// Republished on scrape so it climbs through an outage rather than
+    /// freezing at the last value (OB-13).
+    pub fn publish_freshness(&self) {
+        metrics::report_exchange_success_age(self.cache.last_exchange_success_age());
+        metrics::report_grant_cache_capacity(self.cache.capacity());
     }
 
     /// A route whose path does not name the dataset cannot be checked against
@@ -109,36 +136,34 @@ impl Gate {
         let credential = match credential_from_request(headers) {
             Ok(credential) => credential,
             Err(rejection) => {
-                self.log(Decision::Reject(rejection), None, None);
-                return Decision::Reject(rejection);
+                let verdict = Verdict {
+                    decision: Decision::Reject(rejection),
+                    denial_reason: None,
+                };
+                self.log(&verdict, None, None);
+                return verdict.decision;
             }
         };
 
-        let decision = evaluate::evaluate(
-            &self.store,
-            &self.portal_id,
-            credential.as_ref(),
-            &dataset,
-            now_secs(),
-        )
-        .await;
+        let verdict =
+            evaluate::evaluate(&self.cache, credential.as_ref(), &dataset, now_secs()).await;
         // Shadow mode logs its admissions, and an admitted request has already
         // authenticated — naming its dataset costs what a real customer costs.
         // A rejection logs only what an earlier rung happened to resolve.
-        if let (Decision::Admit, Enforcement::LogOnly) = (decision, self.enforcement) {
+        if let (Decision::Admit, Enforcement::LogOnly) = (verdict.decision, self.enforcement) {
             dataset.resolve();
         }
         self.log(
-            decision,
+            &verdict,
             credential
                 .as_ref()
                 .map(|credential| credential.key_id.as_str()),
             dataset.resolved().as_deref(),
         );
-        decision
+        verdict.decision
     }
 
-    /// Keys carry canonical names, so an alias is resolved first. An
+    /// Grants carry canonical names, so an alias is resolved first. An
     /// unresolvable one is compared as written and simply fails to match.
     fn dataset_for(&self, path: &str, names_dataset: bool) -> Option<String> {
         if !names_dataset {
@@ -170,14 +195,14 @@ impl Gate {
 
     /// Log-only mode records every request; enforcing mode records only the
     /// requests it turns away, since admissions are the hot path.
-    fn log(&self, decision: Decision, key_id: Option<&str>, dataset: Option<&str>) {
+    fn log(&self, verdict: &Verdict, key_id: Option<&str>, dataset: Option<&str>) {
         let enforcing = self.enforcing();
         let key_id = key_id.unwrap_or("none");
         let dataset = dataset.unwrap_or("-");
         let portal_id = self.portal_id.as_str();
         let enforcement = self.enforcement.as_str();
 
-        let Decision::Reject(rejection) = decision else {
+        let Decision::Reject(rejection) = verdict.decision else {
             if !enforcing {
                 tracing::info!(
                     key_id,
@@ -199,6 +224,9 @@ impl Gate {
             decision = if enforcing { "reject" } else { "would_reject" },
             // The internal rung; the wire and the scrape both coarsen it.
             reason = rejection.reason,
+            // What the control plane called it, where it was the one refusing.
+            // The only place a reason this build has no code for survives.
+            denial_reason = verdict.denial_reason.as_deref().unwrap_or("-"),
             error_code = rejection.code.as_str(),
             status = rejection.code.status().as_u16(),
             enforcement,
@@ -252,6 +280,11 @@ fn bearer_token(headers: &HeaderMap) -> Result<Option<String>, Rejection> {
     Ok(Some(token.to_owned()))
 }
 
+#[cfg(test)]
+pub(super) fn parse_token_for_test(token: &str) -> Option<Credential> {
+    parse_token(token)
+}
+
 fn parse_token(token: &str) -> Option<Credential> {
     let rest = TOKEN_PREFIXES
         .iter()
@@ -263,7 +296,8 @@ fn parse_token(token: &str) -> Option<Credential> {
     }
     Some(Credential {
         key_id: key_id.to_owned(),
-        secret_sha256: sha256_hex(secret),
+        fingerprint: sha256_hex(token),
+        token: SecretToken(token.to_owned()),
     })
 }
 
@@ -275,8 +309,8 @@ fn is_segment(segment: &str, max_len: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'~' || byte == b'-')
 }
 
-fn sha256_hex(secret: &str) -> String {
-    hex::encode(Sha256::digest(secret.as_bytes()))
+fn sha256_hex(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
 fn dataset_path_segment(path: &str) -> Option<&str> {
@@ -305,15 +339,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        commercial::{
-            test_support::{key_record, store_with, SECRET, SECRET_SHA256},
-            types::KeyRecord,
-        },
+        commercial::test_support::{cache_for, MockControlPlane, KEY_ID, SECRET, TOKEN},
         types::ErrorCode,
     };
 
-    const TOKEN: &str = "sqd_portal_k1_theverysecretvalue";
     const PORTAL: &str = "portal-premium-eu";
+    const NOW: u64 = 1_800_000_000;
 
     #[derive(Default)]
     struct StaticCatalog {
@@ -330,17 +361,26 @@ mod tests {
         }
     }
 
-    async fn gate(records: Vec<KeyRecord>, enforcement: Enforcement) -> Arc<Gate> {
-        counting_gate(records, enforcement).await.0
+    /// A gate whose control plane grants `KEY_ID` the given dataset scope. The
+    /// grant is minted far enough ahead that no test races its renewal.
+    async fn gate_granting(datasets: Option<Vec<&str>>, enforcement: Enforcement) -> Arc<Gate> {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(
+            KEY_ID,
+            datasets.map(|list| list.into_iter().map(str::to_owned).collect()),
+            NOW + 86_400,
+            NOW + 86_400,
+        );
+        gate_for(&cp, enforcement).await.0
     }
 
-    async fn counting_gate(
-        records: Vec<KeyRecord>,
+    async fn gate_for(
+        cp: &MockControlPlane,
         enforcement: Enforcement,
     ) -> (Arc<Gate>, Arc<AtomicUsize>) {
         let lookups = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Gate {
-            store: store_with(records).await,
+            cache: cache_for(cp).await,
             catalog: Arc::new(StaticCatalog {
                 aliases: HashMap::from([("base".to_string(), "base-mainnet".to_string())]),
                 lookups: lookups.clone(),
@@ -399,11 +439,27 @@ mod tests {
     #[test]
     fn parses_a_token_from_every_accepted_prefix() {
         for prefix in TOKEN_PREFIXES {
-            let credential = parse_token(&format!("{prefix}k1_{SECRET}"))
-                .unwrap_or_else(|| panic!("{prefix} token should parse"));
+            let token = format!("{prefix}k1_{SECRET}");
+            let credential =
+                parse_token(&token).unwrap_or_else(|| panic!("{prefix} token should parse"));
             assert_eq!(credential.key_id, "k1");
-            assert_eq!(credential.secret_sha256, SECRET_SHA256);
+            assert_eq!(credential.token.expose(), token);
         }
+    }
+
+    /// The property the cache key rests on: the same id with a different secret
+    /// is a different credential, so it can never reach the other's grant.
+    #[test]
+    fn the_fingerprint_covers_the_secret_and_not_just_the_id() {
+        let mine = parse_token(&format!("sqd_portal_k1_{SECRET}")).unwrap();
+        let guessed = parse_token("sqd_portal_k1_wrong").unwrap();
+
+        assert_eq!(mine.key_id, guessed.key_id);
+        assert_ne!(mine.fingerprint, guessed.fingerprint);
+        assert_eq!(
+            mine.fingerprint,
+            sha256_hex(&format!("sqd_portal_k1_{SECRET}"))
+        );
     }
 
     #[test]
@@ -421,7 +477,7 @@ mod tests {
     }
 
     /// The control plane mints two prefixes. Accepting a third widens what can
-    /// enter the negative cache and the rejection logs for no benefit.
+    /// buy an exchange and enter the rejection logs, for no benefit.
     #[test]
     fn rejects_prefixes_the_control_plane_never_mints() {
         for token in [
@@ -471,17 +527,20 @@ mod tests {
     }
 
     #[test]
-    fn credential_debug_never_prints_the_digest() {
+    fn no_rendering_of_a_credential_prints_the_token() {
         let credential = parse_token(TOKEN).unwrap();
-        let rendered = format!("{credential:?}");
 
-        assert!(rendered.contains("k1"));
-        assert!(!rendered.contains(&credential.secret_sha256));
-    }
-
-    #[test]
-    fn hash_matches_the_control_plane_vector() {
-        assert_eq!(sha256_hex(SECRET), SECRET_SHA256);
+        for rendered in [
+            format!("{credential:?}"),
+            format!("{:?}", credential.token),
+            format!("{:#?}", credential),
+        ] {
+            assert!(
+                !rendered.contains(SECRET),
+                "the secret reached a rendering: {rendered}"
+            );
+        }
+        assert!(format!("{credential:?}").contains("k1"));
     }
 
     #[test]
@@ -505,8 +564,10 @@ mod tests {
     /// otherwise be a one-line change nobody notices.
     #[tokio::test]
     async fn a_token_in_the_query_string_is_not_a_credential() {
-        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
-        let app = app(gate, "/datasets/:dataset/stream");
+        let app = app(
+            gate_granting(None, Enforcement::Enforce).await,
+            "/datasets/:dataset/stream",
+        );
 
         for query in ["api_key", "apikey", "key", "token", "access_token"] {
             let (status, body) = call(
@@ -541,18 +602,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_valid_key_is_served_from_header_and_query_alike() {
-        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
-        let app = app(gate, "/datasets/:dataset/stream");
+    async fn a_valid_key_is_served() {
+        let app = app(
+            gate_granting(None, Enforcement::Enforce).await,
+            "/datasets/:dataset/stream",
+        );
 
         let (status, body) = call(
-            app.clone(),
+            app,
             request("/datasets/base/stream")
                 .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await;
+
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "served");
     }
@@ -562,8 +626,10 @@ mod tests {
     /// tell an invalid key from a malformed query.
     #[tokio::test]
     async fn a_request_without_a_key_is_refused_in_the_taxonomy() {
-        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
-        let app = app(gate, "/datasets/:dataset/stream");
+        let app = app(
+            gate_granting(None, Enforcement::Enforce).await,
+            "/datasets/:dataset/stream",
+        );
 
         let response = app
             .oneshot(
@@ -593,14 +659,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_wrong_secret_is_rejected_before_the_handler_runs() {
-        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
-        let app = app(gate, "/datasets/:dataset/stream");
+    async fn a_denied_credential_is_rejected_before_the_handler_runs() {
+        let cp = MockControlPlane::spawn().await;
+        cp.deny(KEY_ID, "invalid_secret");
+        let app = app(
+            gate_for(&cp, Enforcement::Enforce).await.0,
+            "/datasets/:dataset/stream",
+        );
 
         let (status, body) = call(
             app,
             request("/datasets/base/stream")
-                .header(header::AUTHORIZATION, "Bearer sqd_portal_k1_wrong")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -614,10 +684,8 @@ mod tests {
     /// whether the secret was right (INV-39).
     #[tokio::test]
     async fn a_scope_refusal_is_indistinguishable_from_a_bad_secret_by_status() {
-        let mut record = key_record("k1", 1);
-        record.datasets = Some(vec!["base-mainnet".to_string()]);
         let app = app(
-            gate(vec![record], Enforcement::Enforce).await,
+            gate_granting(Some(vec!["base-mainnet"]), Enforcement::Enforce).await,
             "/datasets/:dataset/stream",
         );
 
@@ -642,10 +710,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_dataset_scoped_key_matches_the_canonical_name_behind_an_alias() {
-        let mut record = key_record("k1", 1);
-        record.datasets = Some(vec!["base-mainnet".to_string()]);
         let app = app(
-            gate(vec![record], Enforcement::Enforce).await,
+            gate_granting(Some(vec!["base-mainnet"]), Enforcement::Enforce).await,
             "/datasets/:dataset/stream",
         );
 
@@ -674,9 +740,10 @@ mod tests {
     /// cannot be checked there and is refused (OQ-13).
     #[tokio::test]
     async fn a_route_without_a_dataset_is_closed_to_dataset_scoped_keys() {
-        let mut record = key_record("k1", 1);
-        record.datasets = Some(vec!["base-mainnet".to_string()]);
-        let app = app(gate(vec![record], Enforcement::Enforce).await, "/sql/query");
+        let app = app(
+            gate_granting(Some(vec!["base-mainnet"]), Enforcement::Enforce).await,
+            "/sql/query",
+        );
 
         let (status, _) = call(
             app,
@@ -692,22 +759,22 @@ mod tests {
 
     #[tokio::test]
     async fn log_only_admits_everything_the_ladder_would_reject() {
-        let mut record = key_record("k1", 1);
-        record.datasets = Some(vec!["nothing-matching".to_string()]);
-        record.portal_ids = Some(Vec::new());
+        let cp = MockControlPlane::spawn().await;
+        cp.deny(KEY_ID, "revoked");
         let app = app(
-            gate(vec![record], Enforcement::LogOnly).await,
+            gate_for(&cp, Enforcement::LogOnly).await.0,
             "/datasets/:dataset/stream",
         );
 
         for token in [
             // No credential at all.
             None,
-            // A valid one the ladder refuses on both scope rungs.
+            // A well-formed one the control plane refuses.
             Some(format!("Bearer {TOKEN}")),
             // Unparseable.
             Some("Bearer garbage".to_string()),
-            // A well-formed token naming a key the portal does not know.
+            // A well-formed token naming a key the control plane never answers
+            // about, so the exchange fails.
             Some(format!("Bearer sqd_portal_unknown_{SECRET}")),
         ] {
             let mut builder = request("/datasets/base/stream");
@@ -729,9 +796,10 @@ mod tests {
     /// it: the rungs below the dataset rung are the whole defence.
     #[tokio::test]
     async fn a_request_that_fails_an_earlier_rung_never_resolves_the_dataset() {
-        let mut record = key_record("k1", 1);
-        record.datasets = Some(vec!["base-mainnet".to_string()]);
-        let (gate, lookups) = counting_gate(vec![record], Enforcement::Enforce).await;
+        let cp = MockControlPlane::spawn().await;
+        cp.deny(KEY_ID, "invalid_secret");
+        cp.deny("unknown", "unknown_key");
+        let (gate, lookups) = gate_for(&cp, Enforcement::Enforce).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         for headers in [
@@ -739,13 +807,13 @@ mod tests {
             HeaderMap::new(),
             // A token that cannot be parsed.
             header_map("Bearer nonsense"),
-            // A well-formed token naming a key the portal does not know.
+            // A well-formed token the control plane says nothing good about.
             header_map(&format!("Bearer sqd_portal_unknown_{SECRET}")),
-            // A known key presenting the wrong secret.
-            header_map("Bearer sqd_portal_k1_wrong"),
+            // The right id with the wrong secret.
+            header_map(&format!("Bearer {TOKEN}")),
         ] {
             let decision = gate.decide(&headers, &uri, true).await;
-            assert!(matches!(decision, Decision::Reject(_)));
+            assert!(matches!(decision, Decision::Reject(_)), "{headers:?}");
         }
         assert_eq!(
             lookups.load(Ordering::Relaxed),
@@ -754,6 +822,13 @@ mod tests {
         );
 
         // The dataset rung itself still resolves, exactly once.
+        let (gate, lookups) = gate_for(&cp, Enforcement::Enforce).await;
+        cp.grant(
+            KEY_ID,
+            Some(vec!["base-mainnet".to_string()]),
+            NOW + 86_400,
+            NOW + 86_400,
+        );
         let decision = gate
             .decide(&header_map(&format!("Bearer {TOKEN}")), &uri, true)
             .await;
@@ -761,11 +836,13 @@ mod tests {
         assert_eq!(lookups.load(Ordering::Relaxed), 1);
     }
 
-    /// A key with no dataset list is authorized for every dataset, so nothing
-    /// in the ladder needs the request's dataset resolved.
+    /// A grant with no dataset list authorizes every dataset, so nothing in the
+    /// ladder needs the request's dataset resolved.
     #[tokio::test]
     async fn an_unscoped_key_does_not_resolve_the_dataset_either() {
-        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 86_400, NOW + 86_400);
+        let (gate, lookups) = gate_for(&cp, Enforcement::Enforce).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         let decision = gate
@@ -780,7 +857,9 @@ mod tests {
     /// have authenticated, so resolving costs what a real customer costs.
     #[tokio::test]
     async fn log_only_still_resolves_the_dataset_of_an_admitted_request() {
-        let (gate, lookups) = counting_gate(vec![key_record("k1", 1)], Enforcement::LogOnly).await;
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 86_400, NOW + 86_400);
+        let (gate, lookups) = gate_for(&cp, Enforcement::LogOnly).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         gate.decide(&HeaderMap::new(), &uri, true).await;
@@ -799,7 +878,7 @@ mod tests {
 
     #[tokio::test]
     async fn log_only_still_evaluates_the_full_ladder() {
-        let gate = gate(vec![key_record("k1", 1)], Enforcement::LogOnly).await;
+        let gate = gate_granting(None, Enforcement::LogOnly).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         let decision = gate.decide(&HeaderMap::new(), &uri, true).await;
@@ -819,15 +898,17 @@ mod tests {
     /// split them is an enumeration oracle with a scrape interval attached.
     #[tokio::test]
     async fn a_scrape_cannot_tell_an_unknown_key_from_a_wrong_secret() {
-        let gate = gate(vec![key_record("k1", 1)], Enforcement::Enforce).await;
+        let cp = MockControlPlane::spawn().await;
+        cp.deny(KEY_ID, "invalid_secret");
+        cp.deny("guessed", "unknown_key");
+        let (gate, _) = gate_for(&cp, Enforcement::Enforce).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         let mut projections = Vec::new();
         for token in [
             // Known id, wrong secret.
-            "Bearer sqd_portal_k1_wrong".to_string(),
-            // An id the snapshot has never held, and the control plane
-            // authoritatively does not know.
+            format!("Bearer {TOKEN}"),
+            // An id the control plane authoritatively does not know.
             format!("Bearer sqd_portal_guessed_{SECRET}"),
             // A token the portal cannot even parse.
             "Bearer sqd_portal_nonsense".to_string(),
@@ -862,18 +943,19 @@ mod tests {
         }
     }
 
-    /// GAP-32, the accepted residual. Under lookup pressure a snapshot miss and
-    /// a snapshot hit answer differently — retryable congestion versus a
-    /// credential verdict — so the wire does reveal membership there. That is
-    /// REQ-54's accurate retry contract, and the alternative is refusing valid
-    /// keys during a control-plane blip.
+    /// GAP-32, the accepted residual. Under exchange pressure an uncached
+    /// credential and a cached one answer differently — retryable congestion
+    /// versus a verdict — so the wire does reveal cache membership. That is
+    /// REQ-54's accurate retry contract, and the alternative is answering a
+    /// dependency failure with a claim about someone's key.
     ///
     /// What must not happen is the scrape amplifying it: the counter carries
-    /// the code the caller already received and nothing about the lookup.
+    /// the code the caller already received and nothing about the exchange.
     #[tokio::test]
-    async fn a_saturated_lookup_is_publicly_indistinguishable_from_any_overload() {
-        let gate = gate(Vec::new(), Enforcement::Enforce).await;
-        gate.store.exhaust_lookup_budget_for_test();
+    async fn a_saturated_exchange_is_publicly_indistinguishable_from_any_overload() {
+        let cp = MockControlPlane::spawn().await;
+        let (gate, _) = gate_for(&cp, Enforcement::Enforce).await;
+        gate.cache.exhaust_budget_for_test();
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         let decision = gate
@@ -887,7 +969,7 @@ mod tests {
         let Decision::Reject(rejection) = decision else {
             panic!("a spent budget refuses");
         };
-        assert_eq!(rejection.reason, "lookup_saturated");
+        assert_eq!(rejection.reason, "exchange_saturated");
 
         let projection = public_projection(&gate, decision);
         assert_eq!(
@@ -901,8 +983,8 @@ mod tests {
         assert!(
             !projection
                 .iter()
-                .any(|(_, value)| value.contains("lookup") || value.contains("snapshot")),
-            "no lookup detail may reach a keyless scrape: {projection:?}"
+                .any(|(_, value)| value.contains("exchange") || value.contains("grant")),
+            "no exchange detail may reach a keyless scrape: {projection:?}"
         );
     }
 
@@ -911,9 +993,10 @@ mod tests {
     /// (REQ-55).
     #[tokio::test]
     async fn a_shadow_scrape_says_only_that_a_request_was_evaluated() {
-        let mut scoped = key_record("k2", 1);
-        scoped.datasets = Some(vec!["nothing-matching".to_string()]);
-        let gate = gate(vec![key_record("k1", 1), scoped], Enforcement::LogOnly).await;
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 86_400, NOW + 86_400);
+        cp.deny("k2", "revoked");
+        let (gate, _) = gate_for(&cp, Enforcement::LogOnly).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         let mut projections = Vec::new();
@@ -922,7 +1005,7 @@ mod tests {
             header_map(&format!("Bearer {TOKEN}")),
             // Would refuse: no credential.
             HeaderMap::new(),
-            // Would refuse: scoped to another dataset.
+            // Would refuse: the control plane revoked it.
             header_map(&format!("Bearer sqd_portal_k2_{SECRET}")),
         ] {
             let decision = gate.decide(&headers, &uri, true).await;
@@ -947,9 +1030,9 @@ mod tests {
     /// exact delta, since the family is shared.
     #[tokio::test]
     async fn an_enforced_refusal_is_counted_under_the_code_the_client_received() {
-        let mut record = key_record("k1", 1);
-        record.expires_at = Some(1);
-        let gate = gate(vec![record], Enforcement::Enforce).await;
+        let cp = MockControlPlane::spawn().await;
+        cp.deny(KEY_ID, "expired");
+        let (gate, _) = gate_for(&cp, Enforcement::Enforce).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
         let expired = || {

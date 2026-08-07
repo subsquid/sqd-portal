@@ -7859,6 +7859,7 @@ dependencies = [
  "itertools 0.12.1",
  "lazy_static",
  "libz-ng-sys",
+ "lru",
  "num-rational",
  "num-traits",
  "once_cell",

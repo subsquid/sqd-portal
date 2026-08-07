@@ -1,15 +1,11 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use axum::{
-    http::{header, HeaderValue},
-    response::Response,
-};
-use subtle::ConstantTimeEq;
+use axum::{http::header, response::Response};
 
 use super::{
+    cache::{CachedGrant, GrantCache, Resolved},
     extractor::Credential,
-    store::{Lookup, SnapshotStore},
-    types::{KeyRecord, KeyStatus},
+    types::denial,
 };
 use crate::types::{coded_response, ErrorCode, RETRY_AFTER_FLOOR};
 
@@ -25,7 +21,8 @@ pub struct Rejection {
     /// rejections share one on purpose.
     pub code: ErrorCode,
     /// Stable label for protected logs. Never sent to the client and never a
-    /// metric label: four of these collapse onto `invalid_credential` (INV-39).
+    /// metric label: several of these collapse onto `invalid_credential`
+    /// (INV-39).
     pub reason: &'static str,
 }
 
@@ -44,32 +41,30 @@ const MISSING_CREDENTIAL: Rejection =
     Rejection::new(ErrorCode::MissingCredential, "missing_credential");
 const UNKNOWN_KEY: Rejection = Rejection::new(ErrorCode::InvalidCredential, "unknown_key");
 const INVALID_SECRET: Rejection = Rejection::new(ErrorCode::InvalidCredential, "invalid_secret");
-/// A record with no digest cannot establish that the caller holds the secret, so
-/// it fails the secret rung rather than disclosing the later revoked one
-/// (REQ-53).
-const NO_DIGEST: Rejection = Rejection::new(ErrorCode::InvalidCredential, "no_digest");
+/// A denial this build has no code for. Still a denial — reported as the
+/// coarsest one, which is the fail-closed direction — and its raw reason
+/// reaches the protected log.
+const UNRECOGNIZED_DENIAL: Rejection =
+    Rejection::new(ErrorCode::InvalidCredential, "denied_unrecognized");
 const REVOKED: Rejection = Rejection::new(ErrorCode::RevokedCredential, "revoked");
-/// A tombstone is digestless, so it cannot earn the specific `revoked` answer:
-/// that would confirm a guessed key id exists. The operator keeps the
-/// distinction on `reason`, which only protected logs see (ADR-017).
-const REVOKED_TOMBSTONE: Rejection =
-    Rejection::new(ErrorCode::InvalidCredential, "revoked_tombstone");
 const EXPIRED: Rejection = Rejection::new(ErrorCode::ExpiredCredential, "expired");
 const PORTAL_NOT_ALLOWED: Rejection =
     Rejection::new(ErrorCode::PortalNotAllowed, "portal_not_allowed");
 const DATASET_NOT_ALLOWED: Rejection =
     Rejection::new(ErrorCode::DatasetNotAllowed, "dataset_not_allowed");
 
-/// A credential that cannot even be parsed never reaches the ladder.
+/// A credential that cannot even be parsed never reaches the ladder, and never
+/// costs an exchange.
 pub(super) const MALFORMED: Rejection =
     Rejection::new(ErrorCode::InvalidCredential, "malformed_credential");
 
 /// Neither of these is an auth verdict: the portal did not decide the credential
-/// is bad, it failed to find out. Answering `invalid_credential` would tell a
-/// customer whose key was minted seconds ago to stop retrying (ADR-016 §3,
-/// REQ-54).
-const LOOKUP_SATURATED: Rejection = Rejection::new(ErrorCode::Overloaded, "lookup_saturated");
-const LOOKUP_FAILED: Rejection = Rejection::new(ErrorCode::UpstreamUnavailable, "lookup_failed");
+/// is bad, it failed to find out. Answering `invalid_credential` — non-retryable
+/// — would tell a customer whose key is perfectly good to stop retrying, on the
+/// strength of the portal's own dependency being down (REQ-54).
+const EXCHANGE_SATURATED: Rejection = Rejection::new(ErrorCode::Overloaded, "exchange_saturated");
+const EXCHANGE_FAILED: Rejection =
+    Rejection::new(ErrorCode::UpstreamUnavailable, "exchange_failed");
 
 /// The dataset a request targets, named on demand. Naming it is not free: it
 /// canonicalizes through the network client's catalog and interns the result in
@@ -105,73 +100,90 @@ impl<F: Fn() -> Option<String>> LazyDataset<F> {
     }
 }
 
-/// Phase-1 authorization: authentication plus coarse portal/dataset scoping.
-/// A key that passes streams unrestricted — no limits, no quota, no metering.
+/// The verdict, and the raw denial reason behind it where there was one. The
+/// reason exists only for the protected log — the wire and the scrape both see
+/// `Decision` and nothing finer.
+pub struct Verdict {
+    pub decision: Decision,
+    pub denial_reason: Option<String>,
+}
+
+impl Verdict {
+    fn of(decision: Decision) -> Self {
+        Self {
+            decision,
+            denial_reason: None,
+        }
+    }
+}
+
+/// Phase-1 authorization: authentication plus coarse dataset scoping. A key that
+/// passes streams unrestricted — no limits, no quota, no metering.
+///
+/// The portal owns the first rungs and the last; authentication, revocation,
+/// expiry and portal scope are the control plane's answer to the exchange
+/// (REQ-53), which is why they arrive here already decided.
 pub async fn evaluate<F: Fn() -> Option<String>>(
-    store: &SnapshotStore,
-    portal_id: &str,
+    cache: &Arc<GrantCache>,
     credential: Option<&Credential>,
     dataset: &LazyDataset<F>,
     now_secs: u64,
-) -> Decision {
+) -> Verdict {
     let Some(credential) = credential else {
-        return Decision::Reject(MISSING_CREDENTIAL);
-    };
-    let record = match store.get_or_resolve(&credential.key_id).await {
-        Lookup::Found(record) => record,
-        Lookup::Unknown => return Decision::Reject(UNKNOWN_KEY),
-        Lookup::Saturated => return Decision::Reject(LOOKUP_SATURATED),
-        Lookup::Unavailable => return Decision::Reject(LOOKUP_FAILED),
+        return Verdict::of(Decision::Reject(MISSING_CREDENTIAL));
     };
 
-    evaluate_record(&record, portal_id, credential, dataset, now_secs)
+    let grant = match cache.resolve(credential, now_secs).await {
+        Resolved::Grant(grant) => grant,
+        Resolved::Denied(reason) => {
+            return Verdict {
+                decision: Decision::Reject(rejection_for(&reason)),
+                denial_reason: Some(reason),
+            }
+        }
+        Resolved::Saturated => return Verdict::of(Decision::Reject(EXCHANGE_SATURATED)),
+        Resolved::Unavailable => return Verdict::of(Decision::Reject(EXCHANGE_FAILED)),
+    };
+
+    Verdict::of(evaluate_scope(&grant, dataset))
 }
 
-fn evaluate_record<F: Fn() -> Option<String>>(
-    record: &KeyRecord,
-    portal_id: &str,
-    credential: &Credential,
+/// The one rung the grant does not settle: a grant is per credential and outlives
+/// the request, so which dataset this particular request asked for has to be
+/// matched here.
+fn evaluate_scope<F: Fn() -> Option<String>>(
+    grant: &CachedGrant,
     dataset: &LazyDataset<F>,
-    now_secs: u64,
 ) -> Decision {
-    let Some(expected) = record.secret_sha256.as_deref() else {
-        // No digest is the control plane's tombstone shape, and a record that
-        // cannot prove the caller holds the secret cannot disclose anything a
-        // caller holding it would learn. Both answers are `invalid_credential`
-        // on the wire; only `reason` tells them apart, in the protected log.
-        return Decision::Reject(if record.status == KeyStatus::Active {
-            NO_DIGEST
-        } else {
-            REVOKED_TOMBSTONE
-        });
-    };
-    if !constant_time_eq(expected, &credential.secret_sha256) {
-        return Decision::Reject(INVALID_SECRET);
-    }
-    if record.status != KeyStatus::Active {
-        return Decision::Reject(REVOKED);
-    }
-    if record.expires_at.is_some_and(|expiry| expiry <= now_secs) {
-        return Decision::Reject(EXPIRED);
-    }
     // A null list means "any"; an explicit list is matched exactly.
-    if let Some(portal_ids) = record.portal_ids.as_deref() {
-        if !portal_ids.iter().any(|allowed| allowed == portal_id) {
-            return Decision::Reject(PORTAL_NOT_ALLOWED);
-        }
+    let Some(datasets) = grant.datasets.as_deref() else {
+        return Decision::Admit;
+    };
+    // The first and only rung that needs the request's dataset named.
+    let requested = dataset.resolve();
+    let allowed = requested
+        .as_deref()
+        .is_some_and(|dataset| datasets.iter().any(|allowed| allowed == dataset));
+    if allowed {
+        Decision::Admit
+    } else {
+        Decision::Reject(DATASET_NOT_ALLOWED)
     }
-    if let Some(datasets) = record.datasets.as_deref() {
-        // The first and only rung that needs the request's dataset named.
-        let requested = dataset.resolve();
-        let allowed = requested
-            .as_deref()
-            .is_some_and(|dataset| datasets.iter().any(|allowed| allowed == dataset));
-        if !allowed {
-            return Decision::Reject(DATASET_NOT_ALLOWED);
-        }
-    }
+}
 
-    Decision::Admit
+/// A reason this build does not know is still a refusal. Mapping it to the
+/// coarsest code rather than failing the exchange keeps the fail-closed
+/// direction: a newer control plane that denies for a new reason must not have
+/// its denial read as a dependency failure and retried.
+fn rejection_for(reason: &str) -> Rejection {
+    match reason {
+        denial::UNKNOWN_KEY => UNKNOWN_KEY,
+        denial::INVALID_SECRET => INVALID_SECRET,
+        denial::REVOKED => REVOKED,
+        denial::EXPIRED => EXPIRED,
+        denial::PORTAL_NOT_ALLOWED => PORTAL_NOT_ALLOWED,
+        _ => UNRECOGNIZED_DENIAL,
+    }
 }
 
 impl Rejection {
@@ -179,7 +191,7 @@ impl Rejection {
     /// 400 `malformed_request` (GAP-29).
     pub fn into_response(self) -> Response {
         let mut response = coded_response(self.code, self.code.default_message());
-        // Only the two lookup outcomes reach this; no auth verdict is retryable.
+        // Only the two exchange outcomes reach this; no auth verdict is retryable.
         if self.code.requires_hint() {
             response
                 .headers_mut()
@@ -189,42 +201,12 @@ impl Rejection {
     }
 }
 
-/// Secret digests are compared without an early exit so a wrong key cannot be
-/// refined byte by byte from response timing.
-fn constant_time_eq(left: &str, right: &str) -> bool {
-    left.as_bytes().ct_eq(right.as_bytes()).into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commercial::{
-        test_support::{key_record, offline_store, store_with, SECRET_SHA256},
-        types::KeyStatus,
-    };
+    use crate::commercial::test_support::{cache_for, credential, MockControlPlane, KEY_ID};
 
     const NOW: u64 = 1_800_000_000;
-    const PORTAL: &str = "portal-premium-eu";
-
-    fn credential(key_id: &str, secret_sha256: &str) -> Credential {
-        Credential {
-            key_id: key_id.to_owned(),
-            secret_sha256: secret_sha256.to_owned(),
-        }
-    }
-
-    fn valid() -> Credential {
-        credential("k1", SECRET_SHA256)
-    }
-
-    async fn decide(
-        record: KeyRecord,
-        credential: Option<&Credential>,
-        dataset: Option<&str>,
-    ) -> Decision {
-        let store = store_with(vec![record]).await;
-        evaluate(&store, PORTAL, credential, &named(dataset), NOW).await
-    }
 
     /// Tests hand the ladder a dataset name directly; only the request path has
     /// a resolution to defer.
@@ -232,89 +214,142 @@ mod tests {
         LazyDataset::new(move || dataset.map(str::to_owned))
     }
 
-    fn reason(decision: Decision) -> &'static str {
-        match decision {
+    fn reason(verdict: &Verdict) -> &'static str {
+        match verdict.decision {
             Decision::Admit => "admit",
             Decision::Reject(rejection) => rejection.reason,
         }
     }
 
     /// What the client is told, as opposed to what the log records.
-    fn code(decision: Decision) -> &'static str {
-        match decision {
+    fn code(verdict: &Verdict) -> &'static str {
+        match verdict.decision {
             Decision::Admit => "admit",
             Decision::Reject(rejection) => rejection.code.as_str(),
         }
     }
 
-    #[tokio::test]
-    async fn rule_1_no_credential_is_refused() {
-        let decision = decide(key_record("k1", 1), None, Some("ethereum-mainnet")).await;
-
-        assert_eq!(reason(decision), "missing_credential");
+    async fn decide(cp: &MockControlPlane, dataset: Option<&str>) -> Verdict {
+        let cache = cache_for(cp).await;
+        evaluate(&cache, Some(&credential()), &named(dataset), NOW).await
     }
 
     #[tokio::test]
-    async fn rule_2_unknown_key_is_refused() {
-        let store = store_with(vec![key_record("k1", 1)]).await;
-        let credential = credential("other", SECRET_SHA256);
+    async fn rung_1_no_credential_is_refused_without_an_exchange() {
+        let cp = MockControlPlane::spawn().await;
+        let cache = cache_for(&cp).await;
 
-        let decision = evaluate(&store, PORTAL, Some(&credential), &named(Some("eth")), NOW).await;
+        let verdict = evaluate(&cache, None, &named(Some("ethereum-mainnet")), NOW).await;
 
-        assert_eq!(reason(decision), "unknown_key");
-        assert_eq!(code(decision), "invalid_credential");
+        assert_eq!(reason(&verdict), "missing_credential");
+        assert_eq!(cp.exchanges(), 0);
     }
 
-    /// REQ-54: a snapshot miss the portal could not resolve is not a verdict on
-    /// the credential. Answering `invalid_credential` — non-retryable — would
-    /// tell the holder of a key minted seconds ago to give up, on the strength
-    /// of the portal's own dependency being down.
     #[tokio::test]
-    async fn an_unresolvable_miss_is_retryable_rather_than_a_bad_credential() {
-        let store = offline_store(vec![key_record("k1", 1)]);
-        let credential = credential("minted-just-now", SECRET_SHA256);
+    async fn the_control_planes_denials_map_onto_their_wire_codes() {
+        for (denied, expected_reason, expected_code) in [
+            ("unknown_key", "unknown_key", "invalid_credential"),
+            ("invalid_secret", "invalid_secret", "invalid_credential"),
+            ("revoked", "revoked", "revoked_credential"),
+            ("expired", "expired", "expired_credential"),
+            (
+                "portal_not_allowed",
+                "portal_not_allowed",
+                "portal_not_allowed",
+            ),
+        ] {
+            let cp = MockControlPlane::spawn().await;
+            cp.deny(KEY_ID, denied);
 
-        let decision = evaluate(&store, PORTAL, Some(&credential), &named(None), NOW).await;
+            let verdict = decide(&cp, Some("ethereum-mainnet")).await;
 
-        assert_eq!(reason(decision), "lookup_failed");
-        assert_eq!(code(decision), "upstream_unavailable");
-        let Decision::Reject(rejection) = decision else {
-            panic!("an unresolvable miss is refused");
+            assert_eq!(reason(&verdict), expected_reason);
+            assert_eq!(code(&verdict), expected_code);
+            assert_eq!(verdict.denial_reason.as_deref(), Some(denied));
+        }
+    }
+
+    /// A newer control plane denying for a reason this build predates must not
+    /// have its refusal read as a dependency failure and retried.
+    #[tokio::test]
+    async fn an_unrecognized_denial_is_still_a_refusal() {
+        let cp = MockControlPlane::spawn().await;
+        cp.deny(KEY_ID, "quota_exhausted_for_the_billing_period");
+
+        let verdict = decide(&cp, Some("ethereum-mainnet")).await;
+
+        assert_eq!(reason(&verdict), "denied_unrecognized");
+        assert_eq!(code(&verdict), "invalid_credential");
+        assert_eq!(
+            verdict.denial_reason.as_deref(),
+            Some("quota_exhausted_for_the_billing_period"),
+            "the operator needs the reason the client must not get"
+        );
+    }
+
+    /// The wire coarsening INV-39 rests on: distinct internal rungs, one code,
+    /// and no way to tell an unknown id from a known one with a wrong secret.
+    #[tokio::test]
+    async fn every_unauthenticated_rung_answers_the_same_code() {
+        let mut verdicts = Vec::new();
+        for denied in ["unknown_key", "invalid_secret", "something_new"] {
+            let cp = MockControlPlane::spawn().await;
+            cp.deny(KEY_ID, denied);
+            verdicts.push(decide(&cp, None).await);
+        }
+
+        assert_eq!(
+            verdicts.iter().map(reason).collect::<Vec<_>>(),
+            ["unknown_key", "invalid_secret", "denied_unrecognized"],
+            "the operator keeps the distinction on the protected axis"
+        );
+        for verdict in &verdicts {
+            assert_eq!(
+                code(verdict),
+                "invalid_credential",
+                "{}: the wire must not distinguish these",
+                reason(verdict)
+            );
+        }
+    }
+
+    /// REQ-54: an exchange the portal could not make is not a verdict on the
+    /// credential, and the client is told it is worth retrying.
+    #[tokio::test]
+    async fn an_unresolvable_credential_is_retryable_rather_than_bad() {
+        let cp = MockControlPlane::spawn().await;
+        cp.stop();
+
+        let verdict = decide(&cp, None).await;
+
+        assert_eq!(reason(&verdict), "exchange_failed");
+        assert_eq!(code(&verdict), "upstream_unavailable");
+        let Decision::Reject(rejection) = verdict.decision else {
+            panic!("an unreachable control plane refuses");
         };
         assert!(
             rejection.code.error_type().retryable(),
             "the client must be told this one is worth retrying"
         );
-
-        // A snapshot *hit* is unaffected: fail-static means the last good
-        // snapshot keeps answering through the same outage.
-        let decision = evaluate(&store, PORTAL, Some(&valid()), &named(None), NOW).await;
-        assert_eq!(reason(decision), "admit");
     }
 
     /// The other half of REQ-54: the budget running out is congestion, and owes
     /// the client a back-off interval rather than a verdict.
     #[tokio::test]
-    async fn a_spent_lookup_budget_is_overload() {
-        let store = offline_store(Vec::new());
-        store.exhaust_lookup_budget_for_test();
+    async fn a_spent_exchange_budget_is_overload() {
+        let cp = MockControlPlane::spawn().await;
+        let cache = cache_for(&cp).await;
+        cache.exhaust_budget_for_test();
 
-        let decision = evaluate(
-            &store,
-            PORTAL,
-            Some(&credential("minted-just-now", SECRET_SHA256)),
-            &named(None),
-            NOW,
-        )
-        .await;
+        let verdict = evaluate(&cache, Some(&credential()), &named(None), NOW).await;
 
-        assert_eq!(reason(decision), "lookup_saturated");
-        assert_eq!(code(decision), "overloaded");
+        assert_eq!(reason(&verdict), "exchange_saturated");
+        assert_eq!(code(&verdict), "overloaded");
 
-        let response = match decision {
-            Decision::Reject(rejection) => rejection.into_response(),
-            Decision::Admit => panic!("a spent budget refuses"),
+        let Decision::Reject(rejection) = verdict.decision else {
+            panic!("a spent budget refuses");
         };
+        let response = rejection.into_response();
         assert_eq!(response.status(), crate::types::server_overloaded());
         assert!(
             response.headers().contains_key(header::RETRY_AFTER),
@@ -323,262 +358,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_3_secret_mismatch_is_refused() {
-        let wrong = credential("k1", &"0".repeat(64));
-
-        let decision = decide(key_record("k1", 1), Some(&wrong), Some("ethereum-mainnet")).await;
-
-        assert_eq!(reason(decision), "invalid_secret");
-    }
-
-    /// An *active* record with no digest is malformed rather than tombstoned,
-    /// and there is nothing to authenticate against: it stays indistinguishable
-    /// from a wrong secret.
-    #[tokio::test]
-    async fn a_record_without_a_secret_digest_cannot_authenticate() {
-        let mut record = key_record("k1", 1);
-        record.secret_sha256 = None;
-
-        let decision = decide(record, Some(&valid()), Some("ethereum-mainnet")).await;
-
-        assert_eq!(reason(decision), "no_digest");
-        assert_eq!(code(decision), "invalid_credential");
-    }
-
-    /// The control plane publishes a revoked key as a tombstone: identity,
-    /// status and sequence, and no digest at all. That is the only shape a
-    /// revoked key ever arrives in, so it is the shape this rung is tested on.
-    fn cp_tombstone() -> KeyRecord {
-        serde_json::from_value(serde_json::json!({
-            "key_id": "k1",
-            "organization_id": "11111111-1111-1111-1111-111111111111",
-            "status": "revoked",
-            "seq": 2,
-        }))
-        .expect("the control plane's tombstone shape must parse")
-    }
-
-    /// A tombstone cannot check the presented secret, so it cannot tell the
-    /// caller anything only a secret-holder should learn — including that the
-    /// id it guessed exists. `revoked_credential` is reserved for a record that
-    /// proved the caller holds the secret; the tombstone answers
-    /// `invalid_credential` and keeps its own reason for the log (ADR-017).
-    #[tokio::test]
-    async fn rule_4_a_tombstone_is_revoked_in_the_log_and_invalid_on_the_wire() {
-        let record = cp_tombstone();
-        assert_eq!(record.secret_sha256, None);
-
-        let decision = decide(record, Some(&valid()), Some("ethereum-mainnet")).await;
-
-        assert_eq!(
-            reason(decision),
-            "revoked_tombstone",
-            "the operator has to be able to tell a revoked key from a wrong secret"
-        );
-        assert_eq!(
-            code(decision),
-            "invalid_credential",
-            "the client must not learn that the guessed id exists"
-        );
-    }
-
-    /// A key that still carries a digest is a different matter: the caller has
-    /// proved it holds the secret, so `revoked` discloses nothing it did not
-    /// already know — but only after the secret is checked.
-    #[tokio::test]
-    async fn a_revoked_key_that_still_carries_a_digest_checks_the_secret_first() {
-        let mut record = key_record("k1", 1);
-        record.status = KeyStatus::Revoked;
-
-        let wrong = credential("k1", &"0".repeat(64));
-        assert_eq!(
-            reason(decide(record.clone(), Some(&wrong), Some("ethereum-mainnet")).await),
-            "invalid_secret"
-        );
-        let decision = decide(record, Some(&valid()), Some("ethereum-mainnet")).await;
-        assert_eq!(reason(decision), "revoked");
-        assert_eq!(code(decision), "revoked_credential");
-    }
-
-    /// The wire coarsening INV-39 rests on: four internal rungs, one code.
-    #[tokio::test]
-    async fn every_unauthenticated_rung_answers_the_same_code() {
-        let mut active_without_digest = key_record("k1", 1);
-        active_without_digest.secret_sha256 = None;
-
-        let store = store_with(vec![key_record("k1", 1)]).await;
-        let unknown_id = credential("other", SECRET_SHA256);
-
-        let decisions = [
-            // Unknown key id.
-            evaluate(&store, PORTAL, Some(&unknown_id), &named(None), NOW).await,
-            // Known id, wrong secret.
-            decide(
-                key_record("k1", 1),
-                Some(&credential("k1", &"0".repeat(64))),
-                None,
-            )
-            .await,
-            // Active record carrying no digest.
-            decide(active_without_digest, Some(&valid()), None).await,
-            // Tombstone.
-            decide(cp_tombstone(), Some(&valid()), None).await,
-        ];
-
-        let reasons: Vec<_> = decisions.iter().map(|d| reason(*d)).collect();
-        assert_eq!(
-            reasons,
-            [
-                "unknown_key",
-                "invalid_secret",
-                "no_digest",
-                "revoked_tombstone"
-            ],
-            "the operator keeps the distinction on the protected axis"
-        );
-        for decision in decisions {
-            assert_eq!(
-                code(decision),
-                "invalid_credential",
-                "{}: the wire must not distinguish these",
-                reason(decision)
+    async fn dataset_membership_is_exact() {
+        async fn scope(datasets: Option<Vec<&str>>, requested: Option<&str>) -> &'static str {
+            let cp = MockControlPlane::spawn().await;
+            cp.grant(
+                KEY_ID,
+                datasets.map(|list| list.into_iter().map(str::to_owned).collect()),
+                NOW + 300,
+                NOW + 900,
             );
+            reason(&decide(&cp, requested).await)
         }
-    }
 
-    #[tokio::test]
-    async fn rule_5_expiry_refuses_only_once_past() {
-        let mut record = key_record("k1", 1);
-        record.expires_at = Some(NOW + 1);
         assert_eq!(
-            reason(decide(record.clone(), Some(&valid()), Some("ethereum-mainnet")).await),
-            "admit"
-        );
-
-        record.expires_at = Some(NOW);
-        assert_eq!(
-            reason(decide(record.clone(), Some(&valid()), Some("ethereum-mainnet")).await),
-            "expired"
-        );
-
-        record.expires_at = None;
-        assert_eq!(
-            reason(decide(record, Some(&valid()), Some("ethereum-mainnet")).await),
-            "admit"
-        );
-    }
-
-    #[tokio::test]
-    async fn rule_6_portal_membership() {
-        let mut record = key_record("k1", 1);
-
-        record.portal_ids = None;
-        assert_eq!(
-            reason(decide(record.clone(), Some(&valid()), Some("ethereum-mainnet")).await),
-            "admit",
-            "a null list means any portal"
-        );
-
-        record.portal_ids = Some(vec!["portal-other".to_string(), PORTAL.to_string()]);
-        assert_eq!(
-            reason(decide(record.clone(), Some(&valid()), Some("ethereum-mainnet")).await),
-            "admit"
-        );
-
-        record.portal_ids = Some(vec!["portal-other".to_string()]);
-        assert_eq!(
-            reason(decide(record.clone(), Some(&valid()), Some("ethereum-mainnet")).await),
-            "portal_not_allowed"
-        );
-
-        record.portal_ids = Some(Vec::new());
-        assert_eq!(
-            reason(decide(record, Some(&valid()), Some("ethereum-mainnet")).await),
-            "portal_not_allowed",
-            "an empty list means no portal"
-        );
-    }
-
-    #[tokio::test]
-    async fn rule_7_dataset_membership_is_exact() {
-        let mut record = key_record("k1", 1);
-
-        record.datasets = None;
-        assert_eq!(
-            reason(decide(record.clone(), Some(&valid()), Some("ethereum-mainnet")).await),
+            scope(None, Some("ethereum-mainnet")).await,
             "admit",
             "a null list means every dataset"
         );
-
-        record.datasets = Some(vec!["ethereum-mainnet".to_string()]);
         assert_eq!(
-            reason(decide(record.clone(), Some(&valid()), Some("ethereum-mainnet")).await),
+            scope(Some(vec!["ethereum-mainnet"]), Some("ethereum-mainnet")).await,
             "admit"
         );
         assert_eq!(
-            reason(decide(record.clone(), Some(&valid()), Some("base-mainnet")).await),
+            scope(Some(vec!["ethereum-mainnet"]), Some("base-mainnet")).await,
             "dataset_not_allowed"
         );
         assert_eq!(
-            reason(decide(record.clone(), Some(&valid()), Some("ethereum")).await),
+            scope(Some(vec!["ethereum-mainnet"]), Some("ethereum")).await,
             "dataset_not_allowed",
             "matching is exact, not by prefix or alias"
         );
-
-        // `*` is a dataset name like any other: null already means "all".
-        record.datasets = Some(vec!["*".to_string()]);
         assert_eq!(
-            reason(decide(record.clone(), Some(&valid()), Some("ethereum-mainnet")).await),
-            "dataset_not_allowed"
+            scope(Some(vec!["*"]), Some("ethereum-mainnet")).await,
+            "dataset_not_allowed",
+            "`*` is a dataset name like any other: null already means all"
         );
-
-        record.datasets = Some(vec!["ethereum-mainnet".to_string()]);
         assert_eq!(
-            reason(decide(record, Some(&valid()), None).await),
+            scope(Some(Vec::new()), Some("ethereum-mainnet")).await,
+            "dataset_not_allowed",
+            "an empty list means no dataset"
+        );
+        assert_eq!(
+            scope(Some(vec!["ethereum-mainnet"]), None).await,
             "dataset_not_allowed",
             "a dataset-scoped key cannot use an endpoint with no dataset"
         );
     }
 
     #[tokio::test]
-    async fn rule_8_an_unscoped_active_key_is_admitted() {
-        let decision = decide(
-            key_record("k1", 1),
-            Some(&valid()),
-            Some("ethereum-mainnet"),
-        )
-        .await;
+    async fn an_unscoped_grant_is_admitted() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
 
-        assert_eq!(decision, Decision::Admit);
+        let verdict = decide(&cp, Some("ethereum-mainnet")).await;
+
+        assert_eq!(verdict.decision, Decision::Admit);
     }
 
+    /// A grant past its hard expiry admits nothing, and says so as a dependency
+    /// failure rather than as a claim about the key.
     #[tokio::test]
-    async fn earlier_rules_win_over_later_ones() {
-        let mut record = key_record("k1", 1);
-        record.status = KeyStatus::Revoked;
-        record.expires_at = Some(1);
-        record.portal_ids = Some(Vec::new());
-        record.datasets = Some(Vec::new());
+    async fn an_expired_grant_admits_nothing_even_with_the_control_plane_down() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        evaluate(&cache, Some(&credential()), &named(None), NOW).await;
 
-        // Wrong secret outranks every scope check.
-        let wrong = credential("k1", &"0".repeat(64));
-        assert_eq!(
-            reason(decide(record.clone(), Some(&wrong), Some("ethereum-mainnet")).await),
-            "invalid_secret"
-        );
-        // With the right secret, revocation outranks expiry and scoping.
-        assert_eq!(
-            reason(decide(record, Some(&valid()), Some("ethereum-mainnet")).await),
-            "revoked"
-        );
-    }
+        cp.stop();
+        let verdict = evaluate(&cache, Some(&credential()), &named(None), NOW + 901).await;
 
-    #[test]
-    fn constant_time_eq_matches_string_equality() {
-        assert!(constant_time_eq("abc", "abc"));
-        assert!(!constant_time_eq("abc", "abd"));
-        assert!(!constant_time_eq("abc", "ab"));
-        assert!(!constant_time_eq("", "a"));
-        assert!(constant_time_eq("", ""));
+        assert_eq!(reason(&verdict), "exchange_failed");
     }
 }

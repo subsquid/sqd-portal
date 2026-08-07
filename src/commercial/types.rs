@@ -1,175 +1,153 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-/// Anything the control plane may add later (`suspended`, …) fails the record,
-/// which `parse_records` turns into a tombstone — so an unknown status is
-/// fail-closed by the same mechanism as any other malformed record, rather
-/// than by a second one written just for this enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum KeyStatus {
-    Active,
-    Revoked,
+/// The claim vocabulary this build understands. A grant that names any other
+/// version is unusable rather than partly usable: reading a newer vocabulary
+/// for the fields it happens to recognise is how a restriction the control
+/// plane added becomes a permission the portal grants (DC-8, DEF-17).
+pub const CLAIMS_VERSION: u32 = 1;
+
+/// The control plane's two authoritative answers, tagged rather than encoded in
+/// the status line. A 404 would have to mean "no such key", which puts every
+/// proxy, every rewritten route and every half-deployed replica one
+/// misconfiguration away from turning a dependency failure into a verdict about
+/// a customer's key — the defect GAP-34 was opened for. Here a denial is
+/// something the control plane said, and everything else is a failed exchange.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ExchangeAnswer {
+    Granted { grant: Grant },
+    Denied { reason: String },
 }
 
-/// One key as published by the control-plane feed. Unknown fields are ignored
-/// and every optional field defaults to `None`, so the data plane keeps working
-/// against a newer control plane.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeyRecord {
+/// A short-lived authorization for one credential. Every field the portal acts
+/// on is required: an answer missing one is a broken answer, not a permissive
+/// one, and defaulting it would let a truncated or half-written response admit
+/// traffic. `datasets` is the exception, and only because absent-means-
+/// unrestricted is the declared semantics of *this* claims version (REQ-53) —
+/// `claims_version` is what keeps that reading honest as the vocabulary grows.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Grant {
+    pub claims_version: u32,
+
+    /// Which key the control plane resolved the credential to. Checked against
+    /// the id the portal asked about, so an answer about someone else is
+    /// discarded rather than acted on.
     pub key_id: String,
 
-    #[serde(default)]
-    pub organization_id: Option<String>,
-
-    pub status: KeyStatus,
-
-    /// Feed position. Deltas only move a key forward.
-    pub seq: u64,
-
-    /// Absent means the record cannot authenticate anyone; such a key is
-    /// rejected rather than admitted without a secret check.
-    #[serde(default)]
-    pub secret_sha256: Option<String>,
-
-    /// `None` means "valid on any portal"; an empty list means none.
-    #[serde(default)]
-    pub portal_ids: Option<Vec<String>>,
-
-    /// `None` means "all datasets". Entries are canonical dataset names,
-    /// matched exactly — aliases are resolved before matching.
+    /// `None` means every dataset. Entries are canonical names, matched
+    /// exactly — aliases are resolved before matching.
     #[serde(default)]
     pub datasets: Option<Vec<String>>,
 
-    #[serde(default)]
-    pub expires_at: Option<u64>,
+    /// Unix seconds. Past this the portal renews, while still serving on the
+    /// grant it has.
+    pub refresh_after: u64,
+
+    /// Unix seconds. Past this the grant admits nothing, whatever the control
+    /// plane's state — the hard bound on how stale an authorization may get.
+    pub expires_at: u64,
 }
 
-impl KeyRecord {
-    /// Fail-closed stand-in for a record that arrived malformed but identifiable.
-    pub fn tombstone(key_id: String, seq: u64) -> Self {
-        Self {
-            key_id,
-            organization_id: None,
-            status: KeyStatus::Revoked,
-            seq,
-            secret_sha256: None,
-            portal_ids: None,
-            datasets: None,
-            expires_at: None,
-        }
-    }
-}
-
-/// Feed page envelope. The control plane sends all four fields on every page,
-/// so each one is required here: an answer missing any of them is a broken
-/// answer, not an empty page, and defaulting them would turn any 200 — a wrong
-/// route, a half-deployed replica, a proxy with opinions — into a "successful"
-/// sync that quietly stops delivering revocations. Unknown fields are still
-/// ignored, so a newer control plane keeps working.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SnapshotPage {
-    pub records: Vec<serde_json::Value>,
-
-    pub next_cursor: u64,
-
-    /// Changing epoch is the only full-resync signal: the feed's history was
-    /// rebuilt, so cursors from the previous epoch are meaningless.
-    pub epoch: String,
-
-    /// The feed's newest sequence number: what a complete read reaches.
-    pub head_seq: u64,
+/// Denial reasons this build maps to a specific wire code. Anything else is
+/// still a denial — it just cannot be reported more precisely than
+/// `invalid_credential`, which is the fail-closed direction.
+pub mod denial {
+    pub const UNKNOWN_KEY: &str = "unknown_key";
+    pub const INVALID_SECRET: &str = "invalid_secret";
+    pub const REVOKED: &str = "revoked";
+    pub const EXPIRED: &str = "expired";
+    pub const PORTAL_NOT_ALLOWED: &str = "portal_not_allowed";
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn parse(value: serde_json::Value) -> serde_json::Result<ExchangeAnswer> {
+        serde_json::from_value(value)
+    }
+
     #[test]
-    fn record_ignores_unknown_fields_and_defaults_optional_ones() {
-        let record: KeyRecord = serde_json::from_value(serde_json::json!({
-            "key_id": "k1",
-            "organization_id": null,
-            "status": "active",
-            "seq": 7,
-            "tier": "gold",
-            "limits": {"throughput_bytes_per_sec": 1000},
+    fn a_grant_parses_and_ignores_fields_this_build_does_not_know() {
+        let answer = parse(serde_json::json!({
+            "result": "granted",
+            "grant": {
+                "claims_version": 1,
+                "key_id": "k1",
+                "refresh_after": 1_800_000_300u64,
+                "expires_at": 1_800_000_900u64,
+                "tier": "gold",
+                "limits": {"throughput_bytes_per_sec": 1000},
+            },
         }))
         .expect("unknown fields must not break parsing");
 
-        assert_eq!(record.key_id, "k1");
-        assert_eq!(record.status, KeyStatus::Active);
-        assert_eq!(record.seq, 7);
-        assert_eq!(record.secret_sha256, None);
-        assert_eq!(record.portal_ids, None);
-        assert_eq!(record.datasets, None);
-        assert_eq!(record.expires_at, None);
-        assert_eq!(record.organization_id, None);
-    }
-
-    /// A status this build has never heard of must not admit traffic. It fails
-    /// the record, and the snapshot path tombstones records that fail — see
-    /// `store::tests::malformed_records_are_tombstoned_and_unidentifiable_ones_fail_the_page`.
-    #[test]
-    fn an_unknown_status_fails_the_record() {
-        let err = serde_json::from_value::<KeyRecord>(serde_json::json!({
-            "key_id": "k1",
-            "status": "suspended",
-            "seq": 1,
-        }))
-        .expect_err("an unknown status must not parse as a usable record");
-
-        assert!(err.to_string().contains("suspended"), "got {err}");
+        let ExchangeAnswer::Granted { grant } = answer else {
+            panic!("expected a grant");
+        };
+        assert_eq!(grant.key_id, "k1");
+        assert_eq!(grant.datasets, None, "absent scope means unrestricted");
     }
 
     #[test]
-    fn page_requires_every_envelope_field_and_ignores_extra_ones() {
-        let page: SnapshotPage = serde_json::from_value(serde_json::json!({
-            "records": [],
-            "next_cursor": 12,
-            "epoch": "e1",
-            "head_seq": 12,
-            "reset": true,
-        }))
-        .expect("extra envelope fields must be ignored");
-
-        assert_eq!(page.next_cursor, 12);
-        assert_eq!(page.epoch, "e1");
-        assert_eq!(page.head_seq, 12);
-
-        // Each of the four is load-bearing: without it the page cannot be
-        // told apart from a broken answer, so its absence is an error.
-        for missing in ["records", "next_cursor", "epoch", "head_seq"] {
-            let mut body = serde_json::json!({
-                "records": [],
-                "next_cursor": 12,
-                "epoch": "e1",
-                "head_seq": 12,
+    fn a_grant_missing_a_field_the_portal_acts_on_does_not_parse() {
+        for missing in ["claims_version", "key_id", "refresh_after", "expires_at"] {
+            let mut grant = serde_json::json!({
+                "claims_version": 1,
+                "key_id": "k1",
+                "refresh_after": 1u64,
+                "expires_at": 2u64,
             });
-            body.as_object_mut().unwrap().remove(missing);
-            let err = serde_json::from_value::<SnapshotPage>(body)
-                .expect_err("a missing envelope field must not parse");
+            grant.as_object_mut().unwrap().remove(missing);
+
+            let err = parse(serde_json::json!({"result": "granted", "grant": grant}))
+                .expect_err("a missing required claim must not parse");
             assert!(err.to_string().contains(missing), "got {err}");
         }
-
-        serde_json::from_value::<SnapshotPage>(serde_json::json!({}))
-            .expect_err("an empty envelope is not an empty page");
     }
 
     #[test]
-    fn lists_distinguish_absent_from_empty() {
-        let record: KeyRecord = serde_json::from_value(serde_json::json!({
-            "key_id": "k1",
-            "status": "active",
-            "seq": 1,
-            "portal_ids": [],
-            "datasets": ["ethereum-mainnet"],
-        }))
-        .expect("parse");
-
-        assert_eq!(record.portal_ids, Some(Vec::new()));
+    fn scope_lists_distinguish_absent_from_empty() {
+        let with_empty = serde_json::json!({
+            "result": "granted",
+            "grant": {
+                "claims_version": 1,
+                "key_id": "k1",
+                "datasets": [],
+                "refresh_after": 1u64,
+                "expires_at": 2u64,
+            },
+        });
+        let ExchangeAnswer::Granted { grant } = parse(with_empty).expect("parse") else {
+            panic!("expected a grant");
+        };
         assert_eq!(
-            record.datasets.as_deref(),
-            Some(&["ethereum-mainnet".to_string()][..])
+            grant.datasets,
+            Some(Vec::new()),
+            "an empty list means no dataset, which is not the same as no list"
         );
+    }
+
+    /// A reason string rather than an enum: an unrecognised denial is still a
+    /// denial, and refusing to parse one would turn it into a retryable
+    /// dependency failure — the fail-*open* direction.
+    #[test]
+    fn a_denial_carries_its_reason_verbatim() {
+        let answer = parse(serde_json::json!({
+            "result": "denied",
+            "reason": "some_reason_from_a_newer_control_plane",
+        }))
+        .expect("an unknown denial reason must still parse as a denial");
+
+        let ExchangeAnswer::Denied { reason } = answer else {
+            panic!("expected a denial");
+        };
+        assert_eq!(reason, "some_reason_from_a_newer_control_plane");
+    }
+
+    #[test]
+    fn an_untagged_or_unknown_answer_does_not_parse() {
+        parse(serde_json::json!({"grant": {}})).expect_err("an untagged answer is not an answer");
+        parse(serde_json::json!({"result": "maybe"})).expect_err("only two results exist");
     }
 }

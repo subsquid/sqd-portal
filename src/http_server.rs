@@ -696,7 +696,16 @@ async fn get_all_workers(
     tag = "Monitoring",
     extensions(("x-internal" = json!(true))),
 )]
-async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {
+async fn get_metrics(
+    Extension(registry): Extension<Arc<Registry>>,
+    Extension(commercial): Extension<Option<Arc<Gate>>>,
+) -> impl IntoResponse {
+    // Republished per scrape rather than per exchange: the age of the last
+    // successful one has to climb through an outage, not freeze at whatever it
+    // reached before the control plane went quiet (OB-13).
+    if let Some(gate) = &commercial {
+        gate.publish_freshness();
+    }
     lazy_static::lazy_static! {
         static ref HEADERS: HeaderMap = {
             let mut headers = HeaderMap::new();
@@ -732,23 +741,16 @@ async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl Into
 async fn get_readiness(
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(shutting_down): Extension<Arc<AtomicBool>>,
-    Extension(commercial): Extension<Option<Arc<Gate>>>,
 ) -> impl IntoResponse {
     static LAST_STATE: AtomicU8 = AtomicU8::new(READY);
 
-    let (state, code, body, reason) = readiness_verdict(
-        shutting_down.load(Ordering::Relaxed),
-        commercial.as_deref(),
-        client.readiness(),
-    );
+    let (state, code, body, reason) =
+        readiness_verdict(shutting_down.load(Ordering::Relaxed), client.readiness());
 
     if LAST_STATE.swap(state, Ordering::Relaxed) != state {
         match (state, &reason) {
             (READY, _) => tracing::info!("readiness check now passing: portal is ready"),
             (SHUTTING_DOWN, _) => tracing::info!("readiness check now failing: shutting down"),
-            (NO_KEY_SNAPSHOT, _) => tracing::warn!(
-                "readiness check now failing: the commercial key snapshot has not synced yet"
-            ),
             (_, Some(reason)) => tracing::warn!("readiness check now failing: {reason}"),
             (_, None) => {}
         }
@@ -788,11 +790,14 @@ const READY: u8 = 0;
 const SHUTTING_DOWN: u8 = 1;
 const NO_WORKERS: u8 = 2;
 const INSUFFICIENT_CONNECTIONS: u8 = 3;
-const NO_KEY_SNAPSHOT: u8 = 4;
 
+/// Commercial configuration contributes no conjunct here, in either enforcement
+/// mode. There is nothing to load before serving, and every replica shares one
+/// control plane — so a readiness rule keyed on it would take the whole fleet
+/// out of rotation during exactly the outage that triggered it (INV-31,
+/// REQ-54). An unreachable control plane is answered with retryable refusals.
 fn readiness_verdict(
     shutting_down: bool,
-    commercial: Option<&Gate>,
     network: Result<(), NotReady>,
 ) -> (u8, StatusCode, &'static str, Option<NotReady>) {
     if shutting_down {
@@ -813,20 +818,6 @@ fn readiness_verdict(
             StatusCode::SERVICE_UNAVAILABLE,
             "Not ready",
             Some(reason),
-        );
-    }
-    // An ENFORCING portal without the key snapshot refuses every valid
-    // key, which is worse than answering nothing: keep it out of rotation until
-    // it has mirrored the control plane. A shadow-mode portal admits everything
-    // regardless of what it knows, so the same snapshot costs it nothing and
-    // failing it here would cause the outage shadow mode exists to avoid.
-    // Ungated portals never reach this.
-    if commercial.is_some_and(|gate| gate.enforcing() && !gate.snapshot_ready()) {
-        return (
-            NO_KEY_SNAPSHOT,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Not ready",
-            None,
         );
     }
     (READY, StatusCode::OK, "Ready", None)
@@ -1584,7 +1575,7 @@ mod tests {
 
         use crate::commercial::test_support::gate_with;
 
-        let gate = Some(gate_with(crate::commercial::Enforcement::Enforce, true));
+        let gate = Some(gate_with(crate::commercial::Enforcement::Enforce));
         let app = Gated::new(gate)
             .route(
                 "/datasets/:dataset/stream",
@@ -1653,22 +1644,19 @@ mod tests {
         }
     }
 
-    /// A gated portal that has not mirrored the control plane's key set knows
-    /// no keys, so it refuses every valid one. Serving that is worse
-    /// than serving nothing: it must stay out of rotation until the first sync
-    /// (or a fresh disk cache) lands.
+    /// Commercial configuration never withholds readiness, in either mode.
+    /// Every replica shares one control plane, so a rule keyed on it empties
+    /// the fleet during the outage that triggered it; an unreachable control
+    /// plane is answered with retryable refusals instead (INV-31, REQ-54).
     #[test]
-    fn readiness_waits_for_the_commercial_key_snapshot() {
-        use crate::commercial::test_support::gate_with_readiness;
-
-        // Without a commercial block nothing changes.
-        assert_eq!(readiness_verdict(false, None, Ok(())).1, StatusCode::OK);
+    fn readiness_does_not_depend_on_the_control_plane() {
+        assert_eq!(readiness_verdict(false, Ok(())).1, StatusCode::OK);
         assert_eq!(
-            readiness_verdict(true, None, Ok(())).1,
+            readiness_verdict(true, Ok(())).1,
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
-            readiness_verdict(false, None, Err(NotReady::NoWorkers)),
+            readiness_verdict(false, Err(NotReady::NoWorkers)),
             (
                 NO_WORKERS,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1676,44 +1664,8 @@ mod tests {
                 Some(NotReady::NoWorkers)
             )
         );
-
-        let empty = gate_with_readiness(false);
-        let synced = gate_with_readiness(true);
-
-        assert_eq!(
-            readiness_verdict(false, Some(&empty), Ok(())),
-            (
-                NO_KEY_SNAPSHOT,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Not ready",
-                None
-            )
-        );
-        assert_eq!(
-            readiness_verdict(false, Some(&synced), Ok(())).1,
-            StatusCode::OK
-        );
         // Shutdown still outranks everything.
-        assert_eq!(
-            readiness_verdict(true, Some(&synced), Ok(())).0,
-            SHUTTING_DOWN
-        );
-    }
-
-    /// Shadow mode admits every request whatever the snapshot says, so an
-    /// unsynced one costs nothing — and pulling those pods from rotation would
-    /// turn the mode built to make the cutover risk-free into the outage it was
-    /// meant to prevent.
-    #[test]
-    fn readiness_ignores_the_key_snapshot_in_log_only_mode() {
-        use crate::commercial::{test_support::gate_with, Enforcement};
-
-        let empty = gate_with(Enforcement::LogOnly, false);
-
-        assert_eq!(
-            readiness_verdict(false, Some(&empty), Ok(())),
-            (READY, StatusCode::OK, "Ready", None)
-        );
+        assert_eq!(readiness_verdict(true, Ok(())).0, SHUTTING_DOWN);
     }
 
     #[tokio::test]

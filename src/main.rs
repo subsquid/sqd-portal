@@ -139,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(args.config);
     let hotblocks = Arc::new(sqd_portal::hotblocks::build_client(&config).await?);
+    let key_path = args.transport.key.clone();
     let network_client_builder =
         NetworkClient::builder(args.transport, config.clone(), datasets.clone()).await?;
 
@@ -166,10 +167,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cancellation_token = CancellationToken::new();
     let commercial_gate = match config.commercial.as_ref() {
+        // The portal signs its exchanges with the identity it already runs
+        // under, so nothing is provisioned for this beyond the key it has
+        // (ADR-018). Read again rather than threaded out of the transport: it
+        // is one file read at startup, against a whole plumbing change.
         Some(commercial) => Some(sqd_portal::commercial::build(
             commercial,
+            sqd_network_transport::util::get_keypair(Some(key_path)).await?,
             network_client.clone() as Arc<dyn sqd_portal::commercial::DatasetCatalog>,
-            cancellation_token.child_token(),
         )?),
         None => None,
     };

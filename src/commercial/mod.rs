@@ -1,7 +1,7 @@
-//! Portal-side half of commercial access control: the portal mirrors the
-//! control plane's key set and answers, per request, whether the presented key
-//! may be served here. Phase 1 is authentication plus coarse portal/dataset
-//! scoping only — an admitted key streams unrestricted.
+//! Portal-side half of commercial access control: the portal exchanges each
+//! presented credential for a short-lived grant and answers, per request,
+//! whether that grant covers what was asked for. Phase 1 is authentication plus
+//! coarse dataset scoping only — an admitted key streams unrestricted.
 //!
 //! The whole module is inert unless `commercial:` is present in the config.
 
@@ -10,34 +10,48 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use tokio_util::sync::CancellationToken;
+use sqd_network_transport::Keypair;
 
+mod cache;
 mod client;
 mod config;
 mod evaluate;
 mod extractor;
 mod routes;
-mod store;
+mod signing;
 mod types;
 
 pub use config::{CommercialConfig, Enforcement};
 pub use extractor::{DatasetCatalog, Gate};
 pub use routes::{AuthExt, Gated};
 
-use store::SnapshotStore;
+use cache::GrantCache;
+use client::ControlPlaneClient;
 
-/// Starts the snapshot sync loop and returns the gate the router wraps its
-/// data endpoints in. The loop stops when `cancel` fires.
+/// Builds the gate the router wraps its data endpoints in. Nothing is started:
+/// authorization state is learned from the requests that need it, so there is
+/// no background loop to run and no bootstrap to wait for (LIV-5).
+///
+/// `keypair` is the identity the portal already runs under; it signs the
+/// exchange rather than a service token being provisioned for it (ADR-018).
 pub fn build(
     config: &CommercialConfig,
+    keypair: Keypair,
     catalog: Arc<dyn DatasetCatalog>,
-    cancel: CancellationToken,
 ) -> anyhow::Result<Arc<Gate>> {
-    let store = SnapshotStore::new(config)?;
-    store.spawn_sync(cancel);
+    let signer = config.signer(keypair)?;
+    tracing::info!(
+        portal_id = config.portal_id(),
+        peer_id = %signer.peer_id(),
+        "commercial exchange signing identity"
+    );
+    let cache = GrantCache::new(
+        ControlPlaneClient::new(config, signer)?,
+        config.limits.clone(),
+    );
     // The mode itself is logged by `log_authorization_mode` at startup, which
     // covers the disabled case too — this path only exists when it is on.
-    Ok(Arc::new(Gate::new(config, store, catalog)))
+    Ok(Arc::new(Gate::new(config, cache, catalog)))
 }
 
 fn now_secs() -> u64 {
@@ -50,27 +64,27 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 pub mod test_support {
     use std::{
-        collections::{HashMap, VecDeque},
+        collections::HashMap,
         net::SocketAddr,
-        sync::{Mutex, MutexGuard, OnceLock},
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Mutex, MutexGuard,
+        },
+        time::Duration,
     };
 
     use axum::{
-        extract::{Query, State},
+        extract::State,
         http::{HeaderMap, StatusCode},
-        routing::{get, post},
+        routing::post,
         Json, Router,
     };
-    use serde::Deserialize;
 
-    use super::*;
-    use crate::commercial::types::{KeyRecord, KeyStatus};
+    use super::{extractor::Credential, *};
 
+    pub const KEY_ID: &str = "k1";
     pub const SECRET: &str = "theverysecretvalue";
-    pub const SECRET_SHA256: &str =
-        "ef84baff4bd11c9ed15cbaa2aa670ef4d02b6668ed7e98c5ff6d3838412640ef";
-    const SERVICE_TOKEN: &str = "test-service-token";
-    const TEST_TOKEN_ENV: &str = "SQD_COMMERCIAL_TEST_TOKEN";
+    pub const TOKEN: &str = "sqd_portal_k1_theverysecretvalue";
 
     /// Serializes the tests that read or write process-wide environment.
     pub fn env_guard() -> MutexGuard<'static, ()> {
@@ -78,72 +92,8 @@ pub mod test_support {
         LOCK.lock().unwrap_or_else(|err| err.into_inner())
     }
 
-    fn service_token_env() -> String {
-        static INIT: OnceLock<()> = OnceLock::new();
-        INIT.get_or_init(|| {
-            let _guard = env_guard();
-            std::env::set_var(TEST_TOKEN_ENV, SERVICE_TOKEN);
-        });
-        TEST_TOKEN_ENV.to_string()
-    }
-
-    pub fn key_record(key_id: &str, seq: u64) -> KeyRecord {
-        KeyRecord {
-            key_id: key_id.to_string(),
-            organization_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
-            status: KeyStatus::Active,
-            seq,
-            secret_sha256: Some(SECRET_SHA256.to_string()),
-            portal_ids: None,
-            datasets: None,
-            expires_at: None,
-        }
-    }
-
-    /// A well-formed feed page: the control plane sends all four envelope
-    /// fields on every page, and so does this.
-    pub fn page(
-        records: Vec<KeyRecord>,
-        next_cursor: u64,
-        epoch: &str,
-        head_seq: u64,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "records": records,
-            "next_cursor": next_cursor,
-            "epoch": epoch,
-            "head_seq": head_seq,
-        })
-    }
-
-    /// A config pointing at a port nothing listens on, so a store built from it
-    /// never reaches a control plane.
-    pub fn offline_config() -> CommercialConfig {
-        CommercialConfig {
-            control_plane_url: "http://127.0.0.1:1/".parse().unwrap(),
-            service_token_env: service_token_env(),
-            portal_id: "portal-premium-eu".to_string(),
-            enforcement: Enforcement::Enforce,
-            sync_interval_secs: 10,
-        }
-    }
-
-    /// A store preloaded with `records`, backed by a control plane that knows
-    /// nothing else. A miss therefore resolves to the authoritative "no such
-    /// key" — which is a different outcome from a portal that could not reach
-    /// anyone, and tests of the ladder want the former (REQ-54).
-    pub async fn store_with(records: Vec<KeyRecord>) -> Arc<SnapshotStore> {
-        let control_plane = MockControlPlane::spawn().await;
-        let store = SnapshotStore::new(&control_plane.config()).expect("store should build");
-        store.install_for_test(records);
-        store
-    }
-
-    /// A store whose control plane is unreachable, preloaded with `records`.
-    pub fn offline_store(records: Vec<KeyRecord>) -> Arc<SnapshotStore> {
-        let store = SnapshotStore::new(&offline_config()).expect("store should build");
-        store.install_for_test(records);
-        store
+    pub fn credential() -> Credential {
+        super::extractor::parse_token_for_test(TOKEN).expect("the test token parses")
     }
 
     struct NoCatalog;
@@ -154,60 +104,59 @@ pub mod test_support {
         }
     }
 
-    /// A gate whose snapshot store has synced, or one that never has.
-    pub fn gate_with_readiness(ready: bool) -> Arc<Gate> {
-        gate_with(Enforcement::Enforce, ready)
-    }
-
-    pub fn gate_with(enforcement: Enforcement, ready: bool) -> Arc<Gate> {
+    /// A gate whose control plane is a port nothing listens on. Enough for the
+    /// tests that ask whether a route is wrapped at all; the ones about the
+    /// ladder want [`MockControlPlane`].
+    pub fn gate_with(enforcement: Enforcement) -> Arc<Gate> {
         let config = CommercialConfig {
+            control_plane_url: "http://127.0.0.1:1/".parse().unwrap(),
+            portal_id: "portal-premium-eu".to_string(),
             enforcement,
-            ..offline_config()
+            limits: config::Limits::default(),
         };
-        let store = SnapshotStore::new(&config).expect("store should build");
-        if ready {
-            store.install_for_test(Vec::new());
-        }
-        Arc::new(Gate::new(&config, store, Arc::new(NoCatalog)))
+        let signer = config.signer(Keypair::generate_ed25519()).unwrap();
+        let cache = GrantCache::new(
+            ControlPlaneClient::new(&config, signer).unwrap(),
+            config.limits.clone(),
+        );
+        Arc::new(Gate::new(&config, cache, Arc::new(NoCatalog)))
     }
 
-    #[derive(Clone)]
+    pub async fn cache_for(control_plane: &MockControlPlane) -> Arc<GrantCache> {
+        let config = control_plane.config();
+        let signer = config
+            .signer(Keypair::generate_ed25519())
+            .expect("the test config validates");
+        GrantCache::new(
+            ControlPlaneClient::new(&config, signer).expect("client should build"),
+            config.limits.clone(),
+        )
+    }
+
+    /// A control plane that answers whatever a test told it to, and remembers
+    /// what it was asked. Its default answer is a failure rather than a denial:
+    /// nothing should silently read "we never configured this key" as "the
+    /// authority says no".
     pub struct MockControlPlane {
         addr: SocketAddr,
         state: Arc<MockState>,
     }
 
-    /// The largest page the control plane will serve. Asking for more is a
-    /// 400, never a smaller page: a clamped page reads as short, and a short
-    /// page is how the reader knows it has reached the end of the feed.
-    pub const MAX_PAGE_LIMIT: u16 = 1000;
-
     #[derive(Default)]
     struct MockState {
-        pages: Mutex<VecDeque<(u64, serde_json::Value)>>,
-        /// Epoch of the last queued page served, so the empty pages this
-        /// answers with once the queue drains do not read as a feed rebuild.
-        epoch: Mutex<Option<String>>,
-        snapshot_cursors: Mutex<Vec<u64>>,
-        snapshot_limits: Mutex<Vec<u16>>,
-        fail_snapshots: Mutex<bool>,
-        authorize: Mutex<HashMap<String, serde_json::Value>>,
-        authorize_statuses: Mutex<HashMap<String, u16>>,
-        authorize_calls: Mutex<Vec<String>>,
-    }
-
-    #[derive(Deserialize)]
-    struct CursorQuery {
-        cursor: u64,
-        limit: Option<u16>,
+        answers: Mutex<HashMap<String, serde_json::Value>>,
+        statuses: Mutex<HashMap<String, u16>>,
+        exchanges: AtomicUsize,
+        signatures: Mutex<Vec<(String, String, String)>>,
+        stopped: AtomicBool,
+        delay_ms: AtomicUsize,
     }
 
     impl MockControlPlane {
         pub async fn spawn() -> Self {
             let state = Arc::new(MockState::default());
             let app = Router::new()
-                .route("/internal/portal/v1/snapshots", get(snapshots))
-                .route("/internal/portal/v1/authorize", post(authorize))
+                .route("/internal/portal/v1/exchange", post(exchange))
                 .with_state(state.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -218,144 +167,144 @@ pub mod test_support {
         }
 
         pub fn config(&self) -> CommercialConfig {
+            let limits = config::Limits {
+                // Small enough that an eviction test does not have to fill 65k
+                // entries to prove the bound exists.
+                grant_cache_capacity: 32,
+                ..config::Limits::default()
+            };
             CommercialConfig {
                 control_plane_url: format!("http://{}", self.addr).parse().unwrap(),
-                service_token_env: service_token_env(),
                 portal_id: "portal-premium-eu".to_string(),
                 enforcement: Enforcement::Enforce,
-                sync_interval_secs: 10,
+                limits,
             }
         }
 
-        /// Queues a page served to the first poll whose cursor is at least
-        /// `min_cursor`. Unqueued polls answer with an empty page.
-        pub fn push_page(&self, min_cursor: u64, page: serde_json::Value) {
+        pub fn grant(
+            &self,
+            key_id: &str,
+            datasets: Option<Vec<String>>,
+            refresh_after: u64,
+            expires_at: u64,
+        ) {
+            self.raw(
+                key_id,
+                serde_json::json!({
+                    "result": "granted",
+                    "grant": {
+                        "claims_version": types::CLAIMS_VERSION,
+                        "key_id": key_id,
+                        "datasets": datasets,
+                        "refresh_after": refresh_after,
+                        "expires_at": expires_at,
+                    },
+                }),
+            );
+        }
+
+        pub fn deny(&self, key_id: &str, reason: &str) {
+            self.raw(
+                key_id,
+                serde_json::json!({"result": "denied", "reason": reason}),
+            );
+        }
+
+        /// An answer the typed constructors cannot express.
+        pub fn raw(&self, key_id: &str, body: serde_json::Value) {
             self.state
-                .pages
-                .lock()
-                .unwrap()
-                .push_back((min_cursor, page));
-        }
-
-        pub fn snapshot_cursors(&self) -> Vec<u64> {
-            self.state.snapshot_cursors.lock().unwrap().clone()
-        }
-
-        /// The page size each poll asked for.
-        pub fn snapshot_limits(&self) -> Vec<u16> {
-            self.state.snapshot_limits.lock().unwrap().clone()
-        }
-
-        pub fn fail_snapshots(&self, fail: bool) {
-            *self.state.fail_snapshots.lock().unwrap() = fail;
-        }
-
-        pub fn authorize_with(&self, key_id: &str, record: Option<KeyRecord>) {
-            let Some(record) = record else {
-                self.state.authorize.lock().unwrap().remove(key_id);
-                return;
-            };
-            self.authorize_raw(key_id, serde_json::to_value(record).unwrap());
-        }
-
-        /// An answer the `KeyRecord` type cannot express, such as a status this
-        /// build predates.
-        pub fn authorize_raw(&self, key_id: &str, body: serde_json::Value) {
-            self.state
-                .authorize
+                .answers
                 .lock()
                 .unwrap()
                 .insert(key_id.to_string(), body);
         }
 
-        pub fn authorize_status(&self, key_id: &str, status: u16) {
+        pub fn status(&self, key_id: &str, status: u16) {
             self.state
-                .authorize_statuses
+                .statuses
                 .lock()
                 .unwrap()
                 .insert(key_id.to_string(), status);
         }
 
-        pub fn authorize_calls(&self) -> Vec<String> {
-            self.state.authorize_calls.lock().unwrap().clone()
+        pub fn clear_status(&self, key_id: &str) {
+            self.state.statuses.lock().unwrap().remove(key_id);
+        }
+
+        /// Refuses every exchange from here on, the way an unreachable control
+        /// plane does — but without waiting out a connect timeout.
+        pub fn stop(&self) {
+            self.state.stopped.store(true, Ordering::SeqCst);
+        }
+
+        pub fn delay(&self, delay: Duration) {
+            self.state
+                .delay_ms
+                .store(delay.as_millis() as usize, Ordering::SeqCst);
+        }
+
+        pub fn exchanges(&self) -> usize {
+            self.state.exchanges.load(Ordering::SeqCst)
+        }
+
+        /// `(portal_id, timestamp, signature)` per exchange, in order.
+        pub fn signatures(&self) -> Vec<(String, String, String)> {
+            self.state.signatures.lock().unwrap().clone()
         }
     }
 
-    fn authorized(headers: &HeaderMap) -> bool {
-        headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            == Some(&format!("Bearer {SERVICE_TOKEN}"))
-    }
-
-    async fn snapshots(
-        State(state): State<Arc<MockState>>,
-        headers: HeaderMap,
-        Query(query): Query<CursorQuery>,
-    ) -> Result<Json<serde_json::Value>, StatusCode> {
-        if !authorized(&headers) {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-        state.snapshot_cursors.lock().unwrap().push(query.cursor);
-        let limit = query.limit.unwrap_or(MAX_PAGE_LIMIT);
-        state.snapshot_limits.lock().unwrap().push(limit);
-        if limit > MAX_PAGE_LIMIT {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        if *state.fail_snapshots.lock().unwrap() {
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-        let mut pages = state.pages.lock().unwrap();
-        let index = pages
-            .iter()
-            .position(|(min_cursor, _)| query.cursor >= *min_cursor);
-        let Some(mut page) = index
-            .and_then(|index| pages.remove(index))
-            .map(|(_, page)| page)
-        else {
-            let epoch = state.epoch.lock().unwrap().clone();
-            return Ok(Json(serde_json::json!({
-                "records": [],
-                "next_cursor": query.cursor,
-                "epoch": epoch.as_deref().unwrap_or("e1"),
-                "head_seq": query.cursor,
-            })));
-        };
-        if let Some(epoch) = page.get("epoch").and_then(serde_json::Value::as_str) {
-            *state.epoch.lock().unwrap() = Some(epoch.to_owned());
-        }
-        // No page is ever longer than the one that was asked for.
-        if let Some(records) = page.get_mut("records").and_then(|r| r.as_array_mut()) {
-            records.truncate(usize::from(limit));
-        }
-        Ok(Json(page))
-    }
-
-    async fn authorize(
+    async fn exchange(
         State(state): State<Arc<MockState>>,
         headers: HeaderMap,
         Json(body): Json<serde_json::Value>,
     ) -> Result<Json<serde_json::Value>, StatusCode> {
-        if !authorized(&headers) {
+        state.exchanges.fetch_add(1, Ordering::SeqCst);
+
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        state.signatures.lock().unwrap().push((
+            header(signing::PORTAL_ID_HEADER),
+            header(signing::TIMESTAMP_HEADER),
+            header(signing::SIGNATURE_HEADER),
+        ));
+        if header(signing::SIGNATURE_HEADER).is_empty() {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        let key_id = body
-            .get("key_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        state.authorize_calls.lock().unwrap().push(key_id.clone());
+        if state.stopped.load(Ordering::SeqCst) {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let delay = state.delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+        }
 
-        if let Some(status) = state.authorize_statuses.lock().unwrap().get(&key_id) {
+        // The mock speaks the portal's own token grammar so a test can drive it
+        // with a real credential rather than a key id.
+        let key_id = body
+            .get("credential")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|token| token.strip_prefix("sqd_portal_"))
+            .and_then(|rest| rest.split_once('_'))
+            .map(|(key_id, _)| key_id.to_owned())
+            .unwrap_or_default();
+
+        if let Some(status) = state.statuses.lock().unwrap().get(&key_id) {
             return Err(StatusCode::from_u16(*status).unwrap());
         }
         state
-            .authorize
+            .answers
             .lock()
             .unwrap()
             .get(&key_id)
             .cloned()
             .map(Json)
-            .ok_or(StatusCode::NOT_FOUND)
+            // Not a denial: a control plane that was never told about this key
+            // has not said anything about it.
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
     }
 }

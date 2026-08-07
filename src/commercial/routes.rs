@@ -125,7 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_gated_route_needs_a_key_and_an_open_one_does_not() {
-        let gate = Some(gate_with(Enforcement::Enforce, true));
+        let gate = Some(gate_with(Enforcement::Enforce));
 
         let gated = status(gate.clone(), get(|| async { "served" }).auth()).await;
         assert_eq!(gated, StatusCode::FORBIDDEN);

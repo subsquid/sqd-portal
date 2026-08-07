@@ -1,84 +1,98 @@
-use std::time::Duration;
-
 use url::Url;
 
-use super::{config::CommercialConfig, types::SnapshotPage};
+use super::{
+    config::CommercialConfig,
+    signing::RequestSigner,
+    types::{ExchangeAnswer, Grant, CLAIMS_VERSION},
+};
+use crate::commercial::extractor::Credential;
 
-const SNAPSHOTS_PATH: [&str; 4] = ["internal", "portal", "v1", "snapshots"];
-const AUTHORIZE_PATH: [&str; 4] = ["internal", "portal", "v1", "authorize"];
+const EXCHANGE_PATH: [&str; 4] = ["internal", "portal", "v1", "exchange"];
 
-/// Page size requested from the feed. A short page ends the bootstrap loop, so
-/// this value also defines what "short" means.
-pub const PAGE_LIMIT: u16 = 1000;
-
-/// Kept below the sync interval so a hung control plane cannot stack ticks.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub enum Authorized {
-    Found(serde_json::Value),
-    /// The control plane positively knows nothing about this key.
-    Unknown,
+/// What one exchange established. Only the first two are the control plane
+/// speaking about the credential; everything else propagates as an error, and
+/// the caller turns that into a retryable refusal rather than a verdict.
+#[derive(Debug)]
+pub enum Exchanged {
+    Granted(Grant),
+    /// The reason verbatim, mapped to a wire code by the ladder. Kept as the
+    /// control plane wrote it so an unrecognised one still reaches the log.
+    Denied(String),
 }
 
 pub struct ControlPlaneClient {
     http: reqwest::Client,
-    snapshots_url: Url,
-    authorize_url: Url,
-    service_token: String,
+    exchange_url: Url,
+    signer: RequestSigner,
 }
 
 impl ControlPlaneClient {
-    pub fn new(config: &CommercialConfig) -> anyhow::Result<Self> {
+    pub fn new(config: &CommercialConfig, signer: RequestSigner) -> anyhow::Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                // These requests carry the portal's service token and their
-                // answer is the key set itself. Both belong to the configured
+                .timeout(config.exchange_timeout())
+                // This request carries a client's credential and its answer
+                // decides whether to serve. Both belong to the configured
                 // control plane and nowhere else, so a redirect is an error
                 // rather than an instruction. `http://` stays legal: local dev
                 // runs the control plane without TLS.
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
-            snapshots_url: endpoint_url(&config.control_plane_url, &SNAPSHOTS_PATH)?,
-            authorize_url: endpoint_url(&config.control_plane_url, &AUTHORIZE_PATH)?,
-            service_token: config.service_token()?,
+            exchange_url: endpoint_url(&config.control_plane_url, &EXCHANGE_PATH)?,
+            signer,
         })
     }
 
-    pub async fn fetch_page(&self, cursor: u64) -> anyhow::Result<SnapshotPage> {
-        let mut url = self.snapshots_url.clone();
-        url.query_pairs_mut()
-            .append_pair("cursor", &cursor.to_string())
-            .append_pair("limit", &PAGE_LIMIT.to_string());
+    /// Hands the presented credential to the authority and returns what it
+    /// said. `now_secs` stamps the signature; the control plane refuses one it
+    /// considers stale, which is what bounds replay (ADR-018).
+    pub async fn exchange(
+        &self,
+        credential: &Credential,
+        now_secs: u64,
+    ) -> anyhow::Result<Exchanged> {
+        // Serialized once: the signature binds the bytes that are actually
+        // sent, so re-serializing for the body would be a way for the two to
+        // drift apart.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "credential": credential.token.expose(),
+        }))?;
+        let path = self.exchange_url.path().to_owned();
+        let headers = self.signer.headers("POST", &path, &body, now_secs)?;
 
-        let response = self
+        let mut request = self
             .http
-            .get(url)
-            .bearer_auth(&self.service_token)
-            .send()
-            .await?;
+            .post(self.exchange_url.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+
+        let response = request.body(body).send().await?;
         let status = response.status();
-        anyhow::ensure!(
-            status.is_success(),
-            "snapshot feed returned status {status}"
-        );
+        anyhow::ensure!(status.is_success(), "exchange returned status {status}");
 
-        Ok(response.json().await?)
-    }
-
-    pub async fn authorize(&self, key_id: &str) -> anyhow::Result<Authorized> {
-        let response = self
-            .http
-            .post(self.authorize_url.clone())
-            .bearer_auth(&self.service_token)
-            .json(&serde_json::json!({ "key_id": key_id }))
-            .send()
-            .await?;
-
-        match response.status() {
-            status if status.is_success() => Ok(Authorized::Found(response.json().await?)),
-            reqwest::StatusCode::NOT_FOUND => Ok(Authorized::Unknown),
-            status => anyhow::bail!("authorize returned status {status}"),
+        match response.json::<ExchangeAnswer>().await? {
+            ExchangeAnswer::Denied { reason } => Ok(Exchanged::Denied(reason)),
+            ExchangeAnswer::Granted { grant } => {
+                anyhow::ensure!(
+                    grant.claims_version == CLAIMS_VERSION,
+                    "grant claims version {} is not {CLAIMS_VERSION}",
+                    grant.claims_version
+                );
+                // An answer about a different key is not an answer about this
+                // request, and acting on it would admit one caller's traffic on
+                // another caller's entitlements.
+                anyhow::ensure!(
+                    grant.key_id == credential.key_id,
+                    "exchange answered about a different key"
+                );
+                anyhow::ensure!(
+                    grant.expires_at > now_secs,
+                    "grant is already expired on arrival"
+                );
+                Ok(Exchanged::Granted(grant))
+            }
         }
     }
 }
@@ -101,45 +115,150 @@ fn endpoint_url(base: &Url, segments: &[&str]) -> anyhow::Result<Url> {
 
 #[cfg(test)]
 mod tests {
-    use axum::{response::Redirect, routing::get, Json, Router};
+    use axum::{response::Redirect, routing::post, Json, Router};
 
     use super::*;
-    use crate::commercial::test_support::MockControlPlane;
+    use crate::commercial::test_support::{credential, MockControlPlane, KEY_ID};
 
-    /// The feed request carries the portal's service token. A redirect sends
-    /// that request somewhere the operator did not configure, and a redirected
-    /// key set is not the control plane's answer — refuse both.
+    const NOW: u64 = 1_800_000_000;
+
+    async fn client_for(config: &CommercialConfig) -> ControlPlaneClient {
+        ControlPlaneClient::new(config, config.signer(test_keypair()).unwrap()).unwrap()
+    }
+
+    fn test_keypair() -> sqd_network_transport::Keypair {
+        sqd_network_transport::Keypair::generate_ed25519()
+    }
+
     #[tokio::test]
-    async fn the_feed_client_does_not_follow_redirects() {
+    async fn a_grant_comes_back_with_its_claims() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+
+        let client = client_for(&cp.config()).await;
+        let Exchanged::Granted(grant) = client.exchange(&credential(), NOW).await.unwrap() else {
+            panic!("expected a grant");
+        };
+
+        assert_eq!(grant.key_id, KEY_ID);
+        assert_eq!(grant.expires_at, NOW + 900);
+    }
+
+    #[tokio::test]
+    async fn a_denial_comes_back_as_a_denial_rather_than_an_error() {
+        let cp = MockControlPlane::spawn().await;
+        cp.deny(KEY_ID, "revoked");
+
+        let client = client_for(&cp.config()).await;
+        let Exchanged::Denied(reason) = client.exchange(&credential(), NOW).await.unwrap() else {
+            panic!("expected a denial");
+        };
+
+        assert_eq!(reason, "revoked");
+    }
+
+    /// Every one of these is the control plane failing to answer, not answering
+    /// "no". Collapsing them onto a denial is the defect GAP-34 was opened for.
+    #[tokio::test]
+    async fn an_unusable_answer_is_an_error_and_never_a_denial() {
+        let cp = MockControlPlane::spawn().await;
+        let client = client_for(&cp.config()).await;
+
+        cp.status(KEY_ID, 500);
+        assert!(client.exchange(&credential(), NOW).await.is_err());
+
+        cp.status(KEY_ID, 404);
+        assert!(
+            client.exchange(&credential(), NOW).await.is_err(),
+            "a 404 is a routing accident, not an authoritative unknown key"
+        );
+
+        cp.clear_status(KEY_ID);
+        cp.raw(
+            KEY_ID,
+            serde_json::json!({"result": "granted", "grant": {}}),
+        );
+        assert!(client.exchange(&credential(), NOW).await.is_err());
+
+        cp.raw(
+            KEY_ID,
+            serde_json::json!({"result": "granted", "grant": {
+                "claims_version": CLAIMS_VERSION + 1,
+                "key_id": KEY_ID,
+                "refresh_after": NOW + 300,
+                "expires_at": NOW + 900,
+            }}),
+        );
+        let err = client.exchange(&credential(), NOW).await.unwrap_err();
+        assert!(err.to_string().contains("claims version"), "got {err}");
+
+        cp.raw(
+            KEY_ID,
+            serde_json::json!({"result": "granted", "grant": {
+                "claims_version": CLAIMS_VERSION,
+                "key_id": "someone-else",
+                "refresh_after": NOW + 300,
+                "expires_at": NOW + 900,
+            }}),
+        );
+        let err = client.exchange(&credential(), NOW).await.unwrap_err();
+        assert!(err.to_string().contains("different key"), "got {err}");
+
+        cp.grant(KEY_ID, None, NOW - 10, NOW - 1);
+        let err = client.exchange(&credential(), NOW).await.unwrap_err();
+        assert!(err.to_string().contains("already expired"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn the_exchange_carries_a_signature_the_control_plane_can_attribute() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+
+        let client = client_for(&cp.config()).await;
+        client.exchange(&credential(), NOW).await.unwrap();
+
+        let seen = cp.signatures();
+        assert_eq!(seen.len(), 1);
+        let (portal_id, timestamp, signature) = &seen[0];
+        assert_eq!(portal_id, "portal-premium-eu");
+        assert_eq!(timestamp, &NOW.to_string());
+        assert!(!signature.is_empty());
+    }
+
+    /// A redirect sends a client's credential somewhere the operator did not
+    /// configure, and a redirected answer is not the control plane's.
+    #[tokio::test]
+    async fn the_exchange_does_not_follow_redirects() {
         let app = Router::new()
             .route(
-                "/internal/portal/v1/snapshots",
-                get(|| async { Redirect::temporary("/elsewhere") }),
+                "/internal/portal/v1/exchange",
+                post(|| async { Redirect::temporary("/elsewhere") }),
             )
             .route(
                 "/elsewhere",
-                get(|| async { Json(serde_json::json!({ "records": [], "next_cursor": 0 })) }),
+                post(|| async {
+                    Json(serde_json::json!({"result": "denied", "reason": "unknown_key"}))
+                }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // Borrows the mock's service-token plumbing; only the URL differs.
         let cp = MockControlPlane::spawn().await;
         let mut config = cp.config();
         config.control_plane_url = format!("http://{addr}").parse().unwrap();
-        let client = ControlPlaneClient::new(&config).unwrap();
 
-        let err = client
-            .fetch_page(0)
+        let err = client_for(&config)
             .await
-            .expect_err("a redirected feed must not be treated as an answer");
+            .exchange(&credential(), NOW)
+            .await
+            .expect_err("a redirected exchange must not be treated as an answer");
 
         assert!(err.to_string().contains("307"), "got {err}");
     }
 
     fn url_for(base: &str) -> String {
-        endpoint_url(&base.parse().unwrap(), &SNAPSHOTS_PATH)
+        endpoint_url(&base.parse().unwrap(), &EXCHANGE_PATH)
             .unwrap()
             .to_string()
     }
@@ -148,25 +267,25 @@ mod tests {
     fn endpoint_url_appends_to_bases_with_and_without_trailing_slash() {
         assert_eq!(
             url_for("https://cp.example"),
-            "https://cp.example/internal/portal/v1/snapshots"
+            "https://cp.example/internal/portal/v1/exchange"
         );
         assert_eq!(
             url_for("https://cp.example/"),
-            "https://cp.example/internal/portal/v1/snapshots"
+            "https://cp.example/internal/portal/v1/exchange"
         );
         assert_eq!(
             url_for("https://cp.example/saas/"),
-            "https://cp.example/saas/internal/portal/v1/snapshots"
+            "https://cp.example/saas/internal/portal/v1/exchange"
         );
         assert_eq!(
             url_for("https://cp.example/saas?x=1#f"),
-            "https://cp.example/saas/internal/portal/v1/snapshots"
+            "https://cp.example/saas/internal/portal/v1/exchange"
         );
     }
 
     #[test]
     fn endpoint_url_rejects_a_url_that_cannot_be_a_base() {
         let base: Url = "mailto:ops@example.com".parse().unwrap();
-        assert!(endpoint_url(&base, &SNAPSHOTS_PATH).is_err());
+        assert!(endpoint_url(&base, &EXCHANGE_PATH).is_err());
     }
 }

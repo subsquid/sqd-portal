@@ -79,23 +79,32 @@ impl AuthDecision {
     }
 }
 
-/// Why a sync tick failed (OB-13): down and answering nonsense are different pages.
+/// How one credential exchange ended (OB-13).
+///
+/// Publishable on the keyless scrape because the grant cache is keyed on the
+/// whole credential: an unknown key id and a known one presented with a wrong
+/// secret both miss, both exchange, and both land here identically. What a
+/// caller can learn by bracketing its own request is cache membership, which
+/// timing already discloses and INV-39 accepts (GAP-32).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SyncFailureCause {
-    /// The feed could not be read at all.
-    Fetch,
-    /// It answered, and the answer contradicted the feed's own contract.
-    Protocol,
-    /// A record on an otherwise well-formed page could not be identified.
-    Parse,
+pub enum ExchangeOutcome {
+    /// The control plane issued a grant.
+    Granted,
+    /// The control plane refused, for a reason that stays off this axis.
+    Denied,
+    /// The local budget refused to make the call — rate or in-flight cap.
+    Saturated,
+    /// The call failed, timed out, or could not be read.
+    Failed,
 }
 
-impl SyncFailureCause {
+impl ExchangeOutcome {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Fetch => "fetch",
-            Self::Protocol => "protocol",
-            Self::Parse => "parse",
+            Self::Granted => "granted",
+            Self::Denied => "denied",
+            Self::Saturated => "saturated",
+            Self::Failed => "failed",
         }
     }
 }
@@ -186,13 +195,15 @@ lazy_static::lazy_static! {
 
     // Commercial deployments only: inert without a `commercial:` block.
     static ref AUTH_DECISIONS: Family<Labels, Counter> = Default::default();
-    static ref KEY_SNAPSHOT_AGE: Gauge = Default::default();
-    static ref KEY_SNAPSHOT_CURSOR: Gauge = Default::default();
-    static ref KEY_SNAPSHOT_HEAD: Gauge = Default::default();
-    static ref KEY_SNAPSHOT_EPOCH: Family<Labels, Gauge> = Default::default();
-    static ref KEY_SNAPSHOT_DELTAS: Counter = Default::default();
-    static ref KEY_SNAPSHOT_REBUILDS: Counter = Default::default();
-    static ref KEY_SNAPSHOT_SYNC_FAILURES: Family<Labels, Counter> = Default::default();
+    static ref EXCHANGES: Family<Labels, Counter> = Default::default();
+    static ref EXCHANGE_DURATION: Histogram =
+        Histogram::new([0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0].into_iter());
+    static ref EXCHANGE_SUCCESS_AGE: Gauge = Default::default();
+    static ref GRANT_CACHE_ENTRIES: Gauge = Default::default();
+    static ref GRANT_CACHE_CAPACITY: Gauge = Default::default();
+    static ref GRANT_CACHE_EVICTIONS: Counter = Default::default();
+    static ref GRANT_LIFETIMES_CAPPED: Counter = Default::default();
+    static ref GRACE_ADMISSIONS: Counter = Default::default();
 
     // TODO: add metrics for procedure durations
     static ref MUTEX_HELD_NANOS: Family<Labels, Counter> = Default::default();
@@ -277,48 +288,62 @@ pub fn auth_decisions(decision: AuthDecision, enforcement: &str) -> u64 {
         .get()
 }
 
-/// Snapshot freshness and provenance (OB-13). Called on every tick, failed ones
-/// included, so age climbs through an outage instead of freezing.
-pub fn report_key_snapshot(age_seconds: u64, cursor: u64, head_seq: u64, epoch: Option<&str>) {
-    KEY_SNAPSHOT_AGE.set(age_seconds as i64);
-    KEY_SNAPSHOT_CURSOR.set(cursor as i64);
-    KEY_SNAPSHOT_HEAD.set(head_seq as i64);
-    if let Some(epoch) = epoch {
-        let labels = vec![("epoch".to_owned(), epoch.to_owned())];
-        // One series at a time, or every epoch ever seen leaves a sample behind.
-        if KEY_SNAPSHOT_EPOCH.get_or_create(&labels).get() != 1 {
-            KEY_SNAPSHOT_EPOCH.clear();
-            KEY_SNAPSHOT_EPOCH.get_or_create(&labels).set(1);
-        }
+/// Count one credential exchange and how long it took (OB-13).
+pub fn report_exchange(outcome: ExchangeOutcome, elapsed: Option<Duration>) {
+    EXCHANGES
+        .get_or_create(&vec![("outcome".to_owned(), outcome.as_str().to_owned())])
+        .inc();
+    if let Some(elapsed) = elapsed {
+        EXCHANGE_DURATION.observe(elapsed.as_secs_f64());
     }
 }
 
-/// Records applied, not the record count: that would say how many keys exist.
-pub fn report_key_snapshot_delta(applied: usize) {
-    KEY_SNAPSHOT_DELTAS.inc_by(applied as u64);
-}
-
-/// A full re-read of the feed — startup, or an epoch flip.
-pub fn report_key_snapshot_rebuild() {
-    KEY_SNAPSHOT_REBUILDS.inc();
-}
-
-pub fn report_key_snapshot_sync_failure(cause: SyncFailureCause) {
-    KEY_SNAPSHOT_SYNC_FAILURES
-        .get_or_create(&vec![("cause".to_owned(), cause.as_str().to_owned())])
-        .inc();
-}
-
 #[cfg(test)]
-pub fn key_snapshot_sync_failures(cause: SyncFailureCause) -> u64 {
-    KEY_SNAPSHOT_SYNC_FAILURES
-        .get_or_create(&vec![("cause".to_owned(), cause.as_str().to_owned())])
+pub fn exchanges(outcome: ExchangeOutcome) -> u64 {
+    EXCHANGES
+        .get_or_create(&vec![("outcome".to_owned(), outcome.as_str().to_owned())])
         .get()
 }
 
+/// Seconds since the control plane last answered anything. Republished on
+/// scrape rather than on exchange, so it climbs through an outage instead of
+/// freezing at the last value it happened to reach (OB-13).
+pub fn report_exchange_success_age(age_seconds: u64) {
+    EXCHANGE_SUCCESS_AGE.set(age_seconds as i64);
+}
+
+/// Occupancy, and the bound it is measured against — publishing the cap keeps
+/// its literal out of the alert expression (OB-11's argument, applied here).
+pub fn report_grant_cache_size(entries: usize) {
+    GRANT_CACHE_ENTRIES.set(entries as i64);
+}
+
+pub fn report_grant_cache_capacity(capacity: usize) {
+    GRANT_CACHE_CAPACITY.set(capacity as i64);
+}
+
+/// A live grant pushed out to make room. Sustained eviction is the HZ-13
+/// capacity signal: the credential working set is larger than the cache.
+pub fn report_grant_eviction() {
+    GRANT_CACHE_EVICTIONS.inc();
+}
+
+/// The control plane offered a lifetime past the portal's ceiling. Not a
+/// failure — the grant is honoured, shortened — but a misconfiguration an
+/// operator should see before it becomes an incident.
+pub fn report_lifetime_capped() {
+    GRANT_LIFETIMES_CAPPED.inc();
+}
+
+/// A request served on a grant whose renewal has not landed. The leading edge
+/// of the `expires_at` cliff, and the only warning before it (OB-9).
+pub fn report_grace_admission() {
+    GRACE_ADMISSIONS.inc();
+}
+
 #[cfg(test)]
-pub fn key_snapshot_age() -> i64 {
-    KEY_SNAPSHOT_AGE.get()
+pub fn grace_admissions() -> u64 {
+    GRACE_ADMISSIONS.get()
 }
 
 /// Count a capacity-based stream refusal.
@@ -654,39 +679,44 @@ pub fn register_metrics(registry: &mut Registry) {
         AUTH_DECISIONS.clone(),
     );
     registry.register(
-        "commercial_key_snapshot_age_seconds",
-        "Seconds since the control plane last answered a key-feed read",
-        KEY_SNAPSHOT_AGE.clone(),
+        "commercial_exchanges",
+        "Credential exchanges by coarse outcome; carries no key id and no denial reason",
+        EXCHANGES.clone(),
     );
     registry.register(
-        "commercial_key_snapshot_cursor",
-        "Feed position the served key snapshot holds",
-        KEY_SNAPSHOT_CURSOR.clone(),
+        "commercial_exchange_duration_seconds",
+        "How long a credential exchange took",
+        EXCHANGE_DURATION.clone(),
     );
     registry.register(
-        "commercial_key_snapshot_head_seq",
-        "Feed head the control plane last reported; the distance from the cursor is the backlog",
-        KEY_SNAPSHOT_HEAD.clone(),
+        "commercial_exchange_success_age_seconds",
+        "Seconds since the control plane last answered an exchange",
+        EXCHANGE_SUCCESS_AGE.clone(),
     );
     registry.register(
-        "commercial_key_snapshot_epoch",
-        "The feed epoch currently held, as a label; exactly one series at a time",
-        KEY_SNAPSHOT_EPOCH.clone(),
+        "commercial_grant_cache_entries",
+        "Grants currently held",
+        GRANT_CACHE_ENTRIES.clone(),
     );
     registry.register(
-        "commercial_key_snapshot_delta_records",
-        "Key records applied by delta ticks",
-        KEY_SNAPSHOT_DELTAS.clone(),
+        "commercial_grant_cache_capacity",
+        "Bound on grants held; occupancy is meaningless without it",
+        GRANT_CACHE_CAPACITY.clone(),
     );
     registry.register(
-        "commercial_key_snapshot_rebuilds",
-        "Full re-reads of the key feed: startup, and every epoch flip or head rollback",
-        KEY_SNAPSHOT_REBUILDS.clone(),
+        "commercial_grant_cache_evictions",
+        "Live grants evicted to make room; sustained eviction means the working set exceeds the cache",
+        GRANT_CACHE_EVICTIONS.clone(),
     );
     registry.register(
-        "commercial_key_snapshot_sync_failures",
-        "Failed key-feed sync ticks by cause",
-        KEY_SNAPSHOT_SYNC_FAILURES.clone(),
+        "commercial_grant_lifetimes_capped",
+        "Grants whose offered lifetime exceeded the portal's ceiling and was shortened",
+        GRANT_LIFETIMES_CAPPED.clone(),
+    );
+    registry.register(
+        "commercial_grace_admissions",
+        "Requests served on a grant whose renewal has not landed",
+        GRACE_ADMISSIONS.clone(),
     );
 }
 
