@@ -279,18 +279,21 @@ input is destroyed immediately on a cache or negative-answer hit; on a miss, one
 moves it into the single DC-8 exchange and destroys it on completion, timeout, or
 cancellation. It leaves the process in that direction and by no other: no log record,
 metric label, span field, error body, shared or persisted value, or any other outbound
-request carries it, the grant cache holds fingerprints rather than credentials, and
-fingerprint comparison completes in time independent of how many leading bytes matched.
-*Why:* an API key that reaches a log line has been disclosed to everyone with log access,
-and a comparison that exits early lets a wrong secret be refined byte by byte from
-response timing — the fingerprint would then be no better than the secret itself. The one
-egress is not a loophole but the point of naming it: an exception that is written down is
-one a test can bound, and INV-37 already forbids every other destination.
+request carries it, and the grant cache holds fingerprints rather than credentials.
+*Why:* an API key that reaches a log line has been disclosed to everyone with log access.
+The one egress is not a loophole but the point of naming it: an exception that is written
+down is one a test can bound, and INV-37 already forbids every other destination.
+Fingerprint comparison is deliberately *not* required to be constant-time. The attack that
+would motivate it — refining a wrong secret byte by byte from response timing — needs the
+attacker to steer the bytes being compared, and what is compared is SHA-256 of a token they
+supply, so steering it means inverting the hash. Buying immunity to an unavailable attack
+would cost the lookup: a constant-time match against a keyed cache has to touch every entry,
+turning an O(1) hit into a scan of P-GRANT-CACHE-CAPACITY on every request. What the timing
+does leak is cache membership, which is the residual INV-39 already accepts.
 *Check:* CT-10 — drive the full corpus with a marked secret; grep every emitted log,
 metric, span, body, and shared-state dump for it; assert it appears in the control-plane
 stub's ledger only on a miss and in no other stub's; force hit, timeout, cancellation, and
-coalesced-waiter paths and assert no raw input outlives them; assert the comparison is the
-constant-time one by construction.
+coalesced-waiter paths and assert no raw input outlives them.
 
 **INV-39 — No enumeration oracle.** [response]
 On every completed credential verdict, an unparseable token, an authoritatively unknown

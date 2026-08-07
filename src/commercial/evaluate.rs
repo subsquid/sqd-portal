@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 
 use axum::{http::header, response::Response};
 
@@ -69,29 +69,25 @@ const EXCHANGE_FAILED: Rejection =
 /// needs it — an unauthenticated request must not be able to buy that work.
 pub struct LazyDataset<F: Fn() -> Option<String>> {
     name: F,
-    resolved: Mutex<Option<Option<String>>>,
+    resolved: OnceLock<Option<String>>,
 }
 
 impl<F: Fn() -> Option<String>> LazyDataset<F> {
     pub fn new(name: F) -> Self {
         Self {
             name,
-            resolved: Mutex::new(None),
+            resolved: OnceLock::new(),
         }
     }
 
     /// Resolves on first call and remembers the answer.
     pub fn resolve(&self) -> Option<String> {
-        self.resolved
-            .lock()
-            .unwrap()
-            .get_or_insert_with(&self.name)
-            .clone()
+        self.resolved.get_or_init(&self.name).clone()
     }
 
     /// What an earlier rung already resolved, if anything. Never resolves.
     pub fn resolved(&self) -> Option<String> {
-        self.resolved.lock().unwrap().clone().flatten()
+        self.resolved.get().cloned().flatten()
     }
 }
 

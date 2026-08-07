@@ -115,15 +115,22 @@ answered, refused by budget, failed — with latency (the LIV-13/LIV-14 and DC-8
 witnesses); and a count of grants whose offered lifetime was capped. For the cliff it also
 carries a counter of admissions served on renewal grace, the number of grants currently in
 that state, and the minimum time remaining to `expires_at` among them (zero when none are in
-grace). The count says the condition exists and the minimum names the first hard refusal,
-without a key- or dataset-labeled series. None of these carries a key id, a fingerprint, a
-dataset, or a refusal reason finer than the enforcing caller's wire response.
+grace), the latter two recomputed on scrape by one walk of the cache under its lock — a walk
+P-GRANT-CACHE-CAPACITY bounds. The three answer different questions: the rate says the
+condition exists, the count says how wide it is, and the minimum names the first hard
+refusal — the operator's lead time on the cliff, which no rate can supply. None of these
+carries a key id, a fingerprint, a dataset, or a refusal reason finer than the enforcing
+caller's wire response.
 
-Shadow mode is deliberately different. Its keyless scrape exposes none of the cache,
-exchange-outcome, latency, capping, or grace signals above: `issued` versus `denied`, or a
-grant-cache occupancy change, would reveal the verdict of a request whose response admits
-either way. OB-12's single `shadow_evaluated` outcome is its entire public authorization
-projection. The load and cutover evidence shadow mode exists to gather remains in protected
+Shadow mode is deliberately different. None of the cache, exchange-outcome, latency,
+capping, or grace signals above may *move* on its keyless scrape: `issued` versus `denied`,
+or a grant-cache occupancy change, would reveal the verdict of a request whose response
+admits either way. The constraint is on movement, not on presence — these families are
+registered for the process, not per deployment mode, so they exist at zero on a shadow and
+on a non-commercial portal alike. A series pinned at zero is the same series for every
+caller and every credential, which is what the rule protects; a series that moved would not
+be. OB-12's single `shadow_evaluated` outcome is shadow mode's entire public authorization
+projection. The load and cutover evidence it exists to gather remains in protected
 per-exchange events and in the control plane's own telemetry.
 
 The enforcing-mode `answered` class deliberately combines grants and denials. The cache is

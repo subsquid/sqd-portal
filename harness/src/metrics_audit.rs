@@ -51,17 +51,27 @@ pub fn samples(text: &str, family: &str) -> Vec<(String, f64)> {
 }
 
 /// The family's total across every sample whose labels contain all of `labels`.
-/// Absent series read as zero: a counter that never incremented is not exposed.
+/// Matched on whole pairs, not by substring: `("code", v)` must not count an
+/// `error_code="v"` series, or an assertion that a family did NOT move reads
+/// the wrong series and passes. Absent series read as zero: a counter that
+/// never incremented is not exposed.
 pub fn sum_where(text: &str, family: &str, labels: &[(&str, &str)]) -> f64 {
     samples(text, family)
         .into_iter()
-        .filter(|(got, _)| {
-            labels
-                .iter()
-                .all(|(k, v)| got.contains(&format!("{k}=\"{v}\"")))
-        })
+        .filter(|(got, _)| labels.iter().all(|(k, v)| has_label_pair(got, k, v)))
         .map(|(_, value)| value)
         .sum()
+}
+
+/// Whether `key="value"` appears as a whole pair: bounded by start or end of
+/// the label text or by the `,` separator on both sides.
+fn has_label_pair(labels: &str, key: &str, value: &str) -> bool {
+    let needle = format!("{key}=\"{value}\"");
+    labels.match_indices(&needle).any(|(at, _)| {
+        let boundary_before = matches!(labels[..at].chars().next_back(), None | Some(','));
+        let boundary_after = matches!(labels[at + needle.len()..].chars().next(), None | Some(','));
+        boundary_before && boundary_after
+    })
 }
 
 /// Gauge expectations at quiescence. Returns human-readable failures.
@@ -83,4 +93,23 @@ pub fn audit_quiescent(text: &str, known_workers: f64) -> Vec<String> {
         }
     }
     failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_label_key_does_not_match_a_longer_key_it_suffixes() {
+        let text = "family{error_code=\"invalid\"} 3\n\
+                    family{code=\"invalid\"} 5\n\
+                    family{mode=\"x\",code=\"invalid\"} 7\n";
+
+        assert_eq!(sum_where(text, "family", &[("code", "invalid")]), 12.0);
+        assert_eq!(sum_where(text, "family", &[("error_code", "invalid")]), 3.0);
+        assert_eq!(
+            sum_where(text, "family", &[("mode", "x"), ("code", "invalid")]),
+            7.0
+        );
+    }
 }

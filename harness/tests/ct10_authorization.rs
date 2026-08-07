@@ -31,6 +31,20 @@ const AUTH_DECISIONS: &str = "portal_commercial_authorization_decisions";
 const EXCHANGES: &str = "portal_commercial_exchanges";
 const LIFETIMES_CAPPED: &str = "portal_commercial_grant_lifetimes_capped";
 
+/// Every OB-13 signal shadow mode must hold still. They are registered for the
+/// process rather than per mode, so they exist at zero on a shadow and on a
+/// non-commercial portal alike — the rule is that they must not *move*.
+const OB13_SIGNALS: &[&str] = &[
+    "portal_commercial_grant_cache_entries",
+    "portal_commercial_grant_cache_evictions",
+    "portal_commercial_grant_lifetimes_capped",
+    "portal_commercial_grace_admissions",
+    "portal_commercial_grants_in_grace",
+    "portal_commercial_grace_min_remaining_seconds",
+    "portal_commercial_exchange_duration_seconds_count",
+    "portal_commercial_exchange_success_age_seconds",
+];
+
 /// Present in every secret this suite mints, so one substring search covers the
 /// whole corpus.
 const SECRET_MARKER: &str = "s3cr3tvalue";
@@ -712,13 +726,24 @@ async fn shadow(fx: &mut Fixture) -> anyhow::Result<()> {
             && sum_where(&scrape, AUTH_DECISIONS, &[("decision", "admit")]) == 0.0,
         "INV-39: shadow mode must publish neither admissions nor refusals",
     );
-    // The exchange counters are silent too: any of them moving would separate
-    // the credential that was denied from the one that was not.
+    // Every OB-13 signal is silent too: any of them moving would separate the
+    // credential that was denied from the one that was not. OB-13 constrains
+    // movement rather than presence, so the scalar families — which are
+    // registered for the process and exist at zero — are checked by value, not
+    // by absence. Checking only the labelled families would miss them entirely.
     ensure!(
         samples(&scrape, EXCHANGES).is_empty(),
         "OB-13: shadow mode must not publish exchange outcomes, got {:?}",
         samples(&scrape, EXCHANGES),
     );
+    for family in OB13_SIGNALS {
+        ensure!(
+            sum_where(&scrape, family, &[]) == 0.0,
+            "OB-13: {family} moved in shadow mode, which separates a denied credential \
+             from an admitted one — got {}",
+            sum_where(&scrape, family, &[]),
+        );
+    }
 
     // REQ-55 — shadow mode is not free: it exchanges on the same cache-miss rule
     // enforcement uses, which is the point. The load a cutover will produce is
@@ -771,6 +796,12 @@ async fn inert(fx: &mut Fixture) -> anyhow::Result<()> {
         samples(&scrape, AUTH_DECISIONS).is_empty() && samples(&scrape, EXCHANGES).is_empty(),
         "REQ-56: a non-commercial portal must publish no authorization activity",
     );
+    for family in OB13_SIGNALS {
+        ensure!(
+            sum_where(&scrape, family, &[]) == 0.0,
+            "REQ-56: {family} moved on a portal with no commercial block",
+        );
+    }
     Ok(())
 }
 

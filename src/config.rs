@@ -155,6 +155,11 @@ pub struct Config {
     /// into `None` — an open portal is the one outcome it cannot have meant.
     #[serde(default, deserialize_with = "parse_commercial")]
     pub commercial: Option<CommercialConfig>,
+
+    /// Keys the deserializer skipped, carried so `main` can warn about them
+    /// once a tracing subscriber exists — see [`Config::read`].
+    #[serde(skip)]
+    pub ignored_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,18 +207,22 @@ pub struct RealTimeConfig {
 impl Config {
     pub fn read(config_path: &str) -> anyhow::Result<Self> {
         let file = std::fs::File::open(config_path)?;
-        let buf_reader = std::io::BufReader::new(file);
-        let deser = serde_yaml::Deserializer::from_reader(buf_reader);
-        // NOTE: this runs inside clap's `value_parser`, before `setup_tracing`,
-        // so these warnings go to a subscriber that does not exist yet. Kept as
-        // is — main logs the authorization mode once tracing is up, which is
-        // the part an operator must not have to infer.
-        let mut warn_unknown = |path: serde_ignored::Path| {
-            tracing::warn!("ignoring unknown config field: {path}");
-        };
-        let config: Self = serde_yaml::with::singleton_map_recursive::deserialize(
-            serde_ignored::Deserializer::new(deser, &mut warn_unknown),
+        Self::from_reader(std::io::BufReader::new(file))
+    }
+
+    /// Unknown keys are collected onto the config rather than logged here: this
+    /// runs inside clap's `value_parser`, before `setup_tracing`, so a warning
+    /// emitted now goes to a subscriber that does not exist yet and a
+    /// misspelled `commercial.limits` knob would keep its default without a
+    /// trace. `main` replays them once tracing is up.
+    fn from_reader(reader: impl std::io::Read) -> anyhow::Result<Self> {
+        let deser = serde_yaml::Deserializer::from_reader(reader);
+        let mut ignored = Vec::new();
+        let mut collect = |path: serde_ignored::Path| ignored.push(path.to_string());
+        let mut config: Self = serde_yaml::with::singleton_map_recursive::deserialize(
+            serde_ignored::Deserializer::new(deser, &mut collect),
         )?;
+        config.ignored_fields = ignored;
         config.validate()?;
         Ok(config)
     }
@@ -506,24 +515,49 @@ sqd_network:
 
     #[test]
     fn commercial_block_parses_through_the_production_deserializer() {
+        // `from_reader` validates, and validation reads `PORTAL_ID` — which
+        // another test mutates.
+        let _guard = crate::commercial::test_support::env_guard();
         let yaml = format!(
             "{MINIMAL_YAML}commercial:\n  \
              control_plane_url: https://cp.example/\n  \
-             service_token_env: PORTAL_CP_TOKEN\n  \
              portal_id: portal-premium-eu\n  \
              enforcement: log_only\n"
         );
-        let deser = serde_yaml::Deserializer::from_str(&yaml);
-        let config: Config = serde_yaml::with::singleton_map_recursive::deserialize(
-            serde_ignored::Deserializer::new(deser, &mut |_: serde_ignored::Path| {}),
-        )
-        .expect("parse");
+        let config = Config::from_reader(yaml.as_bytes()).expect("parse");
 
         let commercial = config.commercial.expect("commercial block");
         assert_eq!(commercial.portal_id, "portal-premium-eu");
         assert_eq!(
             commercial.enforcement,
             crate::commercial::Enforcement::LogOnly
+        );
+        // Doubles as a lint on this fixture: a stale key here would document a
+        // knob that does not exist.
+        assert_eq!(config.ignored_fields, Vec::<String>::new());
+    }
+
+    /// The other half of the `commercial::config` nesting rationale: a
+    /// misspelled limit is only audible if the unknown key survives the read,
+    /// which happens before tracing exists, all the way to `main`.
+    #[test]
+    fn unknown_config_fields_are_carried_for_later_reporting() {
+        let _guard = crate::commercial::test_support::env_guard();
+        let yaml = format!(
+            "{MINIMAL_YAML}commercial:\n  \
+             control_plane_url: https://cp.example/\n  \
+             portal_id: portal-premium-eu\n  \
+             limits:\n    \
+             max_grant_lifetime_seconds: 60\n"
+        );
+        let config = Config::from_reader(yaml.as_bytes()).expect("parse");
+
+        // The `?` marks `parse_commercial` buffering the block before
+        // re-deserializing it, which loses the position. The key the operator
+        // typed is still legible, which is what the warning is for.
+        assert_eq!(
+            config.ignored_fields,
+            vec!["commercial.?.limits.max_grant_lifetime_seconds"]
         );
     }
 

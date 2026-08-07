@@ -420,7 +420,10 @@ Block delivery, queries and block lookups require a credential. Everything else 
 catalog, per-dataset metadata and state, heads and heights, the worker and debug lookups,
 readiness, metrics and the served API schema — answers without one, on every deployment
 (NG8). A route is in one set or the other because it says so at the point it is declared;
-there is no default, so a route that says nothing does not compile. Because metrics are
+there is no default, so a route that says nothing does not compile. The compile-time gate
+covers routes declared through the gated router's own `route`; a router merged in whole and
+anything mounted after the router is finalized are outside what a type can see, and are held
+instead by the mounted-surface inventory the acceptance below pins. Because metrics are
 client-readable, their public families never expose an internal authorization reason or
 exchange detail beyond the client-visible wire outcome (OB-12/13).
 *Acceptance:* a keyless metadata read succeeds and a keyless stream is refused;
@@ -442,7 +445,7 @@ accepted; anything else is refused as an invalid credential without being exchan
 asks the authority about it — and nowhere else. Before that decision it may exist only in
 the request-local exchange input DEF-16 bounds; it is never logged, placed in shared state,
 echoed, or held past that call, and is matched against the grant cache only as a
-fingerprint, in constant time (INV-38).
+fingerprint (INV-38).
 *Acceptance:* a valid key is accepted through the header and refused when its token is
 truncated, over-long, carries an unknown prefix, or contains bytes outside the minted
 alphabet; the same token in a query parameter is not a credential at all and the request

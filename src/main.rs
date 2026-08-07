@@ -102,6 +102,16 @@ fn setup_tracing(json: bool, log_span_durations: bool) {
         .init();
 }
 
+/// Warnings the config read could not emit: it runs inside clap's
+/// `value_parser`, before `setup_tracing`, where a `tracing::warn!` goes to no
+/// subscriber. Replayed here so a misspelled key — a `commercial.limits` knob
+/// above all — does not keep its default in silence.
+fn report_ignored_config_fields(config: &Config) {
+    for path in &config.ignored_fields {
+        tracing::warn!("ignoring unknown config field: {path}");
+    }
+}
+
 /// States, in one line, whether the data API requires a key. The config is
 /// read inside clap's `value_parser` — before `setup_tracing` — so nothing it
 /// has to say about itself is recorded, and until now an operator could not
@@ -133,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         .then(|| setup_sentry(&args.config, &args));
 
     setup_tracing(args.json_log, args.log_span_durations);
+    report_ignored_config_fields(&args.config);
     log_authorization_mode(&args.config);
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));

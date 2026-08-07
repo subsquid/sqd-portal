@@ -199,6 +199,8 @@ lazy_static::lazy_static! {
     static ref GRANT_CACHE_EVICTIONS: Counter = Default::default();
     static ref GRANT_LIFETIMES_CAPPED: Counter = Default::default();
     static ref GRACE_ADMISSIONS: Counter = Default::default();
+    static ref GRANTS_IN_GRACE: Gauge = Default::default();
+    static ref GRACE_MIN_REMAINING: Gauge = Default::default();
 
     // TODO: add metrics for procedure durations
     static ref MUTEX_HELD_NANOS: Family<Labels, Counter> = Default::default();
@@ -339,6 +341,15 @@ pub fn report_grace_admission() {
 #[cfg(test)]
 pub fn grace_admissions() -> u64 {
     GRACE_ADMISSIONS.get()
+}
+
+/// Point-in-time census of the `expires_at` cliff, republished on scrape: how
+/// many grants are serving on renewal grace, and the smallest remaining life
+/// among them — zero when none are. The admission rate says the condition
+/// exists; the minimum names the first hard refusal (OB-9, OB-13).
+pub fn report_grace_census(in_grace: usize, min_remaining_secs: u64) {
+    GRANTS_IN_GRACE.set(in_grace as i64);
+    GRACE_MIN_REMAINING.set(min_remaining_secs as i64);
 }
 
 /// Count a capacity-based stream refusal.
@@ -712,6 +723,16 @@ pub fn register_metrics(registry: &mut Registry) {
         "commercial_grace_admissions",
         "Requests served on a grant whose renewal has not landed",
         GRACE_ADMISSIONS.clone(),
+    );
+    registry.register(
+        "commercial_grants_in_grace",
+        "Grants currently serving past refresh_after while their renewal has not landed",
+        GRANTS_IN_GRACE.clone(),
+    );
+    registry.register(
+        "commercial_grace_min_remaining_seconds",
+        "Smallest time to expires_at among grants in grace — the first hard refusal; zero when none are in grace",
+        GRACE_MIN_REMAINING.clone(),
     );
 }
 

@@ -23,7 +23,7 @@ mod types;
 pub use config::{CommercialConfig, Enforcement};
 pub use extractor::{DatasetCatalog, Gate};
 pub use routes::Mounted;
-pub use routes::{AuthExt, Gated};
+pub use routes::{AuthExt, EndpointExt, Gated};
 
 use cache::GrantCache;
 use client::ControlPlaneClient;
