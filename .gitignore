@@ -2,3 +2,10 @@
 .env
 *.key
 db
+
+# libp2p identity keypairs. `*.key` never matched these, which is how they
+# reached a public branch once.
+key-*
+!key-*.rs
+
+.idea/
