@@ -23,6 +23,47 @@ pub fn family_sum(text: &str, family: &str) -> Option<f64> {
     sum
 }
 
+/// Every sample of one family, as (label text, value). Counters are exposed
+/// with a `_total` suffix that is not part of the family name, so both spellings
+/// match. The label text is kept verbatim — comparing two scrapes of it is how
+/// CT-10 proves a series did not move.
+pub fn samples(text: &str, family: &str) -> Vec<(String, f64)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((name_and_labels, value)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let (name, labels) = match name_and_labels.split_once('{') {
+            Some((name, labels)) => (name, labels.trim_end_matches('}')),
+            None => (name_and_labels, ""),
+        };
+        if name != family && name != format!("{family}_total") {
+            continue;
+        }
+        if let Ok(x) = value.parse::<f64>() {
+            out.push((labels.to_owned(), x));
+        }
+    }
+    out
+}
+
+/// The family's total across every sample whose labels contain all of `labels`.
+/// Absent series read as zero: a counter that never incremented is not exposed.
+pub fn sum_where(text: &str, family: &str, labels: &[(&str, &str)]) -> f64 {
+    samples(text, family)
+        .into_iter()
+        .filter(|(got, _)| {
+            labels
+                .iter()
+                .all(|(k, v)| got.contains(&format!("{k}=\"{v}\"")))
+        })
+        .map(|(_, value)| value)
+        .sum()
+}
+
 /// Gauge expectations at quiescence. Returns human-readable failures.
 pub fn audit_quiescent(text: &str, known_workers: f64) -> Vec<String> {
     let expectations: HashMap<&str, f64> = HashMap::from([

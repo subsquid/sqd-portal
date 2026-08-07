@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+pub mod control_plane;
 pub mod hotblocks;
 pub mod publisher;
 pub mod registry;

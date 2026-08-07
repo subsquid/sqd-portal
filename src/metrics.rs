@@ -57,6 +57,53 @@ impl RefusalReason {
     }
 }
 
+/// What one evaluation may say on the keyless scrape (OB-12). Never more than
+/// the caller's own response told it (INV-39).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthDecision {
+    /// Enforcing, and the request was served.
+    Admit,
+    /// Enforcing, and this is the code the caller received.
+    Reject(ErrorCode),
+    /// Shadow mode: valid, invalid and indeterminate alike, since all were served.
+    ShadowEvaluated,
+}
+
+impl AuthDecision {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admit => "admit",
+            Self::Reject(_) => "reject",
+            Self::ShadowEvaluated => "shadow_evaluated",
+        }
+    }
+}
+
+/// How one credential exchange ended (OB-13). Keyless-scrape safe: an unknown
+/// key id and a wrong secret both miss and land here identically, so all a
+/// caller learns is cache membership, which timing already discloses (GAP-32).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExchangeOutcome {
+    /// The control plane answered. Issued and refused are one class here: split,
+    /// they let a caller bracket two scrapes and read the verdict off the counter
+    /// (OB-13, INV-39).
+    Answered,
+    /// The local budget refused to make the call — rate or in-flight cap.
+    Saturated,
+    /// The call failed, timed out, or could not be read.
+    Failed,
+}
+
+impl ExchangeOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Saturated => "saturated",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Final transport outcome of one logical DC-4 request (ADR-015, OB-4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HotblocksRequestOutcome {
@@ -141,6 +188,18 @@ lazy_static::lazy_static! {
     static ref KNOWN_CHUNKS: Family<Labels, Gauge> = Default::default();
     static ref LAST_STORAGE_BLOCK: Family<Labels, Gauge> = Default::default();
 
+    // Commercial deployments only: inert without a `commercial:` block.
+    static ref AUTH_DECISIONS: Family<Labels, Counter> = Default::default();
+    static ref EXCHANGES: Family<Labels, Counter> = Default::default();
+    static ref EXCHANGE_DURATION: Histogram =
+        Histogram::new([0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0].into_iter());
+    static ref EXCHANGE_SUCCESS_AGE: Gauge = Default::default();
+    static ref GRANT_CACHE_ENTRIES: Gauge = Default::default();
+    static ref GRANT_CACHE_CAPACITY: Gauge = Default::default();
+    static ref GRANT_CACHE_EVICTIONS: Counter = Default::default();
+    static ref GRANT_LIFETIMES_CAPPED: Counter = Default::default();
+    static ref GRACE_ADMISSIONS: Counter = Default::default();
+
     // TODO: add metrics for procedure durations
     static ref MUTEX_HELD_NANOS: Family<Labels, Counter> = Default::default();
     static ref MUTEXES_EXISTING: Family<Labels, Gauge> = Default::default();
@@ -190,6 +249,96 @@ pub fn hotblocks_requests(outcome: HotblocksRequestOutcome) -> u64 {
     HOTBLOCKS_REQUESTS
         .get_or_create(&hotblocks_request_labels(outcome))
         .get()
+}
+
+/// Count one authorization evaluation (OB-12).
+pub fn report_auth_decision(decision: AuthDecision, enforcement: &str) {
+    AUTH_DECISIONS
+        .get_or_create(&auth_decision_labels(decision, enforcement))
+        .inc();
+}
+
+/// The whole public projection of one evaluation, in one place.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn auth_decision_labels(decision: AuthDecision, enforcement: &str) -> Labels {
+    let mut labels = vec![
+        ("decision".to_owned(), decision.as_str().to_owned()),
+        ("enforcement".to_owned(), enforcement.to_owned()),
+    ];
+    // Only a refusal carries a code, and only the one the caller received.
+    if let AuthDecision::Reject(code) = decision {
+        labels.push(("error_code".to_owned(), code.as_str().to_owned()));
+        labels.push((
+            "error_type".to_owned(),
+            code.error_type().as_str().to_owned(),
+        ));
+    }
+    labels
+}
+
+#[cfg(test)]
+pub fn auth_decisions(decision: AuthDecision, enforcement: &str) -> u64 {
+    AUTH_DECISIONS
+        .get_or_create(&auth_decision_labels(decision, enforcement))
+        .get()
+}
+
+/// Count one credential exchange and how long it took (OB-13).
+pub fn report_exchange(outcome: ExchangeOutcome, elapsed: Option<Duration>) {
+    EXCHANGES
+        .get_or_create(&vec![("outcome".to_owned(), outcome.as_str().to_owned())])
+        .inc();
+    if let Some(elapsed) = elapsed {
+        EXCHANGE_DURATION.observe(elapsed.as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+pub fn exchanges(outcome: ExchangeOutcome) -> u64 {
+    EXCHANGES
+        .get_or_create(&vec![("outcome".to_owned(), outcome.as_str().to_owned())])
+        .get()
+}
+
+/// Seconds since the control plane last answered anything. Republished on
+/// scrape rather than on exchange, so it climbs through an outage instead of
+/// freezing at the last value it happened to reach (OB-13).
+pub fn report_exchange_success_age(age_seconds: u64) {
+    EXCHANGE_SUCCESS_AGE.set(age_seconds as i64);
+}
+
+/// Occupancy, and the bound it is measured against — publishing the cap keeps
+/// its literal out of the alert expression (OB-11's argument, applied here).
+pub fn report_grant_cache_size(entries: usize) {
+    GRANT_CACHE_ENTRIES.set(entries as i64);
+}
+
+pub fn report_grant_cache_capacity(capacity: usize) {
+    GRANT_CACHE_CAPACITY.set(capacity as i64);
+}
+
+/// A live grant pushed out to make room. Sustained eviction is the HZ-13
+/// capacity signal: the credential working set is larger than the cache.
+pub fn report_grant_eviction() {
+    GRANT_CACHE_EVICTIONS.inc();
+}
+
+/// The control plane offered a lifetime past the portal's ceiling. Not a
+/// failure — the grant is honoured, shortened — but a misconfiguration an
+/// operator should see before it becomes an incident.
+pub fn report_lifetime_capped() {
+    GRANT_LIFETIMES_CAPPED.inc();
+}
+
+/// A request served on a grant whose renewal has not landed. The leading edge
+/// of the `expires_at` cliff, and the only warning before it (OB-9).
+pub fn report_grace_admission() {
+    GRACE_ADMISSIONS.inc();
+}
+
+#[cfg(test)]
+pub fn grace_admissions() -> u64 {
+    GRACE_ADMISSIONS.get()
 }
 
 /// Count a capacity-based stream refusal.
@@ -518,6 +667,51 @@ pub fn register_metrics(registry: &mut Registry) {
         "mutexes_existing",
         "Number of existing mutexes",
         MUTEXES_EXISTING.clone(),
+    );
+    registry.register(
+        "commercial_authorization_decisions",
+        "Authorization evaluations by public outcome; empty unless the portal is configured commercially",
+        AUTH_DECISIONS.clone(),
+    );
+    registry.register(
+        "commercial_exchanges",
+        "Credential exchanges by coarse outcome; carries no key id and no denial reason",
+        EXCHANGES.clone(),
+    );
+    registry.register(
+        "commercial_exchange_duration_seconds",
+        "How long a credential exchange took",
+        EXCHANGE_DURATION.clone(),
+    );
+    registry.register(
+        "commercial_exchange_success_age_seconds",
+        "Seconds since the control plane last answered an exchange",
+        EXCHANGE_SUCCESS_AGE.clone(),
+    );
+    registry.register(
+        "commercial_grant_cache_entries",
+        "Grants currently held",
+        GRANT_CACHE_ENTRIES.clone(),
+    );
+    registry.register(
+        "commercial_grant_cache_capacity",
+        "Bound on grants held; occupancy is meaningless without it",
+        GRANT_CACHE_CAPACITY.clone(),
+    );
+    registry.register(
+        "commercial_grant_cache_evictions",
+        "Live grants evicted to make room; sustained eviction means the working set exceeds the cache",
+        GRANT_CACHE_EVICTIONS.clone(),
+    );
+    registry.register(
+        "commercial_grant_lifetimes_capped",
+        "Grants whose offered lifetime exceeded the portal's ceiling and was shortened",
+        GRANT_LIFETIMES_CAPPED.clone(),
+    );
+    registry.register(
+        "commercial_grace_admissions",
+        "Requests served on a grant whose renewal has not landed",
+        GRACE_ADMISSIONS.clone(),
     );
 }
 

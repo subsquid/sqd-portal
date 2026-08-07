@@ -135,8 +135,8 @@ unattributable, past-skewed, or future-skewed requests, with a ledger of every c
 was asked about; and, as a fault
 injector, the denial, the unreadable answer, the unrecognized claims version, the
 wrong-subject answer, the over-cap lifetime, the late completion of a retired exchange
-generation after its successor, and the outage the DC-8 error table names (⚠ unbuilt —
-GAP-33). Log-sink stub (DC-6) and error-report stub (DC-7):
+generation after its successor, and the outage the DC-8 error table names (built, less the
+retired-generation row, which needs a clock — GAP-33). Log-sink stub (DC-6) and error-report stub (DC-7):
 fire-and-forget receivers with ledgers, so egress audits (INV-37) and drop accounting
 (HZ-7) have ground truth. Stubs double as fault
 injectors for the CT-2 matrix.

@@ -10,7 +10,7 @@ use axum::{
     http::{header, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Extension, RequestExt, Router,
+    Extension, RequestExt,
 };
 use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
@@ -27,6 +27,7 @@ use tower_http::request_id::{
 };
 use utoipa_scalar::{Scalar, Servable as _};
 
+use crate::commercial::{AuthExt, Gate, Gated};
 use crate::datasets::DatasetConfig;
 use crate::endpoints::{
     block_number_by_timestamp::get_blocknumber_by_timestamp,
@@ -95,103 +96,22 @@ pub async fn run_server(
     shutting_down: Arc<AtomicBool>,
     shutdown_signal: CancellationToken,
     show_internal_docs: bool,
+    commercial_gate: Option<Arc<Gate>>,
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
     let cors = cors_layer();
 
     tracing::info!("Starting HTTP server listening on {addr}");
-    let app = Router::new()
-        // Portal status
-        .route("/status", get(get_status).endpoint("/status"))
-        .route("/datasets", get(get_datasets).endpoint("/datasets"))
-        // Streaming data
-        .route(
-            "/datasets/:dataset/archival-stream",
-            post(run_archival_stream_restricted).endpoint("/archival-stream"),
-        )
-        .route(
-            "/datasets/:dataset/archival-stream/debug",
-            post(run_archival_stream).endpoint("/archival-stream/debug"),
-        )
-        .route(
-            "/datasets/:dataset/finalized-stream",
-            post(run_finalized_stream).endpoint("/finalized-stream"),
-        )
-        .route(
-            "/datasets/:dataset/stream",
-            post(run_stream).endpoint("/stream"),
-        )
-        // Getting head
-        .route(
-            "/datasets/:dataset/archival-head",
-            get(get_archival_head).endpoint("/archival-head"),
-        )
-        .route(
-            "/datasets/:dataset/finalized-head",
-            get(get_finalized_head).endpoint("/finalized-head"),
-        )
-        .route("/datasets/:dataset/head", get(get_head).endpoint("/head"))
-        // Dataset info
-        .route(
-            "/datasets/:dataset/state",
-            get(get_dataset_state).endpoint("/state"),
-        )
-        .route(
-            "/datasets/:dataset",
-            get(get_dataset_metadata).endpoint("/dataset"),
-        )
-        .route(
-            "/datasets/:dataset/metadata",
-            get(get_dataset_metadata).endpoint("/metadata"),
-        )
-        .route(
-            "/datasets/:dataset/timestamps/:timestamp/block",
-            get(get_blocknumber_by_timestamp).endpoint("/timestamps/block"),
-        )
-        // Backward compatibility routes
-        .route(
-            "/datasets/:dataset/finalized-stream/height",
-            get(get_finalized_stream_height).endpoint("/height"),
-        )
-        .route(
-            "/datasets/:dataset/archival-stream/height",
-            get(get_archival_stream_height).endpoint("/height"),
-        )
-        .route(
-            "/datasets/:dataset_id/query/:worker_id",
-            post(execute_query).endpoint("/query"),
-        )
-        .route(
-            "/datasets/:dataset/height",
-            get(get_height).endpoint("/height"),
-        )
-        .route(
-            "/datasets/:dataset/:start_block/worker",
-            get(get_worker).endpoint("/worker"),
-        )
-        // Internal routes
-        .route(
-            "/debug/workers",
-            get(get_all_workers).endpoint("/debug/workers"),
-        )
-        .route(
-            "/datasets/:dataset/:block/debug",
-            get(get_debug_block).endpoint("/block/debug"),
-        )
-        .route("/metrics", get(get_metrics))
-        .route("/ready", get(get_readiness))
-        .route("/api-docs/openapi.json", get(serve_openapi_spec))
-        .merge(
+    let app = gated_routes(commercial_gate.clone())
+        .merge_ungated(
+            "the Scalar docs UI renders the same schema on every deployment",
             Scalar::with_url("/docs", openapi_spec.clone())
-                .custom_html(include_str!("../docs/openapi/scalar_template.html")),
+                .custom_html(include_str!("../docs/openapi/scalar_template.html"))
+                .into(),
         )
+        .into_router()
         .layer(Extension(Arc::new(openapi_spec)));
 
-    // SQL Query Engine
-    #[cfg(feature = "sql")]
-    let app = app
-        .route("/sql/query", post(sql_query).endpoint("/sql/query"))
-        .route("/sql/metadata", get(sql_metadata).endpoint("/sql/metadata"));
 
     let drain_timeout = config.drain_timeout;
 
@@ -223,6 +143,9 @@ pub async fn run_server(
         )
         .layer(Extension(task_manager))
         .layer(Extension(network_client))
+        // `None` without a `commercial:` block, so `/ready` behaves exactly as
+        // it does on an OSS portal.
+        .layer(Extension(commercial_gate))
         .layer(Extension(config))
         .layer(Extension(Arc::new(metrics_registry)))
         .layer(Extension(hotblocks))
@@ -661,7 +584,16 @@ async fn get_all_workers(
     tag = "Monitoring",
     extensions(("x-internal" = json!(true))),
 )]
-async fn get_metrics(Extension(registry): Extension<Arc<Registry>>) -> impl IntoResponse {
+async fn get_metrics(
+    Extension(registry): Extension<Arc<Registry>>,
+    Extension(commercial): Extension<Option<Arc<Gate>>>,
+) -> impl IntoResponse {
+    // Republished per scrape rather than per exchange: the age of the last
+    // successful one has to climb through an outage, not freeze at whatever it
+    // reached before the control plane went quiet (OB-13).
+    if let Some(gate) = &commercial {
+        gate.publish_freshness();
+    }
     lazy_static::lazy_static! {
         static ref HEADERS: HeaderMap = {
             let mut headers = HeaderMap::new();
@@ -698,42 +630,10 @@ async fn get_readiness(
     Extension(client): Extension<Arc<NetworkClient>>,
     Extension(shutting_down): Extension<Arc<AtomicBool>>,
 ) -> impl IntoResponse {
-    // Stable discriminant per readiness *category*. `/ready` is polled
-    // continuously, so we log only when the category changes — entering a new
-    // state logs once (with live detail), while fluctuating connection counts
-    // within `InsufficientConnections` do not. Starts `READY` so a portal that
-    // never becomes ready still logs the reason on its first probe.
-    const READY: u8 = 0;
-    const SHUTTING_DOWN: u8 = 1;
-    const NO_WORKERS: u8 = 2;
-    const INSUFFICIENT_CONNECTIONS: u8 = 3;
     static LAST_STATE: AtomicU8 = AtomicU8::new(READY);
 
-    let (state, code, body, reason): (u8, StatusCode, &str, Option<NotReady>) =
-        if shutting_down.load(Ordering::Relaxed) {
-            (
-                SHUTTING_DOWN,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Shutting down",
-                None,
-            )
-        } else {
-            match client.readiness() {
-                Ok(()) => (READY, StatusCode::OK, "Ready", None),
-                Err(reason) => {
-                    let state = match reason {
-                        NotReady::NoWorkers => NO_WORKERS,
-                        NotReady::InsufficientConnections { .. } => INSUFFICIENT_CONNECTIONS,
-                    };
-                    (
-                        state,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Not ready",
-                        Some(reason),
-                    )
-                }
-            }
-        };
+    let (state, code, body, reason) =
+        readiness_verdict(shutting_down.load(Ordering::Relaxed), client.readiness());
 
     if LAST_STATE.swap(state, Ordering::Relaxed) != state {
         match (state, &reason) {
@@ -767,6 +667,165 @@ fn readiness_response(code: StatusCode, detail: &str) -> Response {
         return (code, detail.to_owned()).into_response();
     }
     error_response(code, ErrorCode::NotReady, detail)
+}
+
+// Stable discriminant per readiness *category*: `/ready` is polled continuously,
+// so only a category change logs. Starts `READY` so a portal that never becomes
+// ready still logs the reason on its first probe.
+const READY: u8 = 0;
+const SHUTTING_DOWN: u8 = 1;
+const NO_WORKERS: u8 = 2;
+const INSUFFICIENT_CONNECTIONS: u8 = 3;
+
+/// Commercial configuration adds no conjunct in either enforcement mode: there is
+/// nothing to load before serving, and every replica shares one authority, so a rule
+/// keyed on the control plane would empty the fleet during the outage that triggered
+/// it — and a cold replica would wait for traffic it is not being sent (INV-31).
+/// Every route the portal serves, each stating whether it needs a key. Split
+/// out so the surface test can read the classification back (REQ-51).
+#[allow(deprecated)]
+fn gated_routes(commercial_gate: Option<Arc<Gate>>) -> Gated {
+    let routes = Gated::new(commercial_gate)
+    // Portal status
+    .route("/status", get(get_status).endpoint("/status").no_auth())
+    .route(
+        "/datasets",
+        get(get_datasets).endpoint("/datasets").no_auth(),
+    )
+    // Streaming data
+    .route(
+        "/datasets/:dataset/archival-stream",
+        post(run_archival_stream_restricted)
+            .endpoint("/archival-stream")
+            .auth(),
+    )
+    .route(
+        "/datasets/:dataset/archival-stream/debug",
+        post(run_archival_stream)
+            .endpoint("/archival-stream/debug")
+            .auth(),
+    )
+    .route(
+        "/datasets/:dataset/finalized-stream",
+        post(run_finalized_stream)
+            .endpoint("/finalized-stream")
+            .auth(),
+    )
+    .route(
+        "/datasets/:dataset/stream",
+        post(run_stream).endpoint("/stream").auth(),
+    )
+    // Getting head
+    .route(
+        "/datasets/:dataset/archival-head",
+        get(get_archival_head).endpoint("/archival-head").no_auth(),
+    )
+    .route(
+        "/datasets/:dataset/finalized-head",
+        get(get_finalized_head)
+            .endpoint("/finalized-head")
+            .no_auth(),
+    )
+    .route(
+        "/datasets/:dataset/head",
+        get(get_head).endpoint("/head").no_auth(),
+    )
+    // Dataset info
+    .route(
+        "/datasets/:dataset/state",
+        get(get_dataset_state).endpoint("/state").no_auth(),
+    )
+    .route(
+        "/datasets/:dataset",
+        get(get_dataset_metadata).endpoint("/dataset").no_auth(),
+    )
+    .route(
+        "/datasets/:dataset/metadata",
+        get(get_dataset_metadata).endpoint("/metadata").no_auth(),
+    )
+    .route(
+        "/datasets/:dataset/timestamps/:timestamp/block",
+        get(get_blocknumber_by_timestamp)
+            .endpoint("/timestamps/block")
+            .auth(),
+    )
+    // Backward compatibility routes
+    .route(
+        "/datasets/:dataset/finalized-stream/height",
+        get(get_finalized_stream_height)
+            .endpoint("/height")
+            .no_auth(),
+    )
+    .route(
+        "/datasets/:dataset/archival-stream/height",
+        get(get_archival_stream_height)
+            .endpoint("/height")
+            .no_auth(),
+    )
+    .route(
+        "/datasets/:dataset_id/query/:worker_id",
+        post(execute_query).endpoint("/query").auth(),
+    )
+    .route(
+        "/datasets/:dataset/height",
+        get(get_height).endpoint("/height").no_auth(),
+    )
+    .route(
+        "/datasets/:dataset/:start_block/worker",
+        get(get_worker).endpoint("/worker").no_auth(),
+    )
+    // Internal routes
+    .route(
+        "/debug/workers",
+        get(get_all_workers).endpoint("/debug/workers").no_auth(),
+    )
+    .route(
+        "/datasets/:dataset/:block/debug",
+        get(get_debug_block).endpoint("/block/debug").no_auth(),
+    )
+    // Ops probes and the served schema: never gated, or a pod that cannot
+    // answer its own readiness check leaves rotation.
+    .route("/metrics", get(get_metrics).no_auth())
+    .route("/ready", get(get_readiness).no_auth())
+    .route("/api-docs/openapi.json", get(serve_openapi_spec).no_auth());
+
+    // SQL Query Engine
+    #[cfg(feature = "sql")]
+    let routes = routes
+        .route("/sql/query", post(sql_query).endpoint("/sql/query").auth())
+        .route(
+            "/sql/metadata",
+            get(sql_metadata).endpoint("/sql/metadata").no_auth(),
+        );
+
+    routes
+}
+
+fn readiness_verdict(
+    shutting_down: bool,
+    network: Result<(), NotReady>,
+) -> (u8, StatusCode, &'static str, Option<NotReady>) {
+    if shutting_down {
+        return (
+            SHUTTING_DOWN,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Shutting down",
+            None,
+        );
+    }
+    if let Err(reason) = network {
+        let state = match reason {
+            NotReady::NoWorkers => NO_WORKERS,
+            NotReady::InsufficientConnections { .. } => INSUFFICIENT_CONNECTIONS,
+        };
+        return (
+            state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Not ready",
+            Some(reason),
+        );
+    }
+    (READY, StatusCode::OK, "Ready", None)
 }
 
 /// Dataset Height
@@ -1505,6 +1564,151 @@ mod tests {
                 .any(|h| *h == "*" || h.starts_with(INTERNAL_HEADER_PREFIX)),
             "the exposed set must stay explicit and free of internal headers: {exposed:?}"
         );
+    }
+
+    /// GAP-29: a refusal carrying no `ErrorCode` reads as an unmatched client
+    /// error to the normalizing layer and is rewritten to 400. Only the gate and
+    /// that layer stacked together show it, so the test sits here.
+    #[tokio::test]
+    async fn an_auth_refusal_survives_the_middleware_that_normalizes_client_errors() {
+        use tower::ServiceExt;
+        use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
+
+        use crate::commercial::test_support::gate_with;
+
+        let gate = Some(gate_with(crate::commercial::Enforcement::Enforce));
+        let app = Gated::new(gate)
+            .route(
+                "/datasets/:dataset/stream",
+                post(|| async { "served" }).endpoint("/stream").auth(),
+            )
+            .into_router()
+            .route_layer(axum::middleware::from_fn(logging::middleware))
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/datasets/base/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "the refusal must reach the wire as a 403, not a normalized 400"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(body["error"]["code"], "missing_credential");
+    }
+
+    /// The kill switch: with no `commercial:` block the gate is never
+    /// installed, so an OSS build carries no layer at all.
+    #[tokio::test]
+    async fn no_route_carries_authorization_without_a_commercial_config() {
+        use tower::ServiceExt;
+
+        let app = Gated::new(None)
+            .route(
+                "/datasets/:dataset/stream",
+                post(|| async { "served" }).auth(),
+            )
+            .route("/datasets", get(|| async { "served" }).no_auth())
+            .into_router();
+
+        for (method, uri) in [
+            ("POST", "/datasets/ethereum-mainnet/stream"),
+            ("GET", "/datasets"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+    }
+
+    /// A cold replica is ready before it has ever reached the control plane. The
+    /// rule that used to hold it back deadlocked: an exchange happens only on a
+    /// client request, and readiness is what decides whether any arrive (INV-31).
+    #[test]
+    fn readiness_does_not_depend_on_the_control_plane() {
+        assert_eq!(readiness_verdict(false, Ok(())).1, StatusCode::OK);
+        assert_eq!(
+            readiness_verdict(true, Ok(())).1,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            readiness_verdict(false, Err(NotReady::NoWorkers)),
+            (
+                NO_WORKERS,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Not ready",
+                Some(NotReady::NoWorkers)
+            )
+        );
+        // Shutdown still outranks everything.
+        assert_eq!(readiness_verdict(true, Ok(())).0, SHUTTING_DOWN);
+    }
+
+    /// REQ-51: the whole served surface, and which half of it needs a key.
+    ///
+    /// `Gated::route` already makes an unclassified route a compile error, but it
+    /// cannot see inside a merged router and nothing stops a route being added
+    /// after `into_router`. This reads the classification back, so a new data
+    /// route reaches review as a diff here rather than as an open endpoint.
+    #[test]
+    fn every_mounted_route_declares_whether_it_needs_a_key() {
+        use crate::commercial::Mounted::{self, Gated as G, Open as O};
+
+        let routes = gated_routes(None);
+        #[allow(unused_mut)]
+        let mut expected: Vec<Mounted> = vec![
+            O("/status"),
+            O("/datasets"),
+            G("/datasets/:dataset/archival-stream"),
+            G("/datasets/:dataset/archival-stream/debug"),
+            G("/datasets/:dataset/finalized-stream"),
+            G("/datasets/:dataset/stream"),
+            O("/datasets/:dataset/archival-head"),
+            O("/datasets/:dataset/finalized-head"),
+            O("/datasets/:dataset/head"),
+            O("/datasets/:dataset/state"),
+            O("/datasets/:dataset"),
+            O("/datasets/:dataset/metadata"),
+            G("/datasets/:dataset/timestamps/:timestamp/block"),
+            O("/datasets/:dataset/finalized-stream/height"),
+            O("/datasets/:dataset/archival-stream/height"),
+            G("/datasets/:dataset_id/query/:worker_id"),
+            O("/datasets/:dataset/height"),
+            O("/datasets/:dataset/:start_block/worker"),
+            O("/debug/workers"),
+            O("/datasets/:dataset/:block/debug"),
+            O("/metrics"),
+            O("/ready"),
+            O("/api-docs/openapi.json"),
+        ];
+        #[cfg(feature = "sql")]
+        expected.extend([G("/sql/query"), O("/sql/metadata")]);
+
+        assert_eq!(routes.inventory(), expected.as_slice());
     }
 
     #[tokio::test]

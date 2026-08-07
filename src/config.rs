@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use url::Url;
 
+use crate::commercial::CommercialConfig;
 use crate::network::PrioritiesConfig;
 use crate::types::DatasetRef;
 
@@ -148,6 +149,12 @@ pub struct Config {
     pub sentry_is_enabled: bool,
 
     pub client_id: Option<String>,
+
+    /// Absent means no authentication at all; present, the data API requires a
+    /// key. A key written with nothing under it is refused rather than folded
+    /// into `None` — an open portal is the one outcome it cannot have meant.
+    #[serde(default, deserialize_with = "parse_commercial")]
+    pub commercial: Option<CommercialConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +204,10 @@ impl Config {
         let file = std::fs::File::open(config_path)?;
         let buf_reader = std::io::BufReader::new(file);
         let deser = serde_yaml::Deserializer::from_reader(buf_reader);
+        // NOTE: this runs inside clap's `value_parser`, before `setup_tracing`,
+        // so these warnings go to a subscriber that does not exist yet. Kept as
+        // is — main logs the authorization mode once tracing is up, which is
+        // the part an operator must not have to infer.
         let mut warn_unknown = |path: serde_ignored::Path| {
             tracing::warn!("ignoring unknown config field: {path}");
         };
@@ -209,6 +220,9 @@ impl Config {
 
     fn validate(&self) -> anyhow::Result<()> {
         self.congestion.validate()?;
+        if let Some(commercial) = &self.commercial {
+            commercial.validate()?;
+        }
         Ok(())
     }
 }
@@ -379,6 +393,23 @@ where
     Ok(s.trim_end_matches('/').to_owned())
 }
 
+/// Reached only when the config file actually carries a `commercial` key —
+/// `#[serde(default)]` answers for an absent one without coming here — so a
+/// null arriving at this point was written by hand.
+fn parse_commercial<'de, D>(deserializer: D) -> Result<Option<CommercialConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<CommercialConfig>::deserialize(deserializer)? {
+        Some(config) => Ok(Some(config)),
+        None => Err(serde::de::Error::custom(
+            "commercial: the block is present but empty. Remove the key to run the portal \
+             without authorization, or fill the block in — an empty one would silently serve \
+             the data API to anyone.",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +467,64 @@ sqd_network:
         let config: Config = serde_yaml::from_str(&yaml).expect("parse");
         assert_eq!(config.pre_drain_grace_period, Duration::from_secs(3));
         assert_eq!(config.drain_timeout, Duration::from_secs(7));
+    }
+
+    /// The kill switch: without the block the portal is byte-for-byte an OSS
+    /// portal, and `run_server` installs no authorization middleware.
+    #[test]
+    fn commercial_is_absent_unless_configured() {
+        let config: Config = serde_yaml::from_str(MINIMAL_YAML).expect("parse");
+        assert!(config.commercial.is_none());
+    }
+
+    /// An operator who wrote the key meant to configure something. serde folds
+    /// an explicit null into `None`, which is the open portal — the single
+    /// outcome nobody typing `commercial:` can have intended — and nothing
+    /// anywhere would have said so.
+    #[test]
+    fn an_empty_commercial_block_is_a_config_error() {
+        let yaml = format!("{MINIMAL_YAML}commercial:\n");
+
+        let err = serde_yaml::from_str::<Config>(&yaml)
+            .expect_err("a null commercial block must not parse as absent");
+        assert!(err.to_string().contains("commercial"), "got {err}");
+
+        // The production path reads through two adapters; both must agree.
+        let deser = serde_yaml::Deserializer::from_str(&yaml);
+        let err = serde_yaml::with::singleton_map_recursive::deserialize::<Config, _>(
+            serde_ignored::Deserializer::new(deser, &mut |_: serde_ignored::Path| {}),
+        )
+        .expect_err("a null commercial block must not parse as absent");
+        assert!(err.to_string().contains("commercial"), "got {err}");
+
+        // A block that is present but has nothing usable in it fails on the
+        // field it is missing, which is the message the operator needs.
+        let err = serde_yaml::from_str::<Config>(&format!("{MINIMAL_YAML}commercial: {{}}\n"))
+            .expect_err("an empty mapping must not parse either");
+        assert!(err.to_string().contains("control_plane_url"), "got {err}");
+    }
+
+    #[test]
+    fn commercial_block_parses_through_the_production_deserializer() {
+        let yaml = format!(
+            "{MINIMAL_YAML}commercial:\n  \
+             control_plane_url: https://cp.example/\n  \
+             service_token_env: PORTAL_CP_TOKEN\n  \
+             portal_id: portal-premium-eu\n  \
+             enforcement: log_only\n"
+        );
+        let deser = serde_yaml::Deserializer::from_str(&yaml);
+        let config: Config = serde_yaml::with::singleton_map_recursive::deserialize(
+            serde_ignored::Deserializer::new(deser, &mut |_: serde_ignored::Path| {}),
+        )
+        .expect("parse");
+
+        let commercial = config.commercial.expect("commercial block");
+        assert_eq!(commercial.portal_id, "portal-premium-eu");
+        assert_eq!(
+            commercial.enforcement,
+            crate::commercial::Enforcement::LogOnly
+        );
     }
 
     #[test]

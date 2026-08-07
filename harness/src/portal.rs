@@ -14,9 +14,46 @@ pub struct Endpoints {
     pub registry_port: u16,
     pub hotblocks_port: u16,
     pub http_port: u16,
+    /// `Some` turns the portal commercial: presence of the block is the switch
+    /// (REQ-56), so absence has to stay expressible.
+    pub control_plane_port: Option<u16>,
 }
 
-pub fn write_config(scratch: &Path, world: &ToyWorld, e: &Endpoints) -> anyhow::Result<PathBuf> {
+/// The `commercial:` block a CT-10 fixture writes. Limits are spelled as raw
+/// YAML lines because each case bounds a different one and the portal defaults
+/// the rest.
+pub struct Commercial {
+    pub portal_id: String,
+    pub enforcement: &'static str,
+    pub limits: Vec<String>,
+}
+
+impl Commercial {
+    pub fn new(portal_id: impl Into<String>) -> Self {
+        Self {
+            portal_id: portal_id.into(),
+            enforcement: "enforce",
+            limits: Vec::new(),
+        }
+    }
+
+    pub fn enforcement(mut self, mode: &'static str) -> Self {
+        self.enforcement = mode;
+        self
+    }
+
+    pub fn limit(mut self, key: &str, value: impl std::fmt::Display) -> Self {
+        self.limits.push(format!("    {key}: {value}\n"));
+        self
+    }
+}
+
+pub fn write_config(
+    scratch: &Path,
+    world: &ToyWorld,
+    e: &Endpoints,
+    commercial: Option<&Commercial>,
+) -> anyhow::Result<PathBuf> {
     let mut datasets = String::new();
     for ds in &world.datasets {
         datasets.push_str(&format!("  {}:\n", ds.name));
@@ -35,6 +72,26 @@ pub fn write_config(scratch: &Path, world: &ToyWorld, e: &Endpoints) -> anyhow::
             ));
         }
     }
+
+    // Loopback keeps the `https` requirement satisfied without a certificate:
+    // the block carries client credentials, so the portal refuses plaintext
+    // anywhere else.
+    let commercial_block = match (commercial, e.control_plane_port) {
+        (Some(c), Some(port)) => format!(
+            "commercial:\n  \
+             control_plane_url: http://127.0.0.1:{port}/\n  \
+             portal_id: {id}\n  \
+             enforcement: {mode}\n{limits}",
+            id = c.portal_id,
+            mode = c.enforcement,
+            limits = if c.limits.is_empty() {
+                String::new()
+            } else {
+                format!("  limits:\n{}", c.limits.concat())
+            },
+        ),
+        _ => String::new(),
+    };
 
     let config = format!(
         r#"hostname: http://127.0.0.1:{http}
@@ -60,11 +117,12 @@ sqd_network:
   metadata: http://127.0.0.1:{registry}/metadata.yml
   serve: "manual"
 datasets:
-{datasets}"#,
+{datasets}{commercial_block}"#,
         http = e.http_port,
         publisher = e.publisher_port,
         registry = e.registry_port,
         datasets = datasets,
+        commercial_block = commercial_block,
     );
     let path = scratch.join("portal.config.yml");
     std::fs::write(&path, config)?;
@@ -117,6 +175,9 @@ pub fn spawn(
         .env_remove("P2P_LISTEN_ADDRS")
         .env_remove("P2P_PUBLIC_ADDRS")
         .env_remove("SENTRY_DSN")
+        // It overrides the config value, so an inherited one would silently
+        // make every exchange unattributable.
+        .env_remove("PORTAL_ID")
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()
@@ -154,6 +215,12 @@ impl PortalProcess {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    /// The whole log. An audit that greps for a secret has to read every line
+    /// of it, not the tail (INV-38).
+    pub fn log_all(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
     }
 
     pub fn log_tail(&self, lines: usize) -> String {
