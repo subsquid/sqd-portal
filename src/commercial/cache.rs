@@ -60,20 +60,40 @@ struct Denial {
     until: u64,
 }
 
+/// An attempt that established nothing about the credential. Held because the
+/// alternative is paying for it again: once per waiter queued behind it, and
+/// once per request for as long as a renewal keeps failing.
+struct Failure {
+    resolved: Resolved,
+    /// When the attempt finished. A waiter that queued before this is answered
+    /// by it — its own call could not come back fresher.
+    completed_at: Instant,
+    /// No further attempt for this fingerprint until then.
+    retry_after: Instant,
+}
+
 pub struct GrantCache {
     client: ControlPlaneClient,
     limits: Limits,
     grants: Mutex<LruCache<String, Arc<CachedGrant>>>,
     denials: Mutex<LruCache<String, Denial>>,
+    /// Capped for the same reason denials are: the fingerprint is chosen by
+    /// whoever sent the credential (HZ-10).
+    failures: Mutex<LruCache<String, Failure>>,
     /// One exchange in flight per fingerprint. Without it a burst on one
     /// uncached credential is one control-plane call per request.
     inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     permits: Semaphore,
     limiter: Mutex<RateLimiter>,
-    /// Wall-clock second of the last exchange the control plane answered. The
-    /// gauge derived from it climbs through an outage, which is the operator's
-    /// distance to the `expires_at` cliff (OB-9, OB-13).
+    /// Wall-clock second of the last exchange the control plane answered, or 0
+    /// for a replica it has never answered at all. The gauge derived from it
+    /// climbs through an outage, which is the operator's distance to the
+    /// `expires_at` cliff (OB-9, OB-13).
     last_success: AtomicU64,
+    /// Falls back for the gauge while `last_success` is still 0, so a replica
+    /// that has never been served counts up from boot instead of reading as
+    /// freshly successful.
+    started_at: u64,
 }
 
 impl GrantCache {
@@ -82,10 +102,12 @@ impl GrantCache {
             client,
             grants: Mutex::new(LruCache::new(nonzero(limits.grant_cache_capacity))),
             denials: Mutex::new(LruCache::new(nonzero(limits.denial_cache_capacity))),
+            failures: Mutex::new(LruCache::new(nonzero(limits.denial_cache_capacity))),
             inflight: Mutex::new(HashMap::new()),
             permits: Semaphore::new(limits.max_inflight_exchanges),
             limiter: Mutex::new(RateLimiter::new(limits.exchange_rate_per_sec)),
-            last_success: AtomicU64::new(now_secs()),
+            last_success: AtomicU64::new(0),
+            started_at: now_secs(),
             limits,
         });
         cache.publish_gauges();
@@ -110,9 +132,12 @@ impl GrantCache {
             return Resolved::Denied(reason);
         }
 
+        // Taken before queueing: it is what distinguishes an answer the holder
+        // of the lock produced on our behalf from one that predates us.
+        let arrived = Instant::now();
         let lock = self.lock_for(&credential.fingerprint);
         let guard = lock.clone().lock_owned().await;
-        let resolved = self.resolve_exclusively(credential, now).await;
+        let resolved = self.resolve_exclusively(credential, now, arrived).await;
         drop(guard);
         self.drop_lock_if_idle(&credential.fingerprint, lock);
         resolved
@@ -121,25 +146,63 @@ impl GrantCache {
     /// Runs under the fingerprint's lock. Whoever held it before has answered by
     /// now, so this re-checks before paying for a second call: that is what
     /// makes a burst on one credential cost one exchange (INV-14).
-    async fn resolve_exclusively(&self, credential: &Credential, now: u64) -> Resolved {
-        if let Some(grant) = self.usable_grant(&credential.fingerprint, now) {
+    async fn resolve_exclusively(
+        &self,
+        credential: &Credential,
+        now: u64,
+        arrived: Instant,
+    ) -> Resolved {
+        let held = self.usable_grant(&credential.fingerprint, now);
+        if let Some(grant) = &held {
             if grant.refresh_after > now {
-                return Resolved::Grant(grant);
+                return Resolved::Grant(grant.clone());
             }
         }
         if let Some(reason) = self.live_denial(&credential.fingerprint, now) {
             return Resolved::Denied(reason);
         }
-        self.exchange(credential, now).await
+        // A failure is an answer too, for whoever was already waiting on it.
+        // Without this the re-check above catches only the successful case and
+        // a burst against a failing control plane costs one full timeout per
+        // request, serially.
+        if let Some(resolved) = self.failure_since(&credential.fingerprint, arrived) {
+            return self.or_grace(resolved, held);
+        }
+        let resolved = self.exchange(credential, now).await;
+        self.or_grace(resolved, held)
+    }
+
+    /// Keeps a grant that is still inside its hard expiry from being discarded
+    /// by an exchange that established nothing. The fast path already serves
+    /// through an outage on such a grant; refusing here instead would make the
+    /// grace depend on which side of the lock the request arrived (REQ-54).
+    fn or_grace(&self, resolved: Resolved, held: Option<Arc<CachedGrant>>) -> Resolved {
+        match (resolved, held) {
+            (Resolved::Saturated | Resolved::Unavailable, Some(grant)) => {
+                metrics::report_grace_admission();
+                Resolved::Grant(grant)
+            }
+            (resolved, _) => resolved,
+        }
     }
 
     /// The renewal a request past `refresh_after` triggers without waiting for
     /// it. Skipped outright when one is already running for this fingerprint.
     fn spawn_refresh(self: &Arc<Self>, credential: Credential, now: u64) {
+        // `refresh_after` cannot advance while the exchange keeps failing, so
+        // without a cooldown every request served on grace spawns another
+        // attempt and the whole data-plane rate lands on a control plane that
+        // is already down.
+        if self.cooling_down(&credential.fingerprint) {
+            return;
+        }
         let cache = self.clone();
         tokio::spawn(async move {
             let lock = cache.lock_for(&credential.fingerprint);
             let Ok(guard) = lock.clone().try_lock_owned() else {
+                // Even the loser has to check the entry back in: it holds a
+                // clone, so the holder's own check could not have retired it.
+                cache.drop_lock_if_idle(&credential.fingerprint, lock);
                 return;
             };
             // Another refresh may have landed between the request's read and
@@ -168,7 +231,7 @@ impl GrantCache {
                 outcome = "over_inflight_cap",
                 "commercial exchange skipped: too many in flight"
             );
-            return Resolved::Saturated;
+            return self.remember_failure(&credential.fingerprint, Resolved::Saturated);
         };
         if !self.limiter.lock().unwrap().take() {
             metrics::report_exchange(ExchangeOutcome::Saturated, None);
@@ -177,7 +240,7 @@ impl GrantCache {
                 outcome = "rate_limited",
                 "commercial exchange skipped: rate limit"
             );
-            return Resolved::Saturated;
+            return self.remember_failure(&credential.fingerprint, Resolved::Saturated);
         }
 
         let started = Instant::now();
@@ -188,6 +251,7 @@ impl GrantCache {
             Ok(Exchanged::Granted(grant)) => {
                 self.last_success.store(now_secs(), Ordering::Release);
                 metrics::report_exchange(ExchangeOutcome::Granted, Some(elapsed));
+                self.failures.lock().unwrap().pop(&credential.fingerprint);
                 let cached = self.store(&credential.fingerprint, grant, now);
                 Resolved::Grant(cached)
             }
@@ -197,6 +261,7 @@ impl GrantCache {
                 // A denial outranks whatever lifetime the grant it replaces had
                 // left: the authority has spoken since (INV-6).
                 self.grants.lock().unwrap().pop(&credential.fingerprint);
+                self.failures.lock().unwrap().pop(&credential.fingerprint);
                 self.remember_denial(&credential.fingerprint, reason.clone(), now);
                 self.publish_gauges();
                 Resolved::Denied(reason)
@@ -209,7 +274,7 @@ impl GrantCache {
                     error = %err,
                     "commercial exchange failed"
                 );
-                Resolved::Unavailable
+                self.remember_failure(&credential.fingerprint, Resolved::Unavailable)
             }
         }
     }
@@ -234,7 +299,15 @@ impl GrantCache {
         // window actually served rather than of whatever was offered. Early
         // rather than late: jitter must spread a cohort's renewals, never extend
         // how long any one of them serves unrenewed (HZ-12).
-        let renew_at = grant.refresh_after.min(expires_at).max(now);
+        //
+        // The floor is the next second, not this one: a grant landing already
+        // due — upstream clock skew, or a control plane that renews on issue —
+        // would otherwise put every subsequent request back on the exchange
+        // path and never actually cache anything.
+        let renew_at = grant
+            .refresh_after
+            .min(expires_at)
+            .max(now.saturating_add(1));
         let refresh_after = renew_at.saturating_sub(self.jitter(renew_at - now));
 
         let cached = Arc::new(CachedGrant {
@@ -275,6 +348,41 @@ impl GrantCache {
         );
     }
 
+    fn remember_failure(&self, fingerprint: &str, resolved: Resolved) -> Resolved {
+        let completed_at = Instant::now();
+        self.failures.lock().unwrap().put(
+            fingerprint.to_owned(),
+            Failure {
+                resolved: resolved.clone(),
+                completed_at,
+                // One attempt's own deadline: retrying a fingerprint faster than
+                // a call to the authority takes cannot learn anything new.
+                retry_after: completed_at + self.limits.exchange_timeout(),
+            },
+        );
+        resolved
+    }
+
+    /// The outcome of an attempt that finished after `arrived`, if there was
+    /// one — the answer this caller queued for, already paid.
+    fn failure_since(&self, fingerprint: &str, arrived: Instant) -> Option<Resolved> {
+        let mut failures = self.failures.lock().unwrap();
+        let failure = failures.get(fingerprint)?;
+        (failure.completed_at >= arrived).then(|| failure.resolved.clone())
+    }
+
+    fn cooling_down(&self, fingerprint: &str) -> bool {
+        let mut failures = self.failures.lock().unwrap();
+        let Some(failure) = failures.get(fingerprint) else {
+            return false;
+        };
+        if failure.retry_after > Instant::now() {
+            return true;
+        }
+        failures.pop(fingerprint);
+        false
+    }
+
     /// A grant that has not passed its hard expiry, whether or not it is due for
     /// renewal. An expired one is removed rather than returned: it can never be
     /// served on again, so keeping it only costs capacity.
@@ -285,6 +393,12 @@ impl GrantCache {
             return Some(grant.clone());
         }
         grants.pop(fingerprint);
+        // Republished here as well as on store: during an outage nothing is
+        // stored, and occupancy would otherwise sit at its pre-outage peak
+        // while the cache actually drains to empty.
+        let entries = grants.len();
+        drop(grants);
+        metrics::report_grant_cache_size(entries);
         None
     }
 
@@ -308,12 +422,18 @@ impl GrantCache {
     }
 
     /// Keeps the keyed-lock map from growing with every credential ever seen.
-    /// Called only once the guard is dropped: under the map lock no clone can be
-    /// taken, so a count of two — the map's and the caller's — means nobody else
-    /// is waiting on it.
+    /// Every holder of a clone calls this once it is done, and the caller's own
+    /// reference goes under the map lock — where no new clone can be taken — so
+    /// whoever releases last is the one that sees the map holding the only
+    /// remaining reference. Counting without dropping first cannot: each holder
+    /// would see the others and leave the entry to nobody.
     fn drop_lock_if_idle(&self, fingerprint: &str, lock: Arc<tokio::sync::Mutex<()>>) {
         let mut inflight = self.inflight.lock().unwrap();
-        if Arc::strong_count(&lock) <= 2 {
+        drop(lock);
+        if inflight
+            .get(fingerprint)
+            .is_some_and(|held| Arc::strong_count(held) == 1)
+        {
             inflight.remove(fingerprint);
         }
     }
@@ -322,11 +442,23 @@ impl GrantCache {
         metrics::report_grant_cache_size(self.grants.lock().unwrap().len());
     }
 
-    /// Seconds since the control plane last answered anything. Republished on
-    /// scrape rather than on exchange, so it climbs through an outage instead of
-    /// freezing at the last value (OB-13).
+    /// Seconds since the control plane last answered anything, counting from
+    /// boot on a replica it has never answered. Republished on scrape rather
+    /// than on exchange, so it climbs through an outage instead of freezing at
+    /// the last value (OB-13).
     pub fn last_exchange_success_age(&self) -> u64 {
-        now_secs().saturating_sub(self.last_success.load(Ordering::Acquire))
+        let since = match self.last_success.load(Ordering::Acquire) {
+            0 => self.started_at,
+            at => at,
+        };
+        now_secs().saturating_sub(since)
+    }
+
+    /// Whether the control plane has ever answered this replica. False only
+    /// before the first exchange lands, which is the one state the age gauge
+    /// cannot distinguish from a healthy one.
+    pub fn has_exchanged(&self) -> bool {
+        self.last_success.load(Ordering::Acquire) != 0
     }
 
     pub fn capacity(&self) -> usize {
@@ -434,6 +566,157 @@ mod tests {
         }
 
         assert_eq!(cp.exchanges(), 1);
+    }
+
+    /// The burst rule has to survive the answer being a failure. Without it
+    /// each waiter re-enters the exchange and pays the full per-exchange
+    /// deadline in turn, so the last one is held for N times a timeout that is
+    /// specified to stay under the deadline callers wait on.
+    #[tokio::test]
+    async fn a_burst_against_a_failing_control_plane_makes_one_exchange() {
+        let cp = MockControlPlane::spawn().await;
+        cp.status(KEY_ID, 503);
+        cp.delay(Duration::from_millis(50));
+        let cache = cache_for(&cp).await;
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let cache = cache.clone();
+            tasks.spawn(async move { cache.resolve(&credential(), NOW).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            let resolved = result.unwrap();
+            assert!(
+                matches!(resolved, Resolved::Unavailable),
+                "got {resolved:?}"
+            );
+        }
+
+        assert_eq!(cp.exchanges(), 1);
+    }
+
+    /// A control plane that renews on issue — or whose clock trails the
+    /// portal's — must not produce a grant that is due the second it is stored.
+    /// Such a grant is never really cached: every request goes back to the
+    /// exchange path and spends the fleet-shared budget.
+    #[tokio::test]
+    async fn a_grant_that_arrives_already_due_is_still_cached() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW, NOW + 900);
+        let cache = cache_for(&cp).await;
+
+        let first = cache.resolve(&credential(), NOW).await;
+        assert!(
+            granted(&first).refresh_after > NOW,
+            "a grant stored due at the current second re-exchanges forever"
+        );
+
+        cache.resolve(&credential(), NOW).await;
+        assert_eq!(cp.exchanges(), 1);
+    }
+
+    /// `refresh_after` cannot advance while the renewal keeps failing, so a
+    /// grace window without a cooldown turns every request into an attempt and
+    /// points the portal's whole data-plane rate at a control plane that is
+    /// already down.
+    #[tokio::test]
+    async fn grace_does_not_re_ask_the_control_plane_on_every_request() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+        assert_eq!(cp.exchanges(), 1);
+
+        cp.stop();
+        for _ in 0..25 {
+            granted(&cache.resolve(&credential(), NOW + 400).await);
+            // Long enough for the spawned renewal to land, so the loop measures
+            // the cooldown rather than the in-flight guard.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        assert!(
+            cp.exchanges() <= 2,
+            "25 grace-served requests made {} exchanges",
+            cp.exchanges()
+        );
+    }
+
+    /// The fast path serves through an outage on a grant that is due but not
+    /// expired. The path under the lock reads the same grant, so it has to
+    /// reach the same verdict — otherwise the grace depends on which side of a
+    /// contended lock the request happened to arrive (REQ-54).
+    #[tokio::test]
+    async fn a_non_authoritative_refusal_does_not_discard_a_live_grant() {
+        let cp = MockControlPlane::spawn().await;
+        let cache = cache_for(&cp).await;
+        let held = Arc::new(CachedGrant {
+            key_id: KEY_ID.to_owned(),
+            datasets: None,
+            refresh_after: NOW,
+            expires_at: NOW + 900,
+        });
+
+        for refusal in [Resolved::Unavailable, Resolved::Saturated] {
+            let graced = cache.or_grace(refusal, Some(held.clone()));
+            assert_eq!(granted(&graced).key_id, KEY_ID);
+        }
+
+        // With nothing to fall back on the refusal stands, and stays retryable
+        // rather than becoming a verdict about the credential.
+        let bare = cache.or_grace(Resolved::Unavailable, None);
+        assert!(matches!(bare, Resolved::Unavailable), "got {bare:?}");
+    }
+
+    /// The keyed-lock map is the one piece of per-fingerprint state with no
+    /// capacity bound, so an entry left behind is a leak for the process
+    /// lifetime. This drives the contended path — every request in grace, each
+    /// spawning a renewal that races the request holding the lock — and pins
+    /// that the map drains. It does not schedule the interleaving that used to
+    /// orphan an entry; that one is closed by construction, in
+    /// `drop_lock_if_idle`.
+    #[tokio::test]
+    async fn contended_fingerprints_do_not_accumulate_locks() {
+        let cp = MockControlPlane::spawn().await;
+        // Due on arrival, so every request lands in grace and spawns a renewal
+        // that has to race the request holding the lock.
+        cp.grant(KEY_ID, None, NOW, NOW + 100_000);
+        cp.delay(Duration::from_millis(2));
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+
+        for round in 0..24 {
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let cache = cache.clone();
+                tasks.spawn(async move { cache.resolve(&credential(), NOW + 2 + round).await });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        }
+        // Let any renewal still racing the last request check its entry back in.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            cache.inflight.lock().unwrap().len(),
+            0,
+            "a losing renewal orphaned its lock entry"
+        );
+    }
+
+    /// The one state the freshness gauge cannot express: a replica the control
+    /// plane has never answered looks exactly like one it answered a second ago.
+    #[tokio::test]
+    async fn a_replica_reports_whether_the_control_plane_ever_answered() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+
+        assert!(!cache.has_exchanged());
+
+        cache.resolve(&credential(), NOW).await;
+        assert!(cache.has_exchanged());
     }
 
     /// REQ-54's grace, and its end. The control plane stops answering: a grant

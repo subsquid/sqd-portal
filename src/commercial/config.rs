@@ -24,7 +24,10 @@ pub struct CommercialConfig {
     #[serde(default)]
     pub enforcement: Enforcement,
 
-    #[serde(flatten)]
+    /// Nested rather than flattened: a flattened struct absorbs every unmatched
+    /// key in the block, so `Config::read`'s unknown-field warning never fires
+    /// and a misspelled limit silently keeps its default.
+    #[serde(default)]
     pub limits: Limits,
 }
 
@@ -110,6 +113,13 @@ impl CommercialConfig {
                 .all(|c| !c.is_control() && !c.is_whitespace()),
             "commercial.portal_id must not contain whitespace or control characters"
         );
+        // The exchange body carries the caller's credential verbatim, so a
+        // plaintext hop hands whoever can read it a key that works against the
+        // public data API. Loopback keeps local dev on `http://`.
+        anyhow::ensure!(
+            self.control_plane_url.scheme() == "https" || is_loopback(&self.control_plane_url),
+            "commercial.control_plane_url must be https outside loopback: it carries credentials"
+        );
         self.limits.validate()
     }
 
@@ -131,6 +141,15 @@ impl CommercialConfig {
 
     pub fn exchange_timeout(&self) -> Duration {
         self.limits.exchange_timeout()
+    }
+}
+
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(name)) => name == "localhost",
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
     }
 }
 
@@ -162,6 +181,13 @@ impl Limits {
             self.denial_cache_capacity >= 1,
             "commercial.denial_cache_capacity must be at least 1"
         );
+        // Zero expires a denial before the next request reads it, which turns
+        // the cache off without saying so — and the exchange budget it exists
+        // to protect is fleet-shared (HZ-10).
+        anyhow::ensure!(
+            self.denial_ttl_secs >= 1,
+            "commercial.denial_ttl_secs must be at least 1"
+        );
         anyhow::ensure!(
             self.refresh_jitter_pct <= 100,
             "commercial.refresh_jitter_pct must be a percentage"
@@ -190,11 +216,11 @@ impl Default for Limits {
 }
 
 fn default_max_grant_lifetime_secs() -> u64 {
-    900
+    12 * 60 * 60
 }
 
 fn default_exchange_timeout_ms() -> u64 {
-    2000
+    10_000
 }
 
 fn default_exchange_rate_per_sec() -> u64 {
@@ -240,9 +266,9 @@ portal_id: portal-premium-eu
         let config = parse(MINIMAL);
 
         assert_eq!(config.enforcement, Enforcement::Enforce);
-        assert_eq!(config.limits.max_grant_lifetime_secs, 900);
+        assert_eq!(config.limits.max_grant_lifetime_secs, 12 * 60 * 60);
         assert_eq!(config.limits.grant_cache_capacity, 65_536);
-        assert_eq!(config.exchange_timeout(), Duration::from_millis(2000));
+        assert_eq!(config.exchange_timeout(), Duration::from_millis(10_000));
     }
 
     #[test]
@@ -250,13 +276,14 @@ portal_id: portal-premium-eu
         let config = parse(&format!(
             "{MINIMAL}\
              enforcement: log_only\n\
-             max_grant_lifetime_secs: 300\n\
-             exchange_timeout_ms: 500\n\
-             exchange_rate_per_sec: 5\n\
-             max_inflight_exchanges: 4\n\
-             grant_cache_capacity: 128\n\
-             denial_cache_capacity: 64\n\
-             denial_ttl_secs: 30\n\
+             limits:\n  \
+             max_grant_lifetime_secs: 300\n  \
+             exchange_timeout_ms: 500\n  \
+             exchange_rate_per_sec: 5\n  \
+             max_inflight_exchanges: 4\n  \
+             grant_cache_capacity: 128\n  \
+             denial_cache_capacity: 64\n  \
+             denial_ttl_secs: 30\n  \
              refresh_jitter_pct: 25\n"
         ));
 
@@ -326,6 +353,7 @@ portal_id: portal-premium-eu
             |l| l.max_inflight_exchanges = 0,
             |l| l.grant_cache_capacity = 0,
             |l| l.denial_cache_capacity = 0,
+            |l| l.denial_ttl_secs = 0,
             |l| l.refresh_jitter_pct = 101,
         ] {
             let mut config = parse(MINIMAL);
@@ -338,5 +366,48 @@ portal_id: portal-premium-eu
         }
 
         assert!(parse(MINIMAL).validate().is_ok());
+    }
+
+    /// The exchange body carries the caller's credential, so the hop has to be
+    /// one an observer cannot read — except where it never leaves the machine.
+    #[test]
+    fn a_plaintext_control_plane_is_rejected_unless_it_is_loopback() {
+        let _guard = env_guard();
+        std::env::remove_var(PORTAL_ID_ENV);
+
+        let with_url = |url: &str| {
+            let mut config = parse(MINIMAL);
+            config.control_plane_url = url.parse().unwrap();
+            config
+        };
+
+        assert!(with_url("http://cp.example/").validate().is_err());
+        assert!(with_url("http://10.0.0.5:8080/").validate().is_err());
+
+        assert!(with_url("https://cp.example/").validate().is_ok());
+        assert!(with_url("http://127.0.0.1:3000/").validate().is_ok());
+        assert!(with_url("http://localhost:3000/").validate().is_ok());
+        assert!(with_url("http://[::1]:3000/").validate().is_ok());
+    }
+
+    /// A limit is only operator-bindable if a typo in one is audible. Flattening
+    /// the struct into the block swallowed every unmatched key, so the default
+    /// stayed in force and nothing said so.
+    #[test]
+    fn a_misspelled_limit_is_reported_rather_than_ignored() {
+        let yaml = format!(
+            "{MINIMAL}limits:\n  \
+             max_grant_lifetime_seconds: 60\n"
+        );
+
+        let mut ignored = Vec::new();
+        let deser = serde_yaml::Deserializer::from_str(&yaml);
+        let config: CommercialConfig = serde_ignored::deserialize(deser, |path| {
+            ignored.push(path.to_string());
+        })
+        .expect("the block still parses");
+
+        assert_eq!(ignored, vec!["limits.max_grant_lifetime_seconds"]);
+        assert_eq!(config.limits.max_grant_lifetime_secs, 12 * 60 * 60);
     }
 }

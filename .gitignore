@@ -3,8 +3,7 @@
 *.key
 db
 
-# libp2p identity keypairs. `*.key` never matched these, which is how they
-# reached a public branch once.
+# libp2p identity keypairs (`*.key` does not match these)
 key-*
 !key-*.rs
 

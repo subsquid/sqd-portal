@@ -34,8 +34,9 @@ impl ControlPlaneClient {
                 // This request carries a client's credential and its answer
                 // decides whether to serve. Both belong to the configured
                 // control plane and nowhere else, so a redirect is an error
-                // rather than an instruction. `http://` stays legal: local dev
-                // runs the control plane without TLS.
+                // rather than an instruction. The scheme is TLS everywhere the
+                // hop leaves the machine; `CommercialConfig::validate` is what
+                // holds `http://` down to loopback.
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             exchange_url: endpoint_url(&config.control_plane_url, &EXCHANGE_PATH)?,

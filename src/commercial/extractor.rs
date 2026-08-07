@@ -114,6 +114,14 @@ impl Gate {
         self.enforcement == Enforcement::Enforce
     }
 
+    /// A replica that enforces but has never reached the control plane can only
+    /// refuse. Unlike the outage case this is not fleet-wide — the warm
+    /// replicas still serve on their grants — so withholding readiness here
+    /// keeps a cold restart out of rotation instead of taking everyone out.
+    pub fn awaiting_control_plane(&self) -> bool {
+        self.enforcing() && !self.cache.has_exchanged()
+    }
+
     /// Republished on scrape so it climbs through an outage rather than
     /// freezing at the last value (OB-13).
     pub fn publish_freshness(&self) {

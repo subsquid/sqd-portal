@@ -740,17 +740,24 @@ async fn get_metrics(
 )]
 async fn get_readiness(
     Extension(client): Extension<Arc<NetworkClient>>,
+    Extension(gate): Extension<Option<Arc<Gate>>>,
     Extension(shutting_down): Extension<Arc<AtomicBool>>,
 ) -> impl IntoResponse {
     static LAST_STATE: AtomicU8 = AtomicU8::new(READY);
 
-    let (state, code, body, reason) =
-        readiness_verdict(shutting_down.load(Ordering::Relaxed), client.readiness());
+    let (state, code, body, reason) = readiness_verdict(
+        shutting_down.load(Ordering::Relaxed),
+        client.readiness(),
+        gate.is_some_and(|gate| gate.awaiting_control_plane()),
+    );
 
     if LAST_STATE.swap(state, Ordering::Relaxed) != state {
         match (state, &reason) {
             (READY, _) => tracing::info!("readiness check now passing: portal is ready"),
             (SHUTTING_DOWN, _) => tracing::info!("readiness check now failing: shutting down"),
+            (AWAITING_CONTROL_PLANE, _) => {
+                tracing::warn!("readiness check now failing: control plane has not answered yet")
+            }
             (_, Some(reason)) => tracing::warn!("readiness check now failing: {reason}"),
             (_, None) => {}
         }
@@ -790,21 +797,32 @@ const READY: u8 = 0;
 const SHUTTING_DOWN: u8 = 1;
 const NO_WORKERS: u8 = 2;
 const INSUFFICIENT_CONNECTIONS: u8 = 3;
+const AWAITING_CONTROL_PLANE: u8 = 4;
 
-/// Commercial configuration contributes no conjunct here, in either enforcement
-/// mode. There is nothing to load before serving, and every replica shares one
-/// control plane — so a readiness rule keyed on it would take the whole fleet
-/// out of rotation during exactly the outage that triggered it (INV-31,
-/// REQ-54). An unreachable control plane is answered with retryable refusals.
+/// Commercial configuration contributes one conjunct, and only until the first
+/// exchange lands: an enforcing replica that has never reached the control plane
+/// answers every request with a refusal, so it stays out of rotation while its
+/// warm siblings keep serving. Past that first success the rule is gone — a
+/// later outage is fleet-wide, and withholding readiness on it would take
+/// everyone out during exactly the outage that triggered it (INV-31, REQ-54).
 fn readiness_verdict(
     shutting_down: bool,
     network: Result<(), NotReady>,
+    awaiting_control_plane: bool,
 ) -> (u8, StatusCode, &'static str, Option<NotReady>) {
     if shutting_down {
         return (
             SHUTTING_DOWN,
             StatusCode::SERVICE_UNAVAILABLE,
             "Shutting down",
+            None,
+        );
+    }
+    if awaiting_control_plane {
+        return (
+            AWAITING_CONTROL_PLANE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Awaiting the control plane",
             None,
         );
     }
@@ -1644,19 +1662,20 @@ mod tests {
         }
     }
 
-    /// Commercial configuration never withholds readiness, in either mode.
-    /// Every replica shares one control plane, so a rule keyed on it empties
-    /// the fleet during the outage that triggered it; an unreachable control
-    /// plane is answered with retryable refusals instead (INV-31, REQ-54).
+    /// Once the control plane has answered once, nothing about it withholds
+    /// readiness again. Every replica shares one, so a standing rule keyed on it
+    /// empties the fleet during the outage that triggered it; an unreachable
+    /// control plane is answered with retryable refusals instead (INV-31,
+    /// REQ-54).
     #[test]
-    fn readiness_does_not_depend_on_the_control_plane() {
-        assert_eq!(readiness_verdict(false, Ok(())).1, StatusCode::OK);
+    fn readiness_does_not_depend_on_the_control_plane_once_it_has_answered() {
+        assert_eq!(readiness_verdict(false, Ok(()), false).1, StatusCode::OK);
         assert_eq!(
-            readiness_verdict(true, Ok(())).1,
+            readiness_verdict(true, Ok(()), false).1,
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
-            readiness_verdict(false, Err(NotReady::NoWorkers)),
+            readiness_verdict(false, Err(NotReady::NoWorkers), false),
             (
                 NO_WORKERS,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1665,7 +1684,24 @@ mod tests {
             )
         );
         // Shutdown still outranks everything.
-        assert_eq!(readiness_verdict(true, Ok(())).0, SHUTTING_DOWN);
+        assert_eq!(readiness_verdict(true, Ok(()), false).0, SHUTTING_DOWN);
+        assert_eq!(readiness_verdict(true, Ok(()), true).0, SHUTTING_DOWN);
+    }
+
+    /// A replica that enforces but has never reached the control plane can only
+    /// refuse, so it stays out of rotation until its first exchange lands —
+    /// unlike an outage, this leaves the warm replicas serving.
+    #[test]
+    fn a_cold_enforcing_replica_is_not_ready() {
+        assert_eq!(
+            readiness_verdict(false, Ok(()), true),
+            (
+                AWAITING_CONTROL_PLANE,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Awaiting the control plane",
+                None
+            )
+        );
     }
 
     #[tokio::test]
