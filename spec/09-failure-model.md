@@ -69,24 +69,23 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 
 ## Control-plane faults (DC-8)
 
-Commercial deployments only. The governing asymmetry: a fault in the *key* fails closed,
-a fault in the *feed* fails static. Refusing every request because the control plane is
-unreachable would convert its outage into the Portal's (REQ-54).
+Commercial deployments only. The governing asymmetry: a fault in the *credential* fails
+closed, a fault in the *exchange* degrades — onto a cached grant while one is live, and
+into retryable refusals once it is not. The window between those two is the whole outage
+policy, and it is the control plane's `expires_at` under the Portal's cap (REQ-54).
 
 | Fault | Required response |
 |---|---|
-| Feed unreachable / timeout / error status | degrade serve-static on the established snapshot + alarm on age (OB-13); no request fails for this reason. ⚠ Unbounded today — GAP-31 |
-| Feed answers 200 with a malformed envelope | integrity: fail the tick, keep the snapshot, alarm. Never read as "the key set is empty" — that would silently stop delivering revocations |
-| Record malformed but identifiable | integrity: tombstone the key (fail-closed), count, keep serving everything else |
-| Record unidentifiable | integrity: fail the page; snapshot unchanged |
-| Record with an unrecognized status | fail-closed tombstone — a status this build predates must never admit traffic |
-| Feed epoch change / head below cursor | mask: rebuild the snapshot from the start (DEF-18); mid-drain, fail the tick and rebuild on the next |
-| No snapshot ever established, enforcing | fail-safe: decline readiness (INV-31) — leave rotation rather than 401 every valid key |
-| No snapshot ever established, shadow mode | mask: admit everything, stay ready (REQ-55) |
-| Lookup rate-limited or over the in-flight cap | fail-safe: refuse immediately as OVERLOADED with a retry hint; never admit, queue, or claim the credential is invalid (HZ-10) |
-| Lookup unavailable, times out, or returns an unusable answer | fail-safe: refuse as UPSTREAM-FAILURE; the unchanged credential may succeed after recovery |
-| Lookup answers about a different key | integrity: discard and refuse as UPSTREAM-FAILURE |
-| Service credential missing or empty at startup | fail-safe at startup: refuse to run (REQ-33) |
+| Exchange unreachable / timeout / error status, cached grant inside `expires_at` | degrade: serve on the cached grant; count the grace-serving and alarm on it (OB-9/13). No request fails for this reason while the grant lives |
+| Exchange unreachable, no usable grant (never cached, or past `expires_at`) | fail-safe: refuse as UPSTREAM-FAILURE, retryable, attributed to the dependency. This is the accepted cost of asking on demand, not a defect |
+| Answer malformed, missing a field, or carrying an unrecognized claims version | integrity: treat as a failed exchange, store nothing, alarm. Never read for the parts that parsed — an unread restriction is a granted permission |
+| Answer about a different credential than was asked about | integrity: discard and refuse as UPSTREAM-FAILURE |
+| Answer offers a lifetime beyond P-GRANT-MAX-LIFETIME | mask: accept, capped at the bound; count it as a control-plane misconfiguration |
+| Authoritative denial arriving against a live cached grant | fail-closed: evict and refuse from that moment; a denial is never outranked by remaining lifetime (INV-6) |
+| Exchange rate-limited or over the in-flight cap | with no usable grant, fail-safe immediately as OVERLOADED with a retry hint; with a grant inside `expires_at`, suppress this renewal and serve on the grant. Never queue or claim the credential is invalid (REQ-54, HZ-10) |
+| Signing headers malformed or unattributable, or timestamp skew past P-SIGNATURE-MAX-SKEW in either direction | fail-safe as UPSTREAM-FAILURE, and alarm: it fails every exchange at once and the cause is local clock, identity, or request construction, not any client's key |
+| Control plane never reached at all, either mode | mask for readiness — stay ready and refuse retryably (INV-31); leaving rotation would answer one outage with a larger one |
+| Signing identity missing or empty at startup | fail-safe at startup: refuse to run (REQ-33) |
 | Commercial block present but empty | fail-safe at startup: refuse to run — the open portal is the one outcome nobody configuring it intended (REQ-56) |
 
 ## Other dependencies
@@ -120,4 +119,4 @@ unreachable would convert its outage into the Portal's (REQ-54).
 | Publisher | INV-1, INV-2, INV-31, LIV-6, REQ-26 | CT-2 |
 | Real-time source | INV-25, INV-26, LIV-2, REQ-22, REQ-25 | CT-2 |
 | Process/operator | FM-1, INV-30, LIV-11, REQ-33 | CT-2, CT-7 |
-| Control plane | INV-6, INV-31, REQ-54, REQ-55, LIV-13, LIV-14 | CT-10 |
+| Control plane | INV-6, INV-15, INV-31, REQ-54, REQ-55, LIV-13, LIV-14 | CT-10 |

@@ -39,8 +39,8 @@ are new requests).
 *Pre.* In order: (1) resolve alias → dataset, else NOT-FOUND; (2) parse tuning
 parameters, reject zero/unparsable as BAD-REQUEST; (3) decode and validate the query
 per DEF-7, else BAD-REQUEST — **no serving-dependency call happens before validation
-completes**; OP-11's bounded authentication lookup may already have occurred on a
-snapshot miss (INV-10/14); (4) clamp tuning to operator caps (INV-11); (5) admission: if
+completes**; OP-11's bounded credential exchange may already have occurred for a
+credential with no usable grant (INV-10/14); (4) clamp tuning to operator caps (INV-11); (5) admission: if
 the stream census is at P-MAX-STREAMS or congestion utilization exceeds
 P-HEADROOM-THRESHOLD, refuse OVERLOADED with a retry hint (INV-12) — admission is checked
 before any upstream work.
@@ -123,12 +123,11 @@ of the conformance surface beyond existence and freshness.
 
 *Effect.* Pure read of local state — never calls a dependency. *Post.* Ready iff:
 an artifact is applied ∧ worker connectivity ≥ P-READY-CONNECTION-RATIO ∧ not shutting
-down ∧ (on a commercial deployment that is *enforcing*, a key snapshot has been
-established — REQ-54) (INV-31). Shadow enforcement adds no such condition: it admits
-regardless of what the snapshot knows, so withholding readiness for it would cause the
-outage shadow mode exists to avoid (REQ-55). Intent (ADR-013 ⚠): also degrade when
-artifact age > P-ASSIGNMENT-MAX-AGE; the key-set analogue,
-P-KEY-SNAPSHOT-MAX-AGE ⚠, is open on OQ-12.
+down (INV-31). Commercial configuration adds no conjunct in either enforcement mode: there
+is nothing to load before serving, and a control plane that is unreachable is answered with
+retryable refusals, not by leaving rotation — every replica shares one authority, so a
+readiness rule on its account would empty the fleet at the worst possible moment (REQ-54).
+Intent (ADR-013 ⚠): also degrade when artifact age > P-ASSIGNMENT-MAX-AGE.
 
 ## OP-9 — Metrics read
 
@@ -148,30 +147,36 @@ gated route (DEF-19) of a commercial deployment, and does not exist at all on an
 (REQ-56). It is listed as an operation because it has a contract, a failure mapping, and
 tests of its own.
 
-*Pre.* The route's class is gated under the operator's gate scope. An ungated route skips
-this operation entirely and costs exactly what it costs on a non-commercial deployment —
-the credential is not read and the dataset is not resolved.
+*Pre.* The route is a gated one (DEF-19). An ungated route skips this operation entirely
+and costs exactly what it costs on a non-commercial deployment — the credential is not
+read and the dataset is not resolved.
 
-*Effect.* Reads the key snapshot (DEF-18). On a snapshot miss, and only then, it may
-consult the control plane directly (DC-8), under that contract's rate and concurrency
-bounds; a lookup it is not allowed to make is an immediate OVERLOADED outcome, not a
-delay or a BAD-CREDENTIAL claim, and a failed lookup is UPSTREAM-FAILURE. It resolves the
-requested dataset to a canonical name **only** for a key that is dataset-scoped and has
-already authenticated — the one rung that needs it — so an unauthenticated request cannot
-buy that work (INV-14). No serving dependency is consulted, and no shared state is
-mutated beyond the snapshot's own caches and authorization observability.
+*Effect.* Checks the presented credential's grammar, then looks up its fingerprint in the
+grant cache (DEF-18). A grant that has not passed `refresh_after` answers locally and
+consults nothing. Otherwise, and only then, it exchanges at the control plane (DC-8) under
+that contract's rate, concurrency and single-flight bounds. With no usable grant, an
+exchange it is not allowed to make is an immediate OVERLOADED outcome, not a delay and not
+a BAD-CREDENTIAL claim, and a failed one is UPSTREAM-FAILURE. Past `refresh_after` but
+inside `expires_at`, the existing grant answers whether the renewal runs or its local
+budget is exhausted; past `expires_at` the request waits only for an exchange already
+admitted by the limiter, and is refused immediately rather than queued when no permit is
+available. It resolves the requested dataset to a canonical name **only** for a key that
+is dataset-scoped and has already authenticated — the one rung that needs it — so an
+unauthenticated request cannot buy that work (INV-14). No serving dependency is consulted,
+and no shared state is mutated beyond the grant cache, its negative answers, and
+authorization observability.
 
 *Post.* Admit, and the request proceeds to its operation unchanged; reject with the first
 failed rung of REQ-53's ladder, mapped to its DEF-10 row; or fail before a verdict with
-OVERLOADED/UPSTREAM-FAILURE when a required lookup could not run or answer. Any such
+OVERLOADED/UPSTREAM-FAILURE when a required exchange could not run or answer. Any such
 outcome is terminal while enforcing: no handler runs, no stream slot is taken, and no
 serving dependency is called. Under shadow enforcement the verdict or indeterminate
-lookup outcome is recorded and the request proceeds regardless (REQ-55).
+exchange outcome is recorded and the request proceeds regardless (REQ-55).
 
 *Timing.* The rejection path is O(1) in request size and consults no dependency in the
-snapshot-hit and syntactically-invalid cases (PF-7). The evaluation itself is a pure
-function (INV-15); only snapshot-miss resolution may wait on its DC-8 deadline, and local
-lookup saturation refuses immediately as OVERLOADED rather than queuing.
+cache-hit and syntactically-invalid cases (PF-7). The evaluation itself is a pure
+function (INV-15); only a request with no usable grant waits on the DC-8 deadline, and
+local exchange saturation refuses immediately as OVERLOADED rather than queuing.
 
 ## Concurrency
 

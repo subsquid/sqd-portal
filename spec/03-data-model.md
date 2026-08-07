@@ -101,8 +101,10 @@ additional public values.
 | `rate_limit_error` | yes, after hint | Capacity is exhausted |
 | `availability_error` | yes | Data or a dependency is temporarily unavailable |
 | `api_error` | no | A Portal-owned invariant failed; page |
-| `authentication_error` | no | The credential is absent, unreadable, or does not authenticate (ADR-017) |
-| `permission_error` | no | The credential authenticated but does not cover this request (ADR-017) |
+| `authentication_error` | no | The credential is absent, unreadable, or does not authenticate (ADR-011) |
+| `permission_error` | no | The credential authenticated but does not cover this request (ADR-011) |
+
+Both credential types answer 403, so the status never distinguishes them (ADR-011).
 
 | Spec outcome | Wire `type` / `code` | Meaning |
 |---|---|---|
@@ -117,7 +119,7 @@ additional public values.
 | WORKER-FAILURE | `api_error` / `worker_failure` | Worker results violated an owned integrity invariant and rerouting was exhausted (DC-1) |
 | INTERNAL | `api_error` / `internal_error` or `unclassified` | Portal invariant failed or a failure escaped classification |
 | NO-CREDENTIAL | `authentication_error` / `missing_credential` | A gated route was reached with no credential (REQ-50) |
-| BAD-CREDENTIAL | `authentication_error` / `invalid_credential` | The token is unparseable, names no known key, its secret does not match, or the held record has no digest — one code for all four, by design (INV-39) |
+| BAD-CREDENTIAL | `authentication_error` / `invalid_credential` | The token is unparseable, names no known key, or its secret does not match — one code for all three, by design (INV-39) |
 | REVOKED | `authentication_error` / `revoked_credential` | The key authenticated but the control plane has withdrawn it |
 | EXPIRED | `authentication_error` / `expired_credential` | The key authenticated but its expiry has passed |
 | WRONG-PORTAL | `permission_error` / `portal_not_allowed` | The key is scoped to portals not including this one |
@@ -130,7 +132,7 @@ would have restated.
 
 The last six rows exist only on a commercial deployment (REQ-56) and are never
 `api_error`: refusing an unauthenticated request is the system working, and must not
-page (ADR-017). None of them is retryable and none carries a retry hint.
+page (ADR-011). None of them is retryable and none carries a retry hint.
 
 Exact statuses and envelope exceptions are fixed by IB-5. No dependency-specific body
 or code extends this set.
@@ -141,52 +143,63 @@ Every definition in this section is vacuous on a Portal with no commercial
 configuration: nothing constructs these objects and no route consults them (REQ-56).
 
 **DEF-16 — Credential.** What a client presents: the pair (**key id**, **secret**). The
-key id is public and identifies a key record; the secret is proof of holding it. The
-Portal handles the secret only as a digest — it is reduced to one at the moment the
-request is parsed and the original is discarded, so no later stage can log, store, or
-echo what it never received (INV-38). A credential is *well-formed* iff it is presented
-through a channel IB-9 names and both segments fall within the grammar the control plane
-can mint; anything else is an invalid credential and is refused as BAD-CREDENTIAL without
-a lookup. NO-CREDENTIAL is reserved for a gated request that presents neither channel.
+key id is public and identifies a key; the secret is proof of holding it. The Portal
+reduces the presented token to a **fingerprint** — a digest over the *whole* credential,
+id and secret together — at the moment the request is parsed. The raw credential remains
+only as request-local exchange input: a cache or negative-answer hit destroys it
+immediately; on a miss, one request moves it into the single in-flight DC-8 exchange and
+every coalesced waiter destroys its copy. The exchange owner destroys it on completion,
+timeout, or cancellation. It is never shared or cached; only the fingerprint is. A
+credential is *well-formed* iff it is presented through the channel IB-9 names and both
+segments fall within the
+grammar the control plane can mint; anything else is an invalid credential and is refused
+as BAD-CREDENTIAL without being exchanged. NO-CREDENTIAL is reserved for a gated request
+that presents no credential at all.
 
-**DEF-17 — Key record.** The control plane's statement about one key: (key id; **status**
-∈ {active, revoked}; **sequence**, a feed position that only ever moves forward; an
-optional secret digest; **portal scope**; **dataset scope**; optional expiry). A usable
-active record carries a digest. A record without one cannot prove which caller holds its
-secret and therefore authenticates nobody; on the request path it maps to BAD-CREDENTIAL,
-not the more specific REVOKED outcome (REQ-53, INV-39). A scope is either
-*absent*, meaning unrestricted, or a list matched exactly — an empty list therefore
-matches nothing, and the two are never conflated (REQ-53). A record whose status this
-build does not recognize, or which fails to parse while still naming its key, is not
-dropped: it becomes a **tombstone** — a record with no usable digest that authenticates
-nobody — because dropping it would leave an older, possibly usable version of that key
-in service (REQ-54).
+**DEF-17 — Grant.** The control plane's answer to one exchange: a short-lived
+authorization for one credential, carrying (**claims version**; the **subject** key id;
+**dataset scope**; **`refresh_after`**; **`expires_at`**). Portal scope is not a claim the
+Portal evaluates — the exchange knows which portal is asking, and a key that does
+not cover it is denied rather than granted. A scope is either *absent*, meaning
+unrestricted, or a list matched exactly — an empty list therefore matches nothing, and the
+two are never conflated (REQ-53). The two lifetimes are the control plane's to choose and
+the Portal's only to cap (P-GRANT-MAX-LIFETIME): `refresh_after` is when the answer should
+be renewed, `expires_at` when it may no longer be acted on. A grant whose claims version
+this build does not fully understand is unusable rather than partly usable — reading a
+newer vocabulary for the parts it recognizes is how an added restriction becomes an
+accidental permission (REQ-54).
 
-**DEF-18 — Key snapshot.** The Portal's in-memory mirror of the control plane's key set:
-(records by key id; a **cursor**, the feed position read so far; an **epoch**, the
-identity of the feed's history; a **generation**, incremented by every wholesale
-replacement). The snapshot is established by reading the feed from its start and kept
-current by cursor-paged deltas (DC-8). A delta applies a record only if its sequence
-exceeds the held one. An epoch change, or a feed head below the held cursor, means the
-history the cursor refers to no longer exists, and the snapshot is rebuilt from the start
-rather than advanced. Nothing about the snapshot survives restart (NG5).
+A **denial** is the exchange's other authoritative answer: the earliest ladder rung that
+failed (REQ-53), which the Portal maps to its DEF-10 row. A denial is not a grant and is
+never cached as one; it is remembered only as a negative answer, briefly and under a bound
+(DC-8).
 
-**DEF-19 — Route class and gate scope.** Every route carries exactly one class: **data**
-(delivers blocks, query results, or block lookups), **metadata** (describes the Portal or
-its datasets), or **always-open** (readiness, metrics, the served API schema). The
-operator's **gate scope** — `data` or `all` — selects which classes require a credential:
-`data` gates the data class, `all` gates data and metadata. Always-open is gated under
-neither (REQ-51). The classification is a property of the route, not of the request.
+**DEF-18 — Grant cache.** The Portal's bounded in-memory map from credential fingerprint
+(DEF-16) to grant, holding at most P-GRANT-CACHE-CAPACITY entries. It is keyed on the whole
+credential and never on the key id: an entry reached by id alone would admit the next caller
+to name that id without proving it holds the secret. Nothing populates it but exchanges the
+requests themselves triggered — there is no bootstrap, no background fill, and no
+authorization state a replica holds that some request did not put there. Nothing survives
+restart (NG5), and a cold replica is not a degraded one: it is one whose first request per
+credential costs an exchange.
 
-**DEF-20 — Authorization verdict.** The outcome of evaluating DEF-16 against DEF-17 for
-one request: **admit**, or **reject** carrying the first failed rung of REQ-53's ladder.
-The verdict is a pure function of (credential, key record, portal identity, requested
+**DEF-19 — Gated route.** A route that requires a credential on a commercial deployment:
+those delivering blocks, query results, or block lookups. Every other route answers
+without one (NG8). Which it is, is a property of the route rather than of the request or
+of the configuration, and is stated where the route is declared — a route that states
+neither does not compile (REQ-51).
+
+**DEF-20 — Authorization verdict.** The outcome of evaluating DEF-16 against a grant or
+denial (DEF-17) for one request: **admit**, or **reject** carrying the first failed rung of
+REQ-53's ladder. The verdict is a pure function of (credential, grant or denial, requested
 dataset, current time) — it consults no capacity, no load, and no prior request (INV-15).
-A snapshot miss may fail before a verdict exists: lookup-budget exhaustion is OVERLOADED
-and lookup failure is UPSTREAM-FAILURE (DC-8), both retryable system outcomes rather than
-claims about the credential. A verdict is separately *acted on* or not, per the
+An exchange required because no usable grant exists may fail before a verdict: budget
+exhaustion is OVERLOADED and a failed, timed-out, or unreadable exchange is
+UPSTREAM-FAILURE (DC-8), both retryable system outcomes rather than claims about the
+credential. A renewal suppressed while its old grant remains usable does not replace that
+grant's verdict. A verdict is separately *acted on* or not, per the
 enforcement mode (REQ-55): shadow mode discards a verdict when one exists, and records an
-indeterminate lookup when one does not. The rung is the internal reason; what reaches the
+indeterminate exchange when one does not. The rung is the internal reason; what reaches the
 client is the DEF-10 row it maps to, which is deliberately coarser (INV-39).
 
 ## Shared state (the frame of the stateless shape)
@@ -202,9 +215,9 @@ in-memory and reset by restart: (a) the applied artifact (DEF-4) and catalog sna
 (b) the **worker health map** — per worker: open-lease count, error/timeout cooldown
 marks, backoff-until, throughput estimate; (c) the **congestion window** (DEF-13);
 (d) the **stream census** (count of active streams, monotone stream sequence); and, on a
-commercial deployment, (e) the key snapshot, negative-answer cache, and lookup limiters
-(DEF-18, DC-8). Shared adaptive state may influence *admission, worker choice, coverage
-extent, and timing* — never record content (INV-28).
+commercial deployment, (e) the grant cache, the negative-answer cache, and the exchange
+limiters (DEF-18, DC-8). Shared adaptive state may influence *admission, worker choice,
+coverage extent, and timing* — never record content (INV-28).
 
 **DEF-13 — Congestion window.** An adaptive bound on concurrent chunk-body downloads,
 within [P-CONGESTION-MIN-WINDOW, P-CONGESTION-MAX-WINDOW]; grows additively on success,
@@ -217,7 +230,9 @@ snapshots (staleness: 05 §caches).
 
 **DEF-15 — Configuration.** The operator-supplied object binding every `P-*` parameter
 ([15-parameters.md](15-parameters.md)) plus identity (peer key), upstream endpoints,
-and the dataset map. Static per process lifetime.
+and the dataset map; on a commercial deployment it also binds the control-plane endpoint,
+the enforcement mode, and the signing identity DC-8 authenticates with. Static
+per process lifetime.
 
 ## Input events (background, not client-driven)
 
@@ -226,7 +241,10 @@ and the dataset map. Static per process lifetime.
 | Artifact publication | New assignment artifact (DEF-4) | Routing world changed | Polled every P-ASSIGNMENT-REFRESH; at-least-once; deduplicated by identifier |
 | Catalog update | Dataset catalog/metadata | Served-dataset set changed | Polled every P-DATASETS-REFRESH; last-write-wins |
 | Chain status update | Epoch, stake, compute units, worker registry | Accounting/status only | Polled every P-CHAIN-REFRESH; never affects serving (REQ-25) |
-| Key-set delta | Key records past the held cursor (DEF-17) | The served key set changed | Polled every P-KEY-SYNC-INTERVAL; ordered by sequence; applied only forward; epoch change forces a rebuild (DC-8) |
+
+Authorization is deliberately absent from this table. Nothing pushes key state at the
+Portal and no loop polls for it: a grant exists because a request asked for one (DC-8),
+which is what keeps a replica's authorization state the size of its own traffic.
 
 ## Operation summary
 
@@ -263,7 +281,7 @@ Semantics in [04-operations.md](04-operations.md).
 | hotblocks | Real-time source (DC-4) |
 | `x-sqd-data-source` | Serving source marker (DEF-6) |
 | commercial block / gate | Commercial configuration, authorization gate (REQ-56, DEF-19) |
-| snapshot store, feed cursor/epoch | Key snapshot (DEF-18) |
 | ladder, rung | REQ-53's ordered precedence; the rung is DEF-20's internal reason |
 | `log_only` / `enforce` | Shadow and enforcing modes (REQ-55) |
-| authorize-on-miss | Bounded direct lookup for a key absent from the snapshot (DC-8) |
+| exchange | The one control-plane call: credential in, grant or denial out (DC-8) |
+| fingerprint | The digest of a whole credential that keys the grant cache (DEF-16, DEF-18) |
