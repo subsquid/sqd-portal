@@ -1,6 +1,7 @@
 # ADR-011 — Portal API errors use a stable two-axis taxonomy
 
-Status: Accepted (2026-07-16)
+Status: Accepted (2026-07-16); extended 2026-08-05 to cover authentication and
+permission errors
 
 ## Context
 
@@ -21,12 +22,19 @@ specific `code` for client handling.
 | `rate_limit_error` | yes | Portal or upstream capacity is exhausted | no |
 | `availability_error` | yes | Data or a dependency is temporarily unavailable | no |
 | `api_error` | no | A Portal-owned invariant failed | yes |
+| `authentication_error` | no | The credential is absent, unreadable, or does not authenticate | no |
+| `permission_error` | no | The credential authenticated but does not cover this request | no |
 
 The closed code vocabulary is `malformed_request`, `method_not_allowed`,
 `unknown_dataset`, `not_found`, `base_block_mismatch`, `overloaded`, `no_workers`,
 `retries_exhausted`, `upstream_unavailable`, `not_ready`, `worker_failure`,
-`internal_error`, and `unclassified`. A code has exactly one type; its status mapping is
-fixed by IB-5.
+`internal_error`, `unclassified`, `missing_credential`, `invalid_credential`,
+`revoked_credential`, `expired_credential`, `portal_not_allowed`, and
+`dataset_not_allowed`. A code has exactly one type; its status mapping is fixed by IB-5.
+
+The last six belong to the two credential types — the first four to
+`authentication_error`, the last two to `permission_error` — and are reachable only where
+an operator configured commercial access control.
 
 The taxonomy covers failures only. A 204 is the correct answer to a range that is not
 produced yet, so it has no `type` and no `code`: it carries no body, so a code could
@@ -90,6 +98,49 @@ Successes and 204 remain streaming pass-through under ADR-003. The source marker
 that the error originated on the real-time path; upstream implementation-specific codes
 and bodies are not public Portal API.
 
+### Credential refusals
+
+A Portal configured for commercial access control (REQ-50..REQ-56) refuses on grounds of
+*who is asking* — a ground the original four types could not express. Without their own
+vocabulary such a refusal is normalized by the middleware onto `malformed_request` and
+its bound 400, so a client cannot tell "your key is invalid" from "your query is
+malformed", and every auth refusal lands on the metric as a client query error — erasing
+the one signal an operator needs during a cutover.
+
+All six credential codes answer **403**, and none carries `WWW-Authenticate`.
+
+**One status for all six, rather than RFC 9110's 401/403 split.** The split is drawn
+where valid credentials were presented, which is exactly where a guesser learns something:
+a wrong secret answering 401 while a wrong dataset answers 403 puts "your guess was
+correct" on the status line, and nothing bounds guessing on a snapshot hit. The status
+therefore says only that a credential problem occurred; the code says which, to whoever
+already holds the key.
+
+The type axis survives the collapse because it answers a different question: whether the
+credential itself is the problem or its scope is. A client branching on `type` still
+knows whether to present a different key or to ask for a wider one.
+
+Both credential types are non-retryable: retrying with the same credential cannot succeed,
+and a client treating an auth refusal as transient produces exactly the refusal storm
+ADR-012 exists to prevent. Neither carries `Retry-After`. A snapshot miss that could not
+be resolved is not an auth verdict: lookup saturation remains retryable overload, and
+lookup failure remains retryable upstream unavailability (DC-8).
+
+**`invalid_credential` deliberately covers four distinct internal reasons** — a token the
+Portal could not parse, a key id it does not know, a key id whose secret does not match,
+and a record carrying no digest with which to prove the secret. They are one wire code
+because distinguishing them turns the endpoint into an enumeration oracle: a client that
+learns "this key id exists, wrong secret" has been told which of its guesses to keep. The
+operator's need for the distinction is met on the *internal* axis — protected structured
+logs (OB-12) — which no client can read, and the keyless metrics surface keeps the same
+coarsening as the wire. The remaining codes are only reachable by someone already holding
+the right secret, so they can be specific without leaking anything (INV-39). A digestless
+revoked or malformed tombstone cannot establish that fact and therefore remains
+`invalid_credential`.
+
+`api_error` keeps its meaning: an auth refusal is never an `api_error` and must never
+page. The Portal turning away an unauthenticated request is the system working.
+
 ### Field casing
 
 Envelope keys are snake_case: `request_id` is the only multi-word one, and it matches the
@@ -148,3 +199,8 @@ The wire body is a breaking change for clients that parsed legacy prose or flat
 renaming either requires an explicit migration. The status-only mapping of upstream
 errors is intentionally lossy, but the Portal now exposes one coherent contract on a
 route served by either data source.
+
+The credential codes put 403 in IB-5's status set and six rows in its table; CT-5 covers
+them like any other binding row. They are the first types that are not about the Portal's
+own health — the original four all answer "is this retryable and does it page?", and both
+credential types answer no to both.

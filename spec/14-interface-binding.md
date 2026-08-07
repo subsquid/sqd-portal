@@ -99,7 +99,7 @@ The last six rows appear only on a commercial deployment (REQ-56) and only on a 
 route (IB-9). None is retryable and none carries a retry hint: retrying with the same
 credential cannot succeed, and treating an auth refusal as transient reproduces the
 ADR-012 refusal storm. All six share one status, so the status line never reveals that a
-presented secret was the right one (ADR-017); none carries a challenge. None is an
+presented secret was the right one (ADR-011); none carries a challenge. None is an
 `api_error`, so none pages. A snapshot miss that could not be resolved is not one of these
 six rows: lookup-budget exhaustion maps to retryable `overloaded`, and lookup failure to
 retryable `upstream_unavailable` (DC-8).

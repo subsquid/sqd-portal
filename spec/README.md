@@ -19,7 +19,7 @@ nothing durable survives a restart). Modules 06 (consistency/durability) and 10
 refreshed-snapshot lifecycle is folded into 05. Numbering gaps are canonical, never
 recycled.
 
-Commercial access control (REQ-50..REQ-56, DC-8, ADR-016/017) is **conditional**: every
+Commercial access control (REQ-50..REQ-56, DC-8, ADR-011) is **conditional**: every
 property in that area is vacuous on a Portal the operator has not configured
 commercially, which is the default and the only mode a self-hosted build has. It is
 spread through the existing documents rather than given one of its own, because it is a
@@ -44,8 +44,9 @@ precondition on the surface those documents already describe, not a second syste
 | [15-parameters.md](15-parameters.md) | every `P-*` symbol: role, observed value, target | no (registry) | **yes** |
 | `decisions/` | one ADR per decision, append-only | rationale | append-only |
 
-ADR numbers follow decision date. Historical decisions come first; decisions that have
-not been ratified are explicitly `Proposed` and appear after the accepted log.
+ADR numbers follow decision date and are never recycled. Historical decisions come first;
+decisions that have not been ratified are explicitly `Proposed` and appear after the
+accepted log.
 
 | ADR | Date | Title | Status |
 |---|---|---|---|
@@ -57,15 +58,13 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 | ADR-006 | 2026-06-03 | [Network bandwidth is the modeled limiting resource](decisions/ADR-006-bandwidth-limiting-resource.md) | Accepted (historical) |
 | ADR-007 | 2026-06-04 | [Overload gets its own status code (529), distinct from data unavailability](decisions/ADR-007-overload-529.md) | Accepted (historical) |
 | ADR-008 | 2026-06-08 | [Unknown config fields warn, don't reject](decisions/ADR-008-config-unknown-fields-warn.md) | Accepted (historical) |
-| ADR-009 | 2026-06-25 | Per-request artificial head latency for real-time streams *(canonical record kept in the sqd-network decision log; not bundled in this suite — see OQ-5)* | Accepted |
+| ADR-009 | 2026-06-25 | Per-request artificial head latency for real-time streams *(not bundled in this suite — see OQ-5)* | Accepted |
 | ADR-010 | 2026-07-09 | [Upstream deadlines sit strictly below client deadlines](decisions/ADR-010-upstream-deadline-below-client.md) | Accepted (historical) |
-| ADR-011 | 2026-07-16 | [Portal API errors use a stable two-axis taxonomy](decisions/ADR-011-error-taxonomy.md) | Accepted |
+| ADR-011 | 2026-07-16 | [Portal API errors use a stable two-axis taxonomy](decisions/ADR-011-error-taxonomy.md) | Accepted; extended 2026-08-05 |
 | ADR-012 | 2026-07-17 | [Every shed response carries an explicit retry hint](decisions/ADR-012-retry-after-on-shed.md) | Accepted |
 | ADR-014 | 2026-07-17 | [Contract reconciliation: overload hints, conflict precedence, artifact regression, archival finalized head, EMPTY metadata, timestamp frontier, gated debug surface](decisions/ADR-014-contract-reconciliation.md) | Accepted |
 | ADR-015 | 2026-07-21 | [One connection-class replay on the real-time path](decisions/ADR-015-real-time-connection-replay.md) | Accepted |
 | ADR-013 | 2026-07-17 | [Assignment staleness must be bounded and observable](decisions/ADR-013-assignment-staleness-bound.md) | **Proposed** |
-| ADR-016 | 2026-08-05 | [The Portal authenticates requests itself](decisions/ADR-016-portal-side-authentication.md) | **Proposed** |
-| ADR-017 | 2026-08-05 | [Authentication and permission errors extend the ADR-011 taxonomy](decisions/ADR-017-auth-error-taxonomy.md) | **Proposed** |
 
 ## Conventions
 
@@ -93,12 +92,9 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 
 1. **Extend the harness past Phase 0** (13 §build order): the Phase-0 skeleton —
    dependency stubs per IB-7, the structural validators, the reference model — has
-   landed (GAP-14 closed 2026-07-17); build the `CT-2..CT-9` classes on it next.
-2. **Ratify or reject proposed ADR-013, ADR-016 and ADR-017** and the ⚠ targets in
+   landed; build the `CT-2..CT-9` classes on it next.
+2. **Ratify or reject proposed ADR-013** and the ⚠ targets in
    [15-parameters.md](15-parameters.md) and the SLO table (11); close the open questions
-   in [02-requirements.md](02-requirements.md). ADR-016 and ADR-017 are a pair: the
-   first makes the Portal refuse requests on identity grounds, the second gives those
-   refusals somewhere to live in the error taxonomy. Both are implemented; what is left
-   is the ratification.
+   in [02-requirements.md](02-requirements.md).
 3. **Burn down the gap register** in [13-conformance.md](13-conformance.md) in priority
    order — failing test first, fix second, matrices updated in the same change.

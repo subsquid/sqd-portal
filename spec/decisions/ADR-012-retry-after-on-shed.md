@@ -4,13 +4,12 @@ Status: Accepted (2026-07-17)
 
 ## Context
 
-In the 2026-07 production incident, a saturated public portal hitting its stream cap
-returned 503 with **no** `Retry-After` and a message blaming the network ("no available
-workers"). The dominant client SDK honors a pause only when `Retry-After` is present;
-otherwise it falls back to its own schedule whose first step is 10 ms. Shed load came
-straight back — a self-amplifying refusal storm measured at ~314 rps — and the
-misattributed message sent operators debugging the wrong layer. (The same event
-correlates with OOM-kill restarts tracked separately as GAP-3.)
+A saturated portal hitting its stream cap returned 503 with **no** `Retry-After` and a
+message blaming the network ("no available workers"). Clients commonly honor a pause only
+when `Retry-After` is present and otherwise fall back to their own schedule, whose first
+step can be milliseconds. Shed load therefore comes straight back, so the refusal becomes
+self-amplifying rather than self-limiting, and a message naming the wrong layer points
+diagnosis away from the real cause.
 
 ## Decision
 

@@ -60,14 +60,14 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
 | G4 | Be a good network citizen: self-regulate bandwidth, spread load across workers, account for usage | REQ-40..REQ-44, ADR-006, ADR-004 |
 | G5 | Operable: truthful readiness, observable behavior, forgiving configuration | REQ-23, REQ-24, REQ-30..REQ-33 |
 | G6 | Robust against hostile clients and flaky upstreams | REQ-21, REQ-22, REQ-25, REQ-26 |
-| G7 | Commercial access is decided by the Portal, not by whatever sits in front of it — and only where an operator asked for it | REQ-50..REQ-56, ADR-016, ADR-017 |
+| G7 | Commercial access is decided by the Portal, not by whatever sits in front of it — and only where an operator asked for it | REQ-50..REQ-56, ADR-011 |
 
 ## Non-goals
 
 | Non-goal | Rationale |
 |---|---|
-| ~~NG1~~ — *retired by ADR-016.* Per-request authentication is now an opt-in capability (REQ-50..REQ-56). A Portal without commercial configuration still authenticates nothing and has no client-level defenses beyond input validation; that is a deployment choice, no longer a property of the system. Other per-client policy (tiers, head lag) still originates upstream (ADR-009). |
-| NG2 — No per-client quotas or fairness | All capacity limits are global. One client can exhaust shared capacity; isolation between clients is not promised. **An authenticated key is no exception:** admission (REQ-50) decides whether a request is served, never how much of the shared capacity it may take. Quota and metering are explicitly out of scope for ADR-016. |
+| ~~NG1~~ — *retired: a perimeter cannot carry a commercial access decision (02 §commercial access control).* Per-request authentication is now an opt-in capability (REQ-50..REQ-56). A Portal without commercial configuration still authenticates nothing and has no client-level defenses beyond input validation; that is a deployment choice, no longer a property of the system. Other per-client policy (tiers, head lag) still originates upstream (ADR-009). |
+| NG2 — No per-client quotas or fairness | All capacity limits are global. One client can exhaust shared capacity; isolation between clients is not promised. **An authenticated key is no exception:** admission (REQ-50) decides whether a request is served, never how much of the shared capacity it may take. Quota and metering are explicitly out of scope for REQ-50..REQ-56 — later phases, not a permanent property of the system. |
 | NG3 — No head subscription or long-poll | Clients poll. A request beyond the frontier gets a throttled empty response (REQ-5), never a held-open wait for new blocks. |
 | NG4 — No cross-source splicing within one response | Each response is served entirely by one source (archival or real-time). Crossing the boundary is the client's follow-up request (REQ-4). |
 | NG6 — No catalog privacy | Which datasets a Portal serves is public on every deployment: the catalog, heads, heights and worker inventory answer without a credential whatever the commercial configuration says. Gating that surface as a second scope was considered and rejected: it makes every route's classification a decision, and the contract is simpler when the catalog is public everywhere. Revisit if a deployment ever needs the catalog closed. |

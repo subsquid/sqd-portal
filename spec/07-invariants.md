@@ -273,7 +273,7 @@ construction.
 **INV-39 — No enumeration oracle.** [response]
 On every completed credential verdict, an unparseable token, an authoritatively unknown
 key id, a known key id with a wrong secret, and a digestless tombstone are
-indistinguishable to the client: same status, same code, same body (ADR-017). The reasons
+indistinguishable to the client: same status, same code, same body (ADR-011). The reasons
 that *are* distinguishable — revoked, expired, wrong portal, wrong dataset — are reachable
 only by a client already holding the correct secret. The distinction survives on the
 internal axis only, in protected structured logs — never as a label or

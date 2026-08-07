@@ -14,9 +14,9 @@ pub enum ErrorType {
     Availability,
     /// An invariant we own was violated.
     Api,
-    /// The credential is absent, unreadable, or does not authenticate (ADR-017).
+    /// The credential is absent, unreadable, or does not authenticate (ADR-011).
     Authentication,
-    /// The credential authenticated but does not cover this request (ADR-017).
+    /// The credential authenticated but does not cover this request (ADR-011).
     Permission,
 }
 
@@ -105,7 +105,7 @@ error_codes! {
         /// re-types an unclassified 4xx.
         Unclassified => "unclassified",
 
-        // ADR-017. Commercial deployments only; vacuous without a `commercial:` block.
+        // ADR-011. Commercial deployments only; vacuous without a `commercial:` block.
         MissingCredential => "missing_credential",
         /// One code for four rungs — unparseable, unknown id, wrong secret, no digest.
         /// Splitting them tells a caller which guess to keep (INV-39); the operator gets
@@ -170,7 +170,7 @@ impl ErrorCode {
             }
             // One status for all six, against RFC 9110's 401/403 split: that
             // split falls exactly where the secret was proven, so it would put
-            // "your guess was correct" on the status line (ADR-017, INV-39).
+            // "your guess was correct" on the status line (ADR-011, INV-39).
             Self::MissingCredential
             | Self::InvalidCredential
             | Self::RevokedCredential
@@ -676,7 +676,7 @@ mod tests {
         assert!(!ErrorCode::Internal.error_type().retryable());
         assert!(!ErrorCode::WorkerFailure.error_type().retryable());
         assert!(!ErrorCode::MalformedRequest.error_type().retryable());
-        // Retrying the same key cannot change the answer (ADR-017).
+        // Retrying the same key cannot change the answer (ADR-011).
         assert!(!ErrorCode::InvalidCredential.error_type().retryable());
         assert!(!ErrorCode::DatasetNotAllowed.error_type().retryable());
     }

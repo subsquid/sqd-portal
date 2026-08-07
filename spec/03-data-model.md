@@ -101,10 +101,10 @@ additional public values.
 | `rate_limit_error` | yes, after hint | Capacity is exhausted |
 | `availability_error` | yes | Data or a dependency is temporarily unavailable |
 | `api_error` | no | A Portal-owned invariant failed; page |
-| `authentication_error` | no | The credential is absent, unreadable, or does not authenticate (ADR-017) |
-| `permission_error` | no | The credential authenticated but does not cover this request (ADR-017) |
+| `authentication_error` | no | The credential is absent, unreadable, or does not authenticate (ADR-011) |
+| `permission_error` | no | The credential authenticated but does not cover this request (ADR-011) |
 
-Both credential types answer 403, so the status never distinguishes them (ADR-017).
+Both credential types answer 403, so the status never distinguishes them (ADR-011).
 
 | Spec outcome | Wire `type` / `code` | Meaning |
 |---|---|---|
@@ -132,7 +132,7 @@ would have restated.
 
 The last six rows exist only on a commercial deployment (REQ-56) and are never
 `api_error`: refusing an unauthenticated request is the system working, and must not
-page (ADR-017). None of them is retryable and none carries a retry hint.
+page (ADR-011). None of them is retryable and none carries a retry hint.
 
 Exact statuses and envelope exceptions are fixed by IB-5. No dependency-specific body
 or code extends this set.

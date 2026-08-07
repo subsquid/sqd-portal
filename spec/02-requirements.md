@@ -17,8 +17,7 @@ outside the covered range appears. A response may cover less than the requested 
 case (REQ-5).
 *Acceptance:* for any valid request over available data, delivered block numbers are
 strictly increasing, start at the requested first block's range, contain no duplicates,
-and never exceed the requested upper bound. Duplicate delivery of a range is a defect
-(regression: the double-scheduling incident of 2026-06).
+and never exceed the requested upper bound. Duplicate delivery of a range is a defect.
 *Trace:* ADR-001.
 
 **REQ-2 — Resumable progress.** [MUST]
@@ -266,8 +265,7 @@ and refreshing the routing artifact must not require two full copies resident �
 *Acceptance:* memory under saturation load stays within P-MEMORY-BUDGET; an assignment
 refresh does not spike resident memory by ~2× the artifact size. Count-only limits do
 not satisfy this requirement: at current defaults their multiplicative ceiling is
-orders of magnitude above the provisioned budget (GAP-3/GAP-17, OQ-9). Baseline: the
-2026-07-17 production OOM-kill restarts.
+orders of magnitude above the provisioned budget (GAP-3/GAP-17, OQ-9).
 
 ## Operability (30–34)
 
@@ -361,6 +359,33 @@ On any other deployment every requirement here is vacuous: there is no gate, no 
 and no control-plane dependency. Admission decided here is binary — it never shapes how
 much capacity an admitted request may consume (NG2).
 
+**Why the Portal decides this itself.** A perimeter in front of the Portal cannot carry a
+commercial access decision, for two reasons. It is not part of this system — nothing here
+constrains it, so whatever guarantee it provides is unspecified and untested against this
+suite. And it cannot express what the decision needs: a perimeter sees a request, it does
+not know that *this* key is revoked, expired, bought only one dataset, or belongs on a
+different portal. The issuing side already mints keys and knows their state; the missing
+half was a data plane that can decide, per request, whether to serve. That is why
+per-request authentication is no longer a non-goal (NG1, retired), and why the capability
+is opt-in rather than default: a Portal without commercial configuration keeps
+byte-for-byte its previous behavior (REQ-56), and configuration present but empty is a
+startup error, never an open portal.
+
+The shape of the band follows from that. The Portal **mirrors rather than asks** — it
+tails the key feed into an in-memory snapshot (DC-8) and verifies presented secrets
+locally against the published digest, so the request path makes no lookup except the
+bounded authorize-on-miss call that lets a key minted seconds ago work before the next
+sync. It **fails closed on the key and static on the feed**: an unknown key is refused,
+but a feed outage does not invalidate a snapshot hit (REQ-54), because refusing every
+valid key during a blip is a worse outage than briefly honoring one that was just
+revoked; a miss that cannot be resolved is refused retryably as overload or upstream
+unavailability, never mislabeled as an invalid credential. Enforcement is **a mode, not a
+deploy** (REQ-55), so the cutover is a configuration change with a measured blast radius
+rather than a leap. And the gated set is **one surface, not two** (REQ-51): gating the
+catalog as a second scope was rejected because it turns every route's classification into
+a decision (NG6), so each route states which set it is in where it is declared and there
+is no default to forget.
+
 **REQ-50 — Gated routes require a valid key.** [MUST]
 On a commercial deployment, every request to a gated route (DEF-19) is authorized before
 any other work: the presented credential (DEF-16) must resolve to a key record (DEF-17)
@@ -372,7 +397,7 @@ authenticated and only when its dataset scope requires that name (INV-14).
 *Acceptance:* against a gated route, a request with no credential, an unparseable token,
 an unknown key id, a wrong secret, a revoked key retaining its digest, a digestless
 tombstone, an expired key, a key scoped to another portal, and a key scoped to another
-dataset each receive the refusal ADR-017 binds to it; no serving-dependency stub records a
+dataset each receive the refusal ADR-011 binds to it; no serving-dependency stub records a
 call for any of them; only a snapshot miss may call the DC-8 lookup, and only an
 authenticated dataset-scoped case may canonicalize the dataset. A valid unscoped key is
 served exactly as the same request is served on a non-commercial deployment.
@@ -480,26 +505,26 @@ Deliberately left open — tests and clients must not pin these:
   control plane's own issuance, rotation, and organization model — the Portal mirrors a
   key set, it does not define one.
 - Which internal rejection reason underlies a given `invalid_credential` response: the
-  three are deliberately indistinguishable to a client (INV-39, ADR-017).
+  three are deliberately indistinguishable to a client (INV-39, ADR-011).
 
 ## Open questions
 
-| ID | Question | Blocks | Owner |
-|---|---|---|---|
-| OQ-1 | Tuning params `timeout_quantile` and `retries` are advertised but overwritten on public endpoints — honor, reject, or re-document as server-controlled? | REQ-8, GAP-8 | portal team |
-| OQ-2 | Should truncation (REQ-6) become client-detectable (e.g. a trailing marker), or stay resolution-by-resume per ADR-001? | REQ-6 | portal + SDK teams |
-| OQ-3 | Ratify P-ASSIGNMENT-MAX-AGE and the degraded-readiness semantics (ADR-013). | REQ-23, GAP-2 | portal team |
-| OQ-4 | Ratify P-MEMORY-BUDGET and the assignment-size planning figure (docs disagree: ~300 MB vs ~0.5 GB). | REQ-27, GAP-3 | portal team |
-| OQ-5 | ADR-009 (head-lag) is accepted but the Portal-side header injection is not implemented — schedule or re-scope? | GAP-13 | portal team |
-| OQ-7 | A stream body without a first block silently defaults to block 0, while the API description marks it required — reject instead? | REQ-7 | portal team |
-| OQ-9 | Ratify a global P-BUFFERED-BYTES-BUDGET and its accounting/admission semantics. | REQ-27, GAP-17 | portal team |
-| OQ-10 | Ratify the draft SLO target parameters and their benchmark gating policy. | 11 SLO table | portal team |
-| OQ-13 | Should a dataset-scoped key be able to use the SQL surface, which names its datasets in the body rather than the path? Today such a key is refused there outright (REQ-53), which is fail-closed but makes the surface unusable for exactly the customers most likely to be scoped. | REQ-53, OP-10 | portal team |
-| OQ-11 | REQ-40's fleet-cutover premise assumes workers also honor `effective_from`; workers currently apply assignments immediately (recorded in the worker suite's open questions, `worker-rs/spec/02`), so each publication opens a window of routing to reshuffling workers (transient `no_workers`/`retries_exhausted` churn). Size the window for worker convergence, or have workers delay too? | REQ-40, REQ-41 | network team |
+| ID | Question | Blocks |
+|---|---|---|
+| OQ-1 | Tuning params `timeout_quantile` and `retries` are advertised but overwritten on public endpoints — honor, reject, or re-document as server-controlled? | REQ-8, GAP-8 |
+| OQ-2 | Should truncation (REQ-6) become client-detectable (e.g. a trailing marker), or stay resolution-by-resume per ADR-001? | REQ-6 |
+| OQ-3 | Ratify P-ASSIGNMENT-MAX-AGE and the degraded-readiness semantics (ADR-013). | REQ-23, GAP-2 |
+| OQ-4 | Ratify P-MEMORY-BUDGET and the assignment-size planning figure (docs disagree: ~300 MB vs ~0.5 GB). | REQ-27, GAP-3 |
+| OQ-5 | ADR-009 (head-lag) is accepted but the Portal-side header injection is not implemented — schedule or re-scope? | GAP-13 |
+| OQ-7 | A stream body without a first block silently defaults to block 0, while the API description marks it required — reject instead? | REQ-7 |
+| OQ-9 | Ratify a global P-BUFFERED-BYTES-BUDGET and its accounting/admission semantics. | REQ-27, GAP-17 |
+| OQ-10 | Ratify the draft SLO target parameters and their benchmark gating policy. | 11 SLO table |
+| OQ-13 | Should a dataset-scoped key be able to use the SQL surface, which names its datasets in the body rather than the path? Today such a key is refused there outright (REQ-53), which is fail-closed but makes the surface unusable for exactly the customers most likely to be scoped. | REQ-53, OP-10 |
+| OQ-11 | REQ-40's fleet-cutover premise assumes workers also honor `effective_from`; workers currently apply assignments immediately, so each publication opens a window of routing to reshuffling workers (transient `no_workers`/`retries_exhausted` churn). Size the window for worker convergence, or have workers delay too? | REQ-40, REQ-41 |
 
 Closed: **OQ-6** (should the clamp-bypassing debug stream variant be exposed unconditionally,
 or gated behind an operator flag?) — resolved by ADR-014: the variant is gated behind an
 operator flag and disabled by default (GAP-21 until implemented). **OQ-12** (what does an
 enforcing Portal do once its key set is older than P-KEY-SNAPSHOT-MAX-AGE?) — resolved by
-ADR-016: it keeps serving and alarms, and the parameter is an alert threshold rather than
+REQ-54: it keeps serving and alarms, and the parameter is an alert threshold rather than
 anything the binary reads. OQ numbers are never recycled.

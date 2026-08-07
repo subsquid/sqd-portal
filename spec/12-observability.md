@@ -96,7 +96,7 @@ value. In `log_only`, every request increments the same neutral `shadow_evaluate
 outcome: the would-be verdict and an indeterminate lookup are distinguishable only in
 protected structured logs. No metric label or request-synchronous counter may let a
 client bracket two keyless scrapes and learn more than its response revealed (INV-39,
-ADR-017). Auth refusals in enforcing mode must still be distinguishable from every other
+ADR-011). Auth refusals in enforcing mode must still be distinguishable from every other
 refusal on the OB-3 error-code axis — an auth refusal counted as `malformed_request` is a lying
 metric (INV-30). Implemented as `commercial_authorization_decisions`.
 
