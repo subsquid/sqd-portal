@@ -2,7 +2,7 @@ use url::Url;
 
 use super::{
     config::CommercialConfig,
-    signing::RequestSigner,
+    signing::{self, RequestSigner},
     types::{ExchangeAnswer, Grant, CLAIMS_VERSION},
 };
 use crate::commercial::extractor::Credential;
@@ -123,11 +123,7 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     async fn client_for(config: &CommercialConfig) -> ControlPlaneClient {
-        ControlPlaneClient::new(config, config.signer(test_keypair()).unwrap()).unwrap()
-    }
-
-    fn test_keypair() -> sqd_network_transport::Keypair {
-        sqd_network_transport::Keypair::generate_ed25519()
+        ControlPlaneClient::new(config, config.signer(signing::test_keypair()).unwrap()).unwrap()
     }
 
     #[tokio::test]
@@ -222,7 +218,15 @@ mod tests {
         let (portal_id, timestamp, signature) = &seen[0];
         assert_eq!(portal_id, "portal-premium-eu");
         assert_eq!(timestamp, &NOW.to_string());
-        assert!(!signature.is_empty());
+        // Byte-for-byte across a real HTTP hop: a signature is worthless if the
+        // alphabet it is encoded in survives the wire only most of the time.
+        assert_eq!(
+            signature,
+            &signing::sign_for_test(&cp.config(), &credential(), NOW)
+        );
+        assert!(signature
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
     }
 
     /// A redirect sends a client's credential somewhere the operator did not

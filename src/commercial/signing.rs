@@ -7,7 +7,7 @@
 //! the control plane stores a public key rather than a secret.
 
 use axum::http::HeaderValue;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL, Engine};
 use sha2::{Digest, Sha256};
 use sqd_network_transport::{Keypair, PeerId};
 
@@ -18,6 +18,15 @@ pub const SIGNATURE_HEADER: &str = "x-signature";
 /// Bumped only if the canonical form below changes shape, so a portal and a
 /// control plane that disagree fail loudly instead of failing verification.
 const SCHEME: &str = "sqd-portal-v1";
+
+/// Both encoded values use **unpadded base64url**, so every byte of them is
+/// `[A-Za-z0-9_-]`. Standard base64 would also be a legal header value — `+`,
+/// `/` and `=` are all VCHAR — but those three are exactly the characters that
+/// change meaning when a value passes through a query string, a form encoder or
+/// a parser that splits on `=`. A signature that survives the wire only most of
+/// the time is worse than no signature, and the JWK `x` member a verifier feeds
+/// the key into is base64url anyway.
+const _: () = ();
 
 pub struct RequestSigner {
     keypair: Keypair,
@@ -35,18 +44,19 @@ impl RequestSigner {
         self.keypair.public().to_peer_id()
     }
 
-    /// The raw 32-byte Ed25519 public key, base64. This — not the peer id — is
+    /// The raw 32-byte Ed25519 public key, base64url. This — not the peer id — is
     /// what the control plane registers against `portal_id`: a peer id wraps the
     /// key in protobuf inside a multihash, so verifying one means depending on a
     /// libp2p implementation, while these 32 bytes go straight into any standard
-    /// library's Ed25519 verifier.
+    /// library's Ed25519 verifier — and, being base64url already, it drops
+    /// straight into a JWK `x` member with no re-encoding.
     pub fn public_key_base64(&self) -> anyhow::Result<String> {
         let key = self
             .keypair
             .public()
             .try_into_ed25519()
             .map_err(|_| anyhow::anyhow!("the portal's identity key is not Ed25519"))?;
-        Ok(BASE64.encode(key.to_bytes()))
+        Ok(BASE64URL.encode(key.to_bytes()))
     }
 
     /// The three headers the control plane needs to rebuild and check the
@@ -69,7 +79,7 @@ impl RequestSigner {
             ),
             (
                 SIGNATURE_HEADER,
-                HeaderValue::from_str(&BASE64.encode(signature))?,
+                HeaderValue::from_str(&BASE64URL.encode(signature))?,
             ),
         ])
     }
@@ -91,6 +101,35 @@ fn canonical(
         "{SCHEME}\n{portal_id}\n{timestamp_secs}\n{method}\n{path}\n{}",
         hex::encode(Sha256::digest(body))
     )
+}
+
+/// Signs exactly as the client does, so a test can compare what arrived over
+/// the wire against what should have been sent.
+#[cfg(test)]
+pub(super) fn sign_for_test(
+    config: &super::config::CommercialConfig,
+    credential: &super::extractor::Credential,
+    now_secs: u64,
+) -> String {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "credential": credential.token.expose(),
+    }))
+    .expect("a credential serializes");
+    let signer = RequestSigner::new(test_keypair(), config.portal_id());
+    signer
+        .headers("POST", "/internal/portal/v1/exchange", &body, now_secs)
+        .expect("signing should succeed")
+        .into_iter()
+        .find(|(name, _)| *name == SIGNATURE_HEADER)
+        .map(|(_, value)| value.to_str().expect("base64url is ASCII").to_owned())
+        .expect("a signature header")
+}
+
+/// One fixed keypair for the whole test run, so the client and the assertion
+/// that checks it are signing with the same identity.
+#[cfg(test)]
+pub(super) fn test_keypair() -> Keypair {
+    Keypair::ed25519_from_bytes([11u8; 32]).expect("a 32-byte seed")
 }
 
 #[cfg(test)]
@@ -128,7 +167,7 @@ mod tests {
         assert!(signer
             .keypair
             .public()
-            .verify(payload.as_bytes(), &BASE64.decode(encoded).unwrap()));
+            .verify(payload.as_bytes(), &BASE64URL.decode(encoded).unwrap()));
     }
 
     /// The property the whole scheme exists for: a captured header cannot be
@@ -166,16 +205,15 @@ mod tests {
     }
 
     /// A fixed vector the other side of this contract can be tested against
-    /// without running the portal. Ed25519 over the canonical string, raw
-    /// 64-byte signature, base64; the public key is the raw 32 bytes, base64.
-    /// Node verifies it with no dependencies:
+    /// without running the portal. Ed25519 over the canonical string; the
+    /// signature is the raw 64 bytes and the key the raw 32, both unpadded
+    /// base64url. Node verifies it with no dependencies:
     ///
     /// ```js
-    /// const key = crypto.createPublicKey({ format: 'jwk', key: {
-    ///   kty: 'OKP', crv: 'Ed25519',
-    ///   x: Buffer.from(PUBLIC_KEY_B64, 'base64').toString('base64url'),
-    /// }});
-    /// crypto.verify(null, Buffer.from(canonical), key, Buffer.from(sig, 'base64'));
+    /// const key = crypto.createPublicKey({ format: 'jwk',
+    ///   key: { kty: 'OKP', crv: 'Ed25519', x: PUBLIC_KEY } });
+    /// crypto.verify(null, Buffer.from(canonical), key,
+    ///               Buffer.from(SIGNATURE, 'base64url'));
     /// ```
     #[test]
     fn the_wire_format_matches_its_published_vector() {
@@ -187,7 +225,7 @@ mod tests {
 
         assert_eq!(
             signer.public_key_base64().unwrap(),
-            "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw="
+            "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw"
         );
         assert_eq!(
             canonical(
@@ -203,7 +241,7 @@ mod tests {
         );
         assert_eq!(
             signature_of(&signer, body, 1_800_000_000),
-            "/ThgFiJAgcGa7dKAE/EOMDYaL/myOdX2BIlz6RT66ziWZtzCFrFbQ6e9hcvV0zsb0A0bYhyC5GK6Kj6EU36eCA=="
+            "_ThgFiJAgcGa7dKAE_EOMDYaL_myOdX2BIlz6RT66ziWZtzCFrFbQ6e9hcvV0zsb0A0bYhyC5GK6Kj6EU36eCA"
         );
     }
 
