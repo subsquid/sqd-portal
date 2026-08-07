@@ -5,7 +5,7 @@ encodings — as *observable contract*, still no internals. **Anything not speci
 here is unspecified: clients and tests must not pin it** (IB-8).
 
 **IB-1 — Transport generalities.** HTTP/1.1+; permissive CORS (any origin/method/
-header), exposing `Retry-After`, `WWW-Authenticate`, `x-request-id` and the `x-sqd-*`
+header), exposing `Retry-After`, `x-request-id` and the `x-sqd-*`
 stream metadata —
 allowing an origin does not make a response header readable, and the CORS-safelisted set
 contains none of ours, so a browser client would otherwise see the status and nothing
@@ -88,20 +88,22 @@ closed mapping is:
 | `api_error` / `worker_failure` | 500 | envelope |
 | `api_error` / `internal_error` | 500 | envelope |
 | `api_error` / `unclassified` | contextual 5xx | envelope; must be counted and investigated |
-| `authentication_error` / `missing_credential` | 401 | envelope; `WWW-Authenticate: Bearer`; no `Retry-After` |
-| `authentication_error` / `invalid_credential` | 401 | envelope; `WWW-Authenticate: Bearer`; identical byte-for-byte apart from the request id whether the token was unparseable, named an unknown key, carried a wrong secret, or named a digestless tombstone (INV-39) |
-| `authentication_error` / `revoked_credential` | 401 | envelope; `WWW-Authenticate: Bearer` |
-| `authentication_error` / `expired_credential` | 401 | envelope; `WWW-Authenticate: Bearer` |
+| `authentication_error` / `missing_credential` | 403 | envelope; no `Retry-After`, no challenge |
+| `authentication_error` / `invalid_credential` | 403 | envelope; identical byte-for-byte apart from the request id whether the token was unparseable, named an unknown key, or carried a wrong secret (INV-39) |
+| `authentication_error` / `revoked_credential` | 403 | envelope |
+| `authentication_error` / `expired_credential` | 403 | envelope |
 | `permission_error` / `portal_not_allowed` | 403 | envelope |
 | `permission_error` / `dataset_not_allowed` | 403 | envelope |
 
 The last six rows appear only on a commercial deployment (REQ-56) and only on a gated
 route (IB-9). None is retryable and none carries a retry hint: retrying with the same
 credential cannot succeed, and treating an auth refusal as transient reproduces the
-ADR-012 refusal storm. Every 401 carries the Bearer challenge HTTP requires. None is an
-`api_error`, so none pages. A snapshot miss that could not be resolved is not one of these
-six rows: lookup-budget exhaustion maps to retryable `overloaded`, and lookup failure to
-retryable `upstream_unavailable` (DC-8).
+ADR-012 refusal storm. All six share one status, so the status line never reveals that a
+presented secret was the right one (ADR-017); none carries a challenge. None is an
+`api_error`, so none pages. When no usable grant exists, an exchange that could not be made
+is not one of these six rows: budget exhaustion maps to retryable `overloaded`, and a failed
+exchange to retryable `upstream_unavailable`. A suppressed renewal keeps serving on its
+still-usable grant instead (DC-8).
 
 EMPTY (204) is not in this table: it is a success, not a refusal, and carries no
 `type`/`code`. It is bound by IB-4 — no body, head-marker headers, emitted after
@@ -116,8 +118,7 @@ resolve (OP-5) uses the same envelope and code vocabulary.
 `not_ready` envelope (OB-5). `/metrics`: OpenMetrics; families under the `portal_` prefix
 with a constant portal-identity label. On commercial deployments the keyless scrape obeys
 12's confidentiality rule: no internal auth rung or lookup detail beyond the public wire
-outcome under either gate scope, and no dataset identity under `all`. `/status`, `/state`,
-`/debug/*`: bodies explicitly unstable (REQ-14).
+outcome. `/status`, `/state`, `/debug/*`: bodies explicitly unstable (REQ-14).
 
 **IB-7 — Input-side binding (what harness stubs implement).** Worker stub (DC-1): the
 peer-to-peer query protocol — signed query in, sized/compressed result or typed error
@@ -127,10 +128,15 @@ and metadata documents. Real-time stub (DC-4): `/head`, `/finalized-head`, `/sta
 `/stream`, `/finalized-stream` under `datasets/{name}`, honoring the portal-supplied
 client-identity header, emitting head headers and `x-internal-*` noise for
 strip-testing, plus every 4xx/5xx/409 shape needed to assert error normalization. RPC
-stub (DC-5): the contract read set. Control-plane stub (DC-8): the cursor-paged key feed
-with its four-field envelope, plus the single-key lookup — and, as a fault injector, the
-epoch flip, head rollback, non-advancing cursor, short-of-head page, malformed record and
-unrecognized status the DC-8 error table names (⚠ unbuilt — GAP-33). Log-sink stub (DC-6) and error-report stub (DC-7):
+stub (DC-5): the contract read set. Control-plane stub (DC-8): the credential exchange —
+credential in, grant or denial out — verifying the exact `X-Portal-Id`,
+`X-Signature-Timestamp`, and `X-Signature` contract of ADR-018 and refusing malformed,
+unattributable, past-skewed, or future-skewed requests, with a ledger of every credential it
+was asked about; and, as a fault
+injector, the denial, the unreadable answer, the unrecognized claims version, the
+wrong-subject answer, the over-cap lifetime, the late completion of a retired exchange
+generation after its successor, and the outage the DC-8 error table names (⚠ unbuilt —
+GAP-33). Log-sink stub (DC-6) and error-report stub (DC-7):
 fire-and-forget receivers with ledgers, so egress audits (INV-37) and drop accounting
 (HZ-7) have ground truth. Stubs double as fault
 injectors for the CT-2 matrix.
@@ -138,38 +144,41 @@ injectors for the CT-2 matrix.
 **IB-9 — Authorization binding.** Commercial deployments only (REQ-56); on any other
 deployment nothing in this rule is observable.
 
-*Presentation.* A credential is accepted as `Authorization: Bearer <token>` or as the
-`api_key` query parameter, in that precedence. The query channel exists because some
-browser transports cannot set headers on every request; operators should assume a token
-presented that way is recorded by intermediaries and access logs, which is a property of
-URLs, not of this binding.
+*Presentation.* A credential is accepted as `Authorization: Bearer <token>` and nowhere
+else. A query-string channel is deliberately not offered: it would exist to serve
+transports that cannot set headers, and this binding has none — every gated route is POST
+but the timestamp lookup, and `fetch` sets headers on both. What it would have is a secret
+in a URL, which browser history, `Referer` and every intermediary's access log record
+outside this system's reach.
 
 *Token grammar.* `<prefix><key_id>_<secret>`, where the prefix is one the control plane
 mints, the two segments draw from `[A-Za-z0-9~-]`, and their lengths are at most
 P-KEY-ID-MAX-LEN and P-KEY-SECRET-MAX-LEN. A token outside this grammar is refused as
-`invalid_credential` without a lookup — it is not something the control plane could have
-issued (REQ-52).
+`invalid_credential` without an exchange — it is not something the control plane could have
+issued (REQ-52). This check is the cheapest rung and runs first for that reason: it is what
+keeps arbitrary client bytes from reaching a control-plane call (PF-7).
 
-*Gated surface.* Every route in IB-2 carries exactly one class (DEF-19). Under gate scope
-`data`, the gated set is the stream routes, the timestamp-to-block lookup, the direct
-worker query, and the SQL query plan. Under `all`, it additionally includes every
-metadata route: the catalog, per-dataset metadata and state, all head and height
-variants, `/status`, the worker lookup and the debug surfaces. `/ready`, `/metrics` and
-`/api-docs/openapi.json` are gated under neither, and the docs UI is deliberately open
-because it serves the same schema on every deployment and names no dataset. A route whose
-class is unstated is a build failure, not an ungated route (REQ-51).
+*Gated surface.* The gated set is the stream routes, the timestamp-to-block lookup, the
+direct worker query, and the SQL query plan (DEF-19). Every other route in IB-2 answers
+without a credential on every deployment (NG8): the catalog, per-dataset metadata and
+state, all head and height variants, `/status`, the worker lookup, the debug surfaces,
+`/ready`, `/metrics`, `/api-docs/openapi.json` and the docs UI. A route that states
+neither does not compile (REQ-51).
 
 Because `/metrics` is deliberately keyless, its commercial representation is part of the
-authorization boundary rather than an exemption from it: it must not reveal a dataset
-identity under `all`, an internal authorization rung, a key-record count, or whether one
-request hit the snapshot or invoked authorize-on-miss beyond what that request's own wire
-outcome already disclosed (OB-1/12/13, INV-39).
+authorization boundary rather than an exemption from it: it must not reveal an internal
+authorization rung, or which key ids exist, beyond what a request's own wire outcome already
+disclosed. Enforcing-mode aggregate exchange counters are publishable because the grant
+cache is keyed on the whole credential, so they cannot separate an unknown key id from a
+wrong secret; what they do reveal — cache membership — is the residual INV-39 already
+accepts. Shadow mode publishes only the neutral authorization projection (OB-12/13).
 
 *Interaction with the envelope.* An auth refusal is emitted in the IB-5 envelope with the
 codes above. It must reach the client with the status IB-5 binds to its code — a refusal
 carrying no code is normalized onto `malformed_request` at 400 by the same rule that
-catches framework rejections, which would erase the distinction this rule exists to make
-(GAP-29).
+catches framework rejections, which would erase the distinction this rule exists to make.
+Emitting through the envelope is what prevents that, and CT-5 pins it behind the real
+middleware stack rather than at the gate alone.
 
 **IB-8 — Versioning rule.** Any change to this binding (route, code, header, schema,
 taxonomy) updates this file and the interface-conformance class CT-5 in the same

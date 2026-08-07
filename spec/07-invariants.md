@@ -48,30 +48,37 @@ admitted stream decrements exactly once at its end.
 *Why:* census drift silently shrinks (or unbounds) global capacity.
 *Check:* CT-3 — concurrent admit/finish/disconnect storm; compare census to truth.
 
-**INV-6 — Key snapshot coherence.** [transition]
-Every read of the key snapshot (DEF-18) sees exactly one generation: a rebuild replaces
-the record set wholesale and is never partially observable, and a direct lookup that
-began under an earlier generation never inserts its answer into a later one. Within a
-generation a key only moves forward — a delta applies a record only if its sequence
-exceeds the held one, so a replayed or reordered page cannot resurrect a revoked key.
-A record that cannot be used is held as a tombstone, never dropped (DEF-17).
-*Why:* the two ways a mirror silently un-revokes a key are applying a stale record over a
-newer one, and letting an in-flight lookup write into a snapshot that has since been
-rebuilt beneath it.
-*Check:* CT-10 — feed stub replays and reorders pages, and flips epoch while a lookup is
-in flight; assert no key regresses and no answer lands in the wrong generation.
+**INV-6 — Grant cache coherence.** [transition]
+Every entry of the grant cache (DEF-18) is reachable only by the fingerprint of the whole
+credential that earned it, and only until it passes `expires_at`; past that it admits
+nothing, whatever the state of the control plane. "Newer" means the result of a
+later-started local exchange generation for that fingerprint, never a comparison of grant
+deadlines. Starting a successor retires the earlier generation, so a late completion from
+the retired attempt cannot write. An authoritative denial evicts on arrival and is never
+overwritten by an exchange generation that started before it. An answer the Portal cannot
+fully read — a
+missing field, an unrecognized claims version, a subject other than the one asked about —
+is never stored (DEF-17).
+*Why:* the ways a cache silently un-revokes a key are writing a stale answer over a fresh
+one, letting an entry outlive the deadline it was issued under, and admitting on the part
+of an answer that parsed.
+*Check:* CT-10 — time out one exchange without suppressing the stub's late completion,
+start its successor, and deliver the two answers in reverse generation order; also return a
+denial from the successor while the retired call can still complete. Assert the retired
+completion writes nothing, the denial survives, and an entry stops admitting at
+`expires_at` with the stub unreachable.
 
 ## Operation legality (10–19)
 
 **INV-10 — Validation precedes serving work.** [response]
 A request failing DEF-7 validation triggers no serving-dependency call and no shared-state
 mutation beyond authorization caches and observability. Because OP-11 precedes operation
-validation, a syntactically valid credential naming a snapshot-miss key may already have
-made the one bounded DC-8 lookup INV-14 permits; no other dependency exception exists.
+validation, a well-formed credential with no usable grant may already have made the one
+bounded DC-8 exchange INV-14 permits; no other dependency exception exists.
 *Why:* invalid input must be cheap to reject and must never buy the work that serves it;
 the earlier authorization exception has its own explicit bounds.
 *Check:* CT-4/CT-10 — invalid-request corpus against dependency stubs; assert zero
-serving-dependency calls and at most the one DC-8 lookup for a snapshot miss.
+serving-dependency calls and at most the one DC-8 exchange.
 
 **INV-11 — Clamping.** [response]
 Effective tuning = min(requested, operator cap) with defaults for absent values; no
@@ -99,30 +106,37 @@ Pre-routing validation, alias, and admission failures have no source marker.
 **INV-14 — Authorization precedes work.** [response]
 On a gated route (DEF-19), a request that does not pass OP-11 causes no serving-dependency
 call, no handler execution, no stream-census admission, and no shared-state mutation
-beyond the snapshot's own caches and authorization observability. A snapshot miss may
-make the one bounded DC-8 lookup OP-11 declares. Dataset canonicalization is itself work:
-it happens only for a credential that has already authenticated and only where the key's
-scope requires it (REQ-53). On an ungated route, or a Portal with no commercial
-configuration, no part of this runs.
+beyond the grant cache, its negative answers, and authorization observability. A credential
+with no usable grant may make the one bounded DC-8 exchange OP-11 declares — one, whatever
+the request rate, because concurrent requests on a fingerprint share a single call. A token
+outside the grammar makes none. Dataset canonicalization is itself work: it happens only
+for a credential that has already authenticated and only where the key's scope requires it
+(REQ-53). On an ungated route, or a Portal with no commercial configuration, no part of
+this runs.
 *Why:* an unauthenticated request must not be able to buy unbounded or serving-path work.
-The one attacker-reachable exception — authorize-on-miss — has explicit rate,
-concurrency, cache, and deadline bounds so the gate does not become an open cost amplifier.
+The one attacker-reachable exception is now the ordinary path rather than a rare miss, so
+its rate, concurrency, single-flight, negative-cache and deadline bounds are what stop the
+gate from being an open cost amplifier pointed at the control plane (HZ-10).
 *Check:* CT-10 — keyless and bad-key corpus against every gated route with dependency
-stubs and a counting catalog; assert zero serving-dependency calls, a DC-8 call only for
-a snapshot miss, and canonicalization only after authentication on the dataset rung.
+stubs and a counting catalog; assert zero serving-dependency calls, at most one DC-8
+exchange per fingerprint under a concurrent burst, none at all for a malformed token or a
+cached grant, and canonicalization only after authentication on the dataset rung.
 
 **INV-15 — Verdict determinism.** [response]
-The authorization verdict (DEF-20) is a pure function of (credential, key record, portal
-identity, requested dataset, current time). It never depends on load, capacity, prior
-requests, or which replica served, and the ladder's precedence (REQ-53) is total: a
-request failing several rungs always reports the earliest. Two replicas holding the same
-record state and evaluating at the same time return the same verdict for the same request;
-a local generation counter alone does not establish equivalent state.
+The authorization verdict (DEF-20) is a pure function of (credential, grant or denial,
+requested dataset, current time). It never depends on load, capacity, prior requests, or
+which replica served, and the ladder's precedence (REQ-53) is total: a request failing
+several rungs always reports the earliest. Two replicas holding the same grant and
+evaluating at the same time return the same verdict for the same request. They need not
+hold the same grant — each exchanges on its own traffic, so one replica may be a refresh
+ahead of another, and that divergence is bounded by `expires_at` rather than eliminated.
 *Why:* a verdict that varies with load is an availability bug wearing an authorization
 costume, and a precedence that varies makes the refusal reason — the operator's only
-diagnostic — untrustworthy.
-*Check:* CT-10 — the multi-failure corpus of REQ-53 against a fixed snapshot, replayed
-under saturation and on a second replica; assert identical verdicts.
+diagnostic — untrustworthy. Per-replica grant divergence is the honest cost of asking on
+demand, and stating its bound is what keeps it from being mistaken for this defect.
+*Check:* CT-10 — the multi-failure corpus of REQ-53 against a fixed set of grants, replayed
+under saturation and on a second replica; assert identical verdicts, and that two replicas
+given the same denial converge within their grants' `expires_at`.
 
 ## Response semantics (20–29)
 
@@ -227,11 +241,13 @@ through them).
 
 **INV-31 — Readiness honesty.** [state]
 Ready ⇒ (an artifact is applied ∧ connectivity ≥ P-READY-CONNECTION-RATIO ∧ not
-shutting down ∧ (enforcing commercial ⇒ a key snapshot has been established)). A Portal
-that would refuse every valid key is not ready (REQ-54); a shadow-mode one has no such
-conjunct, since it refuses nobody (REQ-55). Shutdown flips readiness before intake stops
-(ADR-005). Intent ⚠: ready also ⇒ artifact age ≤ P-ASSIGNMENT-MAX-AGE (ADR-013, GAP-2),
-and the key-set analogue P-KEY-SNAPSHOT-MAX-AGE ⚠ if OQ-12 ratifies it.
+shutting down). Shutdown flips readiness before intake stops (ADR-005). Intent ⚠: ready
+also ⇒ artifact age ≤ P-ASSIGNMENT-MAX-AGE (ADR-013, GAP-2). Commercial configuration adds
+no conjunct in either enforcement mode and will not get one: there is nothing to load
+before serving, and every replica shares one authority, so a readiness rule keyed on the
+control plane would empty the fleet during exactly the outage that triggered it (REQ-54).
+An unreachable control plane is answered with retryable refusals and an alarm (OB-9), which
+keeps the failure attributable to the thing that failed.
 *Why:* orchestrators route by this; a lying probe turns deploys into outages.
 *Check:* CT-2 — drive each conjunct false via stubs; probe.
 
@@ -257,37 +273,51 @@ where the operator configured it — REQ-56).
 *Check:* CT-2 — harness observes all egress; anything not stub-addressed fails.
 
 **INV-38 — Credential confidentiality.** [state]
-A presented secret exists only as the digest the request parser reduces it to. No log
-record, metric label, span field, error body, stored value, or outbound request ever
-carries the secret, and comparison against the published digest completes in time
-independent of how many leading bytes matched.
+Past the request parser a presented secret exists only in the bounded request-local
+exchange input DEF-16 describes and as the fingerprint the parser reduced it to. The raw
+input is destroyed immediately on a cache or negative-answer hit; on a miss, one owner
+moves it into the single DC-8 exchange and destroys it on completion, timeout, or
+cancellation. It leaves the process in that direction and by no other: no log record,
+metric label, span field, error body, shared or persisted value, or any other outbound
+request carries it, the grant cache holds fingerprints rather than credentials, and
+fingerprint comparison completes in time independent of how many leading bytes matched.
 *Why:* an API key that reaches a log line has been disclosed to everyone with log access,
 and a comparison that exits early lets a wrong secret be refined byte by byte from
-response timing — the digest would then be no better than the secret itself.
+response timing — the fingerprint would then be no better than the secret itself. The one
+egress is not a loophole but the point of naming it: an exception that is written down is
+one a test can bound, and INV-37 already forbids every other destination.
 *Check:* CT-10 — drive the full corpus with a marked secret; grep every emitted log,
-metric, span, and body for it; assert the comparison is the constant-time one by
-construction.
+metric, span, body, and shared-state dump for it; assert it appears in the control-plane
+stub's ledger only on a miss and in no other stub's; force hit, timeout, cancellation, and
+coalesced-waiter paths and assert no raw input outlives them; assert the comparison is the
+constant-time one by construction.
 
 **INV-39 — No enumeration oracle.** [response]
 On every completed credential verdict, an unparseable token, an authoritatively unknown
-key id, a known key id with a wrong secret, and a digestless tombstone are
-indistinguishable to the client: same status, same code, same body (ADR-017). The reasons
-that *are* distinguishable — revoked, expired, wrong portal, wrong dataset — are reachable
-only by a client already holding the correct secret. The distinction survives on the
-internal axis only, in protected structured logs — never as a label or
-request-synchronous counter on the keyless metrics surface (OB-12/13).
+key id, and a known key id presented with a wrong secret are indistinguishable to the
+client: same status, same code, same body (ADR-017). The reasons that *are* distinguishable
+— revoked, expired, wrong portal, wrong dataset — are reachable only by a client already
+holding the correct secret. The distinction survives on the internal axis only, in
+protected structured logs — never as a label or request-synchronous counter on the keyless
+metrics surface (OB-12/13).
 *Why:* telling a caller that a key id exists turns the endpoint into a key-id oracle, and
 the whole point of a public key id plus a secret is that the id alone is worthless.
-*Check:* CT-10 — assert the four responses are byte-identical apart from the request id;
+*Check:* CT-10 — assert the three responses are byte-identical apart from the request id;
 assert the specific reasons appear only for correct-secret requests; bracket every case
 under both enforcement modes with metrics scrapes and assert no public series reveals the
-internal reason or lookup path beyond the response that case received. In shadow mode,
-where every case is admitted, their authorization projections are identical.
-*Known deviation:* a snapshot miss may consult the control plane while a hit answers
-locally, so timing differs; if that lookup cannot run or answer, its retryable
-OVERLOADED/UPSTREAM-FAILURE response also differs from a hit's BAD-CREDENTIAL. The
-residual reveals snapshot membership under lookup pressure, but public metrics must not
-amplify it beyond the response the caller already received (GAP-32).
+internal reason or the exchange path beyond the response that case received. In shadow
+mode, where every case is admitted, their authorization projections are identical.
+*Accepted deviation:* a credential with no usable grant costs an exchange while a cached
+one answers locally, so timing differs in either enforcement mode. In enforcing mode, if
+that exchange cannot run or answer, its retryable OVERLOADED/UPSTREAM-FAILURE response also
+differs from a cached BAD-CREDENTIAL. Shadow mode still admits both cases and exposes the
+same neutral public authorization projection; only protected telemetry records the
+exchange result. The residual reveals *cache membership* under exchange pressure, and is
+accepted because the alternative — collapsing both enforcing responses onto one outcome —
+means answering a dependency failure with a claim about the key, which REQ-54 forbids. It
+is not a key-id oracle: the cache is keyed on the whole credential, so an unknown id and a
+known id with a wrong secret miss identically, and neither timing nor public counters
+separate them.
 
 ## Recovery (40–44)
 

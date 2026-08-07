@@ -2,7 +2,7 @@
 
 **Mutable doc.** Every `P-*` symbol used anywhere in the suite has a row here; the
 operator binds them through the configuration object (DEF-15).
-"Observed" is the current default/behavior at version 0.11.9 (operator-overridable
+"Observed" is the current default/behavior at version 0.12.1 (operator-overridable
 unless marked *fixed*); "Target" is the ratified intent. ⚠ = proposed, awaiting
 ratification via the linked ADR. Environmental rows describe the world the Portal
 assumes, not knobs it owns.
@@ -70,7 +70,7 @@ assumes, not knobs it owns.
 | P-DRAIN-TIMEOUT | In-flight drain budget after intake stops (REQ-24, ADR-005) | 25 s | 25 s |
 | P-KILL-GRACE | *Environmental:* the orchestrator's grace between SIGTERM and SIGKILL — Kubernetes `terminationGracePeriodSeconds` (REQ-24, LIV-11, ADR-005) | deployment-set, unverified; the Kubernetes default of 30 s is **below** the 50 s budget | ≥ P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT + slack (≥ 60 s) |
 | P-READY-CONNECTION-RATIO | Min fraction of known workers connected for readiness (REQ-23) | 3/4 *(fixed)* | 3/4 |
-| P-STARTUP-BOUND | ⚠ Start → ready bound, including artifact fetch and enforcing-commercial key bootstrap (LIV-5, S5) | unmeasured | ⚠ 10 min (proposed) |
+| P-STARTUP-BOUND | ⚠ Start → ready bound; artifact fetch and apply only, commercial configuration adding no term (LIV-5, S5) | unmeasured | ⚠ 10 min (proposed) |
 | P-STALL-BUDGET | ⚠ Max zero-progress interval on a healthy stream; also the first-record bound (LIV-1, LIV-2, OB-2) | unmeasured | ⚠ 2 × P-TRANSPORT-TIMEOUT (proposed) |
 
 ## Accounting & reporting
@@ -85,21 +85,22 @@ assumes, not knobs it owns.
 
 ## Commercial access control
 
-Bound only on a commercial deployment (REQ-56); unused elsewhere. "Observed" values are
-those of the phase-1 implementation under review (PR #143), which hard-codes all but the
-sync interval — making them operator-bindable is part of closing GAP-33.
+Bound only on a commercial deployment (REQ-56); unused elsewhere. Every row is
+operator-bindable in the `commercial:` block and defaults to its observed value; the
+targets stay proposals until OQ-15 ratifies them against a measured credential working
+set, which is the only thing that can size them honestly.
 
 | Parameter | Role (where used) | Observed | Target |
 |---|---|---|---|
-| P-KEY-SYNC-INTERVAL | Key-feed poll interval; one term in the page-count-dependent revocation-convergence bound (DC-8, LIV-13) | 10 s | 10 s |
-| P-KEY-PAGE-LIMIT | Records requested per feed page; also defines what a "short page" is (DC-8) | 1000 *(fixed)* | 1000 |
-| P-KEY-FETCH-TIMEOUT | Per-page feed and single-key lookup deadline; sync ticks are serialized, and LIV-13 accounts for one such bound per page (DC-8) | 5 s *(fixed)* | 5 s |
-| P-KEY-MAX-PAGES-PER-TICK | Bound on pages read in one drain; larger delta backlogs continue next tick, while an atomic bootstrap must fit inside the bound (DC-8, LIV-5/13) | 10000 *(fixed)* | 10000 |
-| P-KEY-SNAPSHOT-MAX-AGE | ⚠ Max tolerated key-snapshot age before an enforcing Portal degrades (REQ-54, INV-31, OB-13) | **unbounded — GAP-31** | ⚠ ratify via OQ-12 |
-| P-KEY-NEGATIVE-TTL | How long a "control plane knows nothing about this key" answer suppresses repeat lookups (DC-8) | 15 s *(fixed)* | 15 s |
-| P-KEY-NEGATIVE-CAPACITY | Cap on remembered negative answers; ids are attacker-chosen, so the map is bounded rather than grown (DC-8, HZ-10) | 4096 *(fixed)* | 4096 |
-| P-KEY-RESOLVE-RATE | Token-bucket rate for authorize-on-miss lookups (DC-8, LIV-14, HZ-10) | 20 /s *(fixed)* | ⚠ one budget serves two opposed purposes — bounding attacker cost and admitting legitimate new keys (HZ-10); ratify via GAP-33 once CT-10 can measure the interference |
-| P-KEY-RESOLVE-INFLIGHT | Cap on concurrent authorize-on-miss lookups (DC-8, HZ-10) | 16 *(fixed)* | 16 |
+| P-GRANT-MAX-LIFETIME | Cap on the `expires_at` the Portal will honour, however long a one the control plane offers. The fleet's worst-case stale-authorization window, and the only lifetime term the Portal owns (REQ-54, DC-8, LIV-13) | 900 s | ⚠ 15 min (draft; ratify via OQ-15) |
+| P-GRANT-EXCHANGE-TIMEOUT | Per-exchange deadline; must stay < P-CLIENT-TIMEOUT (DC-8, ADR-010, PF-7) | 2 s | ⚠ 2 s (draft; ratify via OQ-15) |
+| P-GRANT-EXCHANGE-RATE | Token-bucket rate for exchanges (DC-8, LIV-14, HZ-10) | 20 /s | ⚠ one budget serves two opposed purposes — bounding attacker cost and admitting legitimate uncached keys (HZ-10); ratify via OQ-15 once CT-10 can measure the interference |
+| P-GRANT-EXCHANGE-INFLIGHT | Cap on concurrent exchanges (DC-8, HZ-10) | 32 | ⚠ 32 (draft; ratify via OQ-15) |
+| P-GRANT-CACHE-CAPACITY | Cap on cached grants; sized by the replica's credential working set, not by the key set (DEF-18, DC-8, HZ-13) | 65536 | ⚠ 65536 (draft; ratify via OQ-15) |
+| P-GRANT-NEGATIVE-TTL | How long an authoritative denial suppresses repeat exchanges for the same fingerprint (DC-8) | 15 s | ⚠ 15 s (draft; ratify via OQ-15) |
+| P-GRANT-NEGATIVE-CAPACITY | Cap on remembered denials; fingerprints are attacker-chosen, so the map is bounded rather than grown (DC-8, HZ-10) | 4096 | ⚠ 4096 (draft; ratify via OQ-15) |
+| P-GRANT-REFRESH-JITTER | Spread applied to `refresh_after` so a cohort of grants issued together does not renew together (DC-8, HZ-12, LIV-13) | 10% | ⚠ 10% of the refresh interval (draft; ratify via OQ-15) |
+| P-SIGNATURE-MAX-SKEW | *Environmental:* maximum absolute clock skew accepted on a signed request; a timestamp farther in the past or future fails every exchange at once (DC-8, ADR-018, 08 §0) | n/a — the control plane's bound, not the Portal's | control-plane-set; ⚠ 30 s assumed (ratify via OQ-15) |
 | P-KEY-ID-MAX-LEN | Max accepted key-id length; mirrors what the control plane can mint (IB-9, REQ-52) | 64 *(fixed)* | 64 |
 | P-KEY-SECRET-MAX-LEN | Max accepted secret length (IB-9, REQ-52) | 128 *(fixed)* | 128 |
 

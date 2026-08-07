@@ -19,7 +19,7 @@ nothing durable survives a restart). Modules 06 (consistency/durability) and 10
 refreshed-snapshot lifecycle is folded into 05. Numbering gaps are canonical, never
 recycled.
 
-Commercial access control (REQ-50..REQ-56, DC-8, ADR-016/017) is **conditional**: every
+Commercial access control (REQ-50..REQ-56, DC-8, ADR-016/017/018) is **conditional**: every
 property in that area is vacuous on a Portal the operator has not configured
 commercially, which is the default and the only mode a self-hosted build has. It is
 spread through the existing documents rather than given one of its own, because it is a
@@ -64,8 +64,9 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 | ADR-014 | 2026-07-17 | [Contract reconciliation: overload hints, conflict precedence, artifact regression, archival finalized head, EMPTY metadata, timestamp frontier, gated debug surface](decisions/ADR-014-contract-reconciliation.md) | Accepted |
 | ADR-015 | 2026-07-21 | [One connection-class replay on the real-time path](decisions/ADR-015-real-time-connection-replay.md) | Accepted |
 | ADR-013 | 2026-07-17 | [Assignment staleness must be bounded and observable](decisions/ADR-013-assignment-staleness-bound.md) | **Proposed** |
-| ADR-016 | 2026-08-05 | [The Portal authenticates requests itself](decisions/ADR-016-portal-side-authentication.md) | **Proposed** |
-| ADR-017 | 2026-08-05 | [Authentication and permission errors extend the ADR-011 taxonomy](decisions/ADR-017-auth-error-taxonomy.md) | **Proposed** |
+| ADR-016 | 2026-08-05 | [The Portal authenticates requests itself](decisions/ADR-016-portal-side-authentication.md) | **Proposed** (revised 2026-08-07) |
+| ADR-017 | 2026-08-05 | [Authentication and permission errors extend the ADR-011 taxonomy](decisions/ADR-017-auth-error-taxonomy.md) | **Proposed** (wording aligned 2026-08-07) |
+| ADR-018 | 2026-08-07 | [The Portal signs its control-plane requests](decisions/ADR-018-signed-control-plane-requests.md) | **Proposed** |
 
 ## Conventions
 
@@ -94,11 +95,14 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 1. **Extend the harness past Phase 0** (13 §build order): the Phase-0 skeleton —
    dependency stubs per IB-7, the structural validators, the reference model — has
    landed (GAP-14 closed 2026-07-17); build the `CT-2..CT-9` classes on it next.
-2. **Ratify or reject proposed ADR-013, ADR-016 and ADR-017** and the ⚠ targets in
-   [15-parameters.md](15-parameters.md) and the SLO table (11); close the open questions
-   in [02-requirements.md](02-requirements.md). ADR-016 and ADR-017 are a pair: the
-   first makes the Portal refuse requests on identity grounds, the second gives those
-   refusals somewhere to live in the error taxonomy — adopting the first without the
-   second is what GAP-29 records.
+2. **Ratify or reject proposed ADR-013 and the ADR-016/017/018 group** and the ⚠ targets
+   in [15-parameters.md](15-parameters.md) and the SLO table (11); close the open
+   questions in [02-requirements.md](02-requirements.md). The three commercial ADRs stand
+   or fall together: ADR-016 makes the Portal refuse requests on identity grounds, ADR-017
+   gives those refusals somewhere to live in the error taxonomy, ADR-018 says how the
+   Portal proves its own identity to the authority it asks. ADR-017's taxonomy is
+   implemented. ADR-016 was revised on 2026-08-07 from a mirrored key set to an on-demand
+   exchange; that exchange and ADR-018's signed channel remain specification-only at this
+   baseline (GAP-35). They need both ratification and implementation.
 3. **Burn down the gap register** in [13-conformance.md](13-conformance.md) in priority
    order — failing test first, fix second, matrices updated in the same change.

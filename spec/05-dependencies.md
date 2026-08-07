@@ -114,58 +114,72 @@ never delays or fails serving.
 *Role.* Sampled error/trace reports (P-ERROR-SAMPLE-RATE).
 *Contract.* Fire-and-forget; failure has no client-visible effect.
 
-## DC-8 — Control plane (key feed)
+## DC-8 — Control plane (credential exchange)
 
 Exists only on a commercial deployment (REQ-56); on any other the Portal opens no
 connection to it and this contract is vacuous.
 
-*Role.* Publishes the key set the Portal mirrors (DEF-17, DEF-18) and answers direct
-lookups for a single key; the source of every authorization decision (OP-11).
-*Call contract.* Two interactions, both authenticated with a portal-held service
-credential and neither following redirects — a redirected request carries that credential
-somewhere the operator did not configure, and a redirected key set is not the control
-plane's answer.
+*Role.* Answers one question — is *this* credential authorized here, and under what claims
+— and is the source of every authorization decision (OP-11). It publishes nothing and the
+Portal mirrors nothing.
 
-1. *Feed read* — a background loop only, never on a request path. Polls every
-   P-KEY-SYNC-INTERVAL, reading pages of at most P-KEY-PAGE-LIMIT records forward from
-   the held cursor with a per-page deadline P-KEY-FETCH-TIMEOUT. Ticks are serialized; a
-   slow drain never overlaps the next poll. One tick drains up to
-   P-KEY-MAX-PAGES-PER-TICK rather than applying exactly one page; a larger backlog
-   continues on the next tick, and the resulting convergence bound is LIV-13's function
-   of page count. A page that carries records without advancing the cursor, or a short
-   page whose cursor remains below the head the feed reports, is a broken answer, not an
-   empty one — it fails the tick.
-2. *Direct lookup (authorize-on-miss)* — on the request path, and only for a key the
-   snapshot does not hold, so a key minted seconds ago works before the next tick
-   (LIV-14). Bounded by P-KEY-RESOLVE-RATE and at most P-KEY-RESOLVE-INFLIGHT concurrent
-   calls; a negative answer is remembered for P-KEY-NEGATIVE-TTL across at most
-   P-KEY-NEGATIVE-CAPACITY entries. Every bound is a fail-*closed* bound: exceeding one
-   produces an immediate OVERLOADED response with a retry hint, never a delay or an
-   admission (HZ-10).
+*Call contract.* One interaction, the **exchange**: the presented credential (DEF-16) in,
+a grant or a denial (DEF-17) out. It runs on the request path, and only when the cache holds
+no *fresh* grant for that credential's fingerprint — after a token outside the grammar has
+already been refused, that means an unseen credential or one whose grant has passed
+`refresh_after`. Freshness governs when an exchange happens; usability — not past
+`expires_at` — governs whether the grant in hand may still answer while it does.
+
+- *Authenticated by signature.* Every request carries exactly one `X-Portal-Id`,
+  `X-Signature-Timestamp`, and `X-Signature`; the last covers ADR-018's canonical binding
+  under the Portal's configured Ed25519 identity. The control plane rejects absent,
+  repeated, or malformed signing headers, a portal with no matching active registered key,
+  and a timestamp whose absolute skew exceeds P-SIGNATURE-MAX-SKEW.
+- *No redirects.* A redirected exchange carries a client's credential somewhere the
+  operator did not configure, and its answer is not the control plane's.
+- *Deadline.* P-GRANT-EXCHANGE-TIMEOUT per call, strictly below P-CLIENT-TIMEOUT (ADR-010)
+  — a caller must never still be waiting on an exchange the Portal has stopped waiting for.
+- *Bounded, without shortening a live grant.* At most P-GRANT-EXCHANGE-RATE exchanges per
+  second and P-GRANT-EXCHANGE-INFLIGHT concurrent, with one *logically active* call per
+  fingerprint, so a burst on the same credential costs one exchange rather than one per
+  request. Each attempt owns a locally monotone generation in that fingerprint's
+  coordination state. Timing out or replacing an attempt retires its generation before a
+  successor starts; a late transport completion from a retired generation cannot mutate
+  either cache. The generation is local coordination metadata, not a grant field. A
+  denial is remembered for P-GRANT-NEGATIVE-TTL across at most P-GRANT-NEGATIVE-CAPACITY
+  entries. If no usable grant exists, a rate or in-flight bound produces an immediate
+  OVERLOADED response with a retry hint — never a queue or an admission (HZ-10). If a grant
+  remains inside `expires_at`, the same bound merely suppresses that renewal attempt: the
+  request is served on the grant and the skipped renewal is observed as grace-serving.
+- *Renewal is off the latency path.* A request arriving past `refresh_after` is served on
+  the grant in hand while the exchange runs; only a request with no usable grant waits for
+  one. Renewals are spread by up to P-GRANT-REFRESH-JITTER, so a cohort of grants issued
+  together does not come back together (HZ-12).
 
 *Error mapping.* No control-plane fault ever reaches a client as itself.
 
 | Fault | Own class / action |
 |---|---|
-| Feed unreachable, timeout, or non-success status | keep serving the established snapshot; alarm on age (OB-13). Never fails a request by itself (REQ-54) |
-| Feed envelope missing a required field | treat as a broken answer, not an empty page — fail the tick, keep the snapshot. A 200 from a wrong route or a half-deployed replica must not read as "the key set is now empty", which would quietly stop delivering revocations |
-| Record malformed but identifiable | tombstone that key (DEF-17): it stops authenticating, and the older version it replaces does not survive |
-| Record unidentifiable | fail the page; keep the snapshot |
-| Record status this build predates | tombstone — an unknown status is fail-closed by the same path as any other unusable record |
-| Epoch change, or reported head below the held cursor | the cursor's history is gone: rebuild the snapshot from the start rather than advance (DEF-18) |
-| Epoch change *mid-drain* | fail the tick; pages from two epochs compose into a snapshot of neither |
-| Lookup: key unknown | refuse the request (BAD-CREDENTIAL); remember the answer for P-KEY-NEGATIVE-TTL |
-| Lookup: rate/concurrency bound reached | refuse immediately as OVERLOADED with `Retry-After` ≥ P-RETRY-AFTER-MIN; never queue or claim the credential is bad |
-| Lookup: call fails, times out, or returns an unusable answer | refuse as UPSTREAM-FAILURE; the same credential may succeed after recovery, so this is never BAD-CREDENTIAL |
-| Lookup: answer names a different key than was asked about | discard the answer and refuse as UPSTREAM-FAILURE |
+| Exchange denies the credential | refuse on the rung it names (REQ-53), mapped to its DEF-10 row; evict any cached grant for that fingerprint at once; remember the denial for P-GRANT-NEGATIVE-TTL |
+| Exchange unreachable, times out, or returns a non-success status | serve on a cached grant that has not passed `expires_at`, if one exists; otherwise refuse as UPSTREAM-FAILURE. Never BAD-CREDENTIAL — the credential was never judged (REQ-54) |
+| Answer missing a required field, or carrying a claims version this build does not understand | unusable, not permissive: handled as a failed exchange. Reading a newer vocabulary for the parts it recognizes is how an added restriction becomes an accidental permission (DEF-17) |
+| Answer about a credential other than the one asked about | discard and refuse as UPSTREAM-FAILURE |
+| Answer offering a lifetime beyond P-GRANT-MAX-LIFETIME | accept the grant, capped at the bound, and count it — a control plane drifting past the cap is a misconfiguration an operator should see before it becomes an incident |
+| Signing headers absent, repeated, malformed, unattributable, or outside P-SIGNATURE-MAX-SKEW in either direction | UPSTREAM-FAILURE like any other failed exchange, and alarm. The cause is the Portal's own clock, identity, or request construction, not the client's key, and it fails every exchange at once (ADR-018) |
+| Rate or in-flight bound reached | with no usable grant, refuse immediately as OVERLOADED with `Retry-After` ≥ P-RETRY-AFTER-MIN; with a grant still inside `expires_at`, skip the renewal and serve on that grant. Never queue, and never claim the credential is bad |
+| Cache at P-GRANT-CACHE-CAPACITY | evict by least-recent use; the evicted credential's next request is an ordinary miss. Sustained eviction of live grants is the HZ-13 capacity signal, not a correctness event |
 
-*Degradation.* Fail-static and unbounded today: the established snapshot serves for as
-long as the outage lasts, so a revocation issued during it does not land until the feed
-returns (GAP-31). Intent bounds this at P-KEY-SNAPSHOT-MAX-AGE ⚠ (OQ-12). Before the
-*first* complete bootstrap there is no snapshot to be static about, and an enforcing
-Portal declines readiness instead of refusing every key (INV-31). Nothing survives
-restart (NG5): every replica re-reads the feed from the start on boot, which puts the
-whole key set on the startup path and in every replica's memory (HZ-11).
+*Degradation.* Fail-static, and bounded by construction: a cached grant rides an outage out
+to its `expires_at` and no further, so the worst-case stale-authorization window is one the
+control plane chose and the Portal capped. Past it, and for every credential this replica
+has not cached, an outage means refusals — retryable, attributed to the dependency, and
+never converted into a claim about anyone's key. That is the deliberate direction of failure
+(ADR-016): a quiet control plane closes the gate rather than freezing it open, at the price
+of being a dependency the deployment must run like a production service. Readiness never
+turns on it (INV-31): every replica shares the same authority, so withholding readiness
+fleet-wide would answer an outage with an outage. Nothing survives restart (NG5), and
+nothing needs to — a cold replica has no bootstrap to do, only a first exchange for each
+credential it serves.
 
 ## Caches & refreshed snapshots (lifecycle)
 
@@ -176,8 +190,8 @@ whole key set on the startup path and in every replica's memory (HZ-11).
 | Chain status | DC-5 poll | none (status only) | loading state before first fetch |
 | Worker health map (DEF-12) | per-query outcomes | rolling windows (P-WORKER-ERROR-COOLDOWN / P-WORKER-TIMEOUT-COOLDOWN) | operator debug view |
 | Heads | artifact (archival) / per-request (real-time) | one successful P-ASSIGNMENT-REFRESH cycle / live; archival outage unbounded | response metadata (INV-24) |
-| Key snapshot (DEF-18) | DC-8 feed poll, plus authorize-on-miss for absent keys | LIV-13's page-count-dependent bound while healthy; none during outage today; ⚠ P-KEY-SNAPSHOT-MAX-AGE (OQ-12) | intent: age gauge + alarm (OB-13, GAP-31) |
-| Negative key answers | DC-8 lookup | P-KEY-NEGATIVE-TTL; cleared wholesale by a snapshot rebuild | protected lookup events (OB-13) |
+| Grant cache (DEF-18) | DC-8 exchange, on the request that needs it | each grant's own `refresh_after` while healthy, `expires_at` absolutely — the only snapshot here with a hard bound during an outage | enforcing mode: grace count + minimum remaining expiry and exchange-outcome counters; shadow mode: protected events only (OB-13), alarmed on sustained grace (OB-9) |
+| Negative answers (denials) | DC-8 exchange | P-GRANT-NEGATIVE-TTL | protected exchange events (OB-13) |
 
 There is no response cache: no client-visible value is ever served from a cache other
 than these declared snapshots.

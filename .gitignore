@@ -2,3 +2,9 @@
 .env
 *.key
 db
+
+# Local libp2p identity keypairs.
+key-*
+!key-*.rs
+
+.idea/
