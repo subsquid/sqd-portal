@@ -31,7 +31,7 @@ UUID). Stream responses are chunked `application/jsonl`, compressed:
 | OP-8 | `GET /ready` | 200 / 503 + reason |
 | OP-9 | `GET /metrics` | OpenMetrics text |
 | OP-10 | `POST /sql/query` · `GET /sql/metadata` | build-time capability; experimental |
-| OP-11 | — (admission step on every gated route, IB-9) | commercial deployments only |
+| OP-11 | — (admission step on every gated route, IB-9) | authorizing deployments only |
 | — | `/docs`, `/api-docs/openapi.json` | self-description (REQ-32); never gated |
 | — | deprecated: `/height` variants, `/{start_block}/worker`, `/query/{worker_id}`, `/debug/*` | NG7 — unspecified, don't pin |
 
@@ -95,7 +95,7 @@ closed mapping is:
 | `permission_error` / `portal_not_allowed` | 403 | envelope |
 | `permission_error` / `dataset_not_allowed` | 403 | envelope |
 
-The last six rows appear only on a commercial deployment (REQ-56) and only on a gated
+The last six rows appear only on an authorizing deployment (REQ-56) and only on a gated
 route (IB-9). None is retryable and none carries a retry hint: retrying with the same
 credential cannot succeed, and treating an auth refusal as transient reproduces the
 ADR-012 refusal storm. All six share one status, so the status line never reveals that a
@@ -116,7 +116,7 @@ resolve (OP-5) uses the same envelope and code vocabulary.
 
 **IB-6 — Status & introspection surfaces.** `/ready`: 200 or 503 with the ADR-011
 `not_ready` envelope (OB-5). `/metrics`: OpenMetrics; families under the `portal_` prefix
-with a constant portal-identity label. On commercial deployments the keyless scrape obeys
+with a constant portal-identity label. On authorizing deployments the keyless scrape obeys
 12's confidentiality rule: no internal auth rung or lookup detail beyond the public wire
 outcome. `/status`, `/state`, `/debug/*`: bodies explicitly unstable (REQ-14).
 
@@ -141,7 +141,7 @@ fire-and-forget receivers with ledgers, so egress audits (INV-37) and drop accou
 (HZ-7) have ground truth. Stubs double as fault
 injectors for the CT-2 matrix.
 
-**IB-9 — Authorization binding.** Commercial deployments only (REQ-56); on any other
+**IB-9 — Authorization binding.** Authorizing deployments only (REQ-56); on any other
 deployment nothing in this rule is observable.
 
 *Presentation.* A credential is accepted as `Authorization: Bearer <token>` and nowhere
@@ -165,7 +165,7 @@ state, all head and height variants, `/status`, the worker lookup, the debug sur
 `/ready`, `/metrics`, `/api-docs/openapi.json` and the docs UI. A route that states
 neither does not compile (REQ-51).
 
-Because `/metrics` is deliberately keyless, its commercial representation is part of the
+Because `/metrics` is deliberately keyless, its authorization representation is part of the
 authorization boundary rather than an exemption from it: it must not reveal an internal
 authorization rung, or which key ids exist, beyond what a request's own wire outcome already
 disclosed. Enforcing-mode aggregate exchange counters are publishable because the grant

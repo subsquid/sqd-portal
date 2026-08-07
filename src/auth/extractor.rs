@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     cache::GrantCache,
-    config::{CommercialConfig, Enforcement},
+    config::{AuthConfig, Enforcement},
     evaluate::{self, Decision, LazyDataset, Rejection, Verdict},
     now_secs,
 };
@@ -92,7 +92,7 @@ pub struct Gate {
 
 impl Gate {
     pub fn new(
-        config: &CommercialConfig,
+        config: &AuthConfig,
         cache: Arc<GrantCache>,
         catalog: Arc<dyn DatasetCatalog>,
     ) -> Self {
@@ -118,6 +118,8 @@ impl Gate {
         }
         metrics::report_exchange_success_age(self.cache.last_exchange_success_age());
         metrics::report_grant_cache_capacity(self.cache.capacity());
+        let (in_grace, min_remaining) = self.cache.grace_census(now_secs());
+        metrics::report_grace_census(in_grace, min_remaining);
     }
 
     /// A route whose path does not name the dataset cannot be checked against
@@ -169,10 +171,18 @@ impl Gate {
             return None;
         }
         let raw = dataset_path_segment(path)?;
+        // Decoded the way the handler's `Path` extractor decodes, or the gate
+        // and the handler disagree about which dataset a request names and a
+        // scoped key is refused on any encoded spelling of an allowed URL. A
+        // segment that does not decode stays unresolved, which refuses a
+        // scoped key — the handler answers 400 to such a path anyway.
+        let decoded = percent_encoding::percent_decode_str(raw)
+            .decode_utf8()
+            .ok()?;
         Some(
             self.catalog
-                .canonical_name(raw)
-                .unwrap_or_else(|| raw.to_owned()),
+                .canonical_name(&decoded)
+                .unwrap_or_else(|| decoded.into_owned()),
         )
     }
 
@@ -210,7 +220,7 @@ impl Gate {
                     decision = "admit",
                     reason = "authorized",
                     enforcement,
-                    "commercial authorization"
+                    "authorization"
                 );
             }
             return;
@@ -229,7 +239,7 @@ impl Gate {
             error_code = rejection.code.as_str(),
             status = rejection.code.status().as_u16(),
             enforcement,
-            "commercial authorization"
+            "authorization"
         );
     }
 }
@@ -334,7 +344,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        commercial::test_support::{cache_for, MockControlPlane, KEY_ID, SECRET, TOKEN},
+        auth::test_support::{cache_with, MockControlPlane, KEY_ID, SECRET, TOKEN},
         types::ErrorCode,
     };
 
@@ -369,13 +379,17 @@ mod tests {
         gate_for(&cp, enforcement).await.0
     }
 
+    /// The cache shares the gate's enforcement, exactly as `auth::build`
+    /// wires it: a shadow gate over an enforcing cache is a combination
+    /// production cannot produce, and it would run these tests with the
+    /// cache-side OB-13 metrics suppression disabled (INV-39).
     async fn gate_for(
         cp: &MockControlPlane,
         enforcement: Enforcement,
     ) -> (Arc<Gate>, Arc<AtomicUsize>) {
         let lookups = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Gate {
-            cache: cache_for(cp).await,
+            cache: cache_with(cp, enforcement).await,
             catalog: Arc::new(StaticCatalog {
                 aliases: HashMap::from([("base".to_string(), "base-mainnet".to_string())]),
                 lookups: lookups.clone(),
@@ -701,6 +715,55 @@ mod tests {
             body_json(response).await["error"]["type"],
             "permission_error"
         );
+    }
+
+    /// The handler reads the dataset through axum's `Path`, which
+    /// percent-decodes; the gate must decode the same way, or a scoped key is
+    /// refused on an encoded spelling of a URL the grant covers — and which
+    /// spelling arrives is the client library's choice, not the customer's.
+    /// The handler here extracts `Path` for real, so the test pins the
+    /// gate-vs-handler agreement itself, not just the gate's half of it.
+    #[tokio::test]
+    async fn a_scoped_key_matches_a_percent_encoded_spelling_of_an_allowed_dataset() {
+        let gate = gate_granting(Some(vec!["base-mainnet"]), Enforcement::Enforce).await;
+        let app = Router::new().route(
+            "/datasets/:dataset/stream",
+            post(
+                |axum::extract::Path(dataset): axum::extract::Path<String>| async move { dataset },
+            )
+            .route_layer(from_fn(move |req, next| {
+                middleware(gate.clone(), true, req, next)
+            })),
+        );
+
+        // The canonical name and the alias, each spelled with an encoded byte;
+        // the body is what the handler's `Path` decoded.
+        for (uri, served) in [
+            ("/datasets/base%2Dmainnet/stream", "base-mainnet"),
+            ("/datasets/bas%65/stream", "base"),
+        ] {
+            let (status, body) = call(
+                app.clone(),
+                request(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(body, served, "{uri}");
+        }
+
+        // An undecodable segment resolves nothing and refuses a scoped key.
+        let (status, _) = call(
+            app,
+            request("/datasets/base%FFmainnet/stream")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

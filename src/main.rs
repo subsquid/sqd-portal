@@ -102,22 +102,32 @@ fn setup_tracing(json: bool, log_span_durations: bool) {
         .init();
 }
 
+/// Warnings the config read could not emit: it runs inside clap's
+/// `value_parser`, before `setup_tracing`, where a `tracing::warn!` goes to no
+/// subscriber. Replayed here so a misspelled key — a `auth.limits` knob
+/// above all — does not keep its default in silence.
+fn report_ignored_config_fields(config: &Config) {
+    for path in &config.ignored_fields {
+        tracing::warn!("ignoring unknown config field: {path}");
+    }
+}
+
 /// States, in one line, whether the data API requires a key. The config is
 /// read inside clap's `value_parser` — before `setup_tracing` — so nothing it
 /// has to say about itself is recorded, and until now an operator could not
 /// tell an authorizing portal from an open one by reading the log at all.
 fn log_authorization_mode(config: &Config) {
-    let Some(commercial) = &config.commercial else {
+    let Some(auth) = &config.auth else {
         tracing::warn!(
-            "commercial authorization disabled: no `commercial` block in the config, \
+            "authorization disabled: no `auth` block in the config, \
              so the data API is served to anyone who asks"
         );
         return;
     };
     tracing::info!(
-        portal_id = commercial.portal_id(),
-        enforcement = ?commercial.enforcement,
-        "commercial authorization enabled"
+        portal_id = auth.portal_id(),
+        enforcement = ?auth.enforcement,
+        "authorization enabled"
     );
 }
 
@@ -133,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         .then(|| setup_sentry(&args.config, &args));
 
     setup_tracing(args.json_log, args.log_span_durations);
+    report_ignored_config_fields(&args.config);
     log_authorization_mode(&args.config);
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
@@ -166,13 +177,13 @@ async fn main() -> anyhow::Result<()> {
     let task_manager = Arc::new(TaskManager::new(network_client.clone(), &config));
 
     let cancellation_token = CancellationToken::new();
-    let commercial_gate = match config.commercial.as_ref() {
+    let auth_gate = match config.auth.as_ref() {
         // Signed with the identity the portal already runs under (DC-8). Read
         // again rather than threaded out of the transport: one file read.
-        Some(commercial) => Some(sqd_portal::commercial::build(
-            commercial,
+        Some(auth) => Some(sqd_portal::auth::build(
+            auth,
             sqd_network_transport::util::get_keypair(Some(key_path)).await?,
-            network_client.clone() as Arc<dyn sqd_portal::commercial::DatasetCatalog>,
+            network_client.clone() as Arc<dyn sqd_portal::auth::DatasetCatalog>,
         )?),
         None => None,
     };
@@ -207,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
             shutting_down,
             cancellation_token.clone(),
             args.show_internal_docs,
-            commercial_gate,
+            auth_gate,
         )),
         network_client.run(cancellation_token),
     )?;

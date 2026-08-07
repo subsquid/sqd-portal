@@ -35,7 +35,7 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
 | API key | A credential a client presents: a public key id plus a secret (DEF-16) |
 | grant | The control plane's short-lived authorization answer for one credential: explicit claims plus the lifetimes it chose for them (DEF-17) |
 | grant cache | The Portal's bounded in-memory map from credential fingerprint to grant; the only authorization state a replica holds (DEF-18) |
-| gated route | A route that requires a key on a commercial deployment: block delivery, queries and block lookups (DEF-19) |
+| gated route | A route that requires a key on an authorizing deployment: block delivery, queries and block lookups (DEF-19) |
 
 ## Actors
 
@@ -49,7 +49,7 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
 | Real-time source | Serves head/stream requests for recent blocks; proxied per request | outbound |
 | Chain RPC + contracts | On-chain registry: epoch, stake, compute units, worker set | outbound |
 | Error-reporting sink | Receives sampled error/trace reports | outbound |
-| Control plane | Mints and revokes API keys; answers the Portal's per-credential exchange with a short-lived grant (DC-8). Present only on a commercial deployment | outbound |
+| Control plane | Mints and revokes API keys; answers the Portal's per-credential exchange with a short-lived grant (DC-8). Present only on an authorizing deployment | outbound |
 
 ## Design goals
 
@@ -61,32 +61,32 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
 | G4 | Be a good network citizen: self-regulate bandwidth, spread load across workers, account for usage | REQ-40..REQ-44, ADR-006, ADR-004 |
 | G5 | Operable: truthful readiness, observable behavior, forgiving configuration | REQ-23, REQ-24, REQ-30..REQ-33 |
 | G6 | Robust against hostile clients and flaky upstreams | REQ-21, REQ-22, REQ-25, REQ-26 |
-| G7 | Commercial access is decided by the Portal, not by whatever sits in front of it — and only where an operator asked for it | REQ-50..REQ-56, ADR-011 |
+| G7 | Access control is decided by the Portal, not by whatever sits in front of it — and only where an operator asked for it | REQ-50..REQ-56, ADR-011 |
 
 ## Non-goals
 
 | Non-goal | Rationale |
 |---|---|
-| ~~NG1~~ — *retired.* Per-request authentication is now an opt-in capability (REQ-50..REQ-56). A Portal without commercial configuration still authenticates nothing and has no client-level defenses beyond input validation; that is a deployment choice, no longer a property of the system. Other per-client policy (tiers, head lag) still originates upstream (ADR-009). |
+| ~~NG1~~ — *retired.* Per-request authentication is now an opt-in capability (REQ-50..REQ-56). A Portal without authorization configuration still authenticates nothing and has no client-level defenses beyond input validation; that is a deployment choice, no longer a property of the system. Other per-client policy (tiers, head lag) still originates upstream (ADR-009). |
 | NG2 — No per-client quotas or fairness | All capacity limits are global. One client can exhaust shared capacity; isolation between clients is not promised. **An authenticated key is no exception:** admission (REQ-50) decides whether a request is served, never how much of the shared capacity it may take. Quota and metering are explicitly out of scope for that admission decision. |
 | NG3 — No head subscription or long-poll | Clients poll. A request beyond the frontier gets a throttled empty response (REQ-5), never a held-open wait for new blocks. |
 | NG4 — No cross-source splicing within one response | Each response is served entirely by one source (archival or real-time). Crossing the boundary is the client's follow-up request (REQ-4). |
 | NG5 — No durable local state | Restart amnesia is by design: everything is refetched or relearned. There is nothing to back up or recover. |
 | NG6 — SQL surface plans, never executes | The experimental SQL endpoints return a routing plan (which workers hold which chunks); execution happens elsewhere (REQ-15). |
 | NG7 — Deprecated endpoints are unspecified | Legacy routes (worker lookup, height, direct worker query) exist for migration only; their behavior must not be pinned by new clients or tests. |
-| NG8 — No catalog privacy | Which datasets a Portal serves is public on every deployment: the catalog, heads, heights and worker inventory answer without a credential whatever the commercial configuration says. Gating that surface as a second scope was considered and rejected: it makes every route's classification a decision, and the contract is simpler when the catalog is public everywhere. Revisit if a deployment ever needs the catalog closed. |
+| NG8 — No catalog privacy | Which datasets a Portal serves is public on every deployment: the catalog, heads, heights and worker inventory answer without a credential whatever the authorization configuration says. Gating that surface as a second scope was considered and rejected: it makes every route's classification a decision, and the contract is simpler when the catalog is public everywhere. Revisit if a deployment ever needs the catalog closed. |
 
 ## Trust model
 
 | Actor | Verified | Trusted | Must never be able to cause |
 |---|---|---|---|
-| Data consumer | Query syntax, size caps, parameter ranges; on a commercial deployment, the presented credential against a grant the control plane issued for it (REQ-50) | Nothing | Crash/wedge the process, corrupt another stream, bypass operator caps (REQ-21); on a commercial deployment, reach a gated route without a key that covers it (INV-14), or learn from a completed credential verdict or keyless metrics which key ids exist (INV-39; accepted cache-membership residual: GAP-32) |
+| Data consumer | Query syntax, size caps, parameter ranges; on an authorizing deployment, the presented credential against a grant the control plane issued for it (REQ-50) | Nothing | Crash/wedge the process, corrupt another stream, bypass operator caps (REQ-21); on an authorizing deployment, reach a gated route without a key that covers it (INV-14), or learn from a completed credential verdict or keyless metrics which key ids exist (INV-39; accepted cache-membership residual: GAP-32) |
 | Archival worker | Response signature (when enabled, REQ-43); response size cap; result range plausibility | Data content within its signed response | Process crash, unbounded memory, permanently poisoning the worker pool (penalties decay, REQ-41) |
 | Assignment publisher | Transfer integrity only — structural validity is currently **trusted, not verified** (ADR-002, GAP-1) | Artifact correctness | *Intent:* crash or false readiness via a corrupt artifact (REQ-26) — presently not enforced |
 | Real-time source | Streamed success data and public headers; errors normalized by ADR-011 | Data content, conflict responses | Stalling a client past bounded deadlines (REQ-22) |
 | Chain RPC | Nothing beyond transport | Status values | Any effect on data serving — status only (REQ-25) |
 | Control plane | Transport integrity and answer well-formedness; the Portal authenticates *itself* to the control plane but authenticates the control plane only by the transport; an unreadable answer is fail-closed, never guessed at (INV-6) | Every authorization answer it gives: the grant's claims and the lifetimes it set for them | Admit a credential it denied; hold a grant past P-GRANT-MAX-LIFETIME however long a lifetime it asked for. It *can* close the data API by going silent, for uncached credentials at once and for cached ones at `expires_at` — the direction an outage fails is availability, deliberately (REQ-54, FM table) |
-| Operator | Config validity at startup | Fully | Configure a commercial block that silently serves everything (REQ-56) |
+| Operator | Config validity at startup | Fully | Configure an `auth:` block that silently serves everything (REQ-56) |
 
 ## Lifecycle at a glance
 
@@ -107,5 +107,5 @@ status**. Worker-health bookkeeping is in-memory only and resets on restart.
   empty, or truncated) → client resumes (REQ-2).
 - **Process lifecycle:** start → fetch catalog + first assignment → ready → serve ⟲
   refresh world view → SIGTERM → advertise not-ready, drain two-phase (REQ-24) → exit.
-  Commercial configuration adds nothing here: authorization state is learned from the
+  Authorization configuration adds nothing here: authorization state is learned from the
   requests that need it, so there is no key bootstrap between start and ready (LIV-5).

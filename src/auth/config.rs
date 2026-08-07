@@ -10,10 +10,10 @@ use super::signing::RequestSigner;
 /// file, so the id is normally injected per pod and overrides the file value.
 const PORTAL_ID_ENV: &str = "PORTAL_ID";
 
-/// Presence of this block turns the portal commercial: the data API then
+/// Presence of this block turns authorization on: the data API then
 /// requires a key. Absent, the portal behaves exactly like an OSS build.
 #[derive(Debug, Clone, Deserialize)]
-pub struct CommercialConfig {
+pub struct AuthConfig {
     pub control_plane_url: Url,
 
     /// What the control plane knows this portal as, and what it attributes the
@@ -97,13 +97,10 @@ impl Enforcement {
     }
 }
 
-impl CommercialConfig {
+impl AuthConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         let portal_id = self.portal_id();
-        anyhow::ensure!(
-            !portal_id.is_empty(),
-            "commercial.portal_id must not be empty"
-        );
+        anyhow::ensure!(!portal_id.is_empty(), "auth.portal_id must not be empty");
         // It travels in a header and in the string the signature covers, whose
         // fields are newline-separated. Rejecting control characters here is
         // what lets the canonical form stay unambiguous (DC-8).
@@ -111,14 +108,14 @@ impl CommercialConfig {
             portal_id
                 .chars()
                 .all(|c| !c.is_control() && !c.is_whitespace()),
-            "commercial.portal_id must not contain whitespace or control characters"
+            "auth.portal_id must not contain whitespace or control characters"
         );
         // The exchange body carries the caller's credential verbatim, so a
         // plaintext hop hands whoever can read it a key that works against the
         // public data API. Loopback keeps local dev on `http://`.
         anyhow::ensure!(
             self.control_plane_url.scheme() == "https" || is_loopback(&self.control_plane_url),
-            "commercial.control_plane_url must be https outside loopback: it carries credentials"
+            "auth.control_plane_url must be https outside loopback: it carries credentials"
         );
         self.limits.validate()
     }
@@ -157,40 +154,40 @@ impl Limits {
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.max_grant_lifetime_secs >= 1,
-            "commercial.max_grant_lifetime_secs must be at least 1"
+            "auth.max_grant_lifetime_secs must be at least 1"
         );
         anyhow::ensure!(
             self.exchange_timeout_ms >= 1,
-            "commercial.exchange_timeout_ms must be at least 1"
+            "auth.exchange_timeout_ms must be at least 1"
         );
         // Zero would refuse every exchange, which reads as a control-plane
         // outage rather than as the configuration mistake it is.
         anyhow::ensure!(
             self.exchange_rate_per_sec >= 1,
-            "commercial.exchange_rate_per_sec must be at least 1"
+            "auth.exchange_rate_per_sec must be at least 1"
         );
         anyhow::ensure!(
             self.max_inflight_exchanges >= 1,
-            "commercial.max_inflight_exchanges must be at least 1"
+            "auth.max_inflight_exchanges must be at least 1"
         );
         anyhow::ensure!(
             self.grant_cache_capacity >= 1,
-            "commercial.grant_cache_capacity must be at least 1"
+            "auth.grant_cache_capacity must be at least 1"
         );
         anyhow::ensure!(
             self.denial_cache_capacity >= 1,
-            "commercial.denial_cache_capacity must be at least 1"
+            "auth.denial_cache_capacity must be at least 1"
         );
         // Zero expires a denial before the next request reads it, which turns
         // the cache off without saying so — and the exchange budget it exists
         // to protect is fleet-shared (HZ-10).
         anyhow::ensure!(
             self.denial_ttl_secs >= 1,
-            "commercial.denial_ttl_secs must be at least 1"
+            "auth.denial_ttl_secs must be at least 1"
         );
         anyhow::ensure!(
             self.refresh_jitter_pct <= 100,
-            "commercial.refresh_jitter_pct must be a percentage"
+            "auth.refresh_jitter_pct must be a percentage"
         );
         Ok(())
     }
@@ -250,15 +247,15 @@ fn default_refresh_jitter_pct() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commercial::test_support::env_guard;
+    use crate::auth::test_support::env_guard;
 
     const MINIMAL: &str = r#"
 control_plane_url: https://cp.example/
 portal_id: portal-premium-eu
 "#;
 
-    fn parse(yaml: &str) -> CommercialConfig {
-        serde_yaml::from_str(yaml).expect("commercial config should parse")
+    fn parse(yaml: &str) -> AuthConfig {
+        serde_yaml::from_str(yaml).expect("auth config should parse")
     }
 
     /// The defaults are the ratified parameter values, and the lifetime one is
@@ -312,7 +309,7 @@ portal_id: portal-premium-eu
 
     #[test]
     fn unknown_enforcement_mode_is_rejected() {
-        let err = serde_yaml::from_str::<CommercialConfig>(&format!("{MINIMAL}enforcement: off\n"))
+        let err = serde_yaml::from_str::<AuthConfig>(&format!("{MINIMAL}enforcement: off\n"))
             .expect_err("unknown enforcement mode must not parse");
         assert!(err.to_string().contains("enforce"), "got {err}");
     }
@@ -415,7 +412,7 @@ portal_id: portal-premium-eu
 
         let mut ignored = Vec::new();
         let deser = serde_yaml::Deserializer::from_str(&yaml);
-        let config: CommercialConfig = serde_ignored::deserialize(deser, |path| {
+        let config: AuthConfig = serde_ignored::deserialize(deser, |path| {
             ignored.push(path.to_string());
         })
         .expect("the block still parses");

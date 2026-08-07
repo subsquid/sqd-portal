@@ -7,7 +7,7 @@ otherwise need.
 
 **The no-undeclared-dependencies rule.** Every network or system interaction of the
 Portal appears in this document. Any interaction not listed here observed in operation
-is a conformance violation (INV-37). DC-8 is conditional on commercial configuration:
+is a conformance violation (INV-37). DC-8 is conditional on authorization configuration:
 observing it on a Portal without one is the same violation (REQ-56).
 
 ## DC-1 — Archival workers
@@ -116,7 +116,7 @@ never delays or fails serving.
 
 ## DC-8 — Control plane (credential exchange)
 
-Exists only on a commercial deployment (REQ-56); on any other the Portal opens no
+Exists only on an authorizing deployment (REQ-56); on any other the Portal opens no
 connection to it and this contract is vacuous.
 
 *Role.* Answers one question — is *this* credential authorized here, and under what claims

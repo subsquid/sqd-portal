@@ -123,7 +123,7 @@ of the conformance surface beyond existence and freshness.
 
 *Effect.* Pure read of local state — never calls a dependency. *Post.* Ready iff:
 an artifact is applied ∧ worker connectivity ≥ P-READY-CONNECTION-RATIO ∧ not shutting
-down (INV-31). Commercial configuration adds no conjunct in either enforcement mode: there
+down (INV-31). Authorization configuration adds no conjunct in either enforcement mode: there
 is nothing to load before serving, and a control plane that is unreachable is answered with
 retryable refusals, not by leaving rotation — every replica shares one authority, so a
 readiness rule on its account would empty the fleet at the worst possible moment (REQ-54).
@@ -143,12 +143,12 @@ artifact; no rows (NG6). Experimental: shape unspecified beyond this.
 ## OP-11 — Request authorization
 
 Not a client-callable operation: an admission step that runs before OP-1..OP-10 on every
-gated route (DEF-19) of a commercial deployment, and does not exist at all on any other
+gated route (DEF-19) of an authorizing deployment, and does not exist at all on any other
 (REQ-56). It is listed as an operation because it has a contract, a failure mapping, and
 tests of its own.
 
 *Pre.* The route is a gated one (DEF-19). An ungated route skips this operation entirely
-and costs exactly what it costs on a non-commercial deployment — the credential is not
+and costs exactly what it costs on a non-authorizing deployment — the credential is not
 read and the dataset is not resolved.
 
 *Effect.* Checks the presented credential's grammar, then looks up its fingerprint in the

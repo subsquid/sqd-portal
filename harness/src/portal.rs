@@ -14,21 +14,21 @@ pub struct Endpoints {
     pub registry_port: u16,
     pub hotblocks_port: u16,
     pub http_port: u16,
-    /// `Some` turns the portal commercial: presence of the block is the switch
+    /// `Some` turns authorization on: presence of the block is the switch
     /// (REQ-56), so absence has to stay expressible.
     pub control_plane_port: Option<u16>,
 }
 
-/// The `commercial:` block a CT-10 fixture writes. Limits are spelled as raw
+/// The `auth:` block a CT-10 fixture writes. Limits are spelled as raw
 /// YAML lines because each case bounds a different one and the portal defaults
 /// the rest.
-pub struct Commercial {
+pub struct Auth {
     pub portal_id: String,
     pub enforcement: &'static str,
     pub limits: Vec<String>,
 }
 
-impl Commercial {
+impl Auth {
     pub fn new(portal_id: impl Into<String>) -> Self {
         Self {
             portal_id: portal_id.into(),
@@ -52,7 +52,7 @@ pub fn write_config(
     scratch: &Path,
     world: &ToyWorld,
     e: &Endpoints,
-    commercial: Option<&Commercial>,
+    auth: Option<&Auth>,
 ) -> anyhow::Result<PathBuf> {
     let mut datasets = String::new();
     for ds in &world.datasets {
@@ -76,9 +76,9 @@ pub fn write_config(
     // Loopback keeps the `https` requirement satisfied without a certificate:
     // the block carries client credentials, so the portal refuses plaintext
     // anywhere else.
-    let commercial_block = match (commercial, e.control_plane_port) {
+    let auth_block = match (auth, e.control_plane_port) {
         (Some(c), Some(port)) => format!(
-            "commercial:\n  \
+            "auth:\n  \
              control_plane_url: http://127.0.0.1:{port}/\n  \
              portal_id: {id}\n  \
              enforcement: {mode}\n{limits}",
@@ -117,12 +117,12 @@ sqd_network:
   metadata: http://127.0.0.1:{registry}/metadata.yml
   serve: "manual"
 datasets:
-{datasets}{commercial_block}"#,
+{datasets}{auth_block}"#,
         http = e.http_port,
         publisher = e.publisher_port,
         registry = e.registry_port,
         datasets = datasets,
-        commercial_block = commercial_block,
+        auth_block = auth_block,
     );
     let path = scratch.join("portal.config.yml");
     std::fs::write(&path, config)?;

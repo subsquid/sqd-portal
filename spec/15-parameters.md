@@ -70,7 +70,7 @@ assumes, not knobs it owns.
 | P-DRAIN-TIMEOUT | In-flight drain budget after intake stops (REQ-24, ADR-005) | 25 s | 25 s |
 | P-KILL-GRACE | *Environmental:* the orchestrator's grace between SIGTERM and SIGKILL — Kubernetes `terminationGracePeriodSeconds` (REQ-24, LIV-11, ADR-005) | deployment-set, unverified; the Kubernetes default of 30 s is **below** the 50 s budget | ≥ P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT + slack (≥ 60 s) |
 | P-READY-CONNECTION-RATIO | Min fraction of known workers connected for readiness (REQ-23) | 3/4 *(fixed)* | 3/4 |
-| P-STARTUP-BOUND | ⚠ Start → ready bound; artifact fetch and apply only, commercial configuration adding no term (LIV-5, S5) | unmeasured | ⚠ 10 min (proposed) |
+| P-STARTUP-BOUND | ⚠ Start → ready bound; artifact fetch and apply only, authorization configuration adding no term (LIV-5, S5) | unmeasured | ⚠ 10 min (proposed) |
 | P-STALL-BUDGET | ⚠ Max zero-progress interval on a healthy stream; also the first-record bound (LIV-1, LIV-2, OB-2) | unmeasured | ⚠ 2 × P-TRANSPORT-TIMEOUT (proposed) |
 
 ## Accounting & reporting
@@ -83,10 +83,10 @@ assumes, not knobs it owns.
 | P-MEMORY-BUDGET | ⚠ Per-replica memory budget REQ-27 must fit | 4–5 GB provisioned; **violated 2026-07-17 (OOM-kill restarts on 0.11.8)** | ⚠ ratify via OQ-4 and OQ-9 |
 | P-ASSIGNMENT-SIZE | *Environmental:* mainnet assignment artifact size (REQ-27, GAP-3) | docs disagree: ~300 MB vs ~0.5 GB | resolve via OQ-4 |
 
-## Commercial access control
+## Access control
 
-Bound only on a commercial deployment (REQ-56); unused elsewhere. Every row is
-operator-bindable in the `commercial:` block and defaults to its observed value; the
+Bound only on an authorizing deployment (REQ-56); unused elsewhere. Every row is
+operator-bindable in the `auth:` block and defaults to its observed value; the
 targets stay proposals until OQ-15 ratifies them against a measured credential working
 set, which is the only thing that can size them honestly.
 

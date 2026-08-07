@@ -1,11 +1,11 @@
 use url::Url;
 
 use super::{
-    config::CommercialConfig,
+    config::AuthConfig,
     signing::RequestSigner,
     types::{ExchangeAnswer, Grant, CLAIMS_VERSION},
 };
-use crate::commercial::extractor::Credential;
+use crate::auth::extractor::Credential;
 
 const EXCHANGE_PATH: [&str; 4] = ["internal", "portal", "v1", "exchange"];
 
@@ -27,7 +27,7 @@ pub struct ControlPlaneClient {
 }
 
 impl ControlPlaneClient {
-    pub fn new(config: &CommercialConfig, signer: RequestSigner) -> anyhow::Result<Self> {
+    pub fn new(config: &AuthConfig, signer: RequestSigner) -> anyhow::Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
                 .timeout(config.exchange_timeout())
@@ -104,7 +104,7 @@ fn endpoint_url(base: &Url, segments: &[&str]) -> anyhow::Result<Url> {
     {
         let mut path = url
             .path_segments_mut()
-            .map_err(|()| anyhow::anyhow!("commercial.control_plane_url cannot be a base"))?;
+            .map_err(|()| anyhow::anyhow!("auth.control_plane_url cannot be a base"))?;
         path.pop_if_empty();
         path.extend(segments);
     }
@@ -116,12 +116,12 @@ mod tests {
     use axum::{response::Redirect, routing::post, Json, Router};
 
     use super::*;
-    use crate::commercial::signing;
-    use crate::commercial::test_support::{credential, MockControlPlane, KEY_ID};
+    use crate::auth::signing;
+    use crate::auth::test_support::{credential, MockControlPlane, KEY_ID};
 
     const NOW: u64 = 1_800_000_000;
 
-    async fn client_for(config: &CommercialConfig) -> ControlPlaneClient {
+    async fn client_for(config: &AuthConfig) -> ControlPlaneClient {
         ControlPlaneClient::new(config, config.signer(signing::test_keypair()).unwrap()).unwrap()
     }
 

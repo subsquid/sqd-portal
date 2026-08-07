@@ -130,16 +130,16 @@ that is not produced yet (INV-27), not a failure, so it carries no `type` and no
 It is bound by IB-4 and observed as `status="204"`, which is exactly what a code on it
 would have restated.
 
-The last six rows exist only on a commercial deployment (REQ-56) and are never
+The last six rows exist only on an authorizing deployment (REQ-56) and are never
 `api_error`: refusing an unauthenticated request is the system working, and must not
 page (ADR-011). None of them is retryable and none carries a retry hint.
 
 Exact statuses and envelope exceptions are fixed by IB-5. No dependency-specific body
 or code extends this set.
 
-## Access control (commercial deployments only)
+## Access control (authorizing deployments only)
 
-Every definition in this section is vacuous on a Portal with no commercial
+Every definition in this section is vacuous on a Portal with no authorization
 configuration: nothing constructs these objects and no route consults them (REQ-56).
 
 **DEF-16 — Credential.** What a client presents: the pair (**key id**, **secret**). The
@@ -183,7 +183,7 @@ authorization state a replica holds that some request did not put there. Nothing
 restart (NG5), and a cold replica is not a degraded one: it is one whose first request per
 credential costs an exchange.
 
-**DEF-19 — Gated route.** A route that requires a credential on a commercial deployment:
+**DEF-19 — Gated route.** A route that requires a credential on an authorizing deployment:
 those delivering blocks, query results, or block lookups. Every other route answers
 without one (NG8). Which it is, is a property of the route rather than of the request or
 of the configuration, and is stated where the route is declared — a route that states
@@ -214,8 +214,8 @@ request: no sessions, no per-client identity, no response cache.
 in-memory and reset by restart: (a) the applied artifact (DEF-4) and catalog snapshots;
 (b) the **worker health map** — per worker: open-lease count, error/timeout cooldown
 marks, backoff-until, throughput estimate; (c) the **congestion window** (DEF-13);
-(d) the **stream census** (count of active streams, monotone stream sequence); and, on a
-commercial deployment, (e) the grant cache, the negative-answer cache, and the exchange
+(d) the **stream census** (count of active streams, monotone stream sequence); and, on an
+authorizing deployment, (e) the grant cache, the negative-answer cache, and the exchange
 limiters (DEF-18, DC-8). Shared adaptive state may influence *admission, worker choice,
 coverage extent, and timing* — never record content (INV-28).
 
@@ -230,7 +230,7 @@ snapshots (staleness: 05 §caches).
 
 **DEF-15 — Configuration.** The operator-supplied object binding every `P-*` parameter
 ([15-parameters.md](15-parameters.md)) plus identity (peer key), upstream endpoints,
-and the dataset map; on a commercial deployment it also binds the control-plane endpoint,
+and the dataset map; on an authorizing deployment it also binds the control-plane endpoint,
 the enforcement mode, and the signing identity DC-8 authenticates with. Static
 per process lifetime.
 
@@ -262,7 +262,7 @@ Semantics in [04-operations.md](04-operations.md).
 | OP-8 | Readiness probe | Can this instance serve correctly now |
 | OP-9 | Metrics read | Observability snapshot (12) |
 | OP-10 | SQL route plan | Experimental: relational plan → worker/chunk routing |
-| OP-11 | Request authorization | Admission step preceding OP-1..OP-10 on a commercial deployment (REQ-50) |
+| OP-11 | Request authorization | Admission step preceding OP-1..OP-10 on an authorizing deployment (REQ-50) |
 
 ## Terminology cross-reference (codebase → spec)
 
@@ -280,7 +280,7 @@ Semantics in [04-operations.md](04-operations.md).
 | `BaseBlockMismatch`, `previousBlocks` | CONFLICT (DEF-9, DEF-10) |
 | hotblocks | Real-time source (DC-4) |
 | `x-sqd-data-source` | Serving source marker (DEF-6) |
-| commercial block / gate | Commercial configuration, authorization gate (REQ-56, DEF-19) |
+| `auth:` block / gate | Authorization configuration, and the gate it installs (REQ-56, DEF-19) |
 | ladder, rung | REQ-53's ordered precedence; the rung is DEF-20's internal reason |
 | `log_only` / `enforce` | Shadow and enforcing modes (REQ-55) |
 | exchange | The one control-plane call: credential in, grant or denial out (DC-8) |

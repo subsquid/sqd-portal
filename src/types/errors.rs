@@ -105,7 +105,7 @@ error_codes! {
         /// re-types an unclassified 4xx.
         Unclassified => "unclassified",
 
-        // ADR-011. Commercial deployments only; vacuous without a `commercial:` block.
+        // ADR-011. Authorizing deployments only; vacuous without an `auth:` block.
         MissingCredential => "missing_credential",
         /// One code for four rungs — unparseable, unknown id, wrong secret, no digest.
         /// Splitting them tells a caller which guess to keep (INV-39); the operator gets

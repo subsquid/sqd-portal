@@ -19,9 +19,9 @@ nothing durable survives a restart). Modules 06 (consistency/durability) and 10
 refreshed-snapshot lifecycle is folded into 05. Numbering gaps are canonical, never
 recycled.
 
-Commercial access control (REQ-50..REQ-56, DC-8) is **conditional**: every
+Access control (REQ-50..REQ-56, DC-8) is **conditional**: every
 property in that area is vacuous on a Portal the operator has not configured
-commercially, which is the default and the only mode a self-hosted build has. It is
+for authorization, which is the default and the only mode a self-hosted build has. It is
 spread through the existing documents rather than given one of its own, because it is a
 precondition on the surface those documents already describe, not a second system.
 
@@ -94,7 +94,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
    landed (GAP-14 closed 2026-07-17); build the `CT-2..CT-9` classes on it next.
 2. **Ratify or reject proposed ADR-013** and the ⚠ targets in
    [15-parameters.md](15-parameters.md) and the SLO table (11); close the open questions
-   in [02-requirements.md](02-requirements.md). The commercial band (REQ-50..REQ-56, DC-8)
+   in [02-requirements.md](02-requirements.md). The authorization band (REQ-50..REQ-56, DC-8)
    has landed, error contract and authorization path both, and CT-10 covers its request
    path; what remains is the time-dependent half (GAP-33).
 3. **Burn down the gap register** in [13-conformance.md](13-conformance.md) in priority

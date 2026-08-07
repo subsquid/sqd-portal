@@ -27,7 +27,7 @@ use tower_http::request_id::{
 };
 use utoipa_scalar::{Scalar, Servable as _};
 
-use crate::commercial::{AuthExt, Gate, Gated};
+use crate::auth::{AuthExt, EndpointExt, Gate, Gated};
 use crate::datasets::DatasetConfig;
 use crate::endpoints::{
     block_number_by_timestamp::get_blocknumber_by_timestamp,
@@ -40,7 +40,6 @@ use crate::openapi::{build_openapi_spec, serve_openapi_spec, BlockHead, StatusRe
 use crate::types::api_types::AvailableDatasetApiResponse;
 use crate::types::Compression;
 use crate::utils::conversion::json_lines_to_json;
-use crate::utils::logging::MethodRouterExt;
 use crate::{
     config::Config,
     controller::task_manager::TaskManager,
@@ -96,22 +95,15 @@ pub async fn run_server(
     shutting_down: Arc<AtomicBool>,
     shutdown_signal: CancellationToken,
     show_internal_docs: bool,
-    commercial_gate: Option<Arc<Gate>>,
+    auth_gate: Option<Arc<Gate>>,
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
     let cors = cors_layer();
 
     tracing::info!("Starting HTTP server listening on {addr}");
-    let app = gated_routes(commercial_gate.clone())
-        .merge_ungated(
-            "the Scalar docs UI renders the same schema on every deployment",
-            Scalar::with_url("/docs", openapi_spec.clone())
-                .custom_html(include_str!("../docs/openapi/scalar_template.html"))
-                .into(),
-        )
+    let app = gated_routes(auth_gate.clone(), &openapi_spec)
         .into_router()
         .layer(Extension(Arc::new(openapi_spec)));
-
 
     let drain_timeout = config.drain_timeout;
 
@@ -143,9 +135,9 @@ pub async fn run_server(
         )
         .layer(Extension(task_manager))
         .layer(Extension(network_client))
-        // `None` without a `commercial:` block, so `/ready` behaves exactly as
+        // `None` without an `auth:` block, so `/ready` behaves exactly as
         // it does on an OSS portal.
-        .layer(Extension(commercial_gate))
+        .layer(Extension(auth_gate))
         .layer(Extension(config))
         .layer(Extension(Arc::new(metrics_registry)))
         .layer(Extension(hotblocks))
@@ -586,12 +578,12 @@ async fn get_all_workers(
 )]
 async fn get_metrics(
     Extension(registry): Extension<Arc<Registry>>,
-    Extension(commercial): Extension<Option<Arc<Gate>>>,
+    Extension(auth): Extension<Option<Arc<Gate>>>,
 ) -> impl IntoResponse {
     // Republished per scrape rather than per exchange: the age of the last
     // successful one has to climb through an outage, not freeze at whatever it
     // reached before the control plane went quiet (OB-13).
-    if let Some(gate) = &commercial {
+    if let Some(gate) = &auth {
         gate.publish_freshness();
     }
     lazy_static::lazy_static! {
@@ -677,117 +669,118 @@ const SHUTTING_DOWN: u8 = 1;
 const NO_WORKERS: u8 = 2;
 const INSUFFICIENT_CONNECTIONS: u8 = 3;
 
-/// Commercial configuration adds no conjunct in either enforcement mode: there is
+/// Auth configuration adds no conjunct in either enforcement mode: there is
 /// nothing to load before serving, and every replica shares one authority, so a rule
 /// keyed on the control plane would empty the fleet during the outage that triggered
 /// it — and a cold replica would wait for traffic it is not being sent (INV-31).
-/// Every route the portal serves, each stating whether it needs a key. Split
-/// out so the surface test can read the classification back (REQ-51).
+/// Every route the portal serves, each stating whether it needs a key — including
+/// the routers mounted whole, so the inventory the surface test reads back covers
+/// everything `run_server` serves (REQ-51).
 #[allow(deprecated)]
-fn gated_routes(commercial_gate: Option<Arc<Gate>>) -> Gated {
-    let routes = Gated::new(commercial_gate)
-    // Portal status
-    .route("/status", get(get_status).endpoint("/status").no_auth())
-    .route(
-        "/datasets",
-        get(get_datasets).endpoint("/datasets").no_auth(),
-    )
-    // Streaming data
-    .route(
-        "/datasets/:dataset/archival-stream",
-        post(run_archival_stream_restricted)
-            .endpoint("/archival-stream")
-            .auth(),
-    )
-    .route(
-        "/datasets/:dataset/archival-stream/debug",
-        post(run_archival_stream)
-            .endpoint("/archival-stream/debug")
-            .auth(),
-    )
-    .route(
-        "/datasets/:dataset/finalized-stream",
-        post(run_finalized_stream)
-            .endpoint("/finalized-stream")
-            .auth(),
-    )
-    .route(
-        "/datasets/:dataset/stream",
-        post(run_stream).endpoint("/stream").auth(),
-    )
-    // Getting head
-    .route(
-        "/datasets/:dataset/archival-head",
-        get(get_archival_head).endpoint("/archival-head").no_auth(),
-    )
-    .route(
-        "/datasets/:dataset/finalized-head",
-        get(get_finalized_head)
-            .endpoint("/finalized-head")
-            .no_auth(),
-    )
-    .route(
-        "/datasets/:dataset/head",
-        get(get_head).endpoint("/head").no_auth(),
-    )
-    // Dataset info
-    .route(
-        "/datasets/:dataset/state",
-        get(get_dataset_state).endpoint("/state").no_auth(),
-    )
-    .route(
-        "/datasets/:dataset",
-        get(get_dataset_metadata).endpoint("/dataset").no_auth(),
-    )
-    .route(
-        "/datasets/:dataset/metadata",
-        get(get_dataset_metadata).endpoint("/metadata").no_auth(),
-    )
-    .route(
-        "/datasets/:dataset/timestamps/:timestamp/block",
-        get(get_blocknumber_by_timestamp)
-            .endpoint("/timestamps/block")
-            .auth(),
-    )
-    // Backward compatibility routes
-    .route(
-        "/datasets/:dataset/finalized-stream/height",
-        get(get_finalized_stream_height)
-            .endpoint("/height")
-            .no_auth(),
-    )
-    .route(
-        "/datasets/:dataset/archival-stream/height",
-        get(get_archival_stream_height)
-            .endpoint("/height")
-            .no_auth(),
-    )
-    .route(
-        "/datasets/:dataset_id/query/:worker_id",
-        post(execute_query).endpoint("/query").auth(),
-    )
-    .route(
-        "/datasets/:dataset/height",
-        get(get_height).endpoint("/height").no_auth(),
-    )
-    .route(
-        "/datasets/:dataset/:start_block/worker",
-        get(get_worker).endpoint("/worker").no_auth(),
-    )
-    // Internal routes
-    .route(
-        "/debug/workers",
-        get(get_all_workers).endpoint("/debug/workers").no_auth(),
-    )
-    .route(
-        "/datasets/:dataset/:block/debug",
-        get(get_debug_block).endpoint("/block/debug").no_auth(),
-    )
-    // Ops probes and the served schema: never gated, or a pod that cannot
-    // answer its own readiness check leaves rotation.
-    .route("/metrics", get(get_metrics).no_auth())
-    .route("/ready", get(get_readiness).no_auth())
-    .route("/api-docs/openapi.json", get(serve_openapi_spec).no_auth());
+fn gated_routes(auth_gate: Option<Arc<Gate>>, openapi_spec: &utoipa::openapi::OpenApi) -> Gated {
+    let routes = Gated::new(auth_gate)
+        // Portal status
+        .route("/status", get(get_status).endpoint("/status").no_auth())
+        .route(
+            "/datasets",
+            get(get_datasets).endpoint("/datasets").no_auth(),
+        )
+        // Streaming data
+        .route(
+            "/datasets/:dataset/archival-stream",
+            post(run_archival_stream_restricted)
+                .endpoint("/archival-stream")
+                .auth(),
+        )
+        .route(
+            "/datasets/:dataset/archival-stream/debug",
+            post(run_archival_stream)
+                .endpoint("/archival-stream/debug")
+                .auth(),
+        )
+        .route(
+            "/datasets/:dataset/finalized-stream",
+            post(run_finalized_stream)
+                .endpoint("/finalized-stream")
+                .auth(),
+        )
+        .route(
+            "/datasets/:dataset/stream",
+            post(run_stream).endpoint("/stream").auth(),
+        )
+        // Getting head
+        .route(
+            "/datasets/:dataset/archival-head",
+            get(get_archival_head).endpoint("/archival-head").no_auth(),
+        )
+        .route(
+            "/datasets/:dataset/finalized-head",
+            get(get_finalized_head)
+                .endpoint("/finalized-head")
+                .no_auth(),
+        )
+        .route(
+            "/datasets/:dataset/head",
+            get(get_head).endpoint("/head").no_auth(),
+        )
+        // Dataset info
+        .route(
+            "/datasets/:dataset/state",
+            get(get_dataset_state).endpoint("/state").no_auth(),
+        )
+        .route(
+            "/datasets/:dataset",
+            get(get_dataset_metadata).endpoint("/dataset").no_auth(),
+        )
+        .route(
+            "/datasets/:dataset/metadata",
+            get(get_dataset_metadata).endpoint("/metadata").no_auth(),
+        )
+        .route(
+            "/datasets/:dataset/timestamps/:timestamp/block",
+            get(get_blocknumber_by_timestamp)
+                .endpoint("/timestamps/block")
+                .auth(),
+        )
+        // Backward compatibility routes
+        .route(
+            "/datasets/:dataset/finalized-stream/height",
+            get(get_finalized_stream_height)
+                .endpoint("/height")
+                .no_auth(),
+        )
+        .route(
+            "/datasets/:dataset/archival-stream/height",
+            get(get_archival_stream_height)
+                .endpoint("/height")
+                .no_auth(),
+        )
+        .route(
+            "/datasets/:dataset_id/query/:worker_id",
+            post(execute_query).endpoint("/query").auth(),
+        )
+        .route(
+            "/datasets/:dataset/height",
+            get(get_height).endpoint("/height").no_auth(),
+        )
+        .route(
+            "/datasets/:dataset/:start_block/worker",
+            get(get_worker).endpoint("/worker").no_auth(),
+        )
+        // Internal routes
+        .route(
+            "/debug/workers",
+            get(get_all_workers).endpoint("/debug/workers").no_auth(),
+        )
+        .route(
+            "/datasets/:dataset/:block/debug",
+            get(get_debug_block).endpoint("/block/debug").no_auth(),
+        )
+        // Ops probes and the served schema: never gated, or a pod that cannot
+        // answer its own readiness check leaves rotation.
+        .route("/metrics", get(get_metrics).no_auth())
+        .route("/ready", get(get_readiness).no_auth())
+        .route("/api-docs/openapi.json", get(serve_openapi_spec).no_auth());
 
     // SQL Query Engine
     #[cfg(feature = "sql")]
@@ -798,7 +791,12 @@ fn gated_routes(commercial_gate: Option<Arc<Gate>>) -> Gated {
             get(sql_metadata).endpoint("/sql/metadata").no_auth(),
         );
 
-    routes
+    routes.merge_ungated(
+        "the Scalar docs UI renders the same schema on every deployment",
+        Scalar::with_url("/docs", openapi_spec.clone())
+            .custom_html(include_str!("../docs/openapi/scalar_template.html"))
+            .into(),
+    )
 }
 
 fn readiness_verdict(
@@ -1574,9 +1572,9 @@ mod tests {
         use tower::ServiceExt;
         use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
 
-        use crate::commercial::test_support::gate_with;
+        use crate::auth::test_support::gate_with;
 
-        let gate = Some(gate_with(crate::commercial::Enforcement::Enforce));
+        let gate = Some(gate_with(crate::auth::Enforcement::Enforce));
         let app = Gated::new(gate)
             .route(
                 "/datasets/:dataset/stream",
@@ -1611,10 +1609,10 @@ mod tests {
         assert_eq!(body["error"]["code"], "missing_credential");
     }
 
-    /// The kill switch: with no `commercial:` block the gate is never
+    /// The kill switch: with no `auth:` block the gate is never
     /// installed, so an OSS build carries no layer at all.
     #[tokio::test]
-    async fn no_route_carries_authorization_without_a_commercial_config() {
+    async fn no_route_carries_authorization_without_a_an_auth_config() {
         use tower::ServiceExt;
 
         let app = Gated::new(None)
@@ -1672,13 +1670,14 @@ mod tests {
     ///
     /// `Gated::route` already makes an unclassified route a compile error, but it
     /// cannot see inside a merged router and nothing stops a route being added
-    /// after `into_router`. This reads the classification back, so a new data
-    /// route reaches review as a diff here rather than as an open endpoint.
+    /// after `into_router`. This reads the classification back — merged routers
+    /// included — so a new data route reaches review as a diff here rather than
+    /// as an open endpoint. `run_server` mounts nothing `gated_routes` does not.
     #[test]
     fn every_mounted_route_declares_whether_it_needs_a_key() {
-        use crate::commercial::Mounted::{self, Gated as G, Open as O};
+        use crate::auth::Mounted::{self, Gated as G, Merged as M, Open as O};
 
-        let routes = gated_routes(None);
+        let routes = gated_routes(None, &build_openapi_spec(false));
         #[allow(unused_mut)]
         let mut expected: Vec<Mounted> = vec![
             O("/status"),
@@ -1707,6 +1706,9 @@ mod tests {
         ];
         #[cfg(feature = "sql")]
         expected.extend([G("/sql/query"), O("/sql/metadata")]);
+        expected.push(M(
+            "the Scalar docs UI renders the same schema on every deployment",
+        ));
 
         assert_eq!(routes.inventory(), expected.as_slice());
     }

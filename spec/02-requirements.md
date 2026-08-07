@@ -1,7 +1,7 @@
 # 02 — Requirements
 
 Bands: 1–9 core data delivery · 10–16 discovery & metadata · 20–29 robustness &
-overload · 30–34 operability · 40–44 network integration · 50–56 commercial access
+overload · 30–34 operability · 40–44 network integration · 50–56 authorization
 control. Gaps in numbering are reserved; additions never renumber. Acceptance status lives in
 [13-conformance.md](13-conformance.md), not here.
 
@@ -352,22 +352,22 @@ bounded (queue of P-LOGS-QUEUE); under pressure logs are dropped rather than eve
 delaying or failing data serving.
 *Acceptance:* saturating the log queue never blocks a stream; drops are observable.
 
-## Commercial access control (50–56)
+## Access control (50–56)
 
-This band applies only to a Portal the operator has configured commercially (REQ-56).
+This band applies only to a Portal the operator has configured for authorization (REQ-56).
 On any other deployment every requirement here is vacuous: there is no gate, no grant
 cache, and no control-plane dependency. Admission decided here is binary — it never shapes
 how much capacity an admitted request may consume (NG2).
 
 **Why the Portal decides this itself.** A perimeter in front of the Portal cannot carry a
-commercial access decision, for two reasons. It is not part of this system — nothing here
+authorization decision, for two reasons. It is not part of this system — nothing here
 constrains it, so whatever guarantee it provides is unspecified and untested against this
 suite. And it cannot express what the decision needs: a perimeter sees a request, it does
 not know that *this* key is revoked, expired, bought only one dataset, or belongs on a
 different portal. The issuing side already mints keys and knows their state; the missing
 half was a data plane that can decide, per request, whether to serve. That is why
 per-request authentication is no longer a non-goal (NG1, retired), and why the capability
-is opt-in rather than default: a Portal without commercial configuration keeps
+is opt-in rather than default: a Portal without authorization configuration keeps
 byte-for-byte its previous behavior (REQ-56), and configuration present but empty is a
 startup error, never an open portal.
 
@@ -398,7 +398,7 @@ single-flight per credential, negative caching and fail-closed miss budgets are 
 the gate safe to expose at all, not hardening to add later.
 
 **REQ-50 — Gated routes require a valid key.** [MUST]
-On a commercial deployment, every request to a gated route (DEF-19) is authorized before
+On an authorizing deployment, every request to a gated route (DEF-19) is authorized before
 any other work: the presented credential (DEF-16) must be covered by a usable grant
 (DEF-17) — one the control plane issued for that exact credential, that has not passed
 its hard expiry, and whose claims cover this portal and the requested dataset. A request
@@ -412,7 +412,7 @@ portal, and a key scoped to another dataset each receive the refusal ADR-011 bin
 no serving-dependency stub records a call for any of them; the control-plane stub records
 at most one exchange per request and none at all for a cache hit or a token outside the
 grammar; only an authenticated dataset-scoped case may canonicalize the dataset. A valid
-unscoped key is served exactly as the same request is served on a non-commercial
+unscoped key is served exactly as the same request is served on a non-authorizing
 deployment.
 
 **REQ-51 — The gated surface is fixed, and every route states whether it is in it.** [MUST]
@@ -420,7 +420,10 @@ Block delivery, queries and block lookups require a credential. Everything else 
 catalog, per-dataset metadata and state, heads and heights, the worker and debug lookups,
 readiness, metrics and the served API schema — answers without one, on every deployment
 (NG8). A route is in one set or the other because it says so at the point it is declared;
-there is no default, so a route that says nothing does not compile. Because metrics are
+there is no default, so a route that says nothing does not compile. The compile-time gate
+covers routes declared through the gated router's own `route`; a router merged in whole and
+anything mounted after the router is finalized are outside what a type can see, and are held
+instead by the mounted-surface inventory the acceptance below pins. Because metrics are
 client-readable, their public families never expose an internal authorization reason or
 exchange detail beyond the client-visible wire outcome (OB-12/13).
 *Acceptance:* a keyless metadata read succeeds and a keyless stream is refused;
@@ -442,7 +445,7 @@ accepted; anything else is refused as an invalid credential without being exchan
 asks the authority about it — and nowhere else. Before that decision it may exist only in
 the request-local exchange input DEF-16 bounds; it is never logged, placed in shared state,
 echoed, or held past that call, and is matched against the grant cache only as a
-fingerprint, in constant time (INV-38).
+fingerprint (INV-38).
 *Acceptance:* a valid key is accepted through the header and refused when its token is
 truncated, over-long, carries an unknown prefix, or contains bytes outside the minted
 alphabet; the same token in a query parameter is not a credential at all and the request
@@ -519,12 +522,12 @@ public shadow counter; the control-plane stub's ledger shows shadow mode exchang
 the same cache-miss rule as enforcement.
 
 **REQ-56 — Open by default, never open by accident.** [MUST]
-Absent commercial configuration the Portal authorizes nothing, opens no control-plane
+Absent authorization configuration the Portal authorizes nothing, opens no control-plane
 dependency, and installs no authorization middleware. Configuration that is present but
 carries no settings is a startup error: the one outcome an operator writing it cannot
 have intended is the open portal. Which mode is in effect is stated once at startup.
-*Acceptance:* with no commercial configuration, gated routes are served without a
-credential and no control-plane call is ever made; an empty commercial block fails
+*Acceptance:* with no authorization configuration, gated routes are served without a
+credential and no control-plane call is ever made; an empty `auth:` block fails
 startup naming the field it lacks; startup output states whether authorization is on and,
 if so, in which enforcement mode.
 

@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Context;
 use tempfile::TempDir;
 
-use crate::portal::{Commercial, Endpoints, PortalProcess};
+use crate::portal::{Auth, Endpoints, PortalProcess};
 use crate::stubs::control_plane::ControlPlane;
 use crate::stubs::worker::{WorkerFaults, WorkerStub};
 use crate::{artifact, driver, dummy_chain, keys, portal, stubs, ToyWorld};
@@ -26,7 +26,7 @@ pub struct Fixture {
     pub worker_faults: WorkerFaults,
     pub hotblocks_ledger: stubs::Ledger,
     pub publisher_ledger: stubs::Ledger,
-    /// Present only on a commercial fixture — absent, DC-8 is vacuous (REQ-56).
+    /// Present only on an authorizing fixture — absent, DC-8 is vacuous (REQ-56).
     pub control_plane: Option<ControlPlane>,
     _workers: Vec<WorkerStub>,
     scratch: Option<TempDir>,
@@ -40,21 +40,21 @@ impl Fixture {
         Self::start_with(world, workers, None).await
     }
 
-    /// The same world with a `commercial:` block and the DC-8 stub behind it.
+    /// The same world with an `auth:` block and the DC-8 stub behind it.
     /// The control plane is booted before the portal and verifies against the
     /// portal's own identity key, so signatures are checked for real.
-    pub async fn start_commercial(
+    pub async fn start_with_auth(
         world: ToyWorld,
         workers: usize,
-        commercial: Commercial,
+        auth: Auth,
     ) -> anyhow::Result<Self> {
-        Self::start_with(world, workers, Some(commercial)).await
+        Self::start_with(world, workers, Some(auth)).await
     }
 
     async fn start_with(
         world: ToyWorld,
         workers: usize,
-        commercial: Option<Commercial>,
+        auth: Option<Auth>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(workers >= 1, "need at least one worker");
         // Loopback p2p addresses are filtered as unreachable unless this is set.
@@ -74,7 +74,7 @@ impl Fixture {
             registry_port: crate::free_tcp_port(),
             hotblocks_port: crate::free_tcp_port(),
             http_port: crate::free_tcp_port(),
-            control_plane_port: commercial.as_ref().map(|_| crate::free_tcp_port()),
+            control_plane_port: auth.as_ref().map(|_| crate::free_tcp_port()),
         };
         let worker_udp_ports: Vec<u16> = (0..workers).map(|_| crate::free_udp_port()).collect();
 
@@ -121,7 +121,7 @@ impl Fixture {
 
         // Booted before the portal: the first gated request must find it up,
         // and it verifies against the identity the portal will sign with.
-        let control_plane = match (&commercial, endpoints.control_plane_port) {
+        let control_plane = match (&auth, endpoints.control_plane_port) {
             (Some(c), Some(port)) => Some(
                 stubs::control_plane::start(port, &c.portal_id, portal_id.keypair.public()).await?,
             ),
@@ -134,7 +134,7 @@ impl Fixture {
             .map(|(id, port)| format!("{} /ip4/127.0.0.1/udp/{port}/quic-v1", id.peer_id))
             .collect::<Vec<_>>()
             .join(",");
-        let config = portal::write_config(&scratch, &world, &endpoints, commercial.as_ref())?;
+        let config = portal::write_config(&scratch, &world, &endpoints, auth.as_ref())?;
         let portal = portal::spawn(
             &scratch,
             &config,
@@ -163,12 +163,12 @@ impl Fixture {
         self.portal.wait_ready(timeout).await
     }
 
-    /// The DC-8 stub. Panics on a non-commercial fixture, where asking about it
+    /// The DC-8 stub. Panics on a fixture without authorization, where asking about it
     /// is the test's own mistake.
     pub fn cp(&self) -> &ControlPlane {
         self.control_plane
             .as_ref()
-            .expect("this fixture has no commercial block")
+            .expect("this fixture has no `auth:` block")
     }
 
     /// The keyless `/metrics` scrape, as OpenMetrics text.

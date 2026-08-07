@@ -96,7 +96,7 @@ and bodies are not public Portal API.
 
 ### Authentication and permission errors
 
-A Portal configured for commercial access refuses on grounds of who is asking, which the
+A Portal configured for authorization refuses on grounds of who is asking, which the
 four original types have no way to say. The two added types carry those refusals, and six
 codes name them:
 

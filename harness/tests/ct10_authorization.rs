@@ -3,7 +3,7 @@
 //! The credential corpus and the DC-8 fault rows, driven through the real
 //! middleware stack against a control-plane stub that verifies the exchange
 //! signature for real. Four portals, because the properties differ by
-//! configuration: enforcing, shadow, no `commercial:` block at all, and one
+//! configuration: enforcing, shadow, no `auth:` block at all, and one
 //! whose exchange budget is small enough to saturate.
 //!
 //! The claims that need a ledger rather than a response are the reason this
@@ -18,7 +18,7 @@ use anyhow::{ensure, Context};
 use harness::driver::Decoded;
 use harness::fixture::Fixture;
 use harness::metrics_audit::{samples, sum_where};
-use harness::portal::Commercial;
+use harness::portal::Auth;
 use harness::stubs::control_plane::Answer;
 use harness::{driver, ToyWorld};
 use serde_json::json;
@@ -27,9 +27,23 @@ const PORTAL_ID: &str = "portal-harness-eu";
 
 // Registered under the `portal` sub-registry, so the exposed family carries
 // that prefix (IB-6).
-const AUTH_DECISIONS: &str = "portal_commercial_authorization_decisions";
-const EXCHANGES: &str = "portal_commercial_exchanges";
-const LIFETIMES_CAPPED: &str = "portal_commercial_grant_lifetimes_capped";
+const AUTH_DECISIONS: &str = "portal_auth_decisions";
+const EXCHANGES: &str = "portal_auth_exchanges";
+const LIFETIMES_CAPPED: &str = "portal_auth_grant_lifetimes_capped";
+
+/// Every OB-13 signal shadow mode must hold still. They are registered for the
+/// process rather than per mode, so they exist at zero on a shadow and on a
+/// portal without authorization alike — the rule is that they must not *move*.
+const OB13_SIGNALS: &[&str] = &[
+    "portal_auth_grant_cache_entries",
+    "portal_auth_grant_cache_evictions",
+    "portal_auth_grant_lifetimes_capped",
+    "portal_auth_grace_admissions",
+    "portal_auth_grants_in_grace",
+    "portal_auth_grace_min_remaining_seconds",
+    "portal_auth_exchange_duration_seconds_count",
+    "portal_auth_exchange_success_age_seconds",
+];
 
 /// Present in every secret this suite mints, so one substring search covers the
 /// whole corpus.
@@ -162,8 +176,8 @@ async fn ct10_enforcing_gate() -> anyhow::Result<()> {
     // The rate bound is CT-10's own subject in `ct10_exchange_budget_saturates`;
     // here it is raised out of the way so a case never measures the budget
     // instead of the rung it injected.
-    let commercial = Commercial::new(PORTAL_ID).limit("exchange_rate_per_sec", 1000);
-    let mut fx = Fixture::start_commercial(ToyWorld::standard(), 2, commercial).await?;
+    let auth = Auth::new(PORTAL_ID).limit("exchange_rate_per_sec", 1000);
+    let mut fx = Fixture::start_with_auth(ToyWorld::standard(), 2, auth).await?;
     let result = enforcing(&mut fx).await;
     fx.finish(result)
 }
@@ -553,7 +567,7 @@ async fn enforcing(fx: &mut Fixture) -> anyhow::Result<()> {
         "INV-38: the audit proves nothing if no credential ever reached the exchange",
     );
     ensure!(
-        log.contains("commercial authorization") && scrape.contains(AUTH_DECISIONS),
+        log.contains("authorization") && scrape.contains(AUTH_DECISIONS),
         "INV-38: the audit must run against a log and a scrape that carry auth activity",
     );
     // The key id is what a protected log is *allowed* to carry, so finding one
@@ -659,8 +673,8 @@ async fn enforcing(fx: &mut Fixture) -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ct10_shadow_mode_admits_and_projects_neutrally() -> anyhow::Result<()> {
-    let commercial = Commercial::new(PORTAL_ID).enforcement("log_only");
-    let mut fx = Fixture::start_commercial(ToyWorld::standard(), 2, commercial).await?;
+    let auth = Auth::new(PORTAL_ID).enforcement("log_only");
+    let mut fx = Fixture::start_with_auth(ToyWorld::standard(), 2, auth).await?;
     let result = shadow(&mut fx).await;
     fx.finish(result)
 }
@@ -712,13 +726,24 @@ async fn shadow(fx: &mut Fixture) -> anyhow::Result<()> {
             && sum_where(&scrape, AUTH_DECISIONS, &[("decision", "admit")]) == 0.0,
         "INV-39: shadow mode must publish neither admissions nor refusals",
     );
-    // The exchange counters are silent too: any of them moving would separate
-    // the credential that was denied from the one that was not.
+    // Every OB-13 signal is silent too: any of them moving would separate the
+    // credential that was denied from the one that was not. OB-13 constrains
+    // movement rather than presence, so the scalar families — which are
+    // registered for the process and exist at zero — are checked by value, not
+    // by absence. Checking only the labelled families would miss them entirely.
     ensure!(
         samples(&scrape, EXCHANGES).is_empty(),
         "OB-13: shadow mode must not publish exchange outcomes, got {:?}",
         samples(&scrape, EXCHANGES),
     );
+    for family in OB13_SIGNALS {
+        ensure!(
+            sum_where(&scrape, family, &[]) == 0.0,
+            "OB-13: {family} moved in shadow mode, which separates a denied credential \
+             from an admitted one — got {}",
+            sum_where(&scrape, family, &[]),
+        );
+    }
 
     // REQ-55 — shadow mode is not free: it exchanges on the same cache-miss rule
     // enforcement uses, which is the point. The load a cutover will produce is
@@ -748,11 +773,11 @@ async fn shadow(fx: &mut Fixture) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// No `commercial:` block: DC-8 is vacuous and nothing in IB-9 is observable.
+// No `auth:` block: DC-8 is vacuous and nothing in IB-9 is observable.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ct10_without_a_commercial_block_the_portal_is_inert() -> anyhow::Result<()> {
+async fn ct10_without_an_auth_block_the_portal_is_inert() -> anyhow::Result<()> {
     let mut fx = Fixture::start(ToyWorld::standard(), 2).await?;
     let result = inert(&mut fx).await;
     fx.finish(result)
@@ -769,8 +794,14 @@ async fn inert(fx: &mut Fixture) -> anyhow::Result<()> {
     let scrape = fx.scrape().await?;
     ensure!(
         samples(&scrape, AUTH_DECISIONS).is_empty() && samples(&scrape, EXCHANGES).is_empty(),
-        "REQ-56: a non-commercial portal must publish no authorization activity",
+        "REQ-56: a portal without authorization must publish no authorization activity",
     );
+    for family in OB13_SIGNALS {
+        ensure!(
+            sum_where(&scrape, family, &[]) == 0.0,
+            "REQ-56: {family} moved on a portal with no `auth:` block",
+        );
+    }
     Ok(())
 }
 
@@ -780,10 +811,10 @@ async fn inert(fx: &mut Fixture) -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ct10_exchange_budget_saturates_into_overload() -> anyhow::Result<()> {
-    let commercial = Commercial::new(PORTAL_ID)
+    let auth = Auth::new(PORTAL_ID)
         .limit("exchange_rate_per_sec", 1)
         .limit("max_inflight_exchanges", 1);
-    let mut fx = Fixture::start_commercial(ToyWorld::standard(), 2, commercial).await?;
+    let mut fx = Fixture::start_with_auth(ToyWorld::standard(), 2, auth).await?;
     let result = saturated(&mut fx).await;
     fx.finish(result)
 }

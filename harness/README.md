@@ -34,7 +34,7 @@ network access and finishes in seconds.
 
 `ct10_authorization` is the authorization class. It boots four portals, because
 the properties differ by configuration rather than by request: enforcing, shadow
-(`log_only`), one with no `commercial:` block at all, and one whose exchange
+(`log_only`), one with no `auth:` block at all, and one whose exchange
 budget is small enough to saturate under a burst. Its load-bearing assertions are
 the ones a response alone cannot make — that a refused request reaches no worker,
 no real-time source and no control plane; that a burst of eight on one credential

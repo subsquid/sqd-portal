@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use url::Url;
 
-use crate::commercial::CommercialConfig;
+use crate::auth::AuthConfig;
 use crate::network::PrioritiesConfig;
 use crate::types::DatasetRef;
 
@@ -153,8 +153,13 @@ pub struct Config {
     /// Absent means no authentication at all; present, the data API requires a
     /// key. A key written with nothing under it is refused rather than folded
     /// into `None` — an open portal is the one outcome it cannot have meant.
-    #[serde(default, deserialize_with = "parse_commercial")]
-    pub commercial: Option<CommercialConfig>,
+    #[serde(default, deserialize_with = "parse_auth")]
+    pub auth: Option<AuthConfig>,
+
+    /// Keys the deserializer skipped, carried so `main` can warn about them
+    /// once a tracing subscriber exists — see [`Config::read`].
+    #[serde(skip)]
+    pub ignored_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,26 +207,31 @@ pub struct RealTimeConfig {
 impl Config {
     pub fn read(config_path: &str) -> anyhow::Result<Self> {
         let file = std::fs::File::open(config_path)?;
-        let buf_reader = std::io::BufReader::new(file);
-        let deser = serde_yaml::Deserializer::from_reader(buf_reader);
-        // NOTE: this runs inside clap's `value_parser`, before `setup_tracing`,
-        // so these warnings go to a subscriber that does not exist yet. Kept as
-        // is — main logs the authorization mode once tracing is up, which is
-        // the part an operator must not have to infer.
-        let mut warn_unknown = |path: serde_ignored::Path| {
-            tracing::warn!("ignoring unknown config field: {path}");
-        };
-        let config: Self = serde_yaml::with::singleton_map_recursive::deserialize(
-            serde_ignored::Deserializer::new(deser, &mut warn_unknown),
+        Self::from_reader(std::io::BufReader::new(file))
+    }
+
+    /// Unknown keys are collected onto the config rather than logged here: this
+    /// runs inside clap's `value_parser`, before `setup_tracing`, so a warning
+    /// emitted now goes to a subscriber that does not exist yet and a
+    /// misspelled `auth.limits` knob would keep its default without a
+    /// trace. `main` replays them once tracing is up.
+    fn from_reader(reader: impl std::io::Read) -> anyhow::Result<Self> {
+        let deser = serde_yaml::Deserializer::from_reader(reader);
+        let mut ignored = Vec::new();
+        let mut collect = |path: serde_ignored::Path| ignored.push(path.to_string());
+        let mut config: Self = serde_yaml::with::singleton_map_recursive::deserialize(
+            serde_ignored::Deserializer::new(deser, &mut collect),
         )?;
+        config.ignored_fields = ignored;
+        reject_unrecognized_block_without_auth(&config)?;
         config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
         self.congestion.validate()?;
-        if let Some(commercial) = &self.commercial {
-            commercial.validate()?;
+        if let Some(auth) = &self.auth {
+            auth.validate()?;
         }
         Ok(())
     }
@@ -393,21 +403,50 @@ where
     Ok(s.trim_end_matches('/').to_owned())
 }
 
-/// Reached only when the config file actually carries a `commercial` key —
+/// Reached only when the config file actually carries an `auth` key —
 /// `#[serde(default)]` answers for an absent one without coming here — so a
 /// null arriving at this point was written by hand.
-fn parse_commercial<'de, D>(deserializer: D) -> Result<Option<CommercialConfig>, D::Error>
+fn parse_auth<'de, D>(deserializer: D) -> Result<Option<AuthConfig>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    match Option::<CommercialConfig>::deserialize(deserializer)? {
+    match Option::<AuthConfig>::deserialize(deserializer)? {
         Some(config) => Ok(Some(config)),
         None => Err(serde::de::Error::custom(
-            "commercial: the block is present but empty. Remove the key to run the portal \
+            "auth: the block is present but empty. Remove the key to run the portal \
              without authorization, or fill the block in — an empty one would silently serve \
              the data API to anyone.",
         )),
     }
+}
+
+/// A top-level block this build does not know, on a portal that ends up with no
+/// `auth:` key, has the shape of an authorization block under a wrong name:
+/// serde reads an unrecognized key as absent, and absent means the data API
+/// answers anyone. Refusing to start is the only fail-closed reading — the
+/// alternative is a portal that was closed yesterday quietly serving today.
+///
+/// Nested keys stay a warning: they land on a block that did parse, so the
+/// worst case is one knob keeping its default.
+fn reject_unrecognized_block_without_auth(config: &Config) -> anyhow::Result<()> {
+    if config.auth.is_some() {
+        return Ok(());
+    }
+    let stray: Vec<&str> = config
+        .ignored_fields
+        .iter()
+        .filter(|path| !path.contains('.'))
+        .map(String::as_str)
+        .collect();
+    anyhow::ensure!(
+        stray.is_empty(),
+        "unrecognized top-level config {}: {}. Authorization is configured under `auth:` — \
+         a block left under any other name serves the data API without a credential, \
+         so the portal refuses to start on it.",
+        if stray.len() == 1 { "key" } else { "keys" },
+        stray.join(", "),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -472,59 +511,119 @@ sqd_network:
     /// The kill switch: without the block the portal is byte-for-byte an OSS
     /// portal, and `run_server` installs no authorization middleware.
     #[test]
-    fn commercial_is_absent_unless_configured() {
+    fn auth_is_absent_unless_configured() {
         let config: Config = serde_yaml::from_str(MINIMAL_YAML).expect("parse");
-        assert!(config.commercial.is_none());
+        assert!(config.auth.is_none());
     }
 
     /// An operator who wrote the key meant to configure something. serde folds
     /// an explicit null into `None`, which is the open portal — the single
-    /// outcome nobody typing `commercial:` can have intended — and nothing
-    /// anywhere would have said so.
+    /// outcome nobody typing `auth:` can have intended — and nothing anywhere
+    /// would have said so.
     #[test]
-    fn an_empty_commercial_block_is_a_config_error() {
-        let yaml = format!("{MINIMAL_YAML}commercial:\n");
+    fn an_empty_auth_block_is_a_config_error() {
+        let yaml = format!("{MINIMAL_YAML}auth:\n");
 
         let err = serde_yaml::from_str::<Config>(&yaml)
-            .expect_err("a null commercial block must not parse as absent");
-        assert!(err.to_string().contains("commercial"), "got {err}");
+            .expect_err("a null auth block must not parse as absent");
+        assert!(err.to_string().contains("auth"), "got {err}");
 
         // The production path reads through two adapters; both must agree.
         let deser = serde_yaml::Deserializer::from_str(&yaml);
         let err = serde_yaml::with::singleton_map_recursive::deserialize::<Config, _>(
             serde_ignored::Deserializer::new(deser, &mut |_: serde_ignored::Path| {}),
         )
-        .expect_err("a null commercial block must not parse as absent");
-        assert!(err.to_string().contains("commercial"), "got {err}");
+        .expect_err("a null auth block must not parse as absent");
+        assert!(err.to_string().contains("auth"), "got {err}");
 
         // A block that is present but has nothing usable in it fails on the
         // field it is missing, which is the message the operator needs.
-        let err = serde_yaml::from_str::<Config>(&format!("{MINIMAL_YAML}commercial: {{}}\n"))
+        let err = serde_yaml::from_str::<Config>(&format!("{MINIMAL_YAML}auth: {{}}\n"))
             .expect_err("an empty mapping must not parse either");
         assert!(err.to_string().contains("control_plane_url"), "got {err}");
     }
 
     #[test]
-    fn commercial_block_parses_through_the_production_deserializer() {
+    fn auth_block_parses_through_the_production_deserializer() {
+        // `from_reader` validates, and validation reads `PORTAL_ID` — which
+        // another test mutates.
+        let _guard = crate::auth::test_support::env_guard();
         let yaml = format!(
-            "{MINIMAL_YAML}commercial:\n  \
+            "{MINIMAL_YAML}auth:\n  \
              control_plane_url: https://cp.example/\n  \
-             service_token_env: PORTAL_CP_TOKEN\n  \
              portal_id: portal-premium-eu\n  \
              enforcement: log_only\n"
         );
-        let deser = serde_yaml::Deserializer::from_str(&yaml);
-        let config: Config = serde_yaml::with::singleton_map_recursive::deserialize(
-            serde_ignored::Deserializer::new(deser, &mut |_: serde_ignored::Path| {}),
-        )
-        .expect("parse");
+        let config = Config::from_reader(yaml.as_bytes()).expect("parse");
 
-        let commercial = config.commercial.expect("commercial block");
-        assert_eq!(commercial.portal_id, "portal-premium-eu");
-        assert_eq!(
-            commercial.enforcement,
-            crate::commercial::Enforcement::LogOnly
+        let auth = config.auth.expect("auth block");
+        assert_eq!(auth.portal_id, "portal-premium-eu");
+        assert_eq!(auth.enforcement, crate::auth::Enforcement::LogOnly);
+        // Doubles as a lint on this fixture: a stale key here would document a
+        // knob that does not exist.
+        assert_eq!(config.ignored_fields, Vec::<String>::new());
+    }
+
+    /// The other half of the `auth::config` nesting rationale: a
+    /// misspelled limit is only audible if the unknown key survives the read,
+    /// which happens before tracing exists, all the way to `main`.
+    #[test]
+    fn unknown_config_fields_are_carried_for_later_reporting() {
+        let _guard = crate::auth::test_support::env_guard();
+        let yaml = format!(
+            "{MINIMAL_YAML}auth:\n  \
+             control_plane_url: https://cp.example/\n  \
+             portal_id: portal-premium-eu\n  \
+             limits:\n    \
+             max_grant_lifetime_seconds: 60\n"
         );
+        let config = Config::from_reader(yaml.as_bytes()).expect("parse");
+
+        // The `?` marks `parse_auth` buffering the block before
+        // re-deserializing it, which loses the position. The key the operator
+        // typed is still legible, which is what the warning is for.
+        assert_eq!(
+            config.ignored_fields,
+            vec!["auth.?.limits.max_grant_lifetime_seconds"]
+        );
+    }
+
+    /// An authorization block under a name this build does not know reads as no
+    /// authorization at all, which is the one outcome nobody writing one can
+    /// have meant. It must refuse to start rather than serve the data API to
+    /// anyone.
+    #[test]
+    fn an_unrecognized_top_level_block_refuses_to_start_when_nothing_authorizes() {
+        let _guard = crate::auth::test_support::env_guard();
+        let block = "  control_plane_url: https://cp.example/\n  \
+                     portal_id: portal-premium-eu\n";
+
+        let err = Config::from_reader(format!("{MINIMAL_YAML}authorisation:\n{block}").as_bytes())
+            .expect_err("a misnamed block must not read as an open portal");
+        assert!(err.to_string().contains("authorisation"), "got {err}");
+
+        // Under the name the build knows, the same block configures the gate.
+        let config = Config::from_reader(format!("{MINIMAL_YAML}auth:\n{block}").as_bytes())
+            .expect("the block parses under `auth:`");
+        assert!(config.auth.is_some());
+    }
+
+    /// Only the fail-open shape refuses. A portal that does authorize keeps
+    /// starting with a stray key, which stays the warning it always was —
+    /// refusing there would turn an unknown knob into an outage.
+    #[test]
+    fn a_stray_key_alongside_a_real_auth_block_is_only_a_warning() {
+        let _guard = crate::auth::test_support::env_guard();
+        let yaml = format!(
+            "{MINIMAL_YAML}stray_key: 1\nauth:\n  \
+             control_plane_url: https://cp.example/\n  \
+             portal_id: portal-premium-eu\n"
+        );
+
+        let config = Config::from_reader(yaml.as_bytes()).expect("parse");
+
+        assert!(config.auth.is_some());
+        assert_eq!(config.ignored_fields, vec!["stray_key"]);
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub struct RequestSigner {
 
 impl RequestSigner {
     /// `portal_id` must already be validated free of newlines — the canonical
-    /// form separates fields with them (`CommercialConfig::validate`).
+    /// form separates fields with them (`AuthConfig::validate`).
     pub fn new(keypair: Keypair, portal_id: String) -> Self {
         Self { keypair, portal_id }
     }
@@ -89,7 +89,7 @@ fn canonical(
 /// the wire against what should have been sent.
 #[cfg(test)]
 pub(super) fn sign_for_test(
-    config: &super::config::CommercialConfig,
+    config: &super::config::AuthConfig,
     credential: &super::extractor::Credential,
     now_secs: u64,
 ) -> String {

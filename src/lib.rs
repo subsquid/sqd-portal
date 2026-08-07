@@ -1,4 +1,4 @@
-pub mod commercial;
+pub mod auth;
 pub mod config;
 pub mod controller;
 pub mod datasets;

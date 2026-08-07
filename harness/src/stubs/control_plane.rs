@@ -39,7 +39,7 @@ pub const EXCHANGE_PATH: &str = "/internal/portal/v1/exchange";
 /// A drift here is what the scheme tag exists to make loud.
 const SCHEME: &str = "sqd-portal-v1";
 
-/// The claim vocabulary the portal understands (`commercial::types::CLAIMS_VERSION`).
+/// The claim vocabulary the portal understands (`auth::types::CLAIMS_VERSION`).
 pub const CLAIMS_VERSION: u32 = 1;
 
 /// P-SIGNATURE-MAX-SKEW.
@@ -304,7 +304,7 @@ impl Inner {
     }
 }
 
-/// The canonical binding of `commercial::signing`, reimplemented rather than
+/// The canonical binding of `auth::signing`, reimplemented rather than
 /// imported: a stub sharing the portal's code could not catch the portal
 /// changing it.
 fn canonical(portal_id: &str, timestamp: u64, method: &str, path: &str, body: &[u8]) -> String {

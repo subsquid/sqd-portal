@@ -111,7 +111,7 @@ with no usable grant may make the one bounded DC-8 exchange OP-11 declares — o
 the request rate, because concurrent requests on a fingerprint share a single call. A token
 outside the grammar makes none. Dataset canonicalization is itself work: it happens only
 for a credential that has already authenticated and only where the key's scope requires it
-(REQ-53). On an ungated route, or a Portal with no commercial configuration, no part of
+(REQ-53). On an ungated route, or a Portal with no authorization configuration, no part of
 this runs.
 *Why:* an unauthenticated request must not be able to buy unbounded or serving-path work.
 The one attacker-reachable exception is now the ordinary path rather than a rare miss, so
@@ -242,7 +242,7 @@ through them).
 **INV-31 — Readiness honesty.** [state]
 Ready ⇒ (an artifact is applied ∧ connectivity ≥ P-READY-CONNECTION-RATIO ∧ not
 shutting down). Shutdown flips readiness before intake stops (ADR-005). Intent ⚠: ready
-also ⇒ artifact age ≤ P-ASSIGNMENT-MAX-AGE (ADR-013, GAP-2). Commercial configuration adds
+also ⇒ artifact age ≤ P-ASSIGNMENT-MAX-AGE (ADR-013, GAP-2). Authorization configuration adds
 no conjunct in either enforcement mode and will not get one: there is nothing to load
 before serving, and every replica shares one authority, so a readiness rule keyed on the
 control plane would empty the fleet during exactly the outage that triggered it (REQ-54).
@@ -279,18 +279,21 @@ input is destroyed immediately on a cache or negative-answer hit; on a miss, one
 moves it into the single DC-8 exchange and destroys it on completion, timeout, or
 cancellation. It leaves the process in that direction and by no other: no log record,
 metric label, span field, error body, shared or persisted value, or any other outbound
-request carries it, the grant cache holds fingerprints rather than credentials, and
-fingerprint comparison completes in time independent of how many leading bytes matched.
-*Why:* an API key that reaches a log line has been disclosed to everyone with log access,
-and a comparison that exits early lets a wrong secret be refined byte by byte from
-response timing — the fingerprint would then be no better than the secret itself. The one
-egress is not a loophole but the point of naming it: an exception that is written down is
-one a test can bound, and INV-37 already forbids every other destination.
+request carries it, and the grant cache holds fingerprints rather than credentials.
+*Why:* an API key that reaches a log line has been disclosed to everyone with log access.
+The one egress is not a loophole but the point of naming it: an exception that is written
+down is one a test can bound, and INV-37 already forbids every other destination.
+Fingerprint comparison is deliberately *not* required to be constant-time. The attack that
+would motivate it — refining a wrong secret byte by byte from response timing — needs the
+attacker to steer the bytes being compared, and what is compared is SHA-256 of a token they
+supply, so steering it means inverting the hash. Buying immunity to an unavailable attack
+would cost the lookup: a constant-time match against a keyed cache has to touch every entry,
+turning an O(1) hit into a scan of P-GRANT-CACHE-CAPACITY on every request. What the timing
+does leak is cache membership, which is the residual INV-39 already accepts.
 *Check:* CT-10 — drive the full corpus with a marked secret; grep every emitted log,
 metric, span, body, and shared-state dump for it; assert it appears in the control-plane
 stub's ledger only on a miss and in no other stub's; force hit, timeout, cancellation, and
-coalesced-waiter paths and assert no raw input outlives them; assert the comparison is the
-constant-time one by construction.
+coalesced-waiter paths and assert no raw input outlives them.
 
 **INV-39 — No enumeration oracle.** [response]
 On every completed credential verdict, an unparseable token, an authoritatively unknown

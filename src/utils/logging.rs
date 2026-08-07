@@ -2,7 +2,6 @@ use axum::{
     body::Body,
     extract::Request,
     response::{IntoResponse, Response},
-    routing::MethodRouter,
 };
 use std::task::{Context, Poll};
 use tokio::time::{Duration, Instant};
@@ -401,19 +400,6 @@ fn data_source_metric_label(data_source: &str) -> &str {
     }
 }
 
-pub trait MethodRouterExt {
-    fn endpoint(self, endpoint: impl Into<String>) -> Self;
-}
-
-impl<S> MethodRouterExt for MethodRouter<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    fn endpoint(self, endpoint: impl Into<String>) -> Self {
-        self.layer(EndpointAnnotationLayer::new(endpoint))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::data_source_metric_label;
@@ -658,12 +644,13 @@ mod tests {
         use tower::ServiceExt;
         use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
 
-        use super::{MethodRouterExt, NO_DATA_SOURCE};
+        use super::{EndpointAnnotationLayer, NO_DATA_SOURCE};
 
         let app = axum::Router::new()
             .route(
                 "/labelled/:number",
-                get(|Path(n): Path<u64>| async move { n.to_string() }).endpoint("/labelled"),
+                get(|Path(n): Path<u64>| async move { n.to_string() })
+                    .layer(EndpointAnnotationLayer::new("/labelled")),
             )
             .route_layer(from_fn(super::middleware))
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));

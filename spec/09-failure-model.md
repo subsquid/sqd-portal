@@ -69,7 +69,7 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 
 ## Control-plane faults (DC-8)
 
-Commercial deployments only. The governing asymmetry: a fault in the *credential* fails
+Authorizing deployments only. The governing asymmetry: a fault in the *credential* fails
 closed, a fault in the *exchange* degrades — onto a cached grant while one is live, and
 into retryable refusals once it is not. The window between those two is the whole outage
 policy, and it is the control plane's `expires_at` under the Portal's cap (REQ-54).
@@ -86,7 +86,7 @@ policy, and it is the control plane's `expires_at` under the Portal's cap (REQ-5
 | Signing headers malformed or unattributable, or timestamp skew past P-SIGNATURE-MAX-SKEW in either direction | fail-safe as UPSTREAM-FAILURE, and alarm: it fails every exchange at once and the cause is local clock, identity, or request construction, not any client's key |
 | Control plane never reached at all, either mode | mask for readiness — stay ready and refuse retryably (INV-31); leaving rotation would answer one outage with a larger one |
 | Signing identity missing or empty at startup | fail-safe at startup: refuse to run (REQ-33) |
-| Commercial block present but empty | fail-safe at startup: refuse to run — the open portal is the one outcome nobody configuring it intended (REQ-56) |
+| An `auth:` block present but empty | fail-safe at startup: refuse to run — the open portal is the one outcome nobody configuring it intended (REQ-56) |
 
 ## Other dependencies
 

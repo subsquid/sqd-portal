@@ -11,7 +11,7 @@ Liveness claims hold only under a declared environment:
 - **Healthy control plane:** DC-8 exchanges succeed within their deadline, and the absolute
   skew between the Portal's clock and the control plane's is at most
   P-SIGNATURE-MAX-SKEW — a skew past it in either direction fails every exchange, not a
-  share of them. Vacuous on a Portal with no commercial
+  share of them. Vacuous on a Portal with no authorization
   configuration.
 - **Adequate resources:** census below P-MAX-STREAMS, congestion utilization below
   P-HEADROOM-THRESHOLD, memory within P-MEMORY-BUDGET.
@@ -53,7 +53,7 @@ connections indefinitely). Witness: OB-3. Check: CT-1 timing.
 **LIV-5 — Startup bound, accept/ready decoupled.** From process start with a healthy
 publisher the listener accepts connections early (probes answerable while loading).
 Readiness is achieved within the artifact fetch and apply time plus scheduling slack, which
-a supported deployment sizes to ≤ P-STARTUP-BOUND ⚠. Commercial configuration adds no term:
+a supported deployment sizes to ≤ P-STARTUP-BOUND ⚠. Authorization configuration adds no term:
 there is no key bootstrap, and a Portal whose control plane is unreachable reaches
 readiness on the same schedule as one whose control plane is healthy (REQ-54). Startup
 never blocks on the real-time source, the control plane, or chain RPC. Witness: OB-8
@@ -92,7 +92,7 @@ INV-30 audit.
 within P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT + slack, regardless of client behavior
 (ADR-005). Witness: OB-8/OB-5. Check: CT-2 — shutdown under load with stalled readers.
 
-**LIV-13 — Revocation convergence.** Commercial deployment ⇒ a key revoked at the control
+**LIV-13 — Revocation convergence.** Authorizing deployment ⇒ a key revoked at the control
 plane stops being served by a replica within its grant's `refresh_after` + one exchange +
 P-GRANT-REFRESH-JITTER, and unconditionally at that grant's `expires_at`. The same bound
 covers every narrowing of a live key — a withdrawn dataset, a reduced scope — since all of

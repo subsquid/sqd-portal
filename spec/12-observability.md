@@ -4,7 +4,7 @@ Required signals, numbered. The harness treats a signal that contradicts ledger 
 as a failure (INV-30): **lying metrics are failures**. Cardinality of every labeled
 family is bounded (intent — GAP-6): labels come from closed sets (endpoint, class,
 outcome, dataset) — per-worker labels must be bounded or evicted. `/metrics` is a
-keyless, client-readable surface (IB-9), so commercial deployments apply an additional
+keyless, client-readable surface (IB-9), so authorizing deployments apply an additional
 confidentiality rule: no public series exposes an internal authorization rung or exchange
 detail beyond the client-visible wire outcome (INV-39).
 
@@ -65,7 +65,7 @@ ready, SIGTERM, drain start, exit — the LIV-5/LIV-11 witnesses.
 
 **OB-9 — Alarm states.** Edge events + level reads, reason-coded, for: artifact
 fetch/validation failures (⚠ GAP-1/2), background-loop deaths, usage-log drops,
-signature-verification failures, and — on a commercial deployment — requests being served
+signature-verification failures, and — on an authorizing deployment — requests being served
 on renewal grace (a grant past `refresh_after` whose renewal is failing or locally
 suppressed), sustained exchange failure, and refused signing headers. The first is the one
 that has to page before the others matter: it is the leading edge of the `expires_at` cliff,
@@ -73,7 +73,7 @@ and the minimum remaining lifetime among affected grants is the whole window an 
 has to act in (REQ-54, DC-8). The last is a Portal-local misconfiguration — clock, identity,
 or request construction — that fails every exchange at once, and it must not be diagnosed
 as a client-key problem. Alarms are the LIV-12
-witness: persistent failure is never log-only. None of the three commercial ones is emitted
+witness: persistent failure is never log-only. None of the three authorization ones is emitted
 or configured today (GAP-30). (Sampled error reporting to DC-7 complements, never replaces,
 these.)
 
@@ -95,7 +95,7 @@ truth. Publishing the cap keeps its literal out of the alert expression. All fou
 reasons map to one wire code (IB-5 `overloaded`), and must: the client's move is identical,
 the operator's is not.
 
-**OB-12 — Authorization decisions.** Commercial deployments only. In enforcing mode,
+**OB-12 — Authorization decisions.** Authorizing deployments only. In enforcing mode,
 every completed verdict (DEF-20) is counted on the public scrape by decision × actual
 **wire code** (or success) × enforcement mode; an exchange that produced no
 verdict is counted only by the OVERLOADED or UPSTREAM-FAILURE code actually returned. The
@@ -108,22 +108,29 @@ ADR-011). Auth refusals in enforcing mode must still be distinguishable from eve
 refusal on the OB-3 error-code axis — an auth refusal counted as `malformed_request` is a lying
 metric (INV-30).
 
-**OB-13 — Grant cache and exchange health.** Commercial deployments only. In enforcing
+**OB-13 — Grant cache and exchange health.** Authorizing deployments only. In enforcing
 mode, the public scrape carries cache occupancy against P-GRANT-CACHE-CAPACITY and the
 eviction rate (the HZ-13 witness); exchange attempts and outcomes by operational class —
 answered, refused by budget, failed — with latency (the LIV-13/LIV-14 and DC-8 capacity
 witnesses); and a count of grants whose offered lifetime was capped. For the cliff it also
 carries a counter of admissions served on renewal grace, the number of grants currently in
 that state, and the minimum time remaining to `expires_at` among them (zero when none are in
-grace). The count says the condition exists and the minimum names the first hard refusal,
-without a key- or dataset-labeled series. None of these carries a key id, a fingerprint, a
-dataset, or a refusal reason finer than the enforcing caller's wire response.
+grace), the latter two recomputed on scrape by one walk of the cache under its lock — a walk
+P-GRANT-CACHE-CAPACITY bounds. The three answer different questions: the rate says the
+condition exists, the count says how wide it is, and the minimum names the first hard
+refusal — the operator's lead time on the cliff, which no rate can supply. None of these
+carries a key id, a fingerprint, a dataset, or a refusal reason finer than the enforcing
+caller's wire response.
 
-Shadow mode is deliberately different. Its keyless scrape exposes none of the cache,
-exchange-outcome, latency, capping, or grace signals above: `issued` versus `denied`, or a
-grant-cache occupancy change, would reveal the verdict of a request whose response admits
-either way. OB-12's single `shadow_evaluated` outcome is its entire public authorization
-projection. The load and cutover evidence shadow mode exists to gather remains in protected
+Shadow mode is deliberately different. None of the cache, exchange-outcome, latency,
+capping, or grace signals above may *move* on its keyless scrape: `issued` versus `denied`,
+or a grant-cache occupancy change, would reveal the verdict of a request whose response
+admits either way. The constraint is on movement, not on presence — these families are
+registered for the process, not per deployment mode, so they exist at zero on a shadow and
+on a non-authorizing portal alike. A series pinned at zero is the same series for every
+caller and every credential, which is what the rule protects; a series that moved would not
+be. OB-12's single `shadow_evaluated` outcome is shadow mode's entire public authorization
+projection. The load and cutover evidence it exists to gather remains in protected
 per-exchange events and in the control plane's own telemetry.
 
 The enforcing-mode `answered` class deliberately combines grants and denials. The cache is

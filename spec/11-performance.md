@@ -13,7 +13,7 @@ Parameters (symbolic; scenarios bind them):
 | W-DATASETS | distinct datasets in play |
 | W-CHURN | worker-set / artifact change rate |
 | W-POLL | share of beyond-frontier (head-polling) requests |
-| W-CREDENTIALS | distinct credentials in play, commercial deployments only — the grant cache is sized by this and not by the key set (HZ-13) |
+| W-CREDENTIALS | distinct credentials in play, authorizing deployments only — the grant cache is sized by this and not by the key set (HZ-13) |
 
 Reference scenarios:
 
@@ -54,7 +54,7 @@ register ([13-conformance.md](13-conformance.md)), and seed the regression gates
 | SLI-4 | any | ≥ P-SLO-AVAILABILITY monthly ⚠ |
 | SLI-5 | S1/S4 | ≤ P-SLO-MEMORY-HEADROOM ⚠ |
 | SLI-6 | S1 | ≥ P-SLO-COMPLETION-INTEGRITY ⚠ |
-| readiness time | S5 | ≤ P-STARTUP-BOUND ⚠ (artifact fetch and apply; commercial configuration adds no term, LIV-5) |
+| readiness time | S5 | ≤ P-STARTUP-BOUND ⚠ (artifact fetch and apply; authorization configuration adds no term, LIV-5) |
 | shutdown time | any | ≤ P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT + slack (hard, LIV-11) |
 
 ## Resource-bound requirements
@@ -84,20 +84,20 @@ onto PF-7 and the exchange bounds rather than removing it.
 
 **PF-5 — Startup work scheduling.** Startup-critical work — the artifact fetch — is
 prioritized; nothing else on the startup path may push readiness past P-STARTUP-BOUND
-(LIV-5). Commercial configuration puts nothing on that path.
+(LIV-5). Authorization configuration puts nothing on that path.
 
 **PF-6 — Refusal cheapness.** Every refusal allocates O(1) work and memory per request.
 Locally decidable refusals are at least an order of magnitude cheaper than serving an
 admission. A refusal awaiting an exchange may spend PF-7's one deadline-bounded DC-8 call;
 it is benchmarked separately and never waits in an unbounded queue.
 
-**PF-7 — Authorization cheapness.** On a commercial deployment, an authorization refusal
+**PF-7 — Authorization cheapness.** On an authorizing deployment, an authorization refusal
 costs O(1) in request size and performs no dependency call on a cache hit, a token outside
 the grammar, or a fingerprint under an unexpired negative answer. A credential with no
 usable grant may spend one deadline-bounded DC-8 exchange, shared with every concurrent
 request on the same fingerprint; an authenticated dataset-scoped key may spend one
 canonicalization at the dataset rung. An ungated route costs exactly what it costs on a
-non-commercial deployment: the gate returns before reading the credential. The common
+non-authorizing deployment: the gate returns before reading the credential. The common
 admitted path is one fingerprint digest, one cache read under a briefly held lock, and two
 time comparisons; the exchange and scoped-key paths are measured separately.
 Rationale: the gate is the first thing every request meets and the only thing an

@@ -1,8 +1,8 @@
-//! Portal-side half of commercial access control: each presented credential is
+//! Portal-side half of access control: each presented credential is
 //! exchanged for a short-lived grant, which then answers per request. No quota
 //! or metering — an admitted key streams unrestricted.
 //!
-//! Inert unless `commercial:` is present in the config.
+//! Inert unless `auth:` is present in the config.
 
 use std::{
     sync::Arc,
@@ -20,10 +20,10 @@ mod routes;
 mod signing;
 mod types;
 
-pub use config::{CommercialConfig, Enforcement};
+pub use config::{AuthConfig, Enforcement};
 pub use extractor::{DatasetCatalog, Gate};
 pub use routes::Mounted;
-pub use routes::{AuthExt, Gated};
+pub use routes::{AuthExt, EndpointExt, Gated};
 
 use cache::GrantCache;
 use client::ControlPlaneClient;
@@ -32,7 +32,7 @@ use client::ControlPlaneClient;
 /// state is learned from the requests that need it, so there is no bootstrap to
 /// wait for (LIV-5). `keypair` is the identity the portal already runs under.
 pub fn build(
-    config: &CommercialConfig,
+    config: &AuthConfig,
     keypair: Keypair,
     catalog: Arc<dyn DatasetCatalog>,
 ) -> anyhow::Result<Arc<Gate>> {
@@ -44,7 +44,7 @@ pub fn build(
         portal_id = config.portal_id(),
         peer_id = %signer.peer_id(),
         public_key = signer.public_key_base64()?,
-        "commercial exchange signing identity"
+        "credential exchange signing identity"
     );
     let cache = GrantCache::new(
         ControlPlaneClient::new(config, signer)?,
@@ -110,7 +110,7 @@ pub mod test_support {
     /// tests that ask whether a route is wrapped at all; the ones about the
     /// ladder want [`MockControlPlane`].
     pub fn gate_with(enforcement: Enforcement) -> Arc<Gate> {
-        let config = CommercialConfig {
+        let config = AuthConfig {
             control_plane_url: "http://127.0.0.1:1/".parse().unwrap(),
             portal_id: "portal-premium-eu".to_string(),
             enforcement,
@@ -133,7 +133,7 @@ pub mod test_support {
         control_plane: &MockControlPlane,
         enforcement: Enforcement,
     ) -> Arc<GrantCache> {
-        let config = CommercialConfig {
+        let config = AuthConfig {
             enforcement,
             ..control_plane.config()
         };
@@ -180,14 +180,14 @@ pub mod test_support {
             Self { addr, state }
         }
 
-        pub fn config(&self) -> CommercialConfig {
+        pub fn config(&self) -> AuthConfig {
             let limits = config::Limits {
                 // Small enough that an eviction test does not have to fill 65k
                 // entries to prove the bound exists.
                 grant_cache_capacity: 32,
                 ..config::Limits::default()
             };
-            CommercialConfig {
+            AuthConfig {
                 control_plane_url: format!("http://{}", self.addr).parse().unwrap(),
                 portal_id: "portal-premium-eu".to_string(),
                 enforcement: Enforcement::Enforce,
