@@ -1,14 +1,13 @@
 use serde::Deserialize;
 
-/// The claim vocabulary this build understands. A grant that names any other
-/// version is unusable rather than partly usable: reading a newer vocabulary
-/// for the fields it happens to recognise is how a restriction the control
-/// plane added becomes a permission the portal grants (DC-8, DEF-17).
+/// The claim vocabulary this build understands. Any other version is unusable
+/// rather than partly usable: reading a newer one for the fields it recognises
+/// is how an added restriction becomes a granted permission (DC-8, DEF-17).
 pub const CLAIMS_VERSION: u32 = 1;
 
 /// Tagged rather than encoded in the status line: if 404 meant "no such key",
-/// any proxy or half-deployed replica could turn a dependency failure into a
-/// verdict about a customer's key (GAP-34).
+/// a proxy could turn a dependency failure into a verdict about a key
+/// (GAP-34).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ExchangeAnswer {
@@ -17,15 +16,14 @@ pub enum ExchangeAnswer {
 }
 
 /// A short-lived authorization for one credential. Every acted-on field is
-/// required, so a truncated answer cannot admit traffic. `datasets` is the
-/// exception: absent means unrestricted in this claims version (REQ-53).
+/// required, so a truncated answer cannot admit traffic — except `datasets`,
+/// where absent means unrestricted in this claims version (REQ-53).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Grant {
     pub claims_version: u32,
 
-    /// Which key the control plane resolved the credential to. Checked against
-    /// the id the portal asked about, so an answer about someone else is
-    /// discarded rather than acted on.
+    /// Checked against the id the portal asked about, so an answer about
+    /// someone else is discarded rather than acted on.
     pub key_id: String,
 
     /// `None` means every dataset. Entries are canonical names, matched
@@ -33,18 +31,16 @@ pub struct Grant {
     #[serde(default)]
     pub datasets: Option<Vec<String>>,
 
-    /// Unix seconds. Past this the portal renews, while still serving on the
-    /// grant it has.
+    /// Unix seconds. Past this the portal renews, still serving meanwhile.
     pub refresh_after: u64,
 
     /// Unix seconds. Past this the grant admits nothing, whatever the control
-    /// plane's state — the hard bound on how stale an authorization may get.
+    /// plane's state.
     pub expires_at: u64,
 }
 
 /// Denial reasons this build maps to a specific wire code. Anything else is
-/// still a denial — it just cannot be reported more precisely than
-/// `invalid_credential`, which is the fail-closed direction.
+/// still a denial, just reported no more precisely than `invalid_credential`.
 pub mod denial {
     pub const UNKNOWN_KEY: &str = "unknown_key";
     pub const INVALID_SECRET: &str = "invalid_secret";

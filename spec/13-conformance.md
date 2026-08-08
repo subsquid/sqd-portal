@@ -24,9 +24,10 @@ exercised — re-verify on the next dependency bump. `ct2_worker_faults` covers 
 exhaustion split; the rest of CT-2 and CT-3..CT-9 remain to be built per the build order.
 **CT-10 exists**: a DC-8 control-plane stub that verifies the exchange signature for real
 rather than trusting the headers, with a ledger of every credential it was asked about and
-the fault rows of DC-8's error table as injectors. `ct10_authorization` drives four
-portals — enforcing, shadow, no `auth:` block, and one whose exchange budget is small
-enough to saturate — because the properties differ by configuration rather than by request.
+the fault rows of DC-8's error table as injectors. `ct10_authorization` drives five
+portals — enforcing, shadow, no `auth:` block, one whose exchange budget is small enough
+to saturate, and one signing with a dedicated key — because the properties differ by
+configuration rather than by request.
 Coverage outside those three classes is still inline unit tests.
 All three suites run on every pull request: the harness is a separate crate, so it needs a
 build of the portal and a job of its own — a status this document cites has to be one
@@ -125,7 +126,7 @@ chunk-boundary records FV-6 licenses.
 | CT-7 | Soak/endurance: S4 churn for hours; leak & cardinality audits | HZ-1/5/6, INV-30, SLI-5 |
 | CT-8 | Isolation/noisy-neighbor: S6 | INV-35 |
 | CT-9 | Fuzz, both surfaces: client inputs and stub responses (payloads, artifacts) | INV-36, FM-1, GAP-1 |
-| CT-10 | Authorization: credential corpus × enforcement mode against a control-plane stub; exchange-fault, lifetime and convergence cases (denial mid-grant, a retired timed-out generation completing after its successor, over-cap lifetime, unreadable claims version, outage across `refresh_after` and `expires_at`); bracketed metrics scrapes proving no key-id side channel, including neutral shadow-mode projection | INV-6/10/14/15/38/39, INV-31, LIV-13/14, REQ-50..REQ-56, DC-8, IB-9, HZ-10/12/13 |
+| CT-10 | Authorization: credential corpus × enforcement mode against a control-plane stub; exchange-fault, lifetime and convergence cases (denial mid-grant, a retired timed-out generation completing after its successor, over-cap lifetime, unreadable claims version, outage across `refresh_after` and `expires_at`); which signing key reaches the wire when `auth.key_path` names one; bracketed metrics scrapes proving no key-id side channel, including neutral shadow-mode projection | INV-6/10/14/15/38/39, INV-31, LIV-13/14, REQ-50..REQ-56, DC-8, IB-9, HZ-10/12/13 |
 
 ## Structural validators (kind-agnostic, applied to every response)
 
@@ -190,7 +191,7 @@ chunk-boundary records FV-6 licenses.
 | INV-39 | CT-10 | P | CT-10 asserts an unknown key and a wrong secret return byte-identical bodies at one status, that no internal rung name reaches the scrape, that no key id does, and that shadow mode publishes only `shadow_evaluated` with no code and no exchange counters. A strict bracketed-scrape delta between the two credential cases is not yet driven |
 | LIV-13 | CT-10 | U | needs convergence at `refresh_after` + one exchange with the control plane healthy, and at `expires_at` with it stopped — the second is the one carrying the security claim. Both need a clock the harness does not have (GAP-33) |
 | LIV-14 | CT-10 | C | CT-10 serves a freshly minted key on the request that presents it, and drives a burst of distinct credentials against a bounded budget: the refusals are `overloaded` with a usable hint, never a verdict about a key |
-| DC-8 | CT-10 | P | the stub verifies the signing contract for real — one of each header, an attributable portal, bounded skew, Ed25519 over the canonical binding — and CT-10 asserts the portal never trips it, then that an unattributable portal fails every exchange as `upstream_unavailable`. Deadline, single-flight and the lifetime cap are covered, as is every unusable answer failing rather than denying: 500, 503, 404, a truncated grant, an unknown claims version and an answer about another key all reach the client as retryable. Denial-evicts and outage grace need a clock (GAP-33) |
+| DC-8 | CT-10 | P | the stub verifies the signing contract for real — one of each header, an attributable portal, bounded skew, Ed25519 over the canonical binding — and CT-10 asserts the portal never trips it, then that an unattributable portal fails every exchange as `upstream_unavailable`. A portal configured with `auth.key_path` is driven against a stub that registered only that key, so the dedicated key is checked where it matters — on the wire — rather than at the loader. Deadline, single-flight and the lifetime cap are covered, as is every unusable answer failing rather than denying: 500, 503, 404, a truncated grant, an unknown claims version and an answer about another key all reach the client as retryable. Denial-evicts and outage grace need a clock (GAP-33) |
 
 ## Acceptance matrix — requirements (2026-08-07)
 

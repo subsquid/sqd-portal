@@ -1,7 +1,7 @@
 use url::Url;
 
 use super::{
-    config::AuthConfig,
+    config::ResolvedAuth,
     signing::RequestSigner,
     types::{ExchangeAnswer, Grant, CLAIMS_VERSION},
 };
@@ -9,14 +9,12 @@ use crate::auth::extractor::Credential;
 
 const EXCHANGE_PATH: [&str; 4] = ["internal", "portal", "v1", "exchange"];
 
-/// What one exchange established. Only the first two are the control plane
-/// speaking about the credential; everything else propagates as an error, and
-/// the caller turns that into a retryable refusal rather than a verdict.
+/// What one exchange established. Anything else propagates as an error, which
+/// the caller turns into a retryable refusal rather than a verdict.
 #[derive(Debug)]
 pub enum Exchanged {
     Granted(Grant),
-    /// The reason verbatim, mapped to a wire code by the ladder. Kept as the
-    /// control plane wrote it so an unrecognised one still reaches the log.
+    /// Verbatim, so an unrecognised reason still reaches the log.
     Denied(String),
 }
 
@@ -27,13 +25,12 @@ pub struct ControlPlaneClient {
 }
 
 impl ControlPlaneClient {
-    pub fn new(config: &AuthConfig, signer: RequestSigner) -> anyhow::Result<Self> {
+    pub fn new(config: &ResolvedAuth, signer: RequestSigner) -> anyhow::Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
                 .timeout(config.exchange_timeout())
-                // Carries a client's credential, so a redirect is an error
-                // rather than an instruction: it would hand the secret somewhere
-                // the operator did not configure.
+                // Carries a credential, so a redirect is an error: it would
+                // hand the secret somewhere unconfigured.
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             exchange_url: endpoint_url(&config.control_plane_url, &EXCHANGE_PATH)?,
@@ -41,17 +38,14 @@ impl ControlPlaneClient {
         })
     }
 
-    /// Hands the presented credential to the authority and returns what it
-    /// said. `now_secs` stamps the signature; the control plane refuses one it
-    /// considers stale, which is what bounds replay (DC-8).
+    /// Hands the credential to the authority. `now_secs` stamps the signature;
+    /// refusing a stale one is what bounds replay (DC-8).
     pub async fn exchange(
         &self,
         credential: &Credential,
         now_secs: u64,
     ) -> anyhow::Result<Exchanged> {
-        // Serialized once: the signature binds the bytes that are actually
-        // sent, so re-serializing for the body would be a way for the two to
-        // drift apart.
+        // Once: the signature binds the bytes actually sent.
         let body = serde_json::to_vec(&serde_json::json!({
             "credential": credential.token.expose(),
         }))?;
@@ -78,9 +72,8 @@ impl ControlPlaneClient {
                     "grant claims version {} is not {CLAIMS_VERSION}",
                     grant.claims_version
                 );
-                // An answer about a different key is not an answer about this
-                // request, and acting on it would admit one caller's traffic on
-                // another caller's entitlements.
+                // Acting on it would admit one caller on another's
+                // entitlements.
                 anyhow::ensure!(
                     grant.key_id == credential.key_id,
                     "exchange answered about a different key"
@@ -95,8 +88,7 @@ impl ControlPlaneClient {
     }
 }
 
-/// Appends the internal API path to a configured base that may itself carry a
-/// path prefix, with or without a trailing slash.
+/// Appends the internal API path to a base that may carry a prefix of its own.
 fn endpoint_url(base: &Url, segments: &[&str]) -> anyhow::Result<Url> {
     let mut url = base.clone();
     url.set_query(None);
@@ -121,7 +113,7 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
-    async fn client_for(config: &AuthConfig) -> ControlPlaneClient {
+    async fn client_for(config: &ResolvedAuth) -> ControlPlaneClient {
         ControlPlaneClient::new(config, config.signer(signing::test_keypair()).unwrap()).unwrap()
     }
 

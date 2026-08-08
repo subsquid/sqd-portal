@@ -2,9 +2,10 @@
 //!
 //! The credential corpus and the DC-8 fault rows, driven through the real
 //! middleware stack against a control-plane stub that verifies the exchange
-//! signature for real. Four portals, because the properties differ by
-//! configuration: enforcing, shadow, no `auth:` block at all, and one
-//! whose exchange budget is small enough to saturate.
+//! signature for real. Five portals, because the properties differ by
+//! configuration: enforcing, shadow, no `auth:` block at all, one whose
+//! exchange budget is small enough to saturate, and one signing with a
+//! dedicated key rather than its network identity.
 //!
 //! The claims that need a ledger rather than a response are the reason this
 //! class exists at all (GAP-33): that a refusal costs no dependency call
@@ -871,6 +872,44 @@ async fn saturated(fx: &mut Fixture) -> anyhow::Result<()> {
         "DC-8: {} exchanges for {} admitted requests — the bound did not hold",
         fx.cp().exchanges(),
         12 - overloaded,
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The dedicated signing key: which key reaches the wire, not which key loads.
+// ---------------------------------------------------------------------------
+
+/// The control plane registers `auth.key_path` and nothing else, so signing
+/// with the network identity is refused. A unit test on the loader cannot stand
+/// in: it still passes when the key it returns is dropped on the way to the
+/// signer.
+#[tokio::test(flavor = "multi_thread")]
+async fn ct10_a_dedicated_key_is_what_signs_the_exchange() -> anyhow::Result<()> {
+    let auth = Auth::new(PORTAL_ID)
+        .dedicated_key()
+        .limit("exchange_rate_per_sec", 1000);
+    let mut fx = Fixture::start_with_auth(ToyWorld::standard(), 2, auth).await?;
+    let result = dedicated_key(&mut fx).await;
+    fx.finish(result)
+}
+
+async fn dedicated_key(fx: &mut Fixture) -> anyhow::Result<()> {
+    fx.wait_ready(Duration::from_secs(60)).await?;
+    fx.cp().answer("dedicated", Answer::grant());
+
+    assert_served(
+        fx,
+        "a credential exchanged under the dedicated key",
+        "toy",
+        Some(&bearer("dedicated")),
+    )
+    .await?;
+
+    ensure!(
+        fx.cp().rejections().is_empty(),
+        "DC-8: the exchange was signed with a key the control plane does not hold: {:?}",
+        fx.cp().rejections(),
     );
     Ok(())
 }

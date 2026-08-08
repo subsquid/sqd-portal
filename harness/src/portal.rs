@@ -26,7 +26,13 @@ pub struct Auth {
     pub portal_id: String,
     pub enforcement: &'static str,
     pub limits: Vec<String>,
+    /// Sign with `auth.key_path`. The fixture then registers that key and only
+    /// that key, so signing with the network identity is refused.
+    pub dedicated_key: bool,
 }
+
+/// Where the fixture writes the dedicated key and where `auth.key_path` points.
+pub const AUTH_KEY_FILE: &str = "auth.key";
 
 impl Auth {
     pub fn new(portal_id: impl Into<String>) -> Self {
@@ -34,7 +40,13 @@ impl Auth {
             portal_id: portal_id.into(),
             enforcement: "enforce",
             limits: Vec::new(),
+            dedicated_key: false,
         }
+    }
+
+    pub fn dedicated_key(mut self) -> Self {
+        self.dedicated_key = true;
+        self
     }
 
     pub fn enforcement(mut self, mode: &'static str) -> Self {
@@ -81,9 +93,14 @@ pub fn write_config(
             "auth:\n  \
              control_plane_url: http://127.0.0.1:{port}/\n  \
              portal_id: {id}\n  \
-             enforcement: {mode}\n{limits}",
+             enforcement: {mode}\n{key_path}{limits}",
             id = c.portal_id,
             mode = c.enforcement,
+            key_path = if c.dedicated_key {
+                format!("  key_path: {}\n", scratch.join(AUTH_KEY_FILE).display())
+            } else {
+                String::new()
+            },
             limits = if c.limits.is_empty() {
                 String::new()
             } else {
@@ -175,9 +192,10 @@ pub fn spawn(
         .env_remove("P2P_LISTEN_ADDRS")
         .env_remove("P2P_PUBLIC_ADDRS")
         .env_remove("SENTRY_DSN")
-        // It overrides the config value, so an inherited one would silently
-        // make every exchange unattributable.
+        // Both override the config value, so an inherited one would silently
+        // make every exchange unattributable or sign it with an unregistered key.
         .env_remove("PORTAL_ID")
+        .env_remove("AUTH_KEY_PATH")
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()

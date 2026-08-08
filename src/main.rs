@@ -116,8 +116,8 @@ fn report_ignored_config_fields(config: &Config) {
 /// read inside clap's `value_parser` — before `setup_tracing` — so nothing it
 /// has to say about itself is recorded, and until now an operator could not
 /// tell an authorizing portal from an open one by reading the log at all.
-fn log_authorization_mode(config: &Config) {
-    let Some(auth) = &config.auth else {
+fn log_authorization_mode(auth: Option<&sqd_portal::auth::ResolvedAuth>) {
+    let Some(auth) = auth else {
         tracing::warn!(
             "authorization disabled: no `auth` block in the config, \
              so the data API is served to anyone who asks"
@@ -125,10 +125,31 @@ fn log_authorization_mode(config: &Config) {
         return;
     };
     tracing::info!(
-        portal_id = auth.portal_id(),
+        portal_id = auth.portal_id,
         enforcement = ?auth.enforcement,
         "authorization enabled"
     );
+}
+
+/// The key is never generated, so a deployment that has not provisioned one
+/// cannot start enforcing. Shadow mode is the exception: it exists to be
+/// non-disruptive while upstream is still the real gate, so there a key it
+/// cannot load costs the logged verdicts rather than the data API.
+async fn load_signing_key(
+    auth: &sqd_portal::auth::ResolvedAuth,
+    network_key_path: std::path::PathBuf,
+) -> anyhow::Result<Option<sqd_network_transport::Keypair>> {
+    match sqd_portal::auth::load_keypair(auth, network_key_path).await {
+        Ok(keypair) => Ok(Some(keypair)),
+        Err(err) if auth.enforcement == sqd_portal::auth::Enforcement::LogOnly => {
+            tracing::error!(
+                error = %err,
+                "shadow-mode authorization is not evaluating: no signing key"
+            );
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 #[tokio::main]
@@ -144,13 +165,25 @@ async fn main() -> anyhow::Result<()> {
 
     setup_tracing(args.json_log, args.log_span_durations);
     report_ignored_config_fields(&args.config);
-    log_authorization_mode(&args.config);
+    let auth = args
+        .config
+        .auth
+        .as_ref()
+        .map(sqd_portal::auth::AuthConfig::resolve)
+        .transpose()?;
+    log_authorization_mode(auth.as_ref());
+
+    // Before the first network round trip, and before the transport can create
+    // the network key file this may have to find already there.
+    let auth_keypair = match &auth {
+        Some(auth) => load_signing_key(auth, args.transport.key.clone()).await?,
+        None => None,
+    };
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
 
     let config = Arc::new(args.config);
     let hotblocks = Arc::new(sqd_portal::hotblocks::build_client(&config).await?);
-    let key_path = args.transport.key.clone();
     let network_client_builder =
         NetworkClient::builder(args.transport, config.clone(), datasets.clone()).await?;
 
@@ -177,15 +210,14 @@ async fn main() -> anyhow::Result<()> {
     let task_manager = Arc::new(TaskManager::new(network_client.clone(), &config));
 
     let cancellation_token = CancellationToken::new();
-    let auth_gate = match config.auth.as_ref() {
-        // Signed with the identity the portal already runs under (DC-8). Read
-        // again rather than threaded out of the transport: one file read.
-        Some(auth) => Some(sqd_portal::auth::build(
+    let auth_gate = match (&auth, auth_keypair) {
+        (Some(auth), Some(keypair)) => Some(sqd_portal::auth::build(
             auth,
-            sqd_network_transport::util::get_keypair(Some(key_path)).await?,
+            keypair,
             network_client.clone() as Arc<dyn sqd_portal::auth::DatasetCatalog>,
         )?),
-        None => None,
+        // No block, or shadow mode without a key — which admits either way.
+        _ => None,
     };
     let shutting_down = Arc::new(AtomicBool::new(false));
     let sigterm = {

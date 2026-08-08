@@ -56,17 +56,16 @@ const DATASET_NOT_ALLOWED: Rejection =
 pub(super) const MALFORMED: Rejection =
     Rejection::new(ErrorCode::InvalidCredential, "malformed_credential");
 
-/// Neither of these is an auth verdict: the portal did not decide the credential
-/// is bad, it failed to find out. Answering `invalid_credential` — non-retryable
-/// — would tell a customer whose key is perfectly good to stop retrying, on the
-/// strength of the portal's own dependency being down (REQ-54).
+/// Neither is an auth verdict: the portal failed to find out rather than
+/// deciding. A non-retryable answer would tell a customer with a good key to
+/// stop retrying because the portal's own dependency is down (REQ-54).
 const EXCHANGE_SATURATED: Rejection = Rejection::new(ErrorCode::Overloaded, "exchange_saturated");
 const EXCHANGE_FAILED: Rejection =
     Rejection::new(ErrorCode::UpstreamUnavailable, "exchange_failed");
 
-/// The dataset a request targets, named on demand. Naming it canonicalizes
-/// through the catalog and interns into a process-wide pool, and only one rung
-/// needs it — an unauthenticated request must not be able to buy that work.
+/// The dataset a request targets, named on demand: canonicalizing interns into
+/// a process-wide pool, and only one rung needs it — an unauthenticated request
+/// must not be able to buy that work.
 pub struct LazyDataset<F: Fn() -> Option<String>> {
     name: F,
     resolved: OnceLock<Option<String>>,
@@ -85,8 +84,9 @@ impl<F: Fn() -> Option<String>> LazyDataset<F> {
         self.resolved.get_or_init(&self.name).clone()
     }
 
-    /// What an earlier rung already resolved, if anything. Never resolves.
-    pub fn resolved(&self) -> Option<String> {
+    /// What an earlier rung already resolved, if anything. Never resolves, so
+    /// the log cannot buy the work the ladder declined to.
+    pub fn peek(&self) -> Option<String> {
         self.resolved.get().cloned().flatten()
     }
 }
@@ -109,8 +109,8 @@ impl Verdict {
 }
 
 /// Authentication plus coarse dataset scoping; a key that passes streams
-/// unrestricted. Revocation, expiry and portal scope arrive already decided —
-/// they are the control plane's answer to the exchange (REQ-53).
+/// unrestricted. Revocation, expiry and portal scope arrive already decided by
+/// the exchange (REQ-53).
 pub async fn evaluate<F: Fn() -> Option<String>>(
     cache: &Arc<GrantCache>,
     credential: Option<&Credential>,
@@ -136,9 +136,8 @@ pub async fn evaluate<F: Fn() -> Option<String>>(
     Verdict::of(evaluate_scope(&grant, dataset))
 }
 
-/// The one rung the grant does not settle: a grant is per credential and outlives
-/// the request, so which dataset this particular request asked for has to be
-/// matched here.
+/// The one rung the grant does not settle: it is per credential and outlives
+/// the request, so the dataset has to be matched here.
 fn evaluate_scope<F: Fn() -> Option<String>>(
     grant: &CachedGrant,
     dataset: &LazyDataset<F>,
@@ -159,10 +158,9 @@ fn evaluate_scope<F: Fn() -> Option<String>>(
     }
 }
 
-/// A reason this build does not know is still a refusal. Mapping it to the
-/// coarsest code rather than failing the exchange keeps the fail-closed
-/// direction: a newer control plane that denies for a new reason must not have
-/// its denial read as a dependency failure and retried.
+/// A reason this build does not know is still a refusal: mapping it to the
+/// coarsest code keeps a newer control plane's denial from being read as a
+/// dependency failure and retried.
 fn rejection_for(reason: &str) -> Rejection {
     match reason {
         denial::UNKNOWN_KEY => UNKNOWN_KEY,
@@ -198,8 +196,14 @@ mod tests {
 
     /// Tests hand the ladder a dataset name directly; only the request path has
     /// a resolution to defer.
-    fn named(dataset: Option<&str>) -> LazyDataset<impl Fn() -> Option<String> + '_> {
-        LazyDataset::new(move || dataset.map(str::to_owned))
+    async fn verdict_for(
+        cache: &Arc<GrantCache>,
+        credential: Option<&Credential>,
+        dataset: Option<&str>,
+        now: u64,
+    ) -> Verdict {
+        let named = LazyDataset::new(move || dataset.map(str::to_owned));
+        evaluate(cache, credential, &named, now).await
     }
 
     fn reason(verdict: &Verdict) -> &'static str {
@@ -219,7 +223,7 @@ mod tests {
 
     async fn decide(cp: &MockControlPlane, dataset: Option<&str>) -> Verdict {
         let cache = cache_for(cp).await;
-        evaluate(&cache, Some(&credential()), &named(dataset), NOW).await
+        verdict_for(&cache, Some(&credential()), dataset, NOW).await
     }
 
     #[tokio::test]
@@ -227,7 +231,7 @@ mod tests {
         let cp = MockControlPlane::spawn().await;
         let cache = cache_for(&cp).await;
 
-        let verdict = evaluate(&cache, None, &named(Some("ethereum-mainnet")), NOW).await;
+        let verdict = verdict_for(&cache, None, Some("ethereum-mainnet"), NOW).await;
 
         assert_eq!(reason(&verdict), "missing_credential");
         assert_eq!(cp.exchanges(), 0);
@@ -329,7 +333,7 @@ mod tests {
         let cache = cache_for(&cp).await;
         cache.exhaust_budget_for_test();
 
-        let verdict = evaluate(&cache, Some(&credential()), &named(None), NOW).await;
+        let verdict = verdict_for(&cache, Some(&credential()), None, NOW).await;
 
         assert_eq!(reason(&verdict), "exchange_saturated");
         assert_eq!(code(&verdict), "overloaded");
@@ -410,10 +414,10 @@ mod tests {
         let cp = MockControlPlane::spawn().await;
         cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
         let cache = cache_for(&cp).await;
-        evaluate(&cache, Some(&credential()), &named(None), NOW).await;
+        verdict_for(&cache, Some(&credential()), None, NOW).await;
 
         cp.stop();
-        let verdict = evaluate(&cache, Some(&credential()), &named(None), NOW + 901).await;
+        let verdict = verdict_for(&cache, Some(&credential()), None, NOW + 901).await;
 
         assert_eq!(reason(&verdict), "exchange_failed");
     }
