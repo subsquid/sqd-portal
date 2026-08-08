@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     cache::GrantCache,
-    config::{AuthConfig, Enforcement},
+    config::{Enforcement, ResolvedAuth},
     evaluate::{self, Decision, LazyDataset, Rejection, Verdict},
     now_secs,
 };
@@ -19,15 +19,14 @@ use crate::{
     network::NetworkClient,
 };
 
-/// Token layouts the portal accepts, all of the form `<prefix><key_id>_<secret>`:
-/// the prefix minted by the control plane, plus the legacy prefix carried by
-/// keys imported from before the portal owned authentication. Exactly the set
-/// the control plane issues — a prefix it never mints is not a key.
+/// Accepted layouts, all `<prefix><key_id>_<secret>`: the minted prefix plus
+/// the legacy one. Exactly the set the control plane issues — a prefix it never
+/// mints is not a key.
 const TOKEN_PREFIXES: [&str; 2] = ["sqd_portal_", "prt_"];
 
-/// Both segments mirror the control plane's own `[A-Za-z0-9~-]+`, capped at
-/// what it can mint. A token the control plane could never have issued is
-/// rejected before it reaches the denial cache, a log line, or an exchange.
+/// Mirrors the control plane's own `[A-Za-z0-9~-]+`, capped at what it mints:
+/// a token it could never have issued is rejected before it reaches the cache,
+/// a log line, or an exchange.
 const MAX_KEY_ID_LEN: usize = 64;
 const MAX_SECRET_LEN: usize = 128;
 
@@ -53,7 +52,7 @@ impl fmt::Debug for SecretToken {
 
 /// A presented key, reduced to what the gate needs. The fingerprint covers the
 /// *whole* token: keyed on the id alone the cache would admit the next caller to
-/// name it, and would answer differently for a wrong secret (INV-39).
+/// name it (INV-39).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     pub key_id: String,
@@ -92,14 +91,14 @@ pub struct Gate {
 
 impl Gate {
     pub fn new(
-        config: &AuthConfig,
+        config: &ResolvedAuth,
         cache: Arc<GrantCache>,
         catalog: Arc<dyn DatasetCatalog>,
     ) -> Self {
         Self {
             cache,
             catalog,
-            portal_id: config.portal_id(),
+            portal_id: config.portal_id.clone(),
             enforcement: config.enforcement,
         }
     }
@@ -130,9 +129,8 @@ impl Gate {
         uri: &axum::http::Uri,
         names_dataset: bool,
     ) -> Decision {
-        // Deferred on purpose: canonicalization interns the name in a
-        // process-wide pool and clones the dataset config, so it must stay
-        // behind authentication. Only the dataset rung calls this.
+        // Deferred: canonicalization interns and clones, so it stays behind
+        // authentication. Only the dataset rung calls it.
         let dataset = LazyDataset::new(|| self.dataset_for(uri.path(), names_dataset));
         let credential = match credential_from_request(headers) {
             Ok(credential) => credential,
@@ -148,9 +146,8 @@ impl Gate {
 
         let verdict =
             evaluate::evaluate(&self.cache, credential.as_ref(), &dataset, now_secs()).await;
-        // Shadow mode logs its admissions, and an admitted request has already
-        // authenticated — naming its dataset costs what a real customer costs.
-        // A rejection logs only what an earlier rung happened to resolve.
+        // Shadow mode logs admissions, and an admitted request has already
+        // authenticated. A rejection logs only what a rung already resolved.
         if let (Decision::Admit, Enforcement::LogOnly) = (verdict.decision, self.enforcement) {
             dataset.resolve();
         }
@@ -159,23 +156,22 @@ impl Gate {
             credential
                 .as_ref()
                 .map(|credential| credential.key_id.as_str()),
-            dataset.resolved().as_deref(),
+            dataset.peek().as_deref(),
         );
         verdict.decision
     }
 
-    /// Grants carry canonical names, so an alias is resolved first. An
-    /// unresolvable one is compared as written and simply fails to match.
+    /// Grants carry canonical names, so an alias is resolved first; an
+    /// unresolvable one is compared as written and fails to match.
     fn dataset_for(&self, path: &str, names_dataset: bool) -> Option<String> {
         if !names_dataset {
             return None;
         }
         let raw = dataset_path_segment(path)?;
-        // Decoded the way the handler's `Path` extractor decodes, or the gate
-        // and the handler disagree about which dataset a request names and a
-        // scoped key is refused on any encoded spelling of an allowed URL. A
-        // segment that does not decode stays unresolved, which refuses a
-        // scoped key — the handler answers 400 to such a path anyway.
+        // Decoded as the handler's `Path` extractor decodes, or the two
+        // disagree about which dataset a request names. One that does not
+        // decode stays unresolved, refusing a scoped key — the handler answers
+        // 400 to such a path anyway.
         let decoded = percent_encoding::percent_decode_str(raw)
             .decode_utf8()
             .ok()?;
@@ -260,8 +256,8 @@ pub(super) async fn middleware(
 }
 
 /// Bearer header only: a query parameter puts the secret in browser history,
-/// `Referer` and every proxy's access log (IB-9). A malformed token rejects
-/// rather than reading as absent, which would hide typos behind another error.
+/// `Referer` and every proxy's log (IB-9). A malformed token rejects rather
+/// than reading as absent, which would hide typos behind another error.
 fn credential_from_request(headers: &HeaderMap) -> Result<Option<Credential>, Rejection> {
     let Some(token) = bearer_token(headers)? else {
         return Ok(None);

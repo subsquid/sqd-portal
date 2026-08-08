@@ -231,7 +231,10 @@ impl Config {
     fn validate(&self) -> anyhow::Result<()> {
         self.congestion.validate()?;
         if let Some(auth) = &self.auth {
-            auth.validate()?;
+            // Resolved and discarded: applying the deployment overrides is what
+            // checks them, and reading the file is where a bad block should
+            // fail rather than the first request that needs a key.
+            auth.resolve()?;
         }
         Ok(())
     }
@@ -426,22 +429,29 @@ where
 /// answers anyone. Refusing to start is the only fail-closed reading — the
 /// alternative is a portal that was closed yesterday quietly serving today.
 ///
-/// Nested keys stay a warning: they land on a block that did parse, so the
-/// worst case is one knob keeping its default.
+/// Nested keys elsewhere stay a warning: the worst case is one knob keeping its
+/// default. Inside `auth:` that default is a different signing identity or an
+/// open door, so they are fatal too — except under `limits:`, where the
+/// fallback really is just a default and a build that predates a knob would
+/// otherwise refuse the config a rollback hands it.
 fn reject_unrecognized_block_without_auth(config: &Config) -> anyhow::Result<()> {
-    if config.auth.is_some() {
-        return Ok(());
-    }
     let stray: Vec<&str> = config
         .ignored_fields
         .iter()
-        .filter(|path| !path.contains('.'))
+        .filter(|path| {
+            if config.auth.is_some() {
+                path.starts_with("auth.") && !path.contains(".limits.")
+            } else {
+                !path.contains('.')
+            }
+        })
         .map(String::as_str)
         .collect();
     anyhow::ensure!(
         stray.is_empty(),
-        "unrecognized top-level config {}: {}. Authorization is configured under `auth:` — \
-         a block left under any other name serves the data API without a credential, \
+        "unrecognized config {}: {}. Authorization is configured under `auth:` — a key this \
+         build does not know is a key that is not in force, and the value it falls back to \
+         either serves the data API without a credential or signs with the wrong identity, \
          so the portal refuses to start on it.",
         if stray.len() == 1 { "key" } else { "keys" },
         stray.join(", "),
@@ -564,11 +574,37 @@ sqd_network:
         assert_eq!(config.ignored_fields, Vec::<String>::new());
     }
 
-    /// The other half of the `auth::config` nesting rationale: a
-    /// misspelled limit is only audible if the unknown key survives the read,
+    /// A misspelled limit is only audible if the unknown key survives the read,
     /// which happens before tracing exists, all the way to `main`.
     #[test]
     fn unknown_config_fields_are_carried_for_later_reporting() {
+        let yaml = format!("{MINIMAL_YAML}congestion:\n  min_windo: 5\n");
+        let config = Config::from_reader(yaml.as_bytes()).expect("parse");
+
+        assert_eq!(config.ignored_fields, vec!["congestion.min_windo"]);
+    }
+
+    /// Under `auth:` the same key is fatal: it is a knob that is not in force,
+    /// and the identity it falls back to is registered with nobody.
+    #[test]
+    fn a_misspelled_key_under_auth_refuses_to_start() {
+        let yaml = format!(
+            "{MINIMAL_YAML}auth:\n  \
+             control_plane_url: https://cp.example/\n  \
+             portal_id: portal-premium-eu\n  \
+             key-path: /keys/exchange.key\n"
+        );
+
+        let err = Config::from_reader(yaml.as_bytes())
+            .expect_err("an unknown key under `auth:` must not read as its default");
+        assert!(err.to_string().contains("key-path"), "got {err}");
+    }
+
+    /// A limit is the one thing under `auth:` whose fallback is a plain default,
+    /// so it stays a warning — otherwise rolling back to a build that predates a
+    /// knob turns the config that build is handed into a crash loop.
+    #[test]
+    fn a_misspelled_limit_under_auth_is_reported_rather_than_fatal() {
         let _guard = crate::auth::test_support::env_guard();
         let yaml = format!(
             "{MINIMAL_YAML}auth:\n  \
@@ -577,14 +613,19 @@ sqd_network:
              limits:\n    \
              max_grant_lifetime_seconds: 60\n"
         );
-        let config = Config::from_reader(yaml.as_bytes()).expect("parse");
 
-        // The `?` marks `parse_auth` buffering the block before
-        // re-deserializing it, which loses the position. The key the operator
-        // typed is still legible, which is what the warning is for.
+        let config = Config::from_reader(yaml.as_bytes()).expect("a limit typo still starts");
+
         assert_eq!(
-            config.ignored_fields,
-            vec!["auth.?.limits.max_grant_lifetime_seconds"]
+            config.ignored_fields.len(),
+            1,
+            "{:?}",
+            config.ignored_fields
+        );
+        assert!(
+            config.ignored_fields[0].ends_with("limits.max_grant_lifetime_seconds"),
+            "got {:?}",
+            config.ignored_fields
         );
     }
 

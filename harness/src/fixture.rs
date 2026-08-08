@@ -120,11 +120,17 @@ impl Fixture {
         tokio::time::sleep(Duration::from_millis(500)).await; // QUIC listeners up
 
         // Booted before the portal: the first gated request must find it up,
-        // and it verifies against the identity the portal will sign with.
+        // and it verifies against the identity the portal will sign with —
+        // which is the whole claim when `key_path` names a second key.
         let control_plane = match (&auth, endpoints.control_plane_port) {
-            (Some(c), Some(port)) => Some(
-                stubs::control_plane::start(port, &c.portal_id, portal_id.keypair.public()).await?,
-            ),
+            (Some(c), Some(port)) => {
+                let signing_key = if c.dedicated_key {
+                    keys::generate(&scratch.join(portal::AUTH_KEY_FILE))?.keypair
+                } else {
+                    portal_id.keypair.clone()
+                };
+                Some(stubs::control_plane::start(port, &c.portal_id, signing_key.public()).await?)
+            }
             _ => None,
         };
 

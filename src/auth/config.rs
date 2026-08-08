@@ -1,6 +1,7 @@
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use sqd_network_transport::Keypair;
 use url::Url;
 
@@ -9,6 +10,18 @@ use super::signing::RequestSigner;
 /// Per-deployment portal identity. Every replica of a portal shares one config
 /// file, so the id is normally injected per pod and overrides the file value.
 const PORTAL_ID_ENV: &str = "PORTAL_ID";
+
+/// Overrides `auth.key_path`, as `PORTAL_ID` overrides the id — the two are
+/// registered together and are injected together.
+pub const AUTH_KEY_PATH_ENV: &str = "AUTH_KEY_PATH";
+
+/// The key path and the knob that named it: the override wins silently, so a
+/// failure blaming `auth.key_path` sends an operator to edit nothing.
+#[derive(Debug, Clone)]
+pub(crate) struct KeySource {
+    pub path: PathBuf,
+    pub knob: &'static str,
+}
 
 /// Presence of this block turns authorization on: the data API then
 /// requires a key. Absent, the portal behaves exactly like an OSS build.
@@ -21,25 +34,30 @@ pub struct AuthConfig {
     /// non-empty.
     pub portal_id: String,
 
+    /// Ed25519 key the exchange is signed with, in the network key's format.
+    /// Absent, the portal signs with its network identity; set, one machine can
+    /// keep a dev and a prod registration and pick by path. `AUTH_KEY_PATH`
+    /// wins when set and non-empty, so read this through
+    /// [`ResolvedAuth::key`] rather than directly.
+    #[serde(default, deserialize_with = "key_path_that_names_a_file")]
+    pub key_path: Option<PathBuf>,
+
     #[serde(default)]
     pub enforcement: Enforcement,
 
-    /// Nested rather than flattened: a flattened struct absorbs every unmatched
-    /// key in the block, so `Config::read`'s unknown-field warning never fires
-    /// and a misspelled limit silently keeps its default.
+    /// Nested, not flattened: flattening absorbs every unmatched key, so a
+    /// misspelled limit would keep its default without a warning.
     #[serde(default)]
     pub limits: Limits,
 }
 
-/// Everything that bounds what one credential, or a flood of them, can cost.
-/// Defaulted so a minimal block stays three lines, and operator-bindable
-/// because the right values depend on the credential working set a deployment
-/// actually sees, which is not knowable here.
+/// What one credential, or a flood of them, can cost. Operator-bindable
+/// because the right values follow the credential working set a deployment
+/// sees; defaulted so a minimal block stays three lines.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Limits {
-    /// Ceiling on the lifetime the portal will honour, whatever the control
-    /// plane offers. The fleet's worst-case stale-authorization window, and the
-    /// only lifetime term the portal owns (REQ-54).
+    /// Ceiling on the lifetime the portal honours, whatever is offered: the
+    /// fleet's worst-case stale-authorization window (REQ-54).
     #[serde(default = "default_max_grant_lifetime_secs")]
     pub max_grant_lifetime_secs: u64,
 
@@ -80,15 +98,14 @@ pub struct Limits {
 pub enum Enforcement {
     #[default]
     Enforce,
-    /// Evaluates the full ladder and logs the verdict, then admits regardless —
-    /// including requests with no credential at all. Shadow mode for the
-    /// cutover window, while something upstream is still the real gate.
+    /// Evaluates and logs the verdict, then admits regardless — including with
+    /// no credential. For the cutover, while upstream is still the real gate.
     LogOnly,
 }
 
 impl Enforcement {
-    /// The value the log field and the OB-12 label both carry, so they cannot
-    /// drift into two spellings of the same mode.
+    /// Carried by both the log field and the OB-12 label, so they cannot drift
+    /// into two spellings.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Enforce => "enforce",
@@ -97,15 +114,86 @@ impl Enforcement {
     }
 }
 
+/// The block with its deployment overrides applied, and checked. Everything
+/// downstream takes this: the environment is read in [`AuthConfig::resolve`]
+/// and nowhere else, so no two call sites can disagree about the identity.
+#[derive(Debug, Clone)]
+pub struct ResolvedAuth {
+    pub control_plane_url: Url,
+    pub portal_id: String,
+    /// `None` signs with the network identity.
+    pub(crate) key: Option<KeySource>,
+    pub enforcement: Enforcement,
+    pub limits: Limits,
+}
+
 impl AuthConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        let portal_id = self.portal_id();
-        anyhow::ensure!(!portal_id.is_empty(), "auth.portal_id must not be empty");
+    pub fn resolve(&self) -> anyhow::Result<ResolvedAuth> {
+        let resolved = ResolvedAuth {
+            control_plane_url: self.control_plane_url.clone(),
+            portal_id: env_portal_id().unwrap_or_else(|| self.portal_id.trim().to_owned()),
+            key: self.key_source(),
+            enforcement: self.enforcement,
+            limits: self.limits.clone(),
+        };
+        resolved.validate()?;
+        Ok(resolved)
+    }
+
+    /// Where the signing key lives, or `None` for the network identity. A blank
+    /// variable is an unset one; the file's own value was checked at parse, the
+    /// only point where a template that rendered nothing is still
+    /// distinguishable from an absent key.
+    fn key_source(&self) -> Option<KeySource> {
+        // `var_os`, not `var`: dropping a non-UTF-8 path as if it were never set
+        // signs with the wrong identity silently.
+        let from_env = std::env::var_os(AUTH_KEY_PATH_ENV)
+            .and_then(|value| normalize_key_path(Path::new(&value)))
+            .map(|path| KeySource {
+                path,
+                knob: AUTH_KEY_PATH_ENV,
+            });
+        from_env.or_else(|| {
+            self.key_path.clone().map(|path| KeySource {
+                path,
+                knob: "auth.key_path",
+            })
+        })
+    }
+}
+
+/// A key that is written at all names a file. serde folds YAML null into
+/// `None`, so `key_path:` — what a template that rendered nothing produces —
+/// is indistinguishable from an absent key by the time `resolve` runs, and
+/// would silently sign with the network identity. Only the deserializer, which
+/// runs solely because the key was written, can still tell the two apart.
+fn key_path_that_names_a_file<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<PathBuf>::deserialize(deserializer)?
+        .as_deref()
+        .and_then(normalize_key_path)
+        .map(Some)
+        .ok_or_else(|| {
+            serde::de::Error::custom(
+                "auth.key_path is present but empty. Drop the key to sign with the network \
+                 identity, or point it at the key file the control plane registered.",
+            )
+        })
+}
+
+impl ResolvedAuth {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.portal_id.is_empty(),
+            "auth.portal_id must not be empty"
+        );
         // It travels in a header and in the string the signature covers, whose
         // fields are newline-separated. Rejecting control characters here is
         // what lets the canonical form stay unambiguous (DC-8).
         anyhow::ensure!(
-            portal_id
+            self.portal_id
                 .chars()
                 .all(|c| !c.is_control() && !c.is_whitespace()),
             "auth.portal_id must not contain whitespace or control characters"
@@ -120,25 +208,38 @@ impl AuthConfig {
         self.limits.validate()
     }
 
-    pub fn portal_id(&self) -> String {
-        std::env::var(PORTAL_ID_ENV)
-            .ok()
-            .map(|id| id.trim().to_owned())
-            .filter(|id| !id.is_empty())
-            .unwrap_or_else(|| self.portal_id.trim().to_owned())
-    }
-
-    /// The portal signs with the identity it already has. Nothing new is
-    /// provisioned, and the operator configures it where they always did —
-    /// `KEY_PATH` (DC-8).
+    /// By default the portal signs with the identity it already has, so nothing
+    /// is provisioned (DC-8); `key` separates the two where the registration is
+    /// not the network identity.
+    ///
+    /// Validates rather than trusting `resolve` to have run: every field is
+    /// constructible, so this is the last rung before a portal id forges the
+    /// canonical form or a plaintext hop carries a customer's credential.
     pub fn signer(&self, keypair: Keypair) -> anyhow::Result<RequestSigner> {
         self.validate()?;
-        Ok(RequestSigner::new(keypair, self.portal_id()))
+        Ok(RequestSigner::new(keypair, self.portal_id.clone()))
     }
 
     pub fn exchange_timeout(&self) -> Duration {
         self.limits.exchange_timeout()
     }
+}
+
+fn env_portal_id() -> Option<String> {
+    std::env::var(PORTAL_ID_ENV)
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+}
+
+/// Trims wherever the value reads as text, and reports whitespace-only as
+/// unset. A non-UTF-8 value came from the OS, no place to rewrite bytes.
+fn normalize_key_path(path: &Path) -> Option<PathBuf> {
+    let Some(text) = path.to_str() else {
+        return Some(path.to_owned());
+    };
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
 fn is_loopback(url: &Url) -> bool {
@@ -160,8 +261,7 @@ impl Limits {
             self.exchange_timeout_ms >= 1,
             "auth.exchange_timeout_ms must be at least 1"
         );
-        // Zero would refuse every exchange, which reads as a control-plane
-        // outage rather than as the configuration mistake it is.
+        // Zero refuses every exchange, which reads as a control-plane outage.
         anyhow::ensure!(
             self.exchange_rate_per_sec >= 1,
             "auth.exchange_rate_per_sec must be at least 1"
@@ -178,9 +278,8 @@ impl Limits {
             self.denial_cache_capacity >= 1,
             "auth.denial_cache_capacity must be at least 1"
         );
-        // Zero expires a denial before the next request reads it, which turns
-        // the cache off without saying so — and the exchange budget it exists
-        // to protect is fleet-shared (HZ-10).
+        // Zero expires a denial before the next request reads it, turning the
+        // cache off silently — and the budget it protects is fleet-shared.
         anyhow::ensure!(
             self.denial_ttl_secs >= 1,
             "auth.denial_ttl_secs must be at least 1"
@@ -267,12 +366,17 @@ portal_id: portal-premium-eu
         let config = parse(MINIMAL);
 
         assert_eq!(config.enforcement, Enforcement::Enforce);
+        // Signs with the network identity until told otherwise.
+        assert_eq!(config.key_path, None);
         // P-GRANT-MAX-LIFETIME
         assert_eq!(config.limits.max_grant_lifetime_secs, 900);
         // P-GRANT-CACHE-CAPACITY
         assert_eq!(config.limits.grant_cache_capacity, 65_536);
         // P-GRANT-EXCHANGE-TIMEOUT
-        assert_eq!(config.exchange_timeout(), Duration::from_millis(2_000));
+        assert_eq!(
+            config.limits.exchange_timeout(),
+            Duration::from_millis(2_000)
+        );
         // P-GRANT-EXCHANGE-RATE / -INFLIGHT
         assert_eq!(config.limits.exchange_rate_per_sec, 20);
         assert_eq!(config.limits.max_inflight_exchanges, 32);
@@ -285,6 +389,7 @@ portal_id: portal-premium-eu
     fn full_block_parses_every_field() {
         let config = parse(&format!(
             "{MINIMAL}\
+             key_path: /keys/exchange.key\n\
              enforcement: log_only\n\
              limits:\n  \
              max_grant_lifetime_secs: 300\n  \
@@ -297,6 +402,7 @@ portal_id: portal-premium-eu
              refresh_jitter_pct: 25\n"
         ));
 
+        assert_eq!(config.key_path, Some(PathBuf::from("/keys/exchange.key")));
         assert_eq!(config.enforcement, Enforcement::LogOnly);
         assert_eq!(config.limits.max_grant_lifetime_secs, 300);
         assert_eq!(config.limits.exchange_rate_per_sec, 5);
@@ -305,6 +411,88 @@ portal_id: portal-premium-eu
         assert_eq!(config.limits.denial_cache_capacity, 64);
         assert_eq!(config.limits.denial_ttl_secs, 30);
         assert_eq!(config.limits.refresh_jitter_pct, 25);
+    }
+
+    #[test]
+    fn key_path_env_overrides_config_when_non_empty() {
+        let _guard = env_guard();
+        std::env::remove_var(PORTAL_ID_ENV);
+        let config = parse(&format!("{MINIMAL}key_path: /keys/prod.key\n"));
+        let resolved = |config: &AuthConfig| {
+            config
+                .resolve()
+                .expect("the block validates")
+                .key
+                .map(|key| key.path)
+        };
+
+        std::env::remove_var(AUTH_KEY_PATH_ENV);
+        assert_eq!(resolved(&config), Some(PathBuf::from("/keys/prod.key")));
+
+        std::env::set_var(AUTH_KEY_PATH_ENV, "/keys/dev.key");
+        assert_eq!(resolved(&config), Some(PathBuf::from("/keys/dev.key")));
+
+        std::env::set_var(AUTH_KEY_PATH_ENV, "   ");
+        assert_eq!(resolved(&config), Some(PathBuf::from("/keys/prod.key")));
+
+        std::env::remove_var(AUTH_KEY_PATH_ENV);
+        assert_eq!(resolved(&parse(MINIMAL)), None);
+    }
+
+    /// Told only the path, an operator edits the config file and redeploys into
+    /// the same failure.
+    #[test]
+    fn the_resolved_key_path_names_the_knob_it_came_from() {
+        let _guard = env_guard();
+        std::env::remove_var(PORTAL_ID_ENV);
+        let config = parse(&format!("{MINIMAL}key_path: /keys/prod.key\n"));
+        let knob = |config: &AuthConfig| config.resolve().unwrap().key.unwrap().knob;
+
+        std::env::remove_var(AUTH_KEY_PATH_ENV);
+        assert_eq!(knob(&config), "auth.key_path");
+
+        std::env::set_var(AUTH_KEY_PATH_ENV, "/keys/dev.key");
+        assert_eq!(knob(&config), AUTH_KEY_PATH_ENV);
+
+        std::env::remove_var(AUTH_KEY_PATH_ENV);
+    }
+
+    /// A trailing space is invisible in the error that would name the file.
+    #[test]
+    fn surrounding_whitespace_is_trimmed_from_either_source() {
+        let _guard = env_guard();
+        std::env::remove_var(PORTAL_ID_ENV);
+        std::env::remove_var(AUTH_KEY_PATH_ENV);
+        let path = |config: &AuthConfig| config.resolve().unwrap().key.unwrap().path;
+
+        let config = parse(&format!("{MINIMAL}key_path: \"  /keys/prod.key \"\n"));
+        assert_eq!(path(&config), PathBuf::from("/keys/prod.key"));
+
+        std::env::set_var(AUTH_KEY_PATH_ENV, " /keys/dev.key\n");
+        assert_eq!(path(&config), PathBuf::from("/keys/dev.key"));
+
+        std::env::remove_var(AUTH_KEY_PATH_ENV);
+    }
+
+    /// A rendered-empty value is a broken template, not a request for the
+    /// network identity — and the likeliest rendering of one is the bare
+    /// `key_path:` that YAML reads as null, which serde would otherwise fold
+    /// into the same `None` an absent key produces.
+    #[test]
+    fn an_empty_key_path_in_the_file_is_rejected() {
+        for spelling in ["\"\"", "\"   \"", "", "null", "~"] {
+            let yaml = format!("{MINIMAL}key_path: {spelling}\n");
+            let Err(err) = serde_yaml::from_str::<AuthConfig>(&yaml) else {
+                panic!("`key_path: {spelling}` read as an absent key");
+            };
+            assert!(err.to_string().contains("auth.key_path"), "got {err}");
+        }
+
+        assert_eq!(
+            parse(&format!("{MINIMAL}key_path: /keys/prod.key\n")).key_path,
+            Some(PathBuf::from("/keys/prod.key"))
+        );
+        assert_eq!(parse(MINIMAL).key_path, None);
     }
 
     #[test]
@@ -320,15 +508,15 @@ portal_id: portal-premium-eu
         let config = parse(MINIMAL);
 
         std::env::remove_var(PORTAL_ID_ENV);
-        assert_eq!(config.portal_id(), "portal-premium-eu");
+        assert_eq!(config.resolve().unwrap().portal_id, "portal-premium-eu");
 
         std::env::set_var(PORTAL_ID_ENV, "portal-from-env");
-        assert_eq!(config.portal_id(), "portal-from-env");
+        assert_eq!(config.resolve().unwrap().portal_id, "portal-from-env");
 
         // A blank override is an unset deployment variable, not a request for an
         // empty portal id.
         std::env::set_var(PORTAL_ID_ENV, "   ");
-        assert_eq!(config.portal_id(), "portal-premium-eu");
+        assert_eq!(config.resolve().unwrap().portal_id, "portal-premium-eu");
 
         std::env::remove_var(PORTAL_ID_ENV);
     }
@@ -342,13 +530,13 @@ portal_id: portal-premium-eu
 
         let mut config = parse(MINIMAL);
         config.portal_id = "portal\n1800000000\nPOST".to_string();
-        assert!(config.validate().is_err());
+        assert!(config.resolve().is_err());
 
         config.portal_id = "portal premium".to_string();
-        assert!(config.validate().is_err());
+        assert!(config.resolve().is_err());
 
         config.portal_id = "  ".to_string();
-        assert!(config.validate().is_err());
+        assert!(config.resolve().is_err());
     }
 
     #[test]
@@ -369,13 +557,13 @@ portal_id: portal-premium-eu
             let mut config = parse(MINIMAL);
             mutate(&mut config.limits);
             assert!(
-                config.validate().is_err(),
+                config.resolve().is_err(),
                 "{:?} should not validate",
                 config
             );
         }
 
-        assert!(parse(MINIMAL).validate().is_ok());
+        assert!(parse(MINIMAL).resolve().is_ok());
     }
 
     /// The exchange body carries the caller's credential, so the hop has to be
@@ -391,13 +579,13 @@ portal_id: portal-premium-eu
             config
         };
 
-        assert!(with_url("http://cp.example/").validate().is_err());
-        assert!(with_url("http://10.0.0.5:8080/").validate().is_err());
+        assert!(with_url("http://cp.example/").resolve().is_err());
+        assert!(with_url("http://10.0.0.5:8080/").resolve().is_err());
 
-        assert!(with_url("https://cp.example/").validate().is_ok());
-        assert!(with_url("http://127.0.0.1:3000/").validate().is_ok());
-        assert!(with_url("http://localhost:3000/").validate().is_ok());
-        assert!(with_url("http://[::1]:3000/").validate().is_ok());
+        assert!(with_url("https://cp.example/").resolve().is_ok());
+        assert!(with_url("http://127.0.0.1:3000/").resolve().is_ok());
+        assert!(with_url("http://localhost:3000/").resolve().is_ok());
+        assert!(with_url("http://[::1]:3000/").resolve().is_ok());
     }
 
     /// A limit is only operator-bindable if a typo in one is audible. Flattening

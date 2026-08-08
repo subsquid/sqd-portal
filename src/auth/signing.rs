@@ -24,7 +24,7 @@ pub struct RequestSigner {
 
 impl RequestSigner {
     /// `portal_id` must already be validated free of newlines — the canonical
-    /// form separates fields with them (`AuthConfig::validate`).
+    /// form separates fields with them (`ResolvedAuth::signer`).
     pub fn new(keypair: Keypair, portal_id: String) -> Self {
         Self { keypair, portal_id }
     }
@@ -89,7 +89,7 @@ fn canonical(
 /// the wire against what should have been sent.
 #[cfg(test)]
 pub(super) fn sign_for_test(
-    config: &super::config::AuthConfig,
+    config: &super::config::ResolvedAuth,
     credential: &super::extractor::Credential,
     now_secs: u64,
 ) -> String {
@@ -97,7 +97,7 @@ pub(super) fn sign_for_test(
         "credential": credential.token.expose(),
     }))
     .expect("a credential serializes");
-    let signer = RequestSigner::new(test_keypair(), config.portal_id());
+    let signer = RequestSigner::new(test_keypair(), config.portal_id.clone());
     signer
         .headers("POST", "/internal/portal/v1/exchange", &body, now_secs)
         .expect("signing should succeed")

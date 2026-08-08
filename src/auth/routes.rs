@@ -1,12 +1,10 @@
 //! How a route says whether it needs a key.
 //!
-//! Both [`AuthExt`] methods return a [`Classified`], and [`Gated::route`] takes
-//! nothing else — so a route that says neither does not compile. A wrapper you
-//! can forget to write is open by omission.
-//!
-//! That covers routes added *here*. [`Gated::merge_ungated`] mounts a router
-//! whole and cannot see inside it, so [`Gated::inventory`] records what was
-//! mounted either way and a test asserts the whole surface against it (REQ-51).
+//! [`Gated::route`] takes only a [`Classified`], so a route that says neither
+//! does not compile — a wrapper you can forget to write is open by omission.
+//! [`Gated::merge_ungated`] cannot see inside what it mounts, so
+//! [`Gated::inventory`] records both kinds and a test asserts the surface
+//! against it (REQ-51).
 
 use std::sync::Arc;
 
@@ -22,10 +20,10 @@ pub struct Classified {
     endpoint: Option<String>,
 }
 
-/// A method router carrying the name its metrics go under. The annotation layer
-/// is applied by [`Gated::route`], outermost, so a refusal the gate mints is
-/// labelled like any other response — the metrics fall back to the raw request
-/// path otherwise, one series per spelling an unauthenticated client invents.
+/// A method router carrying the name its metrics go under. [`Gated::route`]
+/// applies the layer outermost, so a refusal the gate mints is labelled too —
+/// otherwise the metrics fall back to the raw path, one series per spelling an
+/// unauthenticated client invents.
 pub struct Named {
     router: MethodRouter,
     endpoint: String,
@@ -136,21 +134,16 @@ impl Gated {
         let router = match (self.gate.clone(), gated) {
             (Some(gate), true) => {
                 let dataset = dataset_param(path);
-                // `layer`, not `route_layer`: the latter skips methods the
-                // route does not declare, so a keyless method mismatch would
-                // answer 405 without ever entering the OB-12 accounting. The
-                // refusal still carries `Allow` — axum appends it outside
-                // every layer — but the method map is public in the served
-                // schema anyway; what this buys is the accounting and the
-                // uniform status.
+                // `layer`, not `route_layer`: the latter skips undeclared
+                // methods, so a keyless method mismatch would answer 405
+                // without entering the OB-12 accounting.
                 router.layer(axum::middleware::from_fn(move |req, next| {
                     extractor::middleware(gate.clone(), dataset, req, next)
                 }))
             }
             _ => router,
         };
-        // Applied after the gate, hence outside it, so a refusal the gate
-        // short-circuits still carries its endpoint name.
+        // Outside the gate, so a short-circuited refusal keeps its name.
         let router = match endpoint {
             Some(endpoint) => router.layer(EndpointAnnotationLayer::new(endpoint)),
             None => router,
@@ -159,9 +152,8 @@ impl Gated {
         self
     }
 
-    /// A router mounted whole. Nothing inside passes through [`Self::route`], so
-    /// its routes answer without a key — hence the reason, which is recorded
-    /// rather than discarded so the surface test can account for it.
+    /// Nothing inside passes through [`Self::route`], so its routes answer
+    /// without a key — hence the reason, recorded for the surface test.
     pub fn merge_ungated(mut self, why: &'static str, other: Router) -> Self {
         self.inventory.push(Mounted::Merged(why));
         self.router = self.router.merge(other);
@@ -173,16 +165,13 @@ impl Gated {
     }
 }
 
-/// Whether the path names the dataset in the form a grant's claims use — the
-/// canonical name.
+/// Whether the path names the dataset the way a grant's claims do.
 ///
-/// The deprecated worker-query route carries a base64 `DatasetId` under
-/// `:dataset_id`. `Datasets::default_name` would resolve it, so this is a choice
-/// rather than a limit: the route is NG7 — unspecified and not to be pinned — and
-/// teaching the gate a second dataset spelling would extend authorization onto a
-/// surface the binding does not describe. Until it is either specified or removed,
-/// it names no dataset and a dataset-scoped key is refused there, which is the
-/// fail-closed direction (REQ-53, NG7, GAP-36).
+/// The deprecated worker-query route carries a base64 `DatasetId` instead. That
+/// is resolvable, so excluding it is a choice: the route is NG7, and teaching
+/// the gate a second spelling would extend authorization onto a surface the
+/// binding does not describe. It names no dataset, so a scoped key is refused
+/// there — the fail-closed direction (REQ-53, NG7, GAP-36).
 fn dataset_param(path: &str) -> bool {
     let mut segments = path.trim_start_matches('/').split('/');
     matches!(
