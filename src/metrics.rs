@@ -187,6 +187,7 @@ lazy_static::lazy_static! {
 
     static ref KNOWN_CHUNKS: Family<Labels, Gauge> = Default::default();
     static ref LAST_STORAGE_BLOCK: Family<Labels, Gauge> = Default::default();
+    pub static ref STALE_ASSIGNMENTS_REJECTED: Counter = Default::default();
 
     // Authorizing deployments only: inert without an `auth:` block.
     static ref AUTH_DECISIONS: Family<Labels, Counter> = Default::default();
@@ -668,6 +669,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "dataset_storage_highest_block",
         "The highest block existing in the persistent storage",
         LAST_STORAGE_BLOCK.clone(),
+    );
+    registry.register(
+        "stale_assignments_rejected",
+        "Number of assignments skipped because they were older than the current one",
+        STALE_ASSIGNMENTS_REJECTED.clone(),
     );
     registry.register(
         "mutex_held_nanos",

@@ -22,10 +22,18 @@ enum ActiveAssignment {
     Portal(sqd_assignments::PortalAssignment),
 }
 
+/// The last applied assignment. Carries its source because `portal_assignment` and the legacy
+/// `assignment` are independent sequences: ids only order within one of them.
+#[derive(Clone)]
+struct AppliedAssignment {
+    id: String,
+    is_portal_assignment: bool,
+}
+
 pub struct StorageClient {
     assignment: RwLock<Option<ActiveAssignment>>,
     datasets_config: Arc<RwLock<Datasets>>,
-    latest_assignment_id: RwLock<Option<String>>,
+    latest_assignment: RwLock<Option<AppliedAssignment>>,
     network_state_url: String,
     reqwest_client: reqwest::Client,
     ignore_deprecated_workers: bool,
@@ -58,7 +66,7 @@ impl StorageClient {
         Self {
             assignment: RwLock::new(None, "StorageClient::assignment"),
             datasets_config,
-            latest_assignment_id: RwLock::new(None, "StorageClient::latest_assignment"),
+            latest_assignment: RwLock::new(None, "StorageClient::latest_assignment"),
             network_state_url,
             reqwest_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
@@ -109,21 +117,35 @@ impl StorageClient {
             .clone()
             .ok_or(anyhow!("Missing assignment URL"))?;
         let effective_from = visible_assignment.effective_from;
-        let latest_id = self.latest_assignment_id.read().clone();
-        if latest_id.as_ref() == Some(&assignment_id) {
+        let latest = self.latest_assignment.read().clone();
+        if latest.as_ref().is_some_and(|l| l.id == assignment_id) {
             tracing::debug!("Assignment has not been changed");
             return Ok(());
+        }
+
+        if let Some(latest) = &latest {
+            if is_stale(latest, &assignment_id, is_portal_assignment) {
+                // Applying it would move the head backwards, dropping already-advertised chunks
+                // and opening a range no source covers. A later poll brings the newer one back.
+                tracing::warn!(
+                    stale_id = %assignment_id,
+                    current_id = %latest.id,
+                    "Rejected an assignment older than the current one"
+                );
+                metrics::STALE_ASSIGNMENTS_REJECTED.inc();
+                return Ok(());
+            }
         }
 
         let assignment = self
             .fetch_assignment(&assignment_url, is_portal_assignment)
             .await?;
 
-        if latest_id.is_some() {
+        if latest.is_some() {
             sleep_until(effective_from).await;
         }
 
-        self.set_assignment(assignment, &assignment_id);
+        self.set_assignment(assignment, &assignment_id, is_portal_assignment);
 
         tracing::info!("Applied assignment \"{}\"", assignment_id);
         Ok(())
@@ -182,8 +204,11 @@ impl StorageClient {
     }
 
     #[instrument(skip_all)]
-    fn set_assignment(&self, assignment: ActiveAssignment, id: &str) {
-        *self.latest_assignment_id.write() = Some(id.to_owned());
+    fn set_assignment(&self, assignment: ActiveAssignment, id: &str, is_portal_assignment: bool) {
+        *self.latest_assignment.write() = Some(AppliedAssignment {
+            id: id.to_owned(),
+            is_portal_assignment,
+        });
 
         let prev = self.assignment.read();
         let workers_len = match &assignment {
@@ -541,6 +566,62 @@ mod tests {
         assert!(is_portal);
     }
 
+    fn applied(id: &str) -> AppliedAssignment {
+        AppliedAssignment {
+            id: id.to_string(),
+            is_portal_assignment: true,
+        }
+    }
+
+    #[test]
+    fn older_assignment_is_stale() {
+        let current = applied("2026-08-07T19:21:53_AAAA");
+        assert!(is_stale(&current, "2026-08-07T19:02:21_BBBB", true));
+    }
+
+    #[test]
+    fn newer_assignment_is_not_stale() {
+        let current = applied("2026-08-07T19:02:21_AAAA");
+        assert!(!is_stale(&current, "2026-08-07T19:21:53_BBBB", true));
+    }
+
+    #[test]
+    fn same_timestamp_is_not_stale() {
+        // Only the timestamp orders, so a differing hash must still apply.
+        let current = applied("2026-08-07T19:21:53_AAAA");
+        assert!(!is_stale(&current, "2026-08-07T19:21:53_BBBB", true));
+    }
+
+    #[test]
+    fn assignment_from_the_other_source_is_never_stale() {
+        // Otherwise a fallback between the two sources would look like a regression.
+        let current = applied("2026-08-07T19:21:53_AAAA");
+        assert!(!is_stale(&current, "2026-08-07T19:02:21_BBBB", false));
+    }
+
+    #[test]
+    fn unparseable_ids_are_never_stale() {
+        let cases = [
+            ("no-separator", "2026-01-01T00:00:00_A"),
+            ("2026-08-07T19:21:53_AAAA", "no-separator"),
+            ("_AAAA", "2026-08-07T19:21:53_BBBB"),
+            ("2026-08-07T19:21:53_", "2020-01-01T00:00:00_B"),
+        ];
+        for (current, candidate) in cases {
+            assert!(
+                !is_stale(&applied(current), candidate, true),
+                "{current} / {candidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn ids_from_different_timestamp_formats_are_never_stale() {
+        // A format change must not make every subsequent assignment look older.
+        let current = applied("2026-08-07T19:21:53_AAAA");
+        assert!(!is_stale(&current, "20260807T192153_BBBB", true));
+    }
+
     #[cfg(feature = "mvcc-chunks")]
     #[test]
     fn visible_assignment_can_be_reverted_to_legacy_via_config() {
@@ -574,6 +655,34 @@ fn convert_chunk_not_found(
         },
         sqd_assignments::ChunkNotFound::UnknownDataset => ChunkNotFound::UnknownDataset,
     }
+}
+
+/// Whether `candidate` is older than the applied assignment, and so must not replace it.
+///
+/// Ids are `<timestamp>_<hash>` with a fixed-width timestamp, so prefixes order lexicographically.
+/// The hash is excluded: it carries no ordering, and would order same-second ids arbitrarily.
+///
+/// Every uncertain case returns false. Wrongly accepting costs one poll; wrongly rejecting freezes
+/// the head until restart.
+fn is_stale(applied: &AppliedAssignment, candidate: &str, candidate_is_portal: bool) -> bool {
+    if applied.is_portal_assignment != candidate_is_portal {
+        return false;
+    }
+    let (Some(current), Some(new)) = (timestamp_prefix(&applied.id), timestamp_prefix(candidate))
+    else {
+        return false;
+    };
+    // Differing lengths mean differing formats, which lexicographic order cannot span.
+    if current.len() != new.len() {
+        return false;
+    }
+    new < current
+}
+
+/// The ordering-bearing prefix of an id, or `None` if it isn't shaped `<timestamp>_<hash>`.
+fn timestamp_prefix(id: &str) -> Option<&str> {
+    let (timestamp, hash) = id.split_once('_')?;
+    (!timestamp.is_empty() && !hash.is_empty()).then_some(timestamp)
 }
 
 async fn sleep_until(timestamp: u64) {
