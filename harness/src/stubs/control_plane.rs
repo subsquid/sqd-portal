@@ -31,9 +31,10 @@ use sha2::{Digest, Sha256};
 
 use super::Ledger;
 
-/// The path the portal's client builds. The signature covers it, so the stub
-/// mounts it exactly or nothing verifies.
-pub const EXCHANGE_PATH: &str = "/internal/portal/v1/exchange";
+/// Where this stub mounts the endpoint. The prefix is its own — the portal
+/// appends `v1/exchange` to whatever base it is configured with — but the
+/// signature covers the whole path, so the two have to agree exactly.
+pub const EXCHANGE_PATH: &str = "/authority/v1/exchange";
 
 /// Both sides reimplement the canonical form, so its bytes are the contract.
 /// A drift here is what the scheme tag exists to make loud.

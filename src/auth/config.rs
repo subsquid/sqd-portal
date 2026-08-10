@@ -27,6 +27,10 @@ pub(crate) struct KeySource {
 /// requires a key. Absent, the portal behaves exactly like an OSS build.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
+    /// Where the control plane mounts its portal API, prefix and all — the
+    /// portal appends only the version and the operation. The route is the
+    /// other side's to move, and this is what lets it move without a release
+    /// here, and without fixing what an operator has to expose.
     pub control_plane_url: Url,
 
     /// What the control plane knows this portal as, and what it attributes the
@@ -349,7 +353,7 @@ mod tests {
     use crate::auth::test_support::env_guard;
 
     const MINIMAL: &str = r#"
-control_plane_url: https://cp.example/
+control_plane_url: https://cp.example/authority
 portal_id: portal-premium-eu
 "#;
 
