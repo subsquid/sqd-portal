@@ -91,7 +91,7 @@ pub fn write_config(
     let auth_block = match (auth, e.control_plane_port) {
         (Some(c), Some(port)) => format!(
             "auth:\n  \
-             control_plane_url: http://127.0.0.1:{port}/\n  \
+             control_plane_url: http://127.0.0.1:{port}/authority\n  \
              portal_id: {id}\n  \
              enforcement: {mode}\n{key_path}{limits}",
             id = c.portal_id,

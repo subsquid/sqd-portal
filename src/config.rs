@@ -560,7 +560,7 @@ sqd_network:
         let _guard = crate::auth::test_support::env_guard();
         let yaml = format!(
             "{MINIMAL_YAML}auth:\n  \
-             control_plane_url: https://cp.example/\n  \
+             control_plane_url: https://cp.example/authority\n  \
              portal_id: portal-premium-eu\n  \
              enforcement: log_only\n"
         );
@@ -590,7 +590,7 @@ sqd_network:
     fn a_misspelled_key_under_auth_refuses_to_start() {
         let yaml = format!(
             "{MINIMAL_YAML}auth:\n  \
-             control_plane_url: https://cp.example/\n  \
+             control_plane_url: https://cp.example/authority\n  \
              portal_id: portal-premium-eu\n  \
              key-path: /keys/exchange.key\n"
         );
@@ -608,7 +608,7 @@ sqd_network:
         let _guard = crate::auth::test_support::env_guard();
         let yaml = format!(
             "{MINIMAL_YAML}auth:\n  \
-             control_plane_url: https://cp.example/\n  \
+             control_plane_url: https://cp.example/authority\n  \
              portal_id: portal-premium-eu\n  \
              limits:\n    \
              max_grant_lifetime_seconds: 60\n"
@@ -636,7 +636,7 @@ sqd_network:
     #[test]
     fn an_unrecognized_top_level_block_refuses_to_start_when_nothing_authorizes() {
         let _guard = crate::auth::test_support::env_guard();
-        let block = "  control_plane_url: https://cp.example/\n  \
+        let block = "  control_plane_url: https://cp.example/authority\n  \
                      portal_id: portal-premium-eu\n";
 
         let err = Config::from_reader(format!("{MINIMAL_YAML}authorisation:\n{block}").as_bytes())
@@ -657,7 +657,7 @@ sqd_network:
         let _guard = crate::auth::test_support::env_guard();
         let yaml = format!(
             "{MINIMAL_YAML}stray_key: 1\nauth:\n  \
-             control_plane_url: https://cp.example/\n  \
+             control_plane_url: https://cp.example/authority\n  \
              portal_id: portal-premium-eu\n"
         );
 

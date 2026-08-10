@@ -7,7 +7,10 @@ use super::{
 };
 use crate::auth::extractor::Credential;
 
-const EXCHANGE_PATH: [&str; 4] = ["internal", "portal", "v1", "exchange"];
+/// The version and the operation only. Where the control plane mounts this is
+/// its own routing, carried by `auth.control_plane_url`, so moving that mount
+/// point is a config change rather than a portal release.
+const EXCHANGE_PATH: [&str; 3] = ["v1", "auth", "exchange"];
 
 /// What one exchange established. Anything else propagates as an error, which
 /// the caller turns into a retryable refusal rather than a verdict.
@@ -88,7 +91,8 @@ impl ControlPlaneClient {
     }
 }
 
-/// Appends the internal API path to a base that may carry a prefix of its own.
+/// Appends the endpoint to a base that carries the control plane's own mount
+/// point, prefix and all.
 fn endpoint_url(base: &Url, segments: &[&str]) -> anyhow::Result<Url> {
     let mut url = base.clone();
     url.set_query(None);
@@ -226,7 +230,7 @@ mod tests {
     async fn the_exchange_does_not_follow_redirects() {
         let app = Router::new()
             .route(
-                "/internal/portal/v1/exchange",
+                "/authority/v1/auth/exchange",
                 post(|| async { Redirect::temporary("/elsewhere") }),
             )
             .route(
@@ -241,7 +245,7 @@ mod tests {
 
         let cp = MockControlPlane::spawn().await;
         let mut config = cp.config();
-        config.control_plane_url = format!("http://{addr}").parse().unwrap();
+        config.control_plane_url = format!("http://{addr}/authority").parse().unwrap();
 
         let err = client_for(&config)
             .await
@@ -262,19 +266,23 @@ mod tests {
     fn endpoint_url_appends_to_bases_with_and_without_trailing_slash() {
         assert_eq!(
             url_for("https://cp.example"),
-            "https://cp.example/internal/portal/v1/exchange"
+            "https://cp.example/v1/auth/exchange"
         );
         assert_eq!(
             url_for("https://cp.example/"),
-            "https://cp.example/internal/portal/v1/exchange"
+            "https://cp.example/v1/auth/exchange"
         );
         assert_eq!(
-            url_for("https://cp.example/saas/"),
-            "https://cp.example/saas/internal/portal/v1/exchange"
+            url_for("https://cp.example/authority"),
+            "https://cp.example/authority/v1/auth/exchange"
         );
         assert_eq!(
-            url_for("https://cp.example/saas?x=1#f"),
-            "https://cp.example/saas/internal/portal/v1/exchange"
+            url_for("https://cp.example/authority/"),
+            "https://cp.example/authority/v1/auth/exchange"
+        );
+        assert_eq!(
+            url_for("https://cp.example/authority?x=1#f"),
+            "https://cp.example/authority/v1/auth/exchange"
         );
     }
 

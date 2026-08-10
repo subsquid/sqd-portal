@@ -143,7 +143,7 @@ mod tests {
 
     fn config_with(key: Option<KeySource>) -> ResolvedAuth {
         ResolvedAuth {
-            control_plane_url: "https://cp.example/".parse().unwrap(),
+            control_plane_url: "https://cp.example/authority".parse().unwrap(),
             portal_id: "portal-premium-eu".to_string(),
             key,
             enforcement: Enforcement::Enforce,

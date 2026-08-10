@@ -48,7 +48,7 @@ impl DatasetCatalog for NoCatalog {
 /// ladder want [`MockControlPlane`].
 pub fn gate_with(enforcement: Enforcement) -> Arc<Gate> {
     let config = ResolvedAuth {
-        control_plane_url: "http://127.0.0.1:1/".parse().unwrap(),
+        control_plane_url: "http://127.0.0.1:1/authority".parse().unwrap(),
         portal_id: "portal-premium-eu".to_string(),
         key: None,
         enforcement,
@@ -106,7 +106,7 @@ impl MockControlPlane {
     pub async fn spawn() -> Self {
         let state = Arc::new(MockState::default());
         let app = Router::new()
-            .route("/internal/portal/v1/exchange", post(exchange))
+            .route("/authority/v1/auth/exchange", post(exchange))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -124,7 +124,7 @@ impl MockControlPlane {
             ..config::Limits::default()
         };
         ResolvedAuth {
-            control_plane_url: format!("http://{}", self.addr).parse().unwrap(),
+            control_plane_url: format!("http://{}/authority", self.addr).parse().unwrap(),
             portal_id: "portal-premium-eu".to_string(),
             key: None,
             enforcement: Enforcement::Enforce,

@@ -99,7 +99,7 @@ pub(super) fn sign_for_test(
     .expect("a credential serializes");
     let signer = RequestSigner::new(test_keypair(), config.portal_id.clone());
     signer
-        .headers("POST", "/internal/portal/v1/exchange", &body, now_secs)
+        .headers("POST", "/authority/v1/auth/exchange", &body, now_secs)
         .expect("signing should succeed")
         .into_iter()
         .find(|(name, _)| *name == SIGNATURE_HEADER)
@@ -124,7 +124,7 @@ mod tests {
 
     fn signature_of(signer: &RequestSigner, body: &[u8], timestamp: u64) -> String {
         let headers = signer
-            .headers("POST", "/internal/portal/v1/exchange", body, timestamp)
+            .headers("POST", "/authority/v1/auth/exchange", body, timestamp)
             .expect("signing should succeed");
         headers
             .iter()
@@ -143,7 +143,7 @@ mod tests {
             "portal-premium-eu",
             1_800_000_000,
             "POST",
-            "/internal/portal/v1/exchange",
+            "/authority/v1/auth/exchange",
             body,
         );
         assert!(signer
@@ -216,16 +216,16 @@ mod tests {
                 "portal-premium-eu",
                 1_800_000_000,
                 "POST",
-                "/internal/portal/v1/exchange",
+                "/authority/v1/auth/exchange",
                 body
             ),
             "sqd-portal-v1\nportal-premium-eu\n1800000000\nPOST\n\
-             /internal/portal/v1/exchange\n\
+             /authority/v1/auth/exchange\n\
              30650daa6d3b90517f572c1154da8fcfb1ebf678003a3e74eaa7a33826d6dd56"
         );
         assert_eq!(
             signature_of(&signer, body, 1_800_000_000),
-            "_ThgFiJAgcGa7dKAE_EOMDYaL_myOdX2BIlz6RT66ziWZtzCFrFbQ6e9hcvV0zsb0A0bYhyC5GK6Kj6EU36eCA"
+            "Y908dYBcRTGdqL0fAiEvBsin44ecTh-55XVhELcvNjCZ5-m7lr9-SukGcKRhU3NlIWkeEkb7bPZNVj2NXkWCCA"
         );
     }
 
