@@ -20,9 +20,10 @@ use crate::{
 };
 
 /// Accepted layouts, all `<prefix><key_id>_<secret>`: the minted prefix plus
-/// the legacy one. Exactly the set the control plane issues — a prefix it never
-/// mints is not a key.
-const TOKEN_PREFIXES: [&str; 2] = ["sqd_portal_", "prt_"];
+/// the two it replaced. Exactly the set the control plane still honours —
+/// a prefix it cannot have issued is not a key, and dropping one here refuses
+/// a live key as `unknown_key` rather than as the removal it is.
+const TOKEN_PREFIXES: [&str; 3] = ["sqd_prt_", "sqd_portal_", "prt_"];
 
 /// Mirrors the control plane's own `[A-Za-z0-9~-]+`, capped at what it mints:
 /// a token it could never have issued is rejected before it reaches the cache,
