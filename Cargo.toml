@@ -6,7 +6,6 @@ default-run = "sqd-portal"
 
 [features]
 sql = ["dep:once_cell", "dep:substrait", "dep:sql_query_plan"]
-mvcc-chunks = ["sqd-assignments/mvcc-chunks"]
 
 [dependencies]
 anyhow = "1"
@@ -87,12 +86,17 @@ tempfile = "3"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
 
-sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "360bbd4", features = ["reader"] }
-sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", version = "1.3.0" }
-sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", version = "2.1.0", features = ["semver", "bitstring"] }
-sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", version = "3.1.0", features = ["portal", "metrics"] }
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", features = ["reader"] }
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", version = "1.3.0" }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", version = "2.1.0", features = ["semver", "bitstring"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", version = "3.1.0", features = ["portal", "metrics"] }
 
 sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "eaa9f86", features = ["serde"] }
 sqd-query = { git = "https://github.com/subsquid/data.git", rev = "eaa9f86" }
 
 sql_query_plan = { git = "https://github.com/subsquid/qplan.git", rev = "2e61b51", optional = true }
+
+# The libp2p fork used by sqd-network builds against its in-tree libp2p-identity, so we must
+# redirect the crates.io one to the same source or two incompatible copies get linked.
+[patch.crates-io]
+libp2p-identity = { git = "https://github.com/kalabukdima/rust-libp2p.git", rev = "fac3b0c9" }

@@ -24,13 +24,20 @@ hex = "0.4"
 sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-libp2p-identity = { version = "0.2", features = ["ed25519", "rand", "peerid"] }
+# Pinned exactly, not `0.2`: the patch below supplies 0.2.12, and a caret range would let the
+# resolver pick a newer crates.io release instead, putting two libp2p_identity copies in the graph.
+libp2p-identity = { version = "=0.2.12", features = ["ed25519", "rand", "peerid"] }
 
 # Same pinned rev as the portal's Cargo.toml — the stubs must speak the exact wire ABI.
-sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", features = ["builder", "reader"] }
-sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", features = ["signatures"] }
-sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", features = ["worker"] }
-sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434" }
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", features = ["builder", "reader"] }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", features = ["signatures"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", features = ["worker"] }
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc" }
+
+# Mirrors the portal's own patch: the libp2p fork builds against its in-tree libp2p-identity, so
+# consumers must redirect the crates.io one or two incompatible copies get linked.
+[patch.crates-io]
+libp2p-identity = { git = "https://github.com/kalabukdima/rust-libp2p.git", rev = "fac3b0c9" }
 
 [profile.dev]
 # The libp2p tree is slow at opt-level 0 and QUIC handshakes are timing-sensitive.

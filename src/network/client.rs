@@ -323,7 +323,7 @@ impl NetworkClientBuilder {
         if config.ignore_deprecated_workers {
             network_state.ignore_deprecated_workers();
         }
-        network_state.set_prefer_portal_assignment(config.prefer_portal_assignment);
+        network_state.set_assignment_source(config.assignment_source);
 
         let read_scheduler = if config.congestion.enabled {
             let sched = Arc::new(DownloadScheduler::new(config.congestion.clone()));
@@ -703,6 +703,11 @@ impl NetworkClient {
             timestamp_ms: timestamp_now_ms(),
             signature: Default::default(),
             compression,
+            // Both defaults, deliberately: `msg_to_sign` only appends these to the signed payload
+            // when one is non-zero, so leaving them alone keeps signatures byte-identical to what
+            // workers that predate the fields already verify.
+            query_engine: sqd_messages::QueryEngine::Default as i32,
+            output_format: sqd_messages::OutputFormat::Jsonl as i32,
         };
         tokio::task::spawn_blocking({
             let keypair = self.keypair.clone();

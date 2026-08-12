@@ -1,7 +1,8 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
-use sqd_assignments::{Assignment, NetworkAssignment};
+use serde::Deserialize;
+use sqd_assignments::{Assignment, NetworkAssignment, PortalAssignment};
 use sqd_contract_client::{Network, PeerId};
 use sqd_primitives::BlockRef;
 use tracing::instrument;
@@ -13,31 +14,51 @@ use crate::{
     utils::RwLock,
 };
 
-/// The assignment currently held by the client: either the legacy shared format, or (under
-/// `mvcc-chunks`) the portal-oriented split format. See docs/assignment-wire-format.md in
-/// network-scheduler for the split rationale.
-enum ActiveAssignment {
-    Legacy(Assignment),
-    #[cfg(feature = "mvcc-chunks")]
-    Portal(sqd_assignments::PortalAssignment),
+/// Which of the published artifacts the portal routes from.
+///
+/// The scheduler publishes both throughout the migration, so this is an outright choice rather
+/// than a preference: only the selected artifact is ever consulted, and its absence is an error
+/// rather than a reason to serve the other one. That is what keeps [`Legacy`] usable as a kill
+/// switch and [`Portal`] verifiable as a canary.
+///
+/// [`Legacy`]: AssignmentSource::Legacy
+/// [`Portal`]: AssignmentSource::Portal
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AssignmentSource {
+    /// `NetworkState::assignment`: the combined artifact served to workers and portals alike.
+    #[default]
+    Legacy,
+    /// `NetworkState::portal_assignment`: carries only what a portal reads.
+    Portal,
 }
 
-/// The last applied assignment. Carries its source because `portal_assignment` and the legacy
-/// `assignment` are independent sequences: ids only order within one of them.
-#[derive(Clone)]
-struct AppliedAssignment {
-    id: String,
-    is_portal_assignment: bool,
+impl std::fmt::Display for AssignmentSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Legacy => "legacy",
+            Self::Portal => "portal",
+        })
+    }
+}
+
+/// The assignment currently held by the client, in whichever wire format it was published in.
+/// See docs/assignment-wire-format.md in network-scheduler for the split rationale.
+enum ActiveAssignment {
+    Legacy(Assignment),
+    Portal(PortalAssignment),
 }
 
 pub struct StorageClient {
     assignment: RwLock<Option<ActiveAssignment>>,
     datasets_config: Arc<RwLock<Datasets>>,
-    latest_assignment: RwLock<Option<AppliedAssignment>>,
+    /// Id of the last applied assignment. Ids only order within a single source, but the source
+    /// is fixed for the process lifetime, so the id alone is enough to spot a regression.
+    latest_assignment_id: RwLock<Option<String>>,
     network_state_url: String,
     reqwest_client: reqwest::Client,
     ignore_deprecated_workers: bool,
-    prefer_portal_assignment: bool,
+    assignment_source: AssignmentSource,
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -66,7 +87,7 @@ impl StorageClient {
         Self {
             assignment: RwLock::new(None, "StorageClient::assignment"),
             datasets_config,
-            latest_assignment: RwLock::new(None, "StorageClient::latest_assignment"),
+            latest_assignment_id: RwLock::new(None, "StorageClient::latest_assignment_id"),
             network_state_url,
             reqwest_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
@@ -75,7 +96,7 @@ impl StorageClient {
                 .build()
                 .unwrap(),
             ignore_deprecated_workers: false,
-            prefer_portal_assignment: true,
+            assignment_source: AssignmentSource::default(),
         }
     }
 
@@ -83,14 +104,13 @@ impl StorageClient {
         self.ignore_deprecated_workers = true;
     }
 
-    pub fn set_prefer_portal_assignment(&mut self, prefer: bool) {
-        self.prefer_portal_assignment = prefer;
+    pub fn set_assignment_source(&mut self, source: AssignmentSource) {
+        self.assignment_source = source;
     }
 
     pub fn num_workers(&self) -> usize {
         match self.assignment.read().as_ref() {
             Some(ActiveAssignment::Legacy(a)) => a.workers().len(),
-            #[cfg(feature = "mvcc-chunks")]
             Some(ActiveAssignment::Portal(a)) => a.workers().len(),
             None => 0,
         }
@@ -109,27 +129,34 @@ impl StorageClient {
     async fn update_assignment(&self) -> anyhow::Result<()> {
         tracing::debug!("Checking for new assignment");
         let network_state = self.fetch_network_state().await?;
-        let (visible_assignment, is_portal_assignment) =
-            visible_assignment(&network_state, self.prefer_portal_assignment);
-        let assignment_id = visible_assignment.id.clone();
-        let assignment_url = visible_assignment
+        let Some(selected) = select_assignment(&network_state, self.assignment_source) else {
+            // Never falls back to the other source: that would make a portal pinned to one format
+            // silently serve the other, defeating both the kill switch and the canary.
+            metrics::MISSING_ASSIGNMENT_SOURCE.inc();
+            return Err(anyhow!(
+                "network state publishes no {} assignment",
+                self.assignment_source
+            ));
+        };
+        let assignment_id = selected.id.clone();
+        let assignment_url = selected
             .fb_url_v1
             .clone()
             .ok_or(anyhow!("Missing assignment URL"))?;
-        let effective_from = visible_assignment.effective_from;
-        let latest = self.latest_assignment.read().clone();
-        if latest.as_ref().is_some_and(|l| l.id == assignment_id) {
+        let effective_from = selected.effective_from;
+        let latest = self.latest_assignment_id.read().clone();
+        if latest.as_deref() == Some(assignment_id.as_str()) {
             tracing::debug!("Assignment has not been changed");
             return Ok(());
         }
 
         if let Some(latest) = &latest {
-            if is_stale(latest, &assignment_id, is_portal_assignment) {
+            if is_stale(latest, &assignment_id) {
                 // Applying it would move the head backwards, dropping already-advertised chunks
                 // and opening a range no source covers. A later poll brings the newer one back.
                 tracing::warn!(
                     stale_id = %assignment_id,
-                    current_id = %latest.id,
+                    current_id = %latest,
                     "Rejected an assignment older than the current one"
                 );
                 metrics::STALE_ASSIGNMENTS_REJECTED.inc();
@@ -138,14 +165,14 @@ impl StorageClient {
         }
 
         let assignment = self
-            .fetch_assignment(&assignment_url, is_portal_assignment)
+            .fetch_assignment(&assignment_url, self.assignment_source)
             .await?;
 
         if latest.is_some() {
             sleep_until(effective_from).await;
         }
 
-        self.set_assignment(assignment, &assignment_id, is_portal_assignment);
+        self.set_assignment(assignment, &assignment_id);
 
         tracing::info!("Applied assignment \"{}\"", assignment_id);
         Ok(())
@@ -163,11 +190,10 @@ impl StorageClient {
     }
 
     #[instrument(skip(self, url))]
-    #[allow(unused_variables)]
     async fn fetch_assignment(
         &self,
         url: &str,
-        is_portal_assignment: bool,
+        source: AssignmentSource,
     ) -> anyhow::Result<ActiveAssignment> {
         use async_compression::tokio::bufread::GzipDecoder;
         use futures::TryStreamExt;
@@ -191,24 +217,19 @@ impl StorageClient {
 
         tracing::debug!("Downloaded assignment from {}", url);
 
-        #[cfg(feature = "mvcc-chunks")]
-        if is_portal_assignment {
-            return Ok(ActiveAssignment::Portal(
-                sqd_assignments::PortalAssignment::from_owned_unchecked(buf),
-            ));
-        }
-
-        Ok(ActiveAssignment::Legacy(Assignment::from_owned_unchecked(
-            buf,
-        )))
+        Ok(match source {
+            AssignmentSource::Legacy => {
+                ActiveAssignment::Legacy(Assignment::from_owned_unchecked(buf))
+            }
+            AssignmentSource::Portal => {
+                ActiveAssignment::Portal(PortalAssignment::from_owned_unchecked(buf))
+            }
+        })
     }
 
     #[instrument(skip_all)]
-    fn set_assignment(&self, assignment: ActiveAssignment, id: &str, is_portal_assignment: bool) {
-        *self.latest_assignment.write() = Some(AppliedAssignment {
-            id: id.to_owned(),
-            is_portal_assignment,
-        });
+    fn set_assignment(&self, assignment: ActiveAssignment, id: &str) {
+        *self.latest_assignment_id.write() = Some(id.to_owned());
 
         let prev = self.assignment.read();
         let workers_len = match &assignment {
@@ -227,7 +248,6 @@ impl StorageClient {
                 );
                 assignment.workers().len()
             }
-            #[cfg(feature = "mvcc-chunks")]
             ActiveAssignment::Portal(assignment) => {
                 self.update_datasets(
                     assignment
@@ -289,7 +309,6 @@ impl StorageClient {
             )?
             .id()
             .to_owned(),
-            #[cfg(feature = "mvcc-chunks")]
             ActiveAssignment::Portal(assignment) => find_chunk_with(
                 || assignment.find_chunk(dataset_url, block),
                 || assignment.get_dataset(dataset_url).unwrap().first_block(),
@@ -317,7 +336,6 @@ impl StorageClient {
             )?
             .id()
             .to_owned(),
-            #[cfg(feature = "mvcc-chunks")]
             ActiveAssignment::Portal(assignment) => find_chunk_with(
                 || assignment.find_chunk_by_timestamp(dataset_url, ts),
                 || assignment.get_dataset(dataset_url).unwrap().first_block(),
@@ -351,7 +369,6 @@ impl StorageClient {
                     }),
                 )
             }
-            #[cfg(feature = "mvcc-chunks")]
             ActiveAssignment::Portal(assignment) => {
                 let chunk = find_chunk_with(
                     || assignment.find_chunk(dataset_url, block),
@@ -400,7 +417,6 @@ impl StorageClient {
         let dataset_url = dataset.to_url();
         match self.assignment.read().as_ref()? {
             ActiveAssignment::Legacy(a) => Some(a.get_dataset(dataset_url)?.first_block()),
-            #[cfg(feature = "mvcc-chunks")]
             ActiveAssignment::Portal(a) => Some(a.get_dataset(dataset_url)?.first_block()),
         }
     }
@@ -415,7 +431,6 @@ impl StorageClient {
                     number: dataset.last_block(),
                 })
             }
-            #[cfg(feature = "mvcc-chunks")]
             ActiveAssignment::Portal(a) => {
                 let dataset = a.get_dataset(dataset_url)?;
                 dataset.last_block_hash().map(|hash| BlockRef {
@@ -433,7 +448,6 @@ impl StorageClient {
                 .iter()
                 .filter_map(|w| (*w.worker_id()).try_into().ok())
                 .collect(),
-            #[cfg(feature = "mvcc-chunks")]
             Some(ActiveAssignment::Portal(a)) => a
                 .workers()
                 .iter()
@@ -455,7 +469,6 @@ impl StorageClient {
                     });
                 }
             }
-            #[cfg(feature = "mvcc-chunks")]
             ActiveAssignment::Portal(assignment) => {
                 for c in assignment.get_dataset(dataset_url)?.chunks().iter() {
                     accumulate_range(&mut ranges, c.id(), c.worker_indexes().iter(), |idx| {
@@ -492,32 +505,20 @@ fn accumulate_range(
     }
 }
 
-/// Selects the assignment portals should use for routing, and reports whether it was the
-/// dedicated portal assignment (`true`) or the legacy shared assignment (`false`).
+/// The artifact descriptor `source` names, or `None` when the publisher hasn't included it.
 ///
-/// Under `mvcc-chunks`, portals prefer `portal_assignment` when `prefer_portal_assignment` is
-/// set (a runtime config flag, so it can be reverted without a rebuild), but fall back to the
-/// legacy assignment if it's disabled or the scheduler hasn't published `portal_assignment` yet.
-fn visible_assignment(
+/// Every field of the network state is optional, because the migration walks it through three
+/// shapes: legacy alone, both, then the split pair alone. Which of those a given network is in is
+/// the publisher's business -- the portal's is to serve the format it was configured for, or
+/// nothing at all.
+fn select_assignment(
     network_state: &sqd_assignments::NetworkState,
-    prefer_portal_assignment: bool,
-) -> (&NetworkAssignment, bool) {
-    #[cfg(feature = "mvcc-chunks")]
-    if prefer_portal_assignment {
-        match network_state.portal_assignment.as_ref() {
-            Some(assignment) => return (assignment, true),
-            None => {
-                tracing::warn!(
-                    "portal_assignment missing in network state; falling back to legacy assignment"
-                );
-            }
-        }
+    source: AssignmentSource,
+) -> Option<&NetworkAssignment> {
+    match source {
+        AssignmentSource::Legacy => network_state.assignment.as_ref(),
+        AssignmentSource::Portal => network_state.portal_assignment.as_ref(),
     }
-
-    #[cfg(not(feature = "mvcc-chunks"))]
-    let _ = prefer_portal_assignment;
-
-    (&network_state.assignment, false)
 }
 
 #[cfg(test)]
@@ -535,68 +536,71 @@ mod tests {
         }
     }
 
-    fn network_state() -> sqd_assignments::NetworkState {
+    /// A state publishing exactly the artifacts named, so a test can spell out which of the three
+    /// migration shapes it is in.
+    fn network_state(legacy: bool, portal: bool) -> sqd_assignments::NetworkState {
         sqd_assignments::NetworkState {
             network: "testnet".to_string(),
-            assignment: assignment("legacy"),
-            #[cfg(feature = "mvcc-chunks")]
+            assignment: legacy.then(|| assignment("legacy")),
             worker_assignment: None,
-            #[cfg(feature = "mvcc-chunks")]
-            portal_assignment: None,
+            portal_assignment: portal.then(|| assignment("portal")),
+            schema_bundle: None,
         }
     }
 
     #[test]
-    fn visible_assignment_uses_legacy_assignment() {
-        let state = network_state();
+    fn each_source_selects_its_own_artifact() {
+        let state = network_state(true, true);
 
-        let (visible, is_portal) = visible_assignment(&state, true);
-        assert_eq!(visible.id, "legacy");
-        assert!(!is_portal);
+        let legacy = select_assignment(&state, AssignmentSource::Legacy);
+        let portal = select_assignment(&state, AssignmentSource::Portal);
+
+        assert_eq!(legacy.map(|a| a.id.as_str()), Some("legacy"));
+        assert_eq!(portal.map(|a| a.id.as_str()), Some("portal"));
     }
 
-    #[cfg(feature = "mvcc-chunks")]
     #[test]
-    fn visible_assignment_prefers_portal_assignment() {
-        let mut state = network_state();
-        state.portal_assignment = Some(assignment("portal"));
+    fn a_missing_source_never_falls_back_to_the_other() {
+        // The whole point of the selector: pinning to one format must not silently serve the
+        // other, in either direction or in either of the one-sided migration shapes.
+        let legacy_only = network_state(true, false);
+        let portal_only = network_state(false, true);
 
-        let (visible, is_portal) = visible_assignment(&state, true);
-        assert_eq!(visible.id, "portal");
-        assert!(is_portal);
+        assert!(select_assignment(&legacy_only, AssignmentSource::Portal).is_none());
+        assert!(select_assignment(&portal_only, AssignmentSource::Legacy).is_none());
     }
 
-    fn applied(id: &str) -> AppliedAssignment {
-        AppliedAssignment {
-            id: id.to_string(),
-            is_portal_assignment: true,
-        }
+    #[test]
+    fn no_published_artifact_selects_nothing() {
+        let state = network_state(false, false);
+
+        assert!(select_assignment(&state, AssignmentSource::Legacy).is_none());
+        assert!(select_assignment(&state, AssignmentSource::Portal).is_none());
     }
 
     #[test]
     fn older_assignment_is_stale() {
-        let current = applied("2026-08-07T19:21:53_AAAA");
-        assert!(is_stale(&current, "2026-08-07T19:02:21_BBBB", true));
+        assert!(is_stale(
+            "2026-08-07T19:21:53_AAAA",
+            "2026-08-07T19:02:21_BBBB"
+        ));
     }
 
     #[test]
     fn newer_assignment_is_not_stale() {
-        let current = applied("2026-08-07T19:02:21_AAAA");
-        assert!(!is_stale(&current, "2026-08-07T19:21:53_BBBB", true));
+        assert!(!is_stale(
+            "2026-08-07T19:02:21_AAAA",
+            "2026-08-07T19:21:53_BBBB"
+        ));
     }
 
     #[test]
     fn same_timestamp_is_not_stale() {
         // Only the timestamp orders, so a differing hash must still apply.
-        let current = applied("2026-08-07T19:21:53_AAAA");
-        assert!(!is_stale(&current, "2026-08-07T19:21:53_BBBB", true));
-    }
-
-    #[test]
-    fn assignment_from_the_other_source_is_never_stale() {
-        // Otherwise a fallback between the two sources would look like a regression.
-        let current = applied("2026-08-07T19:21:53_AAAA");
-        assert!(!is_stale(&current, "2026-08-07T19:02:21_BBBB", false));
+        assert!(!is_stale(
+            "2026-08-07T19:21:53_AAAA",
+            "2026-08-07T19:21:53_BBBB"
+        ));
     }
 
     #[test]
@@ -608,29 +612,17 @@ mod tests {
             ("2026-08-07T19:21:53_", "2020-01-01T00:00:00_B"),
         ];
         for (current, candidate) in cases {
-            assert!(
-                !is_stale(&applied(current), candidate, true),
-                "{current} / {candidate}"
-            );
+            assert!(!is_stale(current, candidate), "{current} / {candidate}");
         }
     }
 
     #[test]
     fn ids_from_different_timestamp_formats_are_never_stale() {
         // A format change must not make every subsequent assignment look older.
-        let current = applied("2026-08-07T19:21:53_AAAA");
-        assert!(!is_stale(&current, "20260807T192153_BBBB", true));
-    }
-
-    #[cfg(feature = "mvcc-chunks")]
-    #[test]
-    fn visible_assignment_can_be_reverted_to_legacy_via_config() {
-        let mut state = network_state();
-        state.portal_assignment = Some(assignment("portal"));
-
-        let (visible, is_portal) = visible_assignment(&state, false);
-        assert_eq!(visible.id, "legacy");
-        assert!(!is_portal);
+        assert!(!is_stale(
+            "2026-08-07T19:21:53_AAAA",
+            "20260807T192153_BBBB"
+        ));
     }
 }
 
@@ -662,13 +654,13 @@ fn convert_chunk_not_found(
 /// Ids are `<timestamp>_<hash>` with a fixed-width timestamp, so prefixes order lexicographically.
 /// The hash is excluded: it carries no ordering, and would order same-second ids arbitrarily.
 ///
+/// Both ids always come from the same source, which is fixed for the process lifetime, so they are
+/// always drawn from one sequence and directly comparable.
+///
 /// Every uncertain case returns false. Wrongly accepting costs one poll; wrongly rejecting freezes
 /// the head until restart.
-fn is_stale(applied: &AppliedAssignment, candidate: &str, candidate_is_portal: bool) -> bool {
-    if applied.is_portal_assignment != candidate_is_portal {
-        return false;
-    }
-    let (Some(current), Some(new)) = (timestamp_prefix(&applied.id), timestamp_prefix(candidate))
+fn is_stale(applied_id: &str, candidate: &str) -> bool {
+    let (Some(current), Some(new)) = (timestamp_prefix(applied_id), timestamp_prefix(candidate))
     else {
         return false;
     };

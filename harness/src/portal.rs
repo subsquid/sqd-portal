@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
+use crate::artifact::AssignmentSource;
 use crate::world::ToyWorld;
 
 pub struct Endpoints {
@@ -65,6 +66,7 @@ pub fn write_config(
     world: &ToyWorld,
     e: &Endpoints,
     auth: Option<&Auth>,
+    assignment_source: AssignmentSource,
 ) -> anyhow::Result<PathBuf> {
     let mut datasets = String::new();
     for ds in &world.datasets {
@@ -116,6 +118,7 @@ pre_drain_grace_period_sec: 1
 drain_timeout_sec: 2
 assignments_url: http://127.0.0.1:{publisher}
 assignments_update_interval_sec: 1
+assignment_source: {assignment_source}
 datasets_update_interval_sec: 600
 chain_update_interval_sec: 60
 send_logs: false
@@ -135,6 +138,7 @@ datasets:
 {datasets}{auth_block}"#,
         http = e.http_port,
         publisher = e.publisher_port,
+        assignment_source = assignment_source.as_str(),
         registry = e.registry_port,
         datasets = datasets,
         auth_block = auth_block,
