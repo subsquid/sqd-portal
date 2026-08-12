@@ -431,16 +431,19 @@ where
 ///
 /// Nested keys elsewhere stay a warning: the worst case is one knob keeping its
 /// default. Inside `auth:` that default is a different signing identity or an
-/// open door, so they are fatal too — except under `limits:`, where the
-/// fallback really is just a default and a build that predates a knob would
-/// otherwise refuse the config a rollback hands it.
+/// open door, so they are fatal too — except under `limits:` and `usage:`,
+/// where the fallback really is just a default and a build that predates a knob
+/// would otherwise refuse the config a rollback hands it. A misspelled `usage:`
+/// block itself stays fatal, like every other unknown key directly under
+/// `auth:`: it is not a security shape, but it is an operator who asked for
+/// measurement and would otherwise get silence.
 fn reject_unrecognized_block_without_auth(config: &Config) -> anyhow::Result<()> {
     let stray: Vec<&str> = config
         .ignored_fields
         .iter()
         .filter(|path| {
             if config.auth.is_some() {
-                path.starts_with("auth.") && !path.contains(".limits.")
+                path.starts_with("auth.") && !path.contains(".limits.") && !path.contains(".usage.")
             } else {
                 !path.contains('.')
             }
@@ -626,6 +629,40 @@ sqd_network:
             config.ignored_fields[0].ends_with("limits.max_grant_lifetime_seconds"),
             "got {:?}",
             config.ignored_fields
+        );
+    }
+
+    /// A usage knob is the second thing under `auth:` whose fallback is a plain
+    /// default — measurement absent is measurement missing, not a door left
+    /// open — so a typo there must not turn a rollback into a crash loop.
+    #[test]
+    fn a_misspelled_usage_knob_is_reported_rather_than_fatal() {
+        let _guard = crate::auth::test_support::env_guard();
+        let yaml = format!(
+            "{MINIMAL_YAML}auth:\n  \
+             control_plane_url: https://cp.example/authority\n  \
+             portal_id: portal-premium-eu\n  \
+             usage:\n    \
+             flush_interval_seconds: 5\n"
+        );
+
+        let config = Config::from_reader(yaml.as_bytes()).expect("a usage typo still starts");
+
+        assert_eq!(
+            config.ignored_fields.len(),
+            1,
+            "{:?}",
+            config.ignored_fields
+        );
+        assert!(
+            config.ignored_fields[0].contains("usage")
+                && config.ignored_fields[0].ends_with("flush_interval_seconds"),
+            "got {:?}",
+            config.ignored_fields
+        );
+        assert!(
+            config.auth.expect("the block parses").usage.is_some(),
+            "the block is still in force, with the misspelled knob defaulted"
         );
     }
 

@@ -104,6 +104,49 @@ impl ExchangeOutcome {
     }
 }
 
+/// Why one usage record never reached the control plane (OB-14, HZ-14).
+/// Closed set, and each value is bound to its own counter at construction — the
+/// hot path increments a pointer it already holds rather than looking a label
+/// family up per event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsageDrop {
+    /// The queue was full: the sink is slower than the data plane, or down.
+    QueueFull,
+    /// Undelivered past the retry-age bound.
+    Expired,
+    /// The control plane refused the batch on its content.
+    Rejected,
+    /// Measured after the reporter finished its shutdown flush.
+    Stopped,
+}
+
+impl UsageDrop {
+    pub const ALL: [Self; 4] = [
+        Self::QueueFull,
+        Self::Expired,
+        Self::Rejected,
+        Self::Stopped,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueFull => "queue_full",
+            Self::Expired => "expired",
+            Self::Rejected => "rejected",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::QueueFull => 0,
+            Self::Expired => 1,
+            Self::Rejected => 2,
+            Self::Stopped => 3,
+        }
+    }
+}
+
 /// Final transport outcome of one logical DC-4 request (ADR-015, OB-4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HotblocksRequestOutcome {
@@ -203,6 +246,16 @@ lazy_static::lazy_static! {
     static ref GRANTS_IN_GRACE: Gauge = Default::default();
     static ref GRACE_MIN_REMAINING: Gauge = Default::default();
 
+    // Usage measurement (OB-14). Registered for the process like every other
+    // family, so they exist at zero on a portal that measures nothing.
+    static ref USAGE_ENQUEUED: Counter = Default::default();
+    static ref USAGE_DELIVERED: Counter = Default::default();
+    static ref USAGE_DROPPED: Family<Labels, Counter> = Default::default();
+    static ref USAGE_QUEUE_DEPTH: Gauge = Default::default();
+    static ref USAGE_FLUSH_FAILURES: Counter = Default::default();
+    static ref USAGE_DELIVERY_DURATION: Histogram =
+        Histogram::new([0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0].into_iter());
+
     // TODO: add metrics for procedure durations
     static ref MUTEX_HELD_NANOS: Family<Labels, Counter> = Default::default();
     static ref MUTEXES_EXISTING: Family<Labels, Gauge> = Default::default();
@@ -252,6 +305,56 @@ pub fn hotblocks_requests(outcome: HotblocksRequestOutcome) -> u64 {
     HOTBLOCKS_REQUESTS
         .get_or_create(&hotblocks_request_labels(outcome))
         .get()
+}
+
+/// Every OB-14 signal, bound once at construction.
+///
+/// Pre-bound rather than looked up: the enqueue path runs inside a response
+/// body's poll, where a metric-family lookup is a lock and a hash per record.
+/// Cloning shares the underlying atomics, so a handle here and the registered
+/// family are the same counter.
+#[derive(Clone)]
+pub struct UsageSignals {
+    pub enqueued: Counter,
+    pub delivered: Counter,
+    pub flush_failures: Counter,
+    pub queue_depth: Gauge,
+    pub delivery_seconds: Histogram,
+    dropped: [Counter; 4],
+}
+
+impl UsageSignals {
+    pub fn bind() -> Self {
+        Self {
+            enqueued: USAGE_ENQUEUED.clone(),
+            delivered: USAGE_DELIVERED.clone(),
+            flush_failures: USAGE_FLUSH_FAILURES.clone(),
+            queue_depth: USAGE_QUEUE_DEPTH.clone(),
+            delivery_seconds: USAGE_DELIVERY_DURATION.clone(),
+            dropped: UsageDrop::ALL.map(|reason| {
+                USAGE_DROPPED
+                    .get_or_create(&usage_drop_labels(reason))
+                    .clone()
+            }),
+        }
+    }
+
+    pub fn dropped(&self, reason: UsageDrop) {
+        self.dropped[reason.index()].inc();
+    }
+
+    pub fn dropped_by(&self, reason: UsageDrop, count: u64) {
+        self.dropped[reason.index()].inc_by(count);
+    }
+
+    #[cfg(test)]
+    pub fn drops(&self, reason: UsageDrop) -> u64 {
+        self.dropped[reason.index()].get()
+    }
+}
+
+fn usage_drop_labels(reason: UsageDrop) -> Labels {
+    vec![("reason".to_owned(), reason.as_str().to_owned())]
 }
 
 /// Count one authorization evaluation (OB-12).
@@ -739,6 +842,36 @@ pub fn register_metrics(registry: &mut Registry) {
         "auth_grace_min_remaining_seconds",
         "Smallest time to expires_at among grants in grace — the first hard refusal; zero when none are in grace",
         GRACE_MIN_REMAINING.clone(),
+    );
+    registry.register(
+        "usage_events_enqueued",
+        "Usage records handed to the reporter; empty unless the portal is configured with an `auth.usage:` block",
+        USAGE_ENQUEUED.clone(),
+    );
+    registry.register(
+        "usage_events_delivered",
+        "Usage records the control plane accepted",
+        USAGE_DELIVERED.clone(),
+    );
+    registry.register(
+        "usage_events_dropped",
+        "Usage records that never reached the control plane, by reason: queue_full, expired, rejected, or stopped",
+        USAGE_DROPPED.clone(),
+    );
+    registry.register(
+        "usage_queue_depth",
+        "Usage records waiting to be reported; sustained growth is the sink falling behind",
+        USAGE_QUEUE_DEPTH.clone(),
+    );
+    registry.register(
+        "usage_flush_failures",
+        "Usage batch deliveries that failed and will be retried",
+        USAGE_FLUSH_FAILURES.clone(),
+    );
+    registry.register(
+        "usage_delivery_duration_seconds",
+        "How long an accepted usage batch took to deliver",
+        USAGE_DELIVERY_DURATION.clone(),
     );
 }
 

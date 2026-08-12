@@ -210,15 +210,19 @@ async fn main() -> anyhow::Result<()> {
     let task_manager = Arc::new(TaskManager::new(network_client.clone(), &config));
 
     let cancellation_token = CancellationToken::new();
-    let auth_gate = match (&auth, auth_keypair) {
+    let authorization = match (&auth, auth_keypair) {
         (Some(auth), Some(keypair)) => Some(sqd_portal::auth::build(
             auth,
             keypair,
             network_client.clone() as Arc<dyn sqd_portal::auth::DatasetCatalog>,
+            cancellation_token.clone(),
         )?),
         // No block, or shadow mode without a key — which admits either way.
         _ => None,
     };
+    let auth_gate = authorization
+        .as_ref()
+        .map(|authorization| authorization.gate.clone());
     let shutting_down = Arc::new(AtomicBool::new(false));
     let sigterm = {
         use anyhow::Context;
@@ -255,6 +259,13 @@ async fn main() -> anyhow::Result<()> {
         network_client.run(cancellation_token),
     )?;
     server_res?;
+
+    // After the listener is down, so nothing being served is waiting on it, and
+    // bounded by the reporter's own budget. What does not go out here is
+    // dropped and counted, like every other record the sink could not take.
+    if let Some(authorization) = authorization {
+        authorization.finish().await;
+    }
 
     Ok(())
 }
