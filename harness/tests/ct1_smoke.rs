@@ -74,6 +74,7 @@ struct Ctx {
     worker_ledgers: Vec<stubs::Ledger>,
     hotblocks_ledger: stubs::Ledger,
     publisher_ledger: stubs::Ledger,
+    assignment_source: AssignmentSource,
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -177,6 +178,7 @@ async fn smoke(assignment_source: AssignmentSource) -> anyhow::Result<()> {
         worker_ledgers,
         hotblocks_ledger,
         publisher_ledger,
+        assignment_source,
     };
 
     let result = run_smoke(&ctx, &mut portal_proc).await;
@@ -494,9 +496,21 @@ async fn run_smoke(ctx: &Ctx, portal_proc: &mut PortalProcess) -> anyhow::Result
         "hotblocks ledger misses stream calls: {:?}",
         ctx.hotblocks_ledger.entries()
     );
+    // Exact entries, not a prefix: "artifact" prefixes "artifact-portal", so a prefix match
+    // would let the portal-source run pass on a legacy fetch. Asserting the other artifact was
+    // never fetched is what pins the selector's no-fallback promise end to end.
+    let (expected, forbidden) = match ctx.assignment_source {
+        AssignmentSource::Legacy => ("artifact", "artifact-portal"),
+        AssignmentSource::Portal => ("artifact-portal", "artifact"),
+    };
+    let fetched = ctx.publisher_ledger.entries();
     ensure!(
-        ctx.publisher_ledger.count_with_prefix("artifact") >= 1,
-        "artifact never fetched"
+        fetched.iter().any(|e| e == expected),
+        "{expected} never fetched: {fetched:?}"
+    );
+    ensure!(
+        !fetched.iter().any(|e| e == forbidden),
+        "fetched {forbidden} while configured for {expected}: {fetched:?}"
     );
 
     // Quiescence (one heartbeat interval, no in-flight work), then the gauge

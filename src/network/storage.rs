@@ -26,10 +26,12 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum AssignmentSource {
-    /// `NetworkState::assignment`: the combined artifact served to workers and portals alike.
+    // Kept short and free of Rust paths: clap renders these verbatim as the `--help` text for
+    // each possible value.
+    /// The combined assignment, served to workers and portals alike.
     #[default]
     Legacy,
-    /// `NetworkState::portal_assignment`: carries only what a portal reads.
+    /// The dedicated portal assignment, carrying only what a portal reads.
     Portal,
 }
 
