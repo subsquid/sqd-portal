@@ -17,11 +17,14 @@ reads an error code.
 **CT-2 has started**: the worker stub is now a DC-1 fault injector (wrong-range both
 directions, bad signature, server-error and not-found verdicts) shared across workers so
 a fault lands wherever the portal routes, and `Fixture` boots the whole stub world for
-any class that needs it. Caveat: production workers pin a newer transport rev whose
-server was rewritten (stream-based accept with silent drop at buffer capacity); the stub
-speaks the portal's older pinned rev, so the production server's drop paths are not
-exercised — re-verify on the next dependency bump. `ct2_worker_faults` covers the worker-fault reroute rows and the
-exhaustion split; the rest of CT-2 and CT-3..CT-9 remain to be built per the build order.
+any class that needs it. The rev gap is closed: the portal and the stub both pin the
+transport at 67f54cc, where the server hands raw protobuf to the consumer and the stub
+decodes and answers on the response stream as a production worker does. Its silent drop
+at buffer capacity is still not driven, so that path stays unexercised.
+`ct2_worker_faults` covers the worker-fault reroute rows and the exhaustion split, and
+`ct2_publisher_faults` covers the DC-2 row where the publisher omits the artifact the
+portal is configured for; the rest of CT-2 and CT-3..CT-9 remain to be built per the
+build order.
 **CT-10 exists**: a DC-8 control-plane stub that verifies the exchange signature for real
 rather than trusting the headers, with a ledger of every credential it was asked about and
 the fault rows of DC-8's error table as injectors. `ct10_authorization` drives five
@@ -148,7 +151,7 @@ chunk-boundary records FV-6 licenses.
 
 | Property | CT | Status | Note |
 |---|---|---|---|
-| INV-1, INV-2 | CT-3/2 | U | artifact-variant selection unit-tested only |
+| INV-1, INV-2 | CT-3/2 | P | artifact-variant selection is now end-to-end: the CT-1 smoke runs against both wire formats and asserts the unselected artifact is never fetched, and `ct2_publisher_faults` proves a configured artifact the publisher omits is refused rather than substituted. Swap-race atomicity (INV-1) remains CT-3 territory |
 | INV-3 | CT-3 | P | quiescent lease census asserted zero after every randomized scheduling case and after client disconnect (controller-level, mock network); CT-3 swarm still absent |
 | INV-4 | CT-1/3 | P | window grow/shrink/priority unit tests |
 | INV-5 | CT-3 | U | transient overshoot untested |

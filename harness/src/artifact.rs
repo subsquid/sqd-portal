@@ -30,6 +30,12 @@ impl AssignmentSource {
     }
 }
 
+impl std::fmt::Display for AssignmentSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Build the artifact assigning every archival chunk to every worker, then
 /// gzip it. The portal pre-leases `1 + retries` *distinct* workers per chunk,
 /// so a realistic world needs at least two.
