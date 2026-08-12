@@ -1,6 +1,11 @@
 //! Portal-side half of access control: each presented credential is
 //! exchanged for a short-lived grant, which then answers per request. No quota
-//! or metering — an admitted key streams unrestricted.
+//! or limit — an admitted key streams unrestricted.
+//!
+//! What an admitted key streams is *measured*, where the operator asked for it
+//! (`auth.usage:`, REQ-60): shadow accounting that records bytes and can never
+//! withhold them. Measurement is not metering, and the distance between the two
+//! is the whole of [`usage`]'s design.
 //!
 //! Inert unless `auth:` is present in the config.
 
@@ -22,11 +27,13 @@ mod routes;
 mod signing;
 mod singleflight;
 mod types;
+mod usage;
 
 #[cfg(test)]
 pub mod test_support;
 
 pub use config::{AuthConfig, Enforcement, ResolvedAuth};
+pub use usage::UsageConfig;
 
 use config::KeySource;
 pub use extractor::{DatasetCatalog, Gate};
@@ -94,14 +101,41 @@ async fn read_keypair(path: &Path, knob: &str) -> anyhow::Result<Keypair> {
         })
 }
 
-/// Builds the gate the router wraps its data endpoints in. Nothing is started:
-/// state is learned from the requests that need it (LIV-5).
+/// The gate, and the usage reporter behind it where one was configured.
+///
+/// The reporter is handed back rather than detached because *this* is what
+/// stops it: it deliberately does not listen to the process's cancellation
+/// token, which fires when the drain begins rather than when serving ends, so
+/// the only thing that ends its run loop is [`Started::finish`] — called after
+/// the listener has stopped (ADR-005's second phase). Nothing on a request path
+/// ever holds this.
+pub struct Started {
+    pub gate: Arc<Gate>,
+    reporter: Option<usage::Reporting>,
+}
+
+impl Started {
+    /// Stops the reporter and awaits its bounded finalize. That budget is
+    /// internal and covers the whole post-stop path, so this cannot outlast it
+    /// however unreachable the sink is; a reporter that panicked is likewise
+    /// nothing to fail shutdown over.
+    pub async fn finish(self) {
+        if let Some(reporter) = self.reporter {
+            reporter.finish().await;
+        }
+    }
+}
+
+/// Builds the gate the router wraps its data endpoints in. No authorization
+/// state is started: it is learned from the requests that need it (LIV-5). A
+/// configured usage sink does start a task — it owns a queue nothing on the
+/// request path may wait on, which is precisely why it is a task.
 pub fn build(
     config: &ResolvedAuth,
     keypair: Keypair,
     catalog: Arc<dyn DatasetCatalog>,
-) -> anyhow::Result<Arc<Gate>> {
-    let signer = config.signer(keypair)?;
+) -> anyhow::Result<Started> {
+    let signer = config.signer(keypair.clone())?;
     // The public key, not the peer id: that is what the registration carries,
     // logged so an operator can read it off a replica rather than derive it.
     tracing::info!(
@@ -115,8 +149,23 @@ pub fn build(
         config.limits.clone(),
         config.enforcement,
     );
+    // Signed with the same identity as the exchange, so the control plane
+    // attributes both to one registration and stamps the portal onto every
+    // record from the signature rather than from a field it would have to trust.
+    let usage = config
+        .usage
+        .as_ref()
+        .map(|settings| usage::start(config, settings, config.signer(keypair)?))
+        .transpose()?;
+    let (sink, reporter) = match usage {
+        Some((sink, reporter)) => (Some(sink), Some(reporter)),
+        None => (None, None),
+    };
     // The mode itself is logged at startup, which covers the disabled case.
-    Ok(Arc::new(Gate::new(config, cache, catalog)))
+    Ok(Started {
+        gate: Arc::new(Gate::new(config, cache, catalog, sink)),
+        reporter,
+    })
 }
 
 // Which knob named the key is settled by `AuthConfig::resolve`, so nothing here
@@ -148,6 +197,7 @@ mod tests {
             key,
             enforcement: Enforcement::Enforce,
             limits: config::Limits::default(),
+            usage: None,
         }
     }
 

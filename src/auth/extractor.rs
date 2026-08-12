@@ -9,10 +9,11 @@ use axum::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    cache::GrantCache,
+    cache::{CachedGrant, GrantCache},
     config::{Enforcement, ResolvedAuth},
     evaluate::{self, Decision, LazyDataset, Rejection, Verdict},
     now_secs,
+    usage::{Attribution, UsageSink},
 };
 use crate::{
     metrics::{self, AuthDecision},
@@ -83,11 +84,28 @@ impl DatasetCatalog for NetworkClient {
     }
 }
 
+/// What one admission established, for the caller that has to act on it: the
+/// verdict, and — only where a grant answered for the request — who it is being
+/// served to (REQ-60).
+///
+/// Attribution rides out of the ladder rather than being recomputed downstream:
+/// the claims are in hand here, and asking the cache a second time per request
+/// would put a lock on the serving path for something already resolved.
+pub(super) struct Admission {
+    pub decision: Decision,
+    pub grant: Option<Arc<CachedGrant>>,
+    /// The canonical name, resolved only where something needed it.
+    pub dataset: Option<String>,
+}
+
 pub struct Gate {
     cache: Arc<GrantCache>,
     catalog: Arc<dyn DatasetCatalog>,
     portal_id: String,
     enforcement: Enforcement,
+    /// Present only with an `auth.usage:` block. Its absence is the whole kill
+    /// switch: no sink, so no attribution is deposited and no route is tapped.
+    usage: Option<Arc<UsageSink>>,
 }
 
 impl Gate {
@@ -95,13 +113,21 @@ impl Gate {
         config: &ResolvedAuth,
         cache: Arc<GrantCache>,
         catalog: Arc<dyn DatasetCatalog>,
+        usage: Option<Arc<UsageSink>>,
     ) -> Self {
         Self {
             cache,
             catalog,
             portal_id: config.portal_id.clone(),
             enforcement: config.enforcement,
+            usage,
         }
+    }
+
+    /// The usage sink, where one is configured. Read by the router, which mounts
+    /// the egress tap only on the routes this gate wraps.
+    pub(super) fn usage(&self) -> Option<Arc<UsageSink>> {
+        self.usage.clone()
     }
 
     /// Whether this gate turns its verdicts into responses. Shadow mode does
@@ -129,7 +155,7 @@ impl Gate {
         headers: &HeaderMap,
         uri: &axum::http::Uri,
         names_dataset: bool,
-    ) -> Decision {
+    ) -> Admission {
         // Deferred: canonicalization interns and clones, so it stays behind
         // authentication. Only the dataset rung calls it.
         let dataset = LazyDataset::new(|| self.dataset_for(uri.path(), names_dataset));
@@ -139,9 +165,14 @@ impl Gate {
                 let verdict = Verdict {
                     decision: Decision::Reject(rejection),
                     denial_reason: None,
+                    grant: None,
                 };
                 self.log(&verdict, None, None);
-                return verdict.decision;
+                return Admission {
+                    decision: verdict.decision,
+                    grant: None,
+                    dataset: None,
+                };
             }
         };
 
@@ -149,7 +180,13 @@ impl Gate {
             evaluate::evaluate(&self.cache, credential.as_ref(), &dataset, now_secs()).await;
         // Shadow mode logs admissions, and an admitted request has already
         // authenticated. A rejection logs only what a rung already resolved.
-        if let (Decision::Admit, Enforcement::LogOnly) = (verdict.decision, self.enforcement) {
+        //
+        // Measurement resolves on the same terms and for the same reason: an
+        // event naming an alias on one deployment and a canonical name on
+        // another is not a dataset column, and the work is only ever bought by a
+        // request that authenticated (INV-14).
+        let admitted = verdict.decision == Decision::Admit;
+        if admitted && (self.enforcement == Enforcement::LogOnly || self.usage.is_some()) {
             dataset.resolve();
         }
         self.log(
@@ -159,7 +196,11 @@ impl Gate {
                 .map(|credential| credential.key_id.as_str()),
             dataset.peek().as_deref(),
         );
-        verdict.decision
+        Admission {
+            decision: verdict.decision,
+            grant: verdict.grant,
+            dataset: dataset.peek(),
+        }
     }
 
     /// Grants carry canonical names, so an alias is resolved first; an
@@ -242,14 +283,27 @@ impl Gate {
 }
 
 /// Installed by `Gated::route` on the routes that declared `.auth()`.
+///
+/// `endpoint` is the route's declared label, not the request path: it names the
+/// series a usage record lands in, and a client-supplied path there would mint
+/// a dimension per spelling (HZ-15, INV-30's argument).
 pub(super) async fn middleware(
     gate: Arc<Gate>,
     names_dataset: bool,
-    req: Request,
+    endpoint: Arc<str>,
+    mut req: Request,
     next: Next,
 ) -> Response {
-    let decision = gate.decide(req.headers(), req.uri(), names_dataset).await;
+    let admission = gate.decide(req.headers(), req.uri(), names_dataset).await;
+    let decision = admission.decision;
     gate.count(decision);
+    if let (Some(_), Some(grant)) = (&gate.usage, admission.grant) {
+        // Deposited on the request, where the egress tap — mounted inside this
+        // middleware — is the only thing that reads it. Nothing on the request
+        // path acts on it: a claim recorded is not a claim enforced.
+        req.extensions_mut()
+            .insert(Attribution::new(grant, admission.dataset, endpoint));
+    }
     match (decision, gate.enforcement) {
         (Decision::Reject(rejection), Enforcement::Enforce) => rejection.into_response(),
         _ => next.run(req).await,
@@ -393,6 +447,7 @@ mod tests {
             }),
             portal_id: PORTAL.to_string(),
             enforcement,
+            usage: None,
         });
         (gate, lookups)
     }
@@ -403,7 +458,7 @@ mod tests {
         Router::new().route(
             path,
             post(|| async { "served" }).route_layer(from_fn(move |req, next| {
-                middleware(gate.clone(), names_dataset, req, next)
+                middleware(gate.clone(), names_dataset, Arc::from("/probe"), req, next)
             })),
         )
     }
@@ -729,7 +784,7 @@ mod tests {
                 |axum::extract::Path(dataset): axum::extract::Path<String>| async move { dataset },
             )
             .route_layer(from_fn(move |req, next| {
-                middleware(gate.clone(), true, req, next)
+                middleware(gate.clone(), true, Arc::from("/stream"), req, next)
             })),
         );
 
@@ -867,7 +922,7 @@ mod tests {
             // The right id with the wrong secret.
             header_map(&format!("Bearer {TOKEN}")),
         ] {
-            let decision = gate.decide(&headers, &uri, true).await;
+            let decision = gate.decide(&headers, &uri, true).await.decision;
             assert!(matches!(decision, Decision::Reject(_)), "{headers:?}");
         }
         assert_eq!(
@@ -886,7 +941,8 @@ mod tests {
         );
         let decision = gate
             .decide(&header_map(&format!("Bearer {TOKEN}")), &uri, true)
-            .await;
+            .await
+            .decision;
         assert_eq!(decision, Decision::Admit);
         assert_eq!(lookups.load(Ordering::Relaxed), 1);
     }
@@ -902,7 +958,8 @@ mod tests {
 
         let decision = gate
             .decide(&header_map(&format!("Bearer {TOKEN}")), &uri, true)
-            .await;
+            .await
+            .decision;
 
         assert_eq!(decision, Decision::Admit);
         assert_eq!(lookups.load(Ordering::Relaxed), 0);
@@ -926,7 +983,8 @@ mod tests {
 
         let decision = gate
             .decide(&header_map(&format!("Bearer {TOKEN}")), &uri, true)
-            .await;
+            .await
+            .decision;
         assert_eq!(decision, Decision::Admit);
         assert_eq!(lookups.load(Ordering::Relaxed), 1);
     }
@@ -936,7 +994,7 @@ mod tests {
         let gate = gate_granting(None, Enforcement::LogOnly).await;
         let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
 
-        let decision = gate.decide(&HeaderMap::new(), &uri, true).await;
+        let decision = gate.decide(&HeaderMap::new(), &uri, true).await.decision;
 
         assert!(matches!(decision, Decision::Reject(_)));
     }
@@ -968,7 +1026,7 @@ mod tests {
             // A token the portal cannot even parse.
             "Bearer sqd_portal_nonsense".to_string(),
         ] {
-            let decision = gate.decide(&header_map(&token), &uri, true).await;
+            let decision = gate.decide(&header_map(&token), &uri, true).await.decision;
             projections.push((decision, public_projection(&gate, decision)));
         }
 
@@ -1015,7 +1073,8 @@ mod tests {
                 &uri,
                 true,
             )
-            .await;
+            .await
+            .decision;
 
         let Decision::Reject(rejection) = decision else {
             panic!("a spent budget refuses");
@@ -1059,7 +1118,7 @@ mod tests {
             // Would refuse: the control plane revoked it.
             header_map(&format!("Bearer sqd_portal_k2_{SECRET}")),
         ] {
-            let decision = gate.decide(&headers, &uri, true).await;
+            let decision = gate.decide(&headers, &uri, true).await.decision;
             projections.push(public_projection(&gate, decision));
         }
 
@@ -1074,6 +1133,145 @@ mod tests {
                 "a shadow verdict must not reach the keyless scrape: {projection:?}"
             );
         }
+    }
+
+    /// A gate whose control plane grants `KEY_ID` with an owner named, and the
+    /// usage sink behind it — the wiring `auth::build` produces from an
+    /// `auth.usage:` block.
+    async fn gate_measuring(organization: Option<&str>) -> Arc<Gate> {
+        let cp = MockControlPlane::spawn().await;
+        cp.raw(
+            KEY_ID,
+            serde_json::json!({
+                "result": "granted",
+                "grant": {
+                    "claims_version": crate::auth::types::CLAIMS_VERSION,
+                    "key_id": KEY_ID,
+                    "organization_id": organization,
+                    "refresh_after": NOW + 86_400,
+                    "expires_at": NOW + 86_400,
+                },
+            }),
+        );
+        let (gate, _) = gate_for(&cp, Enforcement::Enforce).await;
+        let (sink, _events) = UsageSink::for_test(64, std::time::Duration::from_secs(30));
+        Arc::new(Gate {
+            cache: gate.cache.clone(),
+            catalog: gate.catalog.clone(),
+            portal_id: PORTAL.to_string(),
+            enforcement: Enforcement::Enforce,
+            usage: Some(sink),
+        })
+    }
+
+    /// What a usage record is built from, and the one place it is assembled:
+    /// the ladder already resolved every claim, so the tap downstream reads a
+    /// request extension rather than the cache (REQ-60).
+    #[tokio::test]
+    async fn an_admitted_request_carries_its_attribution_to_the_handler() {
+        let gate = gate_measuring(Some("org-7")).await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let recorded = seen.clone();
+        let app = Router::new().route(
+            "/datasets/:dataset/stream",
+            post(move |req: HttpRequest<Body>| {
+                let recorded = recorded.clone();
+                async move {
+                    *recorded.lock().unwrap() =
+                        req.extensions().get::<Attribution>().map(|attribution| {
+                            (
+                                attribution.key_id().to_owned(),
+                                attribution.organization_id().map(str::to_owned),
+                                attribution.dataset().map(str::to_owned),
+                                attribution.endpoint().to_owned(),
+                            )
+                        });
+                    "served"
+                }
+            })
+            .route_layer(from_fn(move |req, next| {
+                middleware(gate.clone(), true, Arc::from("/stream"), req, next)
+            })),
+        );
+
+        let (status, _) = call(
+            app,
+            request("/datasets/base/stream")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some((
+                KEY_ID.to_owned(),
+                Some("org-7".to_owned()),
+                // The canonical name behind the alias the request used: an
+                // event naming an alias is not comparable across deployments.
+                Some("base-mainnet".to_owned()),
+                "/stream".to_owned(),
+            ))
+        );
+    }
+
+    /// The kill switch, from the gate's side: with no `auth.usage:` block there
+    /// is no sink, so nothing is attributed, nothing downstream can be wrapped,
+    /// and the request path is what it was before phase 2 existed.
+    #[tokio::test]
+    async fn without_a_usage_block_nothing_is_attributed() {
+        let gate = gate_granting(None, Enforcement::Enforce).await;
+        let seen = Arc::new(std::sync::Mutex::new(true));
+        let recorded = seen.clone();
+        let app = Router::new().route(
+            "/datasets/:dataset/stream",
+            post(move |req: HttpRequest<Body>| {
+                let recorded = recorded.clone();
+                async move {
+                    *recorded.lock().unwrap() = req.extensions().get::<Attribution>().is_some();
+                    "served"
+                }
+            })
+            .route_layer(from_fn(move |req, next| {
+                middleware(gate.clone(), true, Arc::from("/stream"), req, next)
+            })),
+        );
+
+        let (status, body) = call(
+            app,
+            request("/datasets/base/stream")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "served");
+        assert!(
+            !*seen.lock().unwrap(),
+            "a portal that measures nothing must not even name who it served"
+        );
+    }
+
+    /// A grant with no owner is the answer an older control plane gives, and it
+    /// must attribute what it can rather than refusing to attribute at all —
+    /// the read side joins the key id back to its owner (D4).
+    #[tokio::test]
+    async fn a_grant_without_an_organization_still_attributes_the_key() {
+        let gate = gate_measuring(None).await;
+        let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
+
+        let admission = gate
+            .decide(&header_map(&format!("Bearer {TOKEN}")), &uri, true)
+            .await;
+
+        assert_eq!(admission.decision, Decision::Admit);
+        let grant = admission.grant.expect("an admitted request has its grant");
+        assert_eq!(grant.key_id, KEY_ID);
+        assert_eq!(grant.organization_id, None);
     }
 
     /// An enforced refusal is not silent, though, or the cutover is blind. Goes
@@ -1096,7 +1294,8 @@ mod tests {
 
         let decision = gate
             .decide(&header_map(&format!("Bearer {TOKEN}")), &uri, true)
-            .await;
+            .await
+            .decision;
         gate.count(decision);
 
         assert!(expired() > before, "the refusal must reach the scrape");

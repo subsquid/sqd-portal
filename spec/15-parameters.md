@@ -78,6 +78,11 @@ assumes, not knobs it owns.
 | Parameter | Role (where used) | Observed | Target |
 |---|---|---|---|
 | P-LOGS-QUEUE | Usage-log queue bound; overflow drops (REQ-44) | 10000 *(fixed)* | 10000 |
+| P-USAGE-QUEUE | Commercial usage records held before the hot path drops them (REQ-60, DC-9, HZ-14). Separate from P-LOGS-QUEUE on purpose: a shared bound makes either sink's outage the other's | 16384 | ⚠ 16384 (draft; ratify against a measured record rate) |
+| P-USAGE-BATCH-MAX | Records per delivery to the usage sink (DC-9) | 256 | ⚠ 256 (draft) |
+| P-USAGE-FLUSH | Longest a record waits for company before its batch goes out (DC-9); a full batch leaves sooner | 5 s | ⚠ 5 s (draft) |
+| P-USAGE-MAX-RETRY-AGE | How long an undelivered record is retried before it is dropped and counted (DC-9, HZ-14) | 300 s | ⚠ 300 s (draft) |
+| P-USAGE-INTERIM | Longest measured window one delta record may cover; the streaming-bias correction ADR-016 rests on (REQ-60) | 30 s | ⚠ 30 s (draft; confirm against the stream-duration histogram phase 2's own data produces) |
 | P-ERROR-SAMPLE-RATE | Error-report trace sampling (REQ-31) | 0.01 | 0.01 |
 | P-HEARTBEAT-INTERVAL | Stream progress heartbeat cadence (OB-2, harness quiescence) | 5 s *(fixed)* | 5 s |
 | P-MEMORY-BUDGET | ⚠ Per-replica memory budget REQ-27 must fit | 4–5 GB provisioned; **violated 2026-07-17 (OOM-kill restarts on 0.11.8)** | ⚠ ratify via OQ-4 and OQ-9 |

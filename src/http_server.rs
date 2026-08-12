@@ -783,6 +783,12 @@ fn gated_routes(auth_gate: Option<Arc<Gate>>, openapi_spec: &utoipa::openapi::Op
         .route("/api-docs/openapi.json", get(serve_openapi_spec).no_auth());
 
     // SQL Query Engine
+    //
+    // Gated, and therefore measured where usage measurement is on — but what it
+    // returns is a worker/chunk *plan*, not result data, so its usage records
+    // are plan bytes and are excluded from data-volume analysis at read time by
+    // their `/sql/query` endpoint label (ADR-016). Scanned bytes, if they ever
+    // matter, are separate work with a separate measurement.
     #[cfg(feature = "sql")]
     let routes = routes
         .route("/sql/query", post(sql_query).endpoint("/sql/query").auth())

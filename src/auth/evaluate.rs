@@ -91,12 +91,20 @@ impl<F: Fn() -> Option<String>> LazyDataset<F> {
     }
 }
 
-/// The verdict, and the raw denial reason behind it where there was one. The
-/// reason exists only for the protected log — the wire and the scrape both see
-/// `Decision` and nothing finer.
+/// The verdict, the raw denial reason behind it where there was one, and the
+/// grant it was reached on. The reason exists only for the protected log — the
+/// wire and the scrape both see `Decision` and nothing finer.
+///
+/// The grant rides along for attribution (REQ-60): the claims naming who is
+/// being served are already in hand here, and re-resolving them downstream
+/// would be a second cache lookup per request for something this call already
+/// holds. Present on a scope refusal too — the credential authenticated, it was
+/// only the dataset that did not match — and absent wherever no grant was
+/// established, which is exactly where nothing may be attributed.
 pub struct Verdict {
     pub decision: Decision,
     pub denial_reason: Option<String>,
+    pub grant: Option<Arc<CachedGrant>>,
 }
 
 impl Verdict {
@@ -104,6 +112,15 @@ impl Verdict {
         Self {
             decision,
             denial_reason: None,
+            grant: None,
+        }
+    }
+
+    fn on(decision: Decision, grant: Arc<CachedGrant>) -> Self {
+        Self {
+            decision,
+            denial_reason: None,
+            grant: Some(grant),
         }
     }
 }
@@ -127,13 +144,15 @@ pub async fn evaluate<F: Fn() -> Option<String>>(
             return Verdict {
                 decision: Decision::Reject(rejection_for(&reason)),
                 denial_reason: Some(reason),
+                grant: None,
             }
         }
         Resolved::Saturated => return Verdict::of(Decision::Reject(EXCHANGE_SATURATED)),
         Resolved::Unavailable => return Verdict::of(Decision::Reject(EXCHANGE_FAILED)),
     };
 
-    Verdict::of(evaluate_scope(&grant, dataset))
+    let decision = evaluate_scope(&grant, dataset);
+    Verdict::on(decision, grant)
 }
 
 /// The one rung the grant does not settle: it is per credential and outlives

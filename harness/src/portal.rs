@@ -29,6 +29,10 @@ pub struct Auth {
     /// Sign with `auth.key_path`. The fixture then registers that key and only
     /// that key, so signing with the network identity is refused.
     pub dedicated_key: bool,
+    /// `None` writes no `usage:` block at all, which is the phase-2 kill switch
+    /// (REQ-60): a portal configured this way measures nothing. `Some` writes
+    /// the block with these lines under it.
+    pub usage: Option<Vec<String>>,
 }
 
 /// Where the fixture writes the dedicated key and where `auth.key_path` points.
@@ -41,7 +45,22 @@ impl Auth {
             enforcement: "enforce",
             limits: Vec::new(),
             dedicated_key: false,
+            usage: None,
         }
+    }
+
+    /// Turns usage measurement on, with every knob defaulted.
+    pub fn measuring(mut self) -> Self {
+        self.usage.get_or_insert_with(Vec::new);
+        self
+    }
+
+    /// One `auth.usage:` knob, and measurement on if it was not already.
+    pub fn usage(mut self, key: &str, value: impl std::fmt::Display) -> Self {
+        self.usage
+            .get_or_insert_with(Vec::new)
+            .push(format!("    {key}: {value}\n"));
+        self
     }
 
     pub fn dedicated_key(mut self) -> Self {
@@ -91,7 +110,7 @@ pub fn write_config(
             "auth:\n  \
              control_plane_url: http://127.0.0.1:{port}/authority\n  \
              portal_id: {id}\n  \
-             enforcement: {mode}\n{key_path}{limits}",
+             enforcement: {mode}\n{key_path}{limits}{usage}",
             id = c.portal_id,
             mode = c.enforcement,
             key_path = if c.dedicated_key {
@@ -103,6 +122,11 @@ pub fn write_config(
                 String::new()
             } else {
                 format!("  limits:\n{}", c.limits.concat())
+            },
+            // Written at all is measurement on, even with nothing under it.
+            usage = match &c.usage {
+                None => String::new(),
+                Some(knobs) => format!("  usage:\n{}", knobs.concat()),
             },
         ),
         _ => String::new(),

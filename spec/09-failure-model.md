@@ -96,6 +96,8 @@ policy, and it is the control plane's `expires_at` under the Portal's cap (REQ-5
 | Registry down at refresh | degrade serve-stale, log |
 | Chain RPC (DC-5) down | degrade status only; loading state before first fetch; serving unaffected |
 | Log sink (DC-6) slow/full | mask: drop logs, count drops (HZ-7); never block serving |
+| Usage sink (DC-9) unreachable, slow, or refusing | mask for the client, degrade for the accounting: retry inside P-USAGE-MAX-RETRY-AGE, then drop and count (HZ-14). No response is delayed, altered, shortened or failed for this reason, and no reporting error reaches request handling (REQ-61, INV-32). Totals become a lower bound with respect to the loss, which the counter makes visible rather than silent |
+| Usage queue (DC-9) full | mask: drop the newest record and count it (HZ-14). The bound is the shock absorber; growing it would trade a lost record for a memory hazard |
 | Error sink (DC-7) down | mask |
 
 ## Process & operator faults
@@ -114,6 +116,7 @@ policy, and it is the control plane's `expires_at` under the Portal's cap (REQ-5
 
 | Fault family | Properties | Check |
 |---|---|---|
+| Usage sink | INV-32, REQ-60, REQ-61, DC-9 | CT-11 |
 | Client-side | INV-10, INV-11, INV-36, INV-35, LIV-10 | CT-4, CT-9, CT-3 |
 | Worker | INV-20, INV-22, INV-23, INV-26, LIV-2, LIV-7, LIV-12 | CT-2 fault matrix |
 | Publisher | INV-1, INV-2, INV-31, LIV-6, REQ-26 | CT-2 |

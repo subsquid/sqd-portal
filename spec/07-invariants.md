@@ -251,6 +251,29 @@ keeps the failure attributable to the thing that failed.
 *Why:* orchestrators route by this; a lying probe turns deploys into outages.
 *Check:* CT-2 — drive each conjunct false via stubs; probe.
 
+**INV-32 — Measurement non-interference.** [response]
+On a Portal measuring usage (REQ-60), every response is **semantically equal** to the
+response the same request receives with measurement absent: same status, same headers,
+same body bytes, same ending, whatever the state of the sink. Measurement **never
+blocks**: no request-path step waits on the sink, on its queue, or on a delivery, and
+handing a record over cannot fail — a queue with no room drops the record, never the
+response, and never the request. Measurement failures are **contained**: no reporting
+error reaches request handling, response generation, or process lifecycle, and any
+shutdown flush is bounded and runs outside the serving path. A record is a statement
+about a response, never an input to one.
+*Why:* a measurement path that can refuse, stall, or truncate is enforcement with the
+switch off — the exact thing this capability was scoped to not be, and the failure would
+land on paying traffic at the moment the sink is least healthy. The conjuncts are
+separated because they fail separately: a wrapper that blocks is slow, a wrapper that can
+error is a truncation, and a wrapper that changes framing is a client-visible change no
+one asked for. Non-interference is not a claim of zero cost: counting adds per-frame work,
+which is a budget to measure and state (PF band, CT-6), not a property to assert.
+*Check:* CT-11 — drive gated requests with the sink healthy, refusing every delivery, and
+absent; compare status, headers and encoded body bytes across all three. Queue saturation
+is checked at the hand-off rather than black-box: fill the bound and assert every response
+is still served whole with each dropped record counted (OB-14). A swarm large enough to
+saturate the queue end to end is not in CT-11 and belongs with CT-3.
+
 ## Isolation (35–39)
 
 **INV-35 — Request isolation.** [response]

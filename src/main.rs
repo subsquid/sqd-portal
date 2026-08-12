@@ -210,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
     let task_manager = Arc::new(TaskManager::new(network_client.clone(), &config));
 
     let cancellation_token = CancellationToken::new();
-    let auth_gate = match (&auth, auth_keypair) {
+    let authorization = match (&auth, auth_keypair) {
         (Some(auth), Some(keypair)) => Some(sqd_portal::auth::build(
             auth,
             keypair,
@@ -219,6 +219,9 @@ async fn main() -> anyhow::Result<()> {
         // No block, or shadow mode without a key — which admits either way.
         _ => None,
     };
+    let auth_gate = authorization
+        .as_ref()
+        .map(|authorization| authorization.gate.clone());
     let shutting_down = Arc::new(AtomicBool::new(false));
     let sigterm = {
         use anyhow::Context;
@@ -255,6 +258,15 @@ async fn main() -> anyhow::Result<()> {
         network_client.run(cancellation_token),
     )?;
     server_res?;
+
+    // This, and nothing before it, stops the reporter: the drain's own token
+    // fires up to a whole drain before serving ends, and the records cut while
+    // streams are being closed are the ones worth keeping. Bounded by the
+    // reporter's own budget — what does not go out here is dropped and counted,
+    // like every other record the sink could not take.
+    if let Some(authorization) = authorization {
+        authorization.finish().await;
+    }
 
     Ok(())
 }

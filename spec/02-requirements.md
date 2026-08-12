@@ -2,8 +2,8 @@
 
 Bands: 1–9 core data delivery · 10–16 discovery & metadata · 20–29 robustness &
 overload · 30–34 operability · 40–44 network integration · 50–56 authorization
-control. Gaps in numbering are reserved; additions never renumber. Acceptance status lives in
-[13-conformance.md](13-conformance.md), not here.
+control · 60–61 commercial usage measurement. Gaps in numbering are reserved; additions
+never renumber. Acceptance status lives in [13-conformance.md](13-conformance.md), not here.
 
 ## Core data delivery (1–9)
 
@@ -530,6 +530,74 @@ have intended is the open portal. Which mode is in effect is stated once at star
 credential and no control-plane call is ever made; an empty `auth:` block fails
 startup naming the field it lacks; startup output states whether authorization is on and,
 if so, in which enforcement mode.
+
+## Commercial usage measurement (60–61)
+
+This band is conditional twice over: on a Portal configured for authorization (REQ-56),
+and then on usage measurement being configured under it. Configured for neither, or for
+authorization alone, every requirement here is vacuous — nothing is measured, nothing is
+reported, and the sink is a dependency the Portal never opens (DC-9).
+
+**Two sinks, one contract.** The Portal has reported usage since REQ-44: query logs to the
+network's accounting, best-effort, bounded by P-LOGS-QUEUE, dropped rather than delayed
+(DC-6, HZ-7). This band adds a *second* stream to a *different* destination — per-response
+byte records, attributed to a credential, to the commercial control plane (DC-9), bounded
+by P-USAGE-QUEUE (HZ-14). The two coexist and share nothing: separate queues, separate
+parameters, separate destinations. One is network accounting owed to the protocol, the
+other is commercial measurement owed to a customer, and a shared queue would make either
+one's outage the other's. What they do share is the part that matters — best-effort,
+bounded, drops-not-delays — and neither may ever delay or fail data serving.
+
+**Measurement is not metering.** Nothing in this band decides whether a request is served,
+how fast, or how much of it. A path that could refuse or stall is enforcement with the
+switch off; this is the switch, and there is nothing behind it (NG2, REQ-61).
+
+**REQ-60 — Commercial usage measurement.** [MAY]
+Where configured, the Portal records what each authorized request was served, attributed
+to the credential that caused it, and reports it to the control plane. A record carries the
+key id, the organization the grant named where it named one, the dataset and route, the
+content encoding, the encoded response-body bytes counted at egress, the window they were
+served in, and how that window ended. Records are **deltas**, never running totals: a
+response still open after P-USAGE-INTERIM is recorded then, and once more when it ends —
+including when it ends because the client went away — so the sum of a group's records is
+that group's total with nothing counted twice. Attribution comes from the grant the
+admission already resolved; recording a claim is not acting on it, so no claim recorded
+here may influence any authorization decision. Reporting is best-effort: records are held
+in a bounded queue, delivered in batches of at most P-USAGE-BATCH-MAX no less often than
+P-USAGE-FLUSH, retried within P-USAGE-MAX-RETRY-AGE, and otherwise dropped and counted
+(DC-9, OB-14). Measurement is independent of the enforcement mode, so it runs during a
+`log_only` cutover (REQ-55). A request served without a credential is not measured: there
+is no one to attribute it to.
+Interim records are cut **on a data boundary**, not on a clock: a response that has gone
+quiet reports what it has already served only when it next serves something, or when it
+ends. A stream idle for hours therefore holds counted-but-unreported bytes for that whole
+time. The alternative — a timer per open response — buys freshness for idle streams at the
+price of a per-response timer on every measured response, on a service whose steady state
+is tens of thousands of them, and was rejected for that; nothing is lost by the delay, only
+delayed, and the bound is the interval between a response's own frames.
+*Acceptance:* against a usage-sink stub, a gated request produces one record naming the
+key id, the organization, the canonical dataset, the route label and the encoding, whose
+byte count is the encoded body the client received; a response outliving P-USAGE-INTERIM
+produces more than one record, all but the last marked as continuing, whose counts sum to
+exactly that response's encoded bytes; several requests reach the sink in fewer deliveries
+than there were records; a request that presented no credential produces none; and a
+Portal with no usage configuration makes no call to the sink at all and leaves every
+OB-14 signal at zero.
+*Trace:* ADR-016.
+
+**REQ-61 — Measurement never interferes.** [MUST]
+Response semantics are identical whether the usage sink is healthy, degraded, or absent:
+same status, same headers, same body bytes, same ending. No request-path step waits on
+the sink — handing a record over neither blocks nor fails, a full queue drops the record
+rather than the response, and no reporting failure propagates into request handling or
+process lifecycle. Shutdown flushing is bounded and runs after the serving path has
+stopped. The cost that is *not* zero is stated rather than denied: counting adds per-frame
+work to every measured response, which is a budget to measure, not a claim to make (INV-32).
+*Acceptance:* with the sink refusing every delivery, a gated request's status, headers and
+decoded body are identical to the same request with the sink healthy, and its stream still
+completes; with the queue saturated, responses are served in full and the drops are
+counted (OB-14); no test observes a response outcome that differs by the sink's state.
+*Trace:* ADR-016.
 
 ## Explicitly unspecified
 
