@@ -229,6 +229,14 @@ where
                 if let Some(data) = frame.data_ref() {
                     this.meter.observed(data.remaining());
                 }
+                // A fixed-length body is never polled to `None`: hyper reads
+                // `is_end_stream` after the final frame and stops, so waiting
+                // for EOF would hand every Content-Length response — error
+                // envelopes included — to `Drop`, which cannot tell delivery
+                // from a hang-up and would label it disconnected.
+                if this.inner.is_end_stream() {
+                    this.meter.finish(Status::Completed);
+                }
             }
             // The body failed mid-flight. The response is already committed, so
             // this is a truncation (INV-25) — the bytes that did go out still
@@ -320,6 +328,29 @@ mod tests {
 
     fn total(events: &[UsageEvent]) -> u64 {
         events.iter().map(|event| event.wire_bytes).sum()
+    }
+
+    /// hyper never polls a fixed-length body to `None`: it reads
+    /// `is_end_stream` after the final frame and stops. Caught live — a fully
+    /// delivered 400 envelope recorded as `disconnected` — because every prior
+    /// test polled to EOF by hand, which only chunked bodies experience.
+    #[tokio::test]
+    async fn a_fixed_length_body_completes_when_hyper_stops_at_end_stream() {
+        let (response, mut events) = measured(Body::from("0123456789"), None, INTERIM);
+        let mut body = response.into_body();
+
+        let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("one frame")
+            .expect("no error");
+        assert_eq!(frame.data_ref().expect("data").remaining(), 10);
+        assert!(body.is_end_stream(), "the premise: hyper would stop here");
+        drop(body);
+
+        let events = drain(&mut events);
+        assert_eq!(events.len(), 1, "one terminal record, not one per path");
+        assert_eq!(events[0].status, Status::Completed);
+        assert_eq!(events[0].wire_bytes, 10);
     }
 
     #[tokio::test]
