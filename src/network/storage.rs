@@ -131,20 +131,13 @@ impl StorageClient {
     async fn update_assignment(&self) -> anyhow::Result<()> {
         tracing::debug!("Checking for new assignment");
         let network_state = self.fetch_network_state().await?;
-        let Some(selected) = select_assignment(&network_state, self.assignment_source) else {
-            // Never falls back to the other source: that would make a portal pinned to one format
-            // silently serve the other, defeating both the kill switch and the canary.
-            metrics::MISSING_ASSIGNMENT_SOURCE.inc();
-            return Err(anyhow!(
-                "network state publishes no {} assignment",
-                self.assignment_source
-            ));
-        };
+        // Never falls back to the other source: that would make a portal pinned to one format
+        // silently serve the other, defeating both the kill switch and the canary.
+        let (selected, assignment_url) = usable_assignment(&network_state, self.assignment_source)
+            .inspect_err(|_| {
+                metrics::MISSING_ASSIGNMENT_SOURCE.inc();
+            })?;
         let assignment_id = selected.id.clone();
-        let assignment_url = selected
-            .fb_url_v1
-            .clone()
-            .ok_or(anyhow!("Missing assignment URL"))?;
         let effective_from = selected.effective_from;
         let latest = self.latest_assignment_id.read().clone();
         if latest.as_deref() == Some(assignment_id.as_str()) {
@@ -507,6 +500,27 @@ fn accumulate_range(
     }
 }
 
+/// The descriptor `source` names together with its download url, or why it yielded nothing this
+/// poll.
+///
+/// A descriptor that is absent and one that carries no `fb_url_v1` are the same event to an
+/// operator — the configured source is unusable — so they share a counter at the call site while
+/// keeping messages that say which it was. The second shape is not hypothetical: `fb_url_v1` has
+/// no `skip_serializing_if`, so a publisher serializing a descriptor that still only has the
+/// deprecated urls writes it out as an explicit null.
+fn usable_assignment(
+    network_state: &sqd_assignments::NetworkState,
+    source: AssignmentSource,
+) -> anyhow::Result<(&NetworkAssignment, String)> {
+    let selected = select_assignment(network_state, source)
+        .ok_or_else(|| anyhow!("network state publishes no {source} assignment"))?;
+    let url = selected
+        .fb_url_v1
+        .clone()
+        .ok_or_else(|| anyhow!("the {source} assignment carries no fb_url_v1"))?;
+    Ok((selected, url))
+}
+
 /// The artifact descriptor `source` names, or `None` when the publisher hasn't included it.
 ///
 /// Every field of the network state is optional, because the migration walks it through three
@@ -570,6 +584,46 @@ mod tests {
 
         assert!(select_assignment(&legacy_only, AssignmentSource::Portal).is_none());
         assert!(select_assignment(&portal_only, AssignmentSource::Legacy).is_none());
+    }
+
+    #[allow(deprecated)]
+    fn assignment_without_url(id: &str) -> NetworkAssignment {
+        NetworkAssignment {
+            url: None,
+            fb_url: None,
+            fb_url_v1: None,
+            id: id.to_string(),
+            effective_from: 123,
+        }
+    }
+
+    #[test]
+    fn a_usable_source_yields_its_download_url() {
+        let state = network_state(true, false);
+
+        let (selected, url) = usable_assignment(&state, AssignmentSource::Legacy).unwrap();
+
+        assert_eq!(selected.id, "legacy");
+        assert_eq!(url, "https://example.test/legacy.fb.gz");
+    }
+
+    #[test]
+    fn a_source_carrying_no_v1_url_is_unusable() {
+        // Published but unfetchable is the same event as not published at all, and must reach
+        // the same counter -- an alert cannot tell the two apart and should not have to.
+        let mut state = network_state(true, true);
+        state.portal_assignment = Some(assignment_without_url("portal"));
+
+        assert!(usable_assignment(&state, AssignmentSource::Portal).is_err());
+        // ...and one source's defect says nothing about the other.
+        assert!(usable_assignment(&state, AssignmentSource::Legacy).is_ok());
+    }
+
+    #[test]
+    fn an_absent_source_is_unusable() {
+        let state = network_state(true, false);
+
+        assert!(usable_assignment(&state, AssignmentSource::Portal).is_err());
     }
 
     #[test]
