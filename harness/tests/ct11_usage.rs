@@ -138,7 +138,11 @@ fn statuses(events: &[Value]) -> Vec<String> {
 /// Waits for the reporter's own cadence rather than guessing at it: the flush
 /// interval bounds publication, so a test that asserts before it would be
 /// asserting on the clock.
-async fn wait_for_events(fx: &Fixture, key_id: &str, at_least: usize) -> anyhow::Result<Vec<Value>> {
+async fn wait_for_events(
+    fx: &Fixture,
+    key_id: &str,
+    at_least: usize,
+) -> anyhow::Result<Vec<Value>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let events = fx.cp().usage_events_for(key_id);
@@ -173,8 +177,7 @@ async fn ct11_usage_measurement() -> anyhow::Result<()> {
 
 async fn measuring(fx: &mut Fixture) -> anyhow::Result<()> {
     fx.wait_ready(Duration::from_secs(60)).await?;
-    fx.cp()
-        .default_answer(Answer::grant_owned_by(ORGANIZATION));
+    fx.cp().default_answer(Answer::grant_owned_by(ORGANIZATION));
 
     // ---- 1. Attributed, and carrying what the ingest cannot infer ----------
     let served = stream_as(fx, "toy", "finalized-stream", "attributed", "ct11-attr").await?;

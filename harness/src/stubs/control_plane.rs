@@ -72,7 +72,9 @@ pub enum Answer {
         expires_in: u64,
     },
     /// An unrestricted grant that also names the key's owner.
-    GrantOwned { organization: String },
+    GrantOwned {
+        organization: String,
+    },
     Deny(String),
     Status(u16),
     Raw(Value),
