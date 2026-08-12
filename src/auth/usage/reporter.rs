@@ -39,10 +39,17 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const JITTER: f64 = 0.25;
 
-/// How long the final flush may run. Shutdown is not the time to wait out an
-/// outage: what does not go out in this window is dropped and counted, which is
-/// the same trade the queue makes every other second of the process's life.
+/// How long the final flush may run — the *whole* of it, including a post that
+/// was already on the wire when the stop arrived. Shutdown is not the time to
+/// wait out an outage: what does not go out in this window is dropped and
+/// counted, which is the same trade the queue makes every other second of the
+/// process's life.
 const FINALIZE_BUDGET: Duration = Duration::from_secs(5);
+
+/// How much of `batch_max` is allocated before a single record has arrived. The
+/// batch still grows to whatever the knob allows; this only stops a large
+/// `batch_max_events` from costing a reporter that never fills one.
+const EAGER_BATCH_CAPACITY: usize = 1024;
 
 pub(super) struct Reporter {
     http: reqwest::Client,
@@ -97,16 +104,26 @@ impl Reporter {
     }
 
     /// Fills a batch until it is full or the flush interval elapses, delivers
-    /// it, and repeats. Cancellation ends the loop through the bounded final
-    /// flush rather than by dropping what is in hand.
-    pub(super) async fn run(self, mut events: mpsc::Receiver<Queued>, cancel: CancellationToken) {
-        let mut batch: Vec<Queued> = Vec::with_capacity(self.batch_max);
+    /// it, and repeats. The stop ends the loop through the bounded final flush
+    /// rather than by dropping what is in hand.
+    ///
+    /// `stop` is the reporter's own signal, fired by [`super::Reporting::finish`]
+    /// and by nothing else — deliberately *not* the process's cancellation
+    /// token. That token fires when the HTTP drain begins, up to the drain's
+    /// whole length before serving actually stops, so a reporter listening to it
+    /// would finalize while responses were still ending: every terminal record
+    /// cut during the drain — which is most of them, a drain being exactly where
+    /// long streams end — would arrive at a queue nobody was reading. `finish()`
+    /// runs after the drain returns (ADR-005's second phase), which is the first
+    /// moment there is nothing left to measure.
+    pub(super) async fn run(self, mut events: mpsc::Receiver<Queued>, stop: CancellationToken) {
+        let mut batch: Vec<Queued> = Vec::with_capacity(self.batch_max.min(EAGER_BATCH_CAPACITY));
         loop {
             let deadline = Instant::now() + self.flush_interval;
             loop {
                 tokio::select! {
                     biased;
-                    () = cancel.cancelled() => {
+                    () = stop.cancelled() => {
                         self.finalize(&mut events, &mut batch).await;
                         return;
                     }
@@ -131,17 +148,20 @@ impl Reporter {
             // must not pay for a gauge (OB-14).
             self.signals.queue_depth.set(events.len() as i64);
             if !batch.is_empty() {
-                self.deliver(&mut batch, &cancel).await;
+                // A stop during this returns with the batch still in hand; the
+                // loop above takes its biased stop branch on the next turn and
+                // finalizes it.
+                self.deliver(&mut batch, &stop).await;
             }
         }
     }
 
     /// Delivers one batch, retrying transient failures until they succeed, the
-    /// events age out, or the process is asked to stop. The age bound is what
+    /// events age out, or the reporter is asked to stop. The age bound is what
     /// keeps a dead sink from turning into an unbounded retry loop — and it is
     /// checked before every attempt, so a batch that spent its life in backoff
     /// dies there rather than on the next one.
-    async fn deliver(&self, batch: &mut Vec<Queued>, cancel: &CancellationToken) {
+    async fn deliver(&self, batch: &mut Vec<Queued>, stop: &CancellationToken) {
         let mut backoff = INITIAL_BACKOFF;
         loop {
             self.expire(batch);
@@ -149,7 +169,18 @@ impl Reporter {
                 return;
             }
             let started = Instant::now();
-            match self.post(batch).await {
+            // Raced, not merely awaited. A post to a sink that accepts the
+            // connection and then says nothing holds a whole DELIVERY_TIMEOUT,
+            // and FINALIZE_BUDGET is the budget for the *whole* stop — not for
+            // whatever is left after the request already in flight gives up.
+            // The batch is untouched by the race, so nothing is lost by losing
+            // it: the caller finalizes what is still in hand.
+            let posted = tokio::select! {
+                biased;
+                () = stop.cancelled() => return,
+                posted = self.post(batch) => posted,
+            };
+            match posted {
                 Ok(()) => {
                     self.signals.delivered.inc_by(batch.len() as u64);
                     self.signals
@@ -181,7 +212,7 @@ impl Reporter {
                         "usage batch delivery failed; retrying"
                     );
                     tokio::select! {
-                        () = cancel.cancelled() => return,
+                        () = stop.cancelled() => return,
                         () = tokio::time::sleep(spread(backoff)) => {}
                     }
                     backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -194,6 +225,11 @@ impl Reporter {
     /// listener has stopped taking new work. A response still draining past this
     /// loses its residual record — loss is acceptable and counted (D5).
     async fn finalize(&self, events: &mut mpsc::Receiver<Queued>, batch: &mut Vec<Queued>) {
+        // Closed first, so what is left is a fixed set this can account for in
+        // full rather than a moving one. A response still draining finds the
+        // sink shut from here on and is counted at the hand-off instead.
+        events.close();
+
         let flush = async {
             loop {
                 while batch.len() < self.batch_max {
@@ -204,7 +240,7 @@ impl Reporter {
                 }
                 self.expire(batch);
                 if batch.is_empty() {
-                    return;
+                    return None;
                 }
                 // One attempt each: a shutdown that waits out a retry schedule
                 // is a shutdown that misses its deadline.
@@ -213,26 +249,66 @@ impl Reporter {
                         self.signals.delivered.inc_by(batch.len() as u64);
                         batch.clear();
                     }
-                    Err(why) => {
-                        self.signals
-                            .dropped_by(UsageDrop::Rejected, batch.len() as u64);
-                        tracing::warn!(
-                            events = batch.len(),
-                            reason = %why,
-                            "final usage flush failed; dropping what was queued"
-                        );
-                        batch.clear();
-                        return;
-                    }
+                    Err(why) => return Some(why),
                 }
             }
         };
-        if tokio::time::timeout(FINALIZE_BUDGET, flush).await.is_err() {
-            self.signals
-                .dropped_by(UsageDrop::Expired, batch.len() as u64);
+        let refused = match tokio::time::timeout(FINALIZE_BUDGET, flush).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::warn!(
+                    budget = ?FINALIZE_BUDGET,
+                    "final usage flush did not finish within its budget"
+                );
+                None
+            }
+        };
+        self.abandon(events, batch, refused);
+    }
+
+    /// Everything the final flush did not place, counted before it goes. Every
+    /// exit from [`Self::finalize`] lands here — a refusal, a transport failure,
+    /// the budget running out — and each takes both the batch still in hand and
+    /// whatever the closed queue still holds, which nothing after this will ever
+    /// read. DC-9's bargain is that what does not go out is dropped *and*
+    /// counted; a remnant nobody counted would make the loss largest exactly
+    /// where it is least visible.
+    ///
+    /// The reason is the cause rather than a default. A batch the control plane
+    /// refused on its content is `rejected` and reads as a contract break;
+    /// everything else — a transport failure, the budget, the stop arriving
+    /// mid-post — is `stopped` and reads as shutdown loss. The two page
+    /// different people, which is the whole point of OB-14's reason axis.
+    /// Records still in the queue were never offered to the sink at all, so they
+    /// are `stopped` whatever became of the batch.
+    fn abandon(
+        &self,
+        events: &mut mpsc::Receiver<Queued>,
+        batch: &mut Vec<Queued>,
+        refused: Option<Delivery>,
+    ) {
+        let in_hand = batch.len() as u64;
+        batch.clear();
+        let mut unread = 0u64;
+        while events.try_recv().is_ok() {
+            unread += 1;
+        }
+        if in_hand > 0 {
+            let reason = match &refused {
+                Some(Delivery::Rejected(_)) => UsageDrop::Rejected,
+                _ => UsageDrop::Stopped,
+            };
+            self.signals.dropped_by(reason, in_hand);
+        }
+        if unread > 0 {
+            self.signals.dropped_by(UsageDrop::Stopped, unread);
+        }
+        if in_hand + unread > 0 {
             tracing::warn!(
-                budget = ?FINALIZE_BUDGET,
-                "final usage flush did not finish within its budget"
+                undelivered = in_hand,
+                abandoned = unread,
+                reason = refused.map(|why| why.to_string()).unwrap_or_default(),
+                "final usage flush left records behind; dropping and counting them"
             );
         }
     }
@@ -285,9 +361,17 @@ impl Reporter {
         // A validation refusal is about the batch and will be about it forever;
         // everything else — including the ones that look permanent, like a 401
         // during a key rotation — is worth another attempt inside the age bound.
+        //
+        // 413 belongs with them: it is an ingress size cap answering this
+        // batch's size, so the next attempt is the same batch against the same
+        // cap. Retried, it never lands and head-of-line-blocks every record
+        // behind it until the whole queue ages out — a size limit turned into a
+        // total outage.
         if matches!(
             status,
-            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            reqwest::StatusCode::BAD_REQUEST
+                | reqwest::StatusCode::PAYLOAD_TOO_LARGE
+                | reqwest::StatusCode::UNPROCESSABLE_ENTITY
         ) {
             return Err(Delivery::Rejected(format!("control plane says {status}")));
         }
@@ -436,6 +520,30 @@ mod tests {
         }
     }
 
+    /// The worse outage: the connection is accepted and the answer never comes,
+    /// so a post sits there until its own deadline rather than failing at once.
+    async fn stalling_sink() -> ResolvedAuth {
+        let app = Router::new().route(
+            "/authority/v1/auth/usage",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                StatusCode::ACCEPTED
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        ResolvedAuth {
+            control_plane_url: format!("http://{addr}/authority").parse().unwrap(),
+            portal_id: "portal-premium-eu".to_string(),
+            key: None,
+            enforcement: Enforcement::Enforce,
+            limits: crate::auth::config::Limits::default(),
+            usage: Some(UsageConfig::default()),
+        }
+    }
+
     fn event(id: &str) -> UsageEvent {
         UsageEvent {
             event_id: id.to_owned(),
@@ -494,14 +602,14 @@ mod tests {
             ..UsageConfig::default()
         };
         let (tx, rx) = mpsc::channel(16);
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn(reporter(&config, usage).run(rx, cancel.clone()));
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(reporter(&config, usage).run(rx, stop.clone()));
 
         for id in ["a", "b", "c", "d"] {
             tx.send(queued(id)).await.unwrap();
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
-        cancel.cancel();
+        stop.cancel();
         task.await.unwrap();
 
         assert_eq!(sink.ids().len(), 4, "{:?}", sink.ids());
@@ -536,10 +644,12 @@ mod tests {
 
     /// A batch the control plane refuses on its content will be refused
     /// identically forever, and retrying it spends the whole queue's budget on
-    /// events that can never land.
+    /// events that can never land. 413 is in the set because an ingress size cap
+    /// is a refusal about this batch's size: retried, it head-of-line-blocks
+    /// every record behind it until the queue ages out.
     #[tokio::test]
     async fn a_batch_refused_on_its_content_is_dropped_rather_than_retried() {
-        for status in [400, 422] {
+        for status in [400, 413, 422] {
             let (sink, config) = Sink::spawn(vec![status]).await;
             let reporter = reporter(&config, UsageConfig::default());
             let mut batch = vec![queued("malformed")];
@@ -588,7 +698,7 @@ mod tests {
 
     /// Shutdown takes one pass at what is queued and then gets out of the way.
     #[tokio::test]
-    async fn cancellation_flushes_what_is_queued_and_returns() {
+    async fn stopping_flushes_what_is_queued_and_returns() {
         let (sink, config) = Sink::spawn(Vec::new()).await;
         let usage = UsageConfig {
             // Long enough that nothing is delivered by the interval: the flush
@@ -597,13 +707,13 @@ mod tests {
             ..UsageConfig::default()
         };
         let (tx, rx) = mpsc::channel(16);
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn(reporter(&config, usage).run(rx, cancel.clone()));
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(reporter(&config, usage).run(rx, stop.clone()));
         tx.send(queued("last-words")).await.unwrap();
-        // Let the loop take it off the channel before the token fires.
+        // Let the loop take it off the channel before the stop fires.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        cancel.cancel();
+        stop.cancel();
         tokio::time::timeout(FINALIZE_BUDGET * 2, task)
             .await
             .expect("the reporter must stop inside its own budget")
@@ -618,16 +728,113 @@ mod tests {
     async fn a_dead_sink_does_not_hold_up_shutdown() {
         let config = dead_sink();
         let (tx, rx) = mpsc::channel(16);
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn(reporter(&config, UsageConfig::default()).run(rx, cancel.clone()));
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(reporter(&config, UsageConfig::default()).run(rx, stop.clone()));
         tx.send(queued("into-the-void")).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        cancel.cancel();
+        stop.cancel();
         tokio::time::timeout(FINALIZE_BUDGET * 2, task)
             .await
             .expect("shutdown must not wait on a sink that is not answering")
             .expect("the reporter task must not panic");
+    }
+
+    /// FINALIZE_BUDGET is the budget for the *whole* stop, not for whatever is
+    /// left after a request already on the wire has run out its own deadline. A
+    /// sink that accepts the connection and then says nothing is the case that
+    /// tells the two apart: unraced, the stop costs DELIVERY_TIMEOUT before the
+    /// finalize budget even starts, overshooting the advertised bound.
+    #[tokio::test]
+    async fn a_stalled_post_is_raced_by_the_stop_rather_than_waited_out() {
+        let config = stalling_sink().await;
+        let usage = UsageConfig {
+            flush_interval_ms: 10,
+            ..UsageConfig::default()
+        };
+        let (tx, rx) = mpsc::channel(16);
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(reporter(&config, usage).run(rx, stop.clone()));
+        tx.send(queued("in-flight")).await.unwrap();
+        // Long enough that the post is on the wire, waiting for an answer that
+        // is not coming.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let stopping = Instant::now();
+        stop.cancel();
+        tokio::time::timeout(DELIVERY_TIMEOUT + FINALIZE_BUDGET, task)
+            .await
+            .expect("the stop must not wait out the per-attempt delivery timeout")
+            .expect("the reporter task must not panic");
+
+        assert!(
+            stopping.elapsed() < DELIVERY_TIMEOUT,
+            "stopping took {:?}, which is the in-flight post's own deadline rather \
+             than the finalize budget",
+            stopping.elapsed(),
+        );
+    }
+
+    /// DC-9's bargain, on the one path where it used to be broken: what does not
+    /// go out is dropped *and counted*. A finalize that abandoned the queue
+    /// would hide the loss exactly where it is largest — everything still in
+    /// flight when the process stops.
+    #[tokio::test]
+    async fn what_the_final_flush_cannot_place_is_counted_rather_than_abandoned() {
+        let config = dead_sink();
+        let usage = UsageConfig {
+            // One per batch, so the remnants stay in the queue rather than being
+            // swept into the batch the failing post holds.
+            batch_max_events: 1,
+            ..UsageConfig::default()
+        };
+        let signals = UsageSignals::bind();
+        let reporter = reporter_with(&config, usage, signals.clone());
+        let (tx, mut events) = mpsc::channel(16);
+        for id in ["queued-1", "queued-2"] {
+            tx.send(queued(id)).await.unwrap();
+        }
+        let mut batch = vec![queued("in-hand")];
+        // The families are process-global, so only a lower bound is assertable —
+        // but three is more than every other test in this file can contribute.
+        let stopped = signals.drops(UsageDrop::Stopped);
+
+        reporter.finalize(&mut events, &mut batch).await;
+
+        assert!(batch.is_empty(), "nothing is held past the finalize");
+        assert!(
+            events.try_recv().is_err(),
+            "the queue was drained, not left holding records nobody will read"
+        );
+        assert!(
+            signals.drops(UsageDrop::Stopped) >= stopped + 3,
+            "the batch in hand and both queue remnants must each be counted"
+        );
+        assert!(
+            tx.send(queued("too-late")).await.is_err(),
+            "the queue is closed to new records once the finalize has run"
+        );
+    }
+
+    /// The reason axis earns its keep only if it separates a contract break from
+    /// shutdown loss: a final batch the control plane refused on its content is
+    /// `rejected`, and everything the dead-sink case above loses is `stopped`.
+    #[tokio::test]
+    async fn a_final_batch_refused_on_its_content_is_counted_as_rejected() {
+        let (_sink, config) = Sink::spawn(vec![422]).await;
+        let signals = UsageSignals::bind();
+        let reporter = reporter_with(&config, UsageConfig::default(), signals.clone());
+        let (_tx, mut events) = mpsc::channel(16);
+        let mut batch = vec![queued("malformed")];
+        let rejected = signals.drops(UsageDrop::Rejected);
+
+        reporter.finalize(&mut events, &mut batch).await;
+
+        assert!(batch.is_empty());
+        assert!(
+            signals.drops(UsageDrop::Rejected) > rejected,
+            "a content refusal at shutdown is still a content refusal"
+        );
     }
 
     #[test]

@@ -568,6 +568,13 @@ P-USAGE-FLUSH, retried within P-USAGE-MAX-RETRY-AGE, and otherwise dropped and c
 (DC-9, OB-14). Measurement is independent of the enforcement mode, so it runs during a
 `log_only` cutover (REQ-55). A request served without a credential is not measured: there
 is no one to attribute it to.
+Interim records are cut **on a data boundary**, not on a clock: a response that has gone
+quiet reports what it has already served only when it next serves something, or when it
+ends. A stream idle for hours therefore holds counted-but-unreported bytes for that whole
+time. The alternative — a timer per open response — buys freshness for idle streams at the
+price of a per-response timer on every measured response, on a service whose steady state
+is tens of thousands of them, and was rejected for that; nothing is lost by the delay, only
+delayed, and the bound is the interval between a response's own frames.
 *Acceptance:* against a usage-sink stub, a gated request produces one record naming the
 key id, the organization, the canonical dataset, the route label and the encoding, whose
 byte count is the encoded body the client received; a response outliving P-USAGE-INTERIM

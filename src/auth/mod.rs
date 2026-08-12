@@ -17,7 +17,6 @@ use std::{
 
 use libp2p_identity::ed25519;
 use sqd_network_transport::Keypair;
-use tokio_util::sync::CancellationToken;
 
 mod cache;
 mod client;
@@ -104,21 +103,25 @@ async fn read_keypair(path: &Path, knob: &str) -> anyhow::Result<Keypair> {
 
 /// The gate, and the usage reporter behind it where one was configured.
 ///
-/// The reporter is handed back rather than detached so shutdown can wait for
-/// its bounded final flush — briefly, and only after the listener has stopped
-/// (ADR-005's second phase). Nothing on a request path ever holds this.
+/// The reporter is handed back rather than detached because *this* is what
+/// stops it: it deliberately does not listen to the process's cancellation
+/// token, which fires when the drain begins rather than when serving ends, so
+/// the only thing that ends its run loop is [`Started::finish`] — called after
+/// the listener has stopped (ADR-005's second phase). Nothing on a request path
+/// ever holds this.
 pub struct Started {
     pub gate: Arc<Gate>,
-    reporter: Option<tokio::task::JoinHandle<()>>,
+    reporter: Option<usage::Reporting>,
 }
 
 impl Started {
-    /// Awaits the reporter's own bounded finalize. Its budget is internal, so
-    /// this cannot outlast it however unreachable the sink is; a reporter that
-    /// panicked is likewise nothing to fail shutdown over.
+    /// Stops the reporter and awaits its bounded finalize. That budget is
+    /// internal and covers the whole post-stop path, so this cannot outlast it
+    /// however unreachable the sink is; a reporter that panicked is likewise
+    /// nothing to fail shutdown over.
     pub async fn finish(self) {
         if let Some(reporter) = self.reporter {
-            let _ = reporter.await;
+            reporter.finish().await;
         }
     }
 }
@@ -131,7 +134,6 @@ pub fn build(
     config: &ResolvedAuth,
     keypair: Keypair,
     catalog: Arc<dyn DatasetCatalog>,
-    cancel: CancellationToken,
 ) -> anyhow::Result<Started> {
     let signer = config.signer(keypair.clone())?;
     // The public key, not the peer id: that is what the registration carries,
@@ -153,7 +155,7 @@ pub fn build(
     let usage = config
         .usage
         .as_ref()
-        .map(|settings| usage::start(config, settings, config.signer(keypair)?, cancel))
+        .map(|settings| usage::start(config, settings, config.signer(keypair)?))
         .transpose()?;
     let (sink, reporter) = match usage {
         Some((sink, reporter)) => (Some(sink), Some(reporter)),

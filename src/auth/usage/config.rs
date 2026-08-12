@@ -49,6 +49,23 @@ pub struct UsageConfig {
     pub interim_interval_secs: u64,
 }
 
+/// Past this tokio's channel panics inside its own constructor, so a capacity
+/// meant as "unbounded" would take the process down at startup with a message
+/// about a semaphore rather than about a knob.
+const MAX_QUEUE_CAPACITY: usize = 1_048_576;
+
+/// The ingest contract's batch cap (DC-9). A batch above it is refused on its
+/// content, forever and identically, which turns every record behind it into a
+/// counted drop.
+const MAX_BATCH_MAX_EVENTS: usize = 1_000;
+
+/// An hour, a day, a week. None of the three is a working value; they are the
+/// distance a misplaced unit travels — seconds typed as milliseconds, days as
+/// seconds — and past them the knob has stopped meaning what it says.
+const MAX_FLUSH_INTERVAL_MS: u64 = 3_600_000;
+const MAX_INTERIM_INTERVAL_SECS: u64 = 86_400;
+const MAX_RETRY_AGE_SECS: u64 = 604_800;
+
 impl UsageConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         // Zero would flush in a tight loop, turning the sink into the load.
@@ -57,8 +74,16 @@ impl UsageConfig {
             "auth.usage.flush_interval_ms must be at least 1"
         );
         anyhow::ensure!(
+            self.flush_interval_ms <= MAX_FLUSH_INTERVAL_MS,
+            "auth.usage.flush_interval_ms must be at most {MAX_FLUSH_INTERVAL_MS}"
+        );
+        anyhow::ensure!(
             self.batch_max_events >= 1,
             "auth.usage.batch_max_events must be at least 1"
+        );
+        anyhow::ensure!(
+            self.batch_max_events <= MAX_BATCH_MAX_EVENTS,
+            "auth.usage.batch_max_events must be at most {MAX_BATCH_MAX_EVENTS}"
         );
         // Zero drops every event on the floor while still paying for the
         // measurement — reporting off is spelled by removing the block.
@@ -67,13 +92,25 @@ impl UsageConfig {
             "auth.usage.queue_capacity must be at least 1"
         );
         anyhow::ensure!(
+            self.queue_capacity <= MAX_QUEUE_CAPACITY,
+            "auth.usage.queue_capacity must be at most {MAX_QUEUE_CAPACITY}"
+        );
+        anyhow::ensure!(
             self.max_retry_age_secs >= 1,
             "auth.usage.max_retry_age_secs must be at least 1"
+        );
+        anyhow::ensure!(
+            self.max_retry_age_secs <= MAX_RETRY_AGE_SECS,
+            "auth.usage.max_retry_age_secs must be at most {MAX_RETRY_AGE_SECS}"
         );
         // Zero would emit a record per polled frame.
         anyhow::ensure!(
             self.interim_interval_secs >= 1,
             "auth.usage.interim_interval_secs must be at least 1"
+        );
+        anyhow::ensure!(
+            self.interim_interval_secs <= MAX_INTERIM_INTERVAL_SECS,
+            "auth.usage.interim_interval_secs must be at most {MAX_INTERIM_INTERVAL_SECS}"
         );
         Ok(())
     }
@@ -198,6 +235,11 @@ portal_id: portal-premium-eu
         assert!(config.usage.is_some());
     }
 
+    /// Both ends of every knob. The upper bounds are not taste: `usize::MAX`
+    /// panics inside tokio's channel, a batch past the ingest's cap is refused
+    /// on its content forever, and a duration a unit slip wide has stopped
+    /// meaning what its name says — all three are startup failures rather than
+    /// something an operator discovers from a drop counter.
     #[test]
     fn validate_rejects_out_of_range_knobs() {
         let _guard = crate::auth::test_support::env_guard();
@@ -209,12 +251,36 @@ portal_id: portal-premium-eu
             |u| u.queue_capacity = 0,
             |u| u.max_retry_age_secs = 0,
             |u| u.interim_interval_secs = 0,
+            |u| u.flush_interval_ms = MAX_FLUSH_INTERVAL_MS + 1,
+            |u| u.batch_max_events = MAX_BATCH_MAX_EVENTS + 1,
+            |u| u.queue_capacity = usize::MAX,
+            |u| u.max_retry_age_secs = MAX_RETRY_AGE_SECS + 1,
+            |u| u.interim_interval_secs = MAX_INTERIM_INTERVAL_SECS + 1,
         ] {
             let mut config = parse(&format!("{MINIMAL}usage: {{}}\n"));
             mutate(config.usage.as_mut().expect("the block is present"));
             assert!(
                 config.resolve().is_err(),
                 "{:?} should not validate",
+                config.usage
+            );
+        }
+
+        // The bounds themselves are legal, or the message an operator reads is
+        // off by one from the rule it states.
+        for mutate in [
+            (|u: &mut UsageConfig| u.flush_interval_ms = MAX_FLUSH_INTERVAL_MS)
+                as fn(&mut UsageConfig),
+            |u| u.batch_max_events = MAX_BATCH_MAX_EVENTS,
+            |u| u.queue_capacity = MAX_QUEUE_CAPACITY,
+            |u| u.max_retry_age_secs = MAX_RETRY_AGE_SECS,
+            |u| u.interim_interval_secs = MAX_INTERIM_INTERVAL_SECS,
+        ] {
+            let mut config = parse(&format!("{MINIMAL}usage: {{}}\n"));
+            mutate(config.usage.as_mut().expect("the block is present"));
+            assert!(
+                config.resolve().is_ok(),
+                "{:?} should validate",
                 config.usage
             );
         }

@@ -215,7 +215,6 @@ async fn main() -> anyhow::Result<()> {
             auth,
             keypair,
             network_client.clone() as Arc<dyn sqd_portal::auth::DatasetCatalog>,
-            cancellation_token.clone(),
         )?),
         // No block, or shadow mode without a key — which admits either way.
         _ => None,
@@ -260,9 +259,11 @@ async fn main() -> anyhow::Result<()> {
     )?;
     server_res?;
 
-    // After the listener is down, so nothing being served is waiting on it, and
-    // bounded by the reporter's own budget. What does not go out here is
-    // dropped and counted, like every other record the sink could not take.
+    // This, and nothing before it, stops the reporter: the drain's own token
+    // fires up to a whole drain before serving ends, and the records cut while
+    // streams are being closed are the ones worth keeping. Bounded by the
+    // reporter's own budget — what does not go out here is dropped and counted,
+    // like every other record the sink could not take.
     if let Some(authorization) = authorization {
         authorization.finish().await;
     }

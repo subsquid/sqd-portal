@@ -164,8 +164,13 @@ records do, and they go to the control plane over an authenticated channel; the 
 keyless (IB-9), and a per-customer series there would publish the customer list to anyone
 who can reach `/metrics` — as well as growing without bound at the client's choosing
 (HZ-15, INV-39's argument applied to measurement). Like every other family these are
-registered for the process, so on a Portal that measures nothing they exist and sit at
-zero.
+registered for the process **unconditionally**, so on a Portal that measures nothing they
+exist and read zero rather than being absent. That is deliberate and is not a hole in
+REQ-61: non-interference is a claim about **data-surface responses** — status, headers,
+body bytes, ending — not about the `/metrics` document, whose shape must not depend on
+configuration. A family that appeared only where measurement was on would make a missing
+counter ambiguous between "not configured" and "nothing reported", which is the harder
+question to answer during an incident.
 
 ## Property → observable mapping
 

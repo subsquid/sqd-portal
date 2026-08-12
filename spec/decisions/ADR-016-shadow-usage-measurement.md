@@ -84,10 +84,31 @@ one-directional. None of this is fixable at this layer — exactness means measu
 socket, which the Portal does not own — so it is stated rather than papered over, and no
 number from this data is quoted as revenue.
 
+Interim records are cut when a response yields data, not on a clock of their own, so a
+stream that has gone quiet reports what it already served only at its next frame or at its
+end (REQ-60). Nothing is lost by that, only delayed, and the delay is bounded by the
+stream's own idle gap.
+
+One class of response is counted before it is rewritten. Errors the router raises before
+any handler runs are normalized into the published envelope by a layer that sits *outside*
+the tap: it reads the original body — only ever a short buffered one, bounded at 8 KB —
+and builds a new one. The record therefore counts the bytes the handler produced, not the
+bytes the client received. The gap is bounded by that same 8 KB, applies only to framework
+rejections, and is not worth a second tap to close; moving the tap outside the
+normalization instead would put it outside the gate, where there is no attribution to read.
+
 `/sql/query` returns a worker/chunk **plan**, not result data. Its records carry the
 `/sql/query` route label and are excluded from data-volume analysis at read time. If SQL
 data volume ever matters, that is scanned-bytes work, reopened as a stated limitation
 rather than smuggled in here.
+
+The measurement metric families (OB-14) are registered unconditionally, like every other
+family the process has, and read zero where no `usage:` block is configured. The
+non-interference guarantee is about **data-surface responses** — status, headers, body,
+ending — and not about the `/metrics` document, which gains a handful of zero-valued
+series either way. Registering them conditionally would make the scrape's shape depend on
+configuration, which is a worse property than a zero: it turns "the counter is missing"
+into an ambiguity between "not configured" and "not reported".
 
 Counting costs per-frame work on every measured response. That is a budget to measure
 (CT-6, CT-11), not a cost to claim is zero.
@@ -110,3 +131,21 @@ exactly where the money is, and gives an operator nothing about traffic in fligh
 **Durable spool for undelivered records.** Would make totals exact. Rejected: it turns
 measurement into stateful infrastructure on a service that owns no persistent state (NG5),
 to protect a number that is explicitly not a billing record in this phase.
+
+**A timer per open response, so an idle stream reports on the interval.** Would remove the
+frame-boundary caveat above. Rejected: it puts a timer on every measured response — tens of
+thousands concurrently in the steady state — to advance the reporting time of records that
+are not lost, only late. Reconsider if idle-but-open streams ever turn out to hold a
+material share of the counted bytes.
+
+**Register the usage metric families only where measurement is configured.** Would keep the
+scrape identical on a Portal that measures nothing. Rejected: it makes the scrape's shape
+configuration-dependent, so a missing counter no longer distinguishes "not configured" from
+"nothing reported", and it breaks the convention every other family in the process follows.
+A zero-valued series is the cheaper answer.
+
+**An event identifier derived from the response rather than a random one.** A hash of
+(key, window, endpoint) would be a smaller identifier and need no randomness. Rejected: it
+is the ingest's deduplication key, and any derivation collides exactly where two records
+legitimately agree on every input — two empty polls by one key in the same instant — which
+would silently discard the second. A v4 uuid cannot.

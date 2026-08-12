@@ -18,7 +18,8 @@
 //!   pays beyond the counting itself.
 //! - [`reporter`] owns everything slow — batching, signing, POSTing, retrying,
 //!   the shutdown flush — on its own task, where a failure has nowhere to
-//!   propagate to.
+//!   propagate to. It outlives the HTTP drain by design and is stopped by
+//!   [`Reporting::finish`] once serving has actually ended.
 //!
 //! Inert unless `auth.usage:` is present: with no block there is no sink, so
 //! the gate deposits no attribution and no body is ever wrapped.
@@ -159,6 +160,29 @@ impl UsageSink {
     }
 }
 
+/// The reporter's task and the one switch that stops it.
+///
+/// The switch is private on purpose. The process's cancellation token fires at
+/// the *start* of the HTTP drain, up to the drain's whole length before serving
+/// stops; a reporter stopping on it would finalize while responses were still
+/// ending, and a drain is precisely when long streams end. This one is fired by
+/// [`Reporting::finish`], which shutdown calls after the drain has returned.
+pub(super) struct Reporting {
+    stop: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl Reporting {
+    /// Stops the reporter and waits out its bounded finalize. The budget is the
+    /// reporter's own and covers the whole post-stop path, so this cannot
+    /// outlast it however unreachable the sink is; a reporter that panicked is
+    /// likewise nothing to fail shutdown over.
+    pub(super) async fn finish(self) {
+        self.stop.cancel();
+        let _ = self.task.await;
+    }
+}
+
 /// Builds the sink and starts the reporter behind it. Nothing is measured
 /// before this runs, and nothing outside `auth::build` calls it: the sink's
 /// presence *is* the switch.
@@ -166,8 +190,7 @@ pub(super) fn start(
     config: &ResolvedAuth,
     usage: &UsageConfig,
     signer: RequestSigner,
-    cancel: CancellationToken,
-) -> anyhow::Result<(Arc<UsageSink>, JoinHandle<()>)> {
+) -> anyhow::Result<(Arc<UsageSink>, Reporting)> {
     let signals = UsageSignals::bind();
     let (events, receiver) = mpsc::channel(usage.queue_capacity);
     let sink = Arc::new(UsageSink {
@@ -185,6 +208,7 @@ pub(super) fn start(
         interim_interval_secs = usage.interim_interval_secs,
         "usage measurement enabled"
     );
-    let task = tokio::spawn(reporter.run(receiver, cancel));
-    Ok((sink, task))
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(reporter.run(receiver, stop.clone()));
+    Ok((sink, Reporting { stop, task }))
 }

@@ -269,8 +269,10 @@ error is a truncation, and a wrapper that changes framing is a client-visible ch
 one asked for. Non-interference is not a claim of zero cost: counting adds per-frame work,
 which is a budget to measure and state (PF band, CT-6), not a property to assert.
 *Check:* CT-11 — drive gated requests with the sink healthy, refusing every delivery, and
-absent; compare status, headers and decoded body across all three; saturate the queue and
-assert responses are served in full with the drops counted (OB-14).
+absent; compare status, headers and encoded body bytes across all three. Queue saturation
+is checked at the hand-off rather than black-box: fill the bound and assert every response
+is still served whole with each dropped record counted (OB-14). A swarm large enough to
+saturate the queue end to end is not in CT-11 and belongs with CT-3.
 
 ## Isolation (35–39)
 

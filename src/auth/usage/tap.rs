@@ -153,8 +153,16 @@ impl Meter {
 
     /// One yielded frame. Cuts an interim record when the open window has run
     /// longer than `P-USAGE-INTERIM` — on the frame boundary, so a record is
-    /// never made while a frame is half-counted.
+    /// never made while a frame is half-counted. That boundary is also the
+    /// caveat REQ-60 states: an idle stream's counted-but-unreported bytes wait
+    /// for its next frame or its end.
     fn observed(&mut self, bytes: usize) {
+        // The terminal record is the last word on a response. Armor, not a live
+        // case: a frame arriving after it would open a window the completion
+        // already closed, and cut a delta nothing would ever terminate.
+        if self.finished {
+            return;
+        }
         self.pending = self.pending.saturating_add(bytes as u64);
         let now = Instant::now();
         if now.duration_since(self.window) >= self.interim {
@@ -206,7 +214,11 @@ fn offset(started: Instant, at: Instant) -> f64 {
 /// is the normal end of a long stream, and a wrapper that only reported at EOF
 /// would systematically under-report exactly the responses that carry the most
 /// bytes.
-struct MeasuredBody<B> {
+///
+/// The bound is on the struct rather than the impls because `Drop` needs it:
+/// deciding how a dropped body ended means asking the inner body, and a `Drop`
+/// impl may not require more than the type it drops.
+struct MeasuredBody<B: HttpBody> {
     inner: B,
     meter: Meter,
 }
@@ -258,9 +270,20 @@ where
     }
 }
 
-impl<B> Drop for MeasuredBody<B> {
+impl<B: HttpBody> Drop for MeasuredBody<B> {
     fn drop(&mut self) {
-        self.meter.finish(Status::Disconnected);
+        // The same question `poll_frame` asks after a frame, asked again for the
+        // body that never gets one: a body already at end of stream when the
+        // head is written — a 204, a HEAD, an empty stream — is never polled at
+        // all, hyper drops it straight away. An unconditional `Disconnected`
+        // here would label every fully delivered empty response a hang-up, and
+        // on the head-tailing clients that poll into an empty range that is the
+        // steady state rather than an edge.
+        self.meter.finish(if self.inner.is_end_stream() {
+            Status::Completed
+        } else {
+            Status::Disconnected
+        });
     }
 }
 
@@ -465,11 +488,23 @@ mod tests {
     /// A 204 carries no bytes and still says a key made a request. Without this
     /// the table would show nothing at all for the polling clients that are the
     /// steady state of the product.
+    ///
+    /// Dropped without a poll, because that is the only life hyper gives such a
+    /// body: it reads `is_end_stream` off the response and never polls at all.
+    /// Driving it to `None` by hand — which is what this test used to do —
+    /// exercises a path the transport never takes and would pass with `Drop`
+    /// mislabelling every empty response as a hang-up. CT-11 witnesses the same
+    /// claim against a real server.
     #[tokio::test]
     async fn a_response_with_no_body_still_reports_the_request() {
         let (response, mut events) = measured(Body::empty(), None, INTERIM);
+        let body = response.into_body();
 
-        assert_eq!(read(response.into_body()).await, 0);
+        assert!(
+            body.is_end_stream(),
+            "the premise: hyper would never poll this body"
+        );
+        drop(body);
 
         let events = drain(&mut events);
         assert_eq!(events.len(), 1);

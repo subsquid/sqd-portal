@@ -324,7 +324,7 @@ mod tests {
         Decoded {
             status,
             headers,
-            encoded_len: body.len(),
+            encoded: body.as_bytes().to_vec(),
             body: body.as_bytes().to_vec(),
             lines: Vec::new(),
             decode_errors: Vec::new(),

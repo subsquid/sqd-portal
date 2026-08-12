@@ -216,7 +216,11 @@ reason. Never on a request path, never awaited by one.
 *Degradation.* Lossy by design, and never anything else: there is no spool, no disk, no
 backpressure onto serving, and no error path from here into a response (REQ-61, INV-32).
 The one thing the Portal owes the data is that what *is* reported is accurate about what
-was served, and that what is lost is visible as a number (OB-14).
+was served, and that what is lost is visible as a number (OB-14) — including at shutdown,
+where the records the bounded flush cannot place are counted by cause rather than
+abandoned. On a deployment where this contract is vacuous the OB-14 families are still
+registered and read zero: the non-interference guarantee is over responses, not over the
+scrape's shape.
 
 ## Caches & refreshed snapshots (lifecycle)
 

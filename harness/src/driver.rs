@@ -14,8 +14,10 @@ pub struct Decoded {
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
     /// Bytes as they arrived, before decoding — what the portal's egress tap
-    /// counts, and so what a usage record must add up to (CT-11).
-    pub encoded_len: usize,
+    /// counts, and so what a usage record must add up to (CT-11). Kept whole
+    /// rather than as a length because measurement must not change the *bytes*
+    /// either, which only the bytes can witness.
+    pub encoded: Vec<u8>,
     /// Parsed JSONL lines when the body is line-delimited JSON.
     pub lines: Vec<Value>,
     /// Decode errors (bad encoding / torn lines) — validator 1 failures.
@@ -27,6 +29,10 @@ impl Decoded {
         self.headers
             .get(&name.to_ascii_lowercase())
             .map(|s| s.as_str())
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        self.encoded.len()
     }
 
     pub fn block_numbers(&self) -> Vec<u64> {
@@ -93,7 +99,7 @@ async fn decode(resp: reqwest::Response) -> anyhow::Result<Decoded> {
     Ok(Decoded {
         status,
         headers,
-        encoded_len: raw.len(),
+        encoded: raw,
         body,
         lines,
         decode_errors,

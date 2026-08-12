@@ -102,6 +102,22 @@ pub struct UsageEvent {
     pub status: Status,
 }
 
+/// Cap on the two claims that travel as free text. Both are system-controlled —
+/// `dataset` is the canonical catalog name the gate resolved, `organization_id`
+/// a uuid the control plane minted — so this is armor against an upstream that
+/// changes its mind, not a live bound either is expected to approach. Bytes
+/// rather than characters, on a char boundary, because the ingest's column is
+/// bytes and slicing one in half would panic.
+const MAX_CLAIM_BYTES: usize = 256;
+
+fn capped(value: &str) -> String {
+    let mut end = MAX_CLAIM_BYTES.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
 impl UsageEvent {
     pub fn new(
         attribution: &super::Attribution,
@@ -113,8 +129,8 @@ impl UsageEvent {
         Self {
             event_id: uuid::Uuid::new_v4().to_string(),
             key_id: attribution.key_id().to_owned(),
-            organization_id: attribution.organization_id().map(str::to_owned),
-            dataset: attribution.dataset().map(str::to_owned),
+            organization_id: attribution.organization_id().map(capped),
+            dataset: attribution.dataset().map(capped),
             endpoint: attribution.endpoint().to_owned(),
             encoding,
             wire_bytes,
@@ -244,6 +260,46 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap();
         assert!(json["organization_id"].is_null());
         assert!(json["dataset"].is_null());
+    }
+
+    /// Armor rather than a live bound: neither claim is client-supplied, so this
+    /// only ever fires if an upstream starts sending something the ingest's
+    /// column cannot hold. Multi-byte on purpose — a cap that split a character
+    /// would panic on the serving path, which is the one thing measurement may
+    /// never do (INV-32).
+    #[test]
+    fn the_free_text_claims_are_capped_on_a_character_boundary() {
+        // Three bytes a character, so the cap does not land on a boundary and
+        // the walk back is exercised rather than skipped.
+        let long = "€".repeat(400);
+        let attribution = super::super::Attribution::new(
+            std::sync::Arc::new(crate::auth::cache::CachedGrant {
+                key_id: "k1".to_owned(),
+                datasets: None,
+                organization_id: Some(long.clone()),
+                refresh_after: 1,
+                expires_at: 2,
+            }),
+            Some(long),
+            std::sync::Arc::from("/stream"),
+        );
+
+        let event = UsageEvent::new(
+            &attribution,
+            Encoding::Identity,
+            0,
+            Window {
+                started_at: 0.0,
+                duration: Duration::default(),
+            },
+            Status::Completed,
+        );
+
+        for claim in [&event.organization_id, &event.dataset] {
+            let claim = claim.as_deref().expect("both claims were set");
+            assert_eq!(claim.len(), 255, "the last whole character inside 256B");
+            assert!(claim.chars().all(|c| c == '€'), "no character was split");
+        }
     }
 
     #[test]
