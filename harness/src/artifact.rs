@@ -11,8 +11,10 @@ use sqd_assignments::{AssignmentBuilder, PortalAssignmentBuilder};
 use crate::world::ToyWorld;
 
 /// Which artifact the portal under test is configured to route from, mirroring its own
-/// `assignment_source`. The publisher stub always serves both — that is the migration state
-/// the portal has to work in — so this only picks which one the portal is pointed at.
+/// `assignment_source`. The stub publishes both, which models the migration window and not the
+/// states either side of it: here this picks which artifact the portal reads, never which ones
+/// exist. A network that has finished migrating publishes only the split pair, and that shape
+/// is not covered by this harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentSource {
     Legacy,
