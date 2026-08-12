@@ -1,4 +1,5 @@
-//! DC-8 stub: the control-plane credential exchange (IB-7).
+//! DC-8 stub: the control-plane credential exchange (IB-7), and DC-9's usage
+//! ingest beside it.
 //!
 //! Verifies the signing contract a real control plane must verify — exactly one
 //! of each header, an attributable portal, a timestamp inside the skew window,
@@ -8,7 +9,10 @@
 //!
 //! Everything it was asked about lands in the ledger, which is what lets CT-10
 //! assert an exchange did *not* happen (INV-14) and that the presented secret
-//! reached exactly one place (INV-38).
+//! reached exactly one place (INV-38). The usage endpoint keeps every batch it
+//! accepted, whole and in order, so CT-11 can assert what was reported, that it
+//! arrived batched, and — with the endpoint refusing — that a portal whose sink
+//! is down serves exactly what it served when the sink was up.
 
 use std::{
     collections::HashMap,
@@ -35,6 +39,10 @@ use super::Ledger;
 /// appends `v1/exchange` to whatever base it is configured with — but the
 /// signature covers the whole path, so the two have to agree exactly.
 pub const EXCHANGE_PATH: &str = "/authority/v1/auth/exchange";
+
+/// The usage ingest, mounted beside the exchange under the same base — a real
+/// control plane routes both from one mount point (DC-9).
+pub const USAGE_PATH: &str = "/authority/v1/auth/usage";
 
 /// Both sides reimplement the canonical form, so its bytes are the contract.
 /// A drift here is what the scheme tag exists to make loud.
@@ -63,6 +71,8 @@ pub enum Answer {
         refresh_in: u64,
         expires_in: u64,
     },
+    /// An unrestricted grant that also names the key's owner.
+    GrantOwned { organization: String },
     Deny(String),
     Status(u16),
     Raw(Value),
@@ -86,6 +96,14 @@ impl Answer {
         }
     }
 
+    /// A grant naming the key's owner, as a control plane that carries the
+    /// claim does. The portal records it and acts on none of it (REQ-60).
+    pub fn grant_owned_by(organization: &str) -> Self {
+        Answer::GrantOwned {
+            organization: organization.to_owned(),
+        }
+    }
+
     /// Lifetimes are relative to the timestamp the portal signed, so the answer
     /// lands on the portal's clock without the harness owning one.
     fn render(&self, key_id: &str, now: u64) -> Response {
@@ -102,6 +120,17 @@ impl Answer {
                     "datasets": datasets,
                     "refresh_after": now + refresh_in,
                     "expires_at": now + expires_in,
+                },
+            }))
+            .into_response(),
+            Answer::GrantOwned { organization } => Json(json!({
+                "result": "granted",
+                "grant": {
+                    "claims_version": CLAIMS_VERSION,
+                    "key_id": key_id,
+                    "organization_id": organization,
+                    "refresh_after": now + 300,
+                    "expires_at": now + 900,
                 },
             }))
             .into_response(),
@@ -133,6 +162,11 @@ struct Inner {
     default_answer: Mutex<Answer>,
     delay: Mutex<Duration>,
     seen: Mutex<Vec<Seen>>,
+    /// One entry per accepted delivery, in order, so a test can tell four
+    /// records arriving together from four arriving alone (DC-9).
+    usage: Mutex<Vec<Vec<Value>>>,
+    /// What the usage endpoint answers from now on. `None` accepts.
+    usage_status: Mutex<Option<u16>>,
     ledger: Ledger,
 }
 
@@ -191,6 +225,40 @@ impl ControlPlane {
     pub fn expect_portal_id(&self, portal_id: &str) {
         *self.inner.portal_id.lock().unwrap() = portal_id.to_owned();
     }
+
+    /// Every accepted delivery, in order — the batching evidence.
+    pub fn usage_batches(&self) -> Vec<Vec<Value>> {
+        self.inner.usage.lock().unwrap().clone()
+    }
+
+    /// Every reported record, flattened.
+    pub fn usage_events(&self) -> Vec<Value> {
+        self.usage_batches().into_iter().flatten().collect()
+    }
+
+    /// The records attributed to one key. Events carry no request id by design
+    /// (DC-9), so a test separates traffic by the key that caused it.
+    pub fn usage_events_for(&self, key_id: &str) -> Vec<Value> {
+        self.usage_events()
+            .into_iter()
+            .filter(|event| event["key_id"] == key_id)
+            .collect()
+    }
+
+    /// Takes the usage endpoint down without touching the exchange: the DC-9
+    /// outage row, which must be invisible to every client.
+    pub fn refuse_usage(&self, status: u16) {
+        *self.inner.usage_status.lock().unwrap() = Some(status);
+    }
+
+    pub fn accept_usage(&self) {
+        *self.inner.usage_status.lock().unwrap() = None;
+    }
+
+    /// Deliveries the endpoint was asked for, accepted or refused.
+    pub fn usage_attempts(&self) -> usize {
+        self.ledger.count_with_prefix("usage ")
+    }
 }
 
 pub async fn start(
@@ -206,17 +274,20 @@ pub async fn start(
         default_answer: Mutex::new(Answer::grant()),
         delay: Mutex::new(Duration::ZERO),
         seen: Mutex::new(Vec::new()),
+        usage: Mutex::new(Vec::new()),
+        usage_status: Mutex::new(None),
         ledger: ledger.clone(),
     });
     let app = Router::new()
         .route(EXCHANGE_PATH, post(exchange))
+        .route(USAGE_PATH, post(usage))
         .with_state(inner.clone());
     super::serve(app, port).await?;
     Ok(ControlPlane { ledger, inner })
 }
 
 async fn exchange(State(s): State<Arc<Inner>>, headers: HeaderMap, body: Bytes) -> Response {
-    let timestamp = match s.verify(&headers, &body) {
+    let timestamp = match s.verify(EXCHANGE_PATH, &headers, &body) {
         Ok(timestamp) => timestamp,
         Err(why) => {
             s.ledger.push(format!("reject {why}"));
@@ -261,11 +332,41 @@ async fn exchange(State(s): State<Arc<Inner>>, headers: HeaderMap, body: Bytes) 
     answer.render(&key_id, timestamp)
 }
 
+/// DC-9's ingest: the same signing contract as the exchange, because it is the
+/// signature that says which portal these records belong to — an event carries
+/// no portal identity of its own, and a field would be one a portal could forge.
+async fn usage(State(s): State<Arc<Inner>>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(why) = s.verify(USAGE_PATH, &headers, &body) {
+        s.ledger.push(format!("usage reject {why}"));
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": why }))).into_response();
+    }
+    let events = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => value["events"].as_array().cloned().unwrap_or_default(),
+        Err(_) => {
+            s.ledger.push("usage reject unparseable-body");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    // Ledgered before the verdict: a delivery the stub refuses is still one the
+    // portal made, and the outage case is about exactly those.
+    s.ledger.push(format!("usage {}", events.len()));
+
+    if let Some(status) = *s.usage_status.lock().unwrap() {
+        return StatusCode::from_u16(status)
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            .into_response();
+    }
+    s.usage.lock().unwrap().push(events);
+    StatusCode::ACCEPTED.into_response()
+}
+
 impl Inner {
     /// The DC-8 signing contract, clause by clause, returning the timestamp the
     /// request was signed at. Each failure names its clause so a test can assert
-    /// *why* an exchange was refused.
-    fn verify(&self, headers: &HeaderMap, body: &[u8]) -> Result<u64, String> {
+    /// *why* a request was refused. The path is a parameter because the
+    /// signature covers it: a signature made for the exchange must not verify
+    /// against the usage endpoint, and vice versa.
+    fn verify(&self, path: &str, headers: &HeaderMap, body: &[u8]) -> Result<u64, String> {
         let exactly_one = |name: &str| -> Result<String, String> {
             let mut values = headers.get_all(name).iter();
             let first = values.next().ok_or_else(|| format!("missing-{name}"))?;
@@ -297,7 +398,7 @@ impl Inner {
         let signature = BASE64URL
             .decode(&signature)
             .map_err(|_| "malformed-signature".to_owned())?;
-        let payload = canonical(&portal_id, timestamp, "POST", EXCHANGE_PATH, body);
+        let payload = canonical(&portal_id, timestamp, "POST", path, body);
         if !self.public_key.verify(payload.as_bytes(), &signature) {
             return Err("bad-signature".into());
         }

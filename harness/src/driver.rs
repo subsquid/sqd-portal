@@ -13,6 +13,9 @@ pub struct Decoded {
     /// Lowercased header names → first value.
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    /// Bytes as they arrived, before decoding — what the portal's egress tap
+    /// counts, and so what a usage record must add up to (CT-11).
+    pub encoded_len: usize,
     /// Parsed JSONL lines when the body is line-delimited JSON.
     pub lines: Vec<Value>,
     /// Decode errors (bad encoding / torn lines) — validator 1 failures.
@@ -90,6 +93,7 @@ async fn decode(resp: reqwest::Response) -> anyhow::Result<Decoded> {
     Ok(Decoded {
         status,
         headers,
+        encoded_len: raw.len(),
         body,
         lines,
         decode_errors,

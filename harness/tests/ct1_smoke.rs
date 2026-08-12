@@ -123,7 +123,12 @@ async fn ct1_smoke() -> anyhow::Result<()> {
     )
     .await?;
     let _registry_ledger = stubs::registry::start(endpoints.registry_port, &world).await?;
-    let hotblocks_ledger = stubs::hotblocks::start(endpoints.hotblocks_port, world.clone()).await?;
+    let hotblocks_ledger = stubs::hotblocks::start(
+        endpoints.hotblocks_port,
+        world.clone(),
+        stubs::hotblocks::Trickle::none(),
+    )
+    .await?;
     let mut worker_ledgers = Vec::new();
     for (i, id) in worker_ids.iter().enumerate() {
         let stub = stubs::worker::start(

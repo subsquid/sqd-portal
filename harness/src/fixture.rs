@@ -12,6 +12,7 @@ use tempfile::TempDir;
 
 use crate::portal::{Auth, Endpoints, PortalProcess};
 use crate::stubs::control_plane::ControlPlane;
+use crate::stubs::hotblocks::Trickle;
 use crate::stubs::worker::{WorkerFaults, WorkerStub};
 use crate::{artifact, driver, dummy_chain, keys, portal, stubs, ToyWorld};
 
@@ -25,6 +26,9 @@ pub struct Fixture {
     /// portal picks, so tests don't depend on the routing choice (FV-1).
     pub worker_faults: WorkerFaults,
     pub hotblocks_ledger: stubs::Ledger,
+    /// Paces the real-time stub's body. The harness's only way to make a
+    /// response outlive an interval the portal measures on (CT-11).
+    pub hotblocks_trickle: Trickle,
     pub publisher_ledger: stubs::Ledger,
     /// Present only on an authorizing fixture — absent, DC-8 is vacuous (REQ-56).
     pub control_plane: Option<ControlPlane>,
@@ -97,8 +101,13 @@ impl Fixture {
         )
         .await?;
         let _registry_ledger = stubs::registry::start(endpoints.registry_port, &world).await?;
-        let hotblocks_ledger =
-            stubs::hotblocks::start(endpoints.hotblocks_port, world.clone()).await?;
+        let hotblocks_trickle = Trickle::none();
+        let hotblocks_ledger = stubs::hotblocks::start(
+            endpoints.hotblocks_port,
+            world.clone(),
+            hotblocks_trickle.clone(),
+        )
+        .await?;
 
         let worker_faults = WorkerFaults::none();
         let mut worker_ledgers = Vec::new();
@@ -158,6 +167,7 @@ impl Fixture {
             worker_ledgers,
             worker_faults,
             hotblocks_ledger,
+            hotblocks_trickle,
             publisher_ledger,
             control_plane,
             _workers: stub_workers,
