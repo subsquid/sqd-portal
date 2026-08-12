@@ -26,7 +26,10 @@ struct HotblocksState {
 
 pub async fn start(port: u16, world: ToyWorld) -> anyhow::Result<Ledger> {
     let ledger = Ledger::default();
-    let state = HotblocksState { world, ledger: ledger.clone() };
+    let state = HotblocksState {
+        world,
+        ledger: ledger.clone(),
+    };
     let app = Router::new()
         .route("/datasets/:ds/head", get(head))
         .route("/datasets/:ds/finalized-head", get(finalized_head))
@@ -75,11 +78,7 @@ async fn status(State(s): State<HotblocksState>, Path(ds): Path<String>) -> Resp
     .into_response()
 }
 
-async fn stream(
-    State(s): State<HotblocksState>,
-    Path(ds): Path<String>,
-    body: String,
-) -> Response {
+async fn stream(State(s): State<HotblocksState>, Path(ds): Path<String>, body: String) -> Response {
     serve_stream(s, ds, body, false)
 }
 
@@ -104,12 +103,19 @@ fn serve_stream(s: HotblocksState, ds: String, body: String, finalized: bool) ->
     let frontier = if finalized { fin } else { head };
     s.ledger.push(format!(
         "{} {ds} from={from} to={to:?}",
-        if finalized { "finalized-stream" } else { "stream" }
+        if finalized {
+            "finalized-stream"
+        } else {
+            "stream"
+        }
     ));
 
     let mut headers = HeaderMap::new();
     headers.insert("x-sqd-head-number", head.to_string().parse().unwrap());
-    headers.insert("x-sqd-finalized-head-number", fin.to_string().parse().unwrap());
+    headers.insert(
+        "x-sqd-finalized-head-number",
+        fin.to_string().parse().unwrap(),
+    );
     headers.insert(
         "x-sqd-finalized-head-hash",
         s.world.hash(&ds, fin).parse().unwrap(),

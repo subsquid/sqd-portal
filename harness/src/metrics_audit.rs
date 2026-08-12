@@ -10,7 +10,7 @@ pub fn family_sum(text: &str, family: &str) -> Option<f64> {
         if line.starts_with('#') {
             continue;
         }
-        let name_end = line.find(|c| c == '{' || c == ' ').unwrap_or(line.len());
+        let name_end = line.find(['{', ' ']).unwrap_or(line.len());
         if &line[..name_end] != family {
             continue;
         }
@@ -86,9 +86,7 @@ pub fn audit_quiescent(text: &str, known_workers: f64) -> Vec<String> {
     for (family, expected) in expectations {
         match family_sum(text, family) {
             Some(actual) if (actual - expected).abs() < f64::EPSILON => {}
-            Some(actual) => {
-                failures.push(format!("{family} = {actual}, expected {expected}"))
-            }
+            Some(actual) => failures.push(format!("{family} = {actual}, expected {expected}")),
             None => failures.push(format!("{family} missing from /metrics")),
         }
     }

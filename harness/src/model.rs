@@ -46,7 +46,10 @@ pub fn model(world: &ToyWorld, req: &StreamReq) -> Expect {
     let finalized_head = (fin, world.hash(&ds.name, fin));
 
     if req.from > frontier {
-        return Expect::Empty { head, finalized_head };
+        return Expect::Empty {
+            head,
+            finalized_head,
+        };
     }
 
     let source = match archival_head {
@@ -89,5 +92,7 @@ fn network_boundary_records(world: &ToyWorld, ds: &ToyDataset, from: u64, last: 
     }
     nums.sort_unstable();
     nums.dedup();
-    nums.into_iter().map(|n| world.record(&ds.name, n)).collect()
+    nums.into_iter()
+        .map(|n| world.record(&ds.name, n))
+        .collect()
 }

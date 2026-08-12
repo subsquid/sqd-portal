@@ -127,7 +127,10 @@ pub async fn start(
     ])
     .context("stub cli parse")?;
 
-    let agent = AgentInfo { name: "conformance-worker", version: "0.1.0" };
+    let agent = AgentInfo {
+        name: "conformance-worker",
+        version: "0.1.0",
+    };
     let builder = P2PTransportBuilder::from_cli(cli.transport, agent)
         .await
         .context("transport builder")?;
@@ -142,7 +145,11 @@ pub async fn start(
         futures::pin_mut!(events);
         while let Some(event) = events.next().await {
             match event {
-                WorkerEvent::Query { peer_id, query, resp_chan } => {
+                WorkerEvent::Query {
+                    peer_id,
+                    query,
+                    resp_chan,
+                } => {
                     let fault = faults.next();
                     tracing::info!(%peer_id, chunk = %query.chunk_id, ?fault, "stub worker query");
                     let result = answer(&world, &signing_keypair, &query, &ledger2, fault);
@@ -165,14 +172,18 @@ fn answer(
     ledger: &Ledger,
     fault: Option<WorkerFault>,
 ) -> sqd_messages::QueryResult {
-    let range = query.block_range.unwrap_or(sqd_messages::Range { begin: 0, end: 0 });
+    let range = query
+        .block_range
+        .unwrap_or(sqd_messages::Range { begin: 0, end: 0 });
     ledger.push(format!(
         "query chunk={} range={}-{} dataset={} fault={}",
         query.chunk_id,
         range.begin,
         range.end,
         query.dataset,
-        fault.as_ref().map_or("none".to_owned(), |f| format!("{f:?}")),
+        fault
+            .as_ref()
+            .map_or("none".to_owned(), |f| format!("{f:?}")),
     ));
 
     match &fault {
@@ -228,10 +239,9 @@ fn answer(
 
     let mut result = sqd_messages::QueryResult {
         query_id: query.query_id.clone(),
-        result: Some(sqd_messages::query_result::Result::Ok(sqd_messages::QueryOk {
-            data,
-            last_block,
-        })),
+        result: Some(sqd_messages::query_result::Result::Ok(
+            sqd_messages::QueryOk { data, last_block },
+        )),
         ..Default::default()
     };
     // A wrong key produces a well-formed result that fails verification —
@@ -249,7 +259,11 @@ fn error_result(
     keypair: &Keypair,
     msg: &str,
 ) -> sqd_messages::QueryResult {
-    verdict_result(query, keypair, query_error::Err::ServerError(msg.to_string()))
+    verdict_result(
+        query,
+        keypair,
+        query_error::Err::ServerError(msg.to_string()),
+    )
 }
 
 fn verdict_result(
@@ -259,9 +273,9 @@ fn verdict_result(
 ) -> sqd_messages::QueryResult {
     let mut result = sqd_messages::QueryResult {
         query_id: query.query_id.clone(),
-        result: Some(sqd_messages::query_result::Result::Err(sqd_messages::QueryError {
-            err: Some(err),
-        })),
+        result: Some(sqd_messages::query_result::Result::Err(
+            sqd_messages::QueryError { err: Some(err) },
+        )),
         ..Default::default()
     };
     result.sign(keypair).expect("error signs");

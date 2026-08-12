@@ -65,11 +65,7 @@ async fn await_pool_recovery(fx: &Fixture, label: &str) -> anyhow::Result<Decode
 /// The ADR-011 code, after validator 6 has passed on the envelope carrying it.
 fn error_code(context: &str, d: &Decoded) -> anyhow::Result<String> {
     let verdict = harness::validators::validate_error(d);
-    ensure!(
-        verdict.errors.is_empty(),
-        "{context}: {:?}",
-        verdict.errors
-    );
+    ensure!(verdict.errors.is_empty(), "{context}: {:?}", verdict.errors);
     let body: serde_json::Value = serde_json::from_slice(&d.body)?;
     Ok(body["error"]["code"]
         .as_str()

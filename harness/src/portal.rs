@@ -69,11 +69,9 @@ pub fn write_config(
     let mut datasets = String::new();
     for ds in &world.datasets {
         datasets.push_str(&format!("  {}:\n", ds.name));
-        let extra_aliases: Vec<&String> =
-            ds.aliases.iter().filter(|a| **a != ds.name).collect();
+        let extra_aliases: Vec<&String> = ds.aliases.iter().filter(|a| **a != ds.name).collect();
         if !extra_aliases.is_empty() {
-            let quoted: Vec<String> =
-                extra_aliases.iter().map(|a| format!("\"{a}\"")).collect();
+            let quoted: Vec<String> = extra_aliases.iter().map(|a| format!("\"{a}\"")).collect();
             datasets.push_str(&format!("    aliases: [{}]\n", quoted.join(", ")));
         }
         datasets.push_str("    kind: \"evm\"\n");

@@ -99,6 +99,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dsherret/rust-toolchain-file@v1
       - run: cargo fmt --all -- --check
+      # `--all` spans workspace members, and the harness is its own workspace, so the
+      # root invocation never reaches it.
+      - run: cargo fmt --manifest-path harness/Cargo.toml --all -- --check
 
   spec:
     name: Spec lint
@@ -140,4 +143,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dsherret/rust-toolchain-file@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            harness
       - run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
+      # Same blind spot as rustfmt: the harness is not a workspace member.
+      - run: cargo clippy --manifest-path harness/Cargo.toml --all-targets -- -D clippy::correctness -D clippy::suspicious

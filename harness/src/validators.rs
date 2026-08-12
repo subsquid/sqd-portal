@@ -280,9 +280,9 @@ pub fn validate_error(d: &Decoded) -> Verdict {
             d.status
         ));
     }
-    if !body["error"]["message"]
+    if body["error"]["message"]
         .as_str()
-        .is_some_and(|m| !m.is_empty())
+        .is_none_or(|m| m.is_empty())
     {
         v.err(format!("validator6: {code} does not explain itself"));
     }

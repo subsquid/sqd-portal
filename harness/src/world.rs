@@ -58,8 +58,14 @@ impl ToyWorld {
                     network_id: Some("s3://toy-dataset".into()),
                     chunks: vec![
                         ToyChunk { first: 0, last: 39 },
-                        ToyChunk { first: 40, last: 79 },
-                        ToyChunk { first: 80, last: 99 },
+                        ToyChunk {
+                            first: 40,
+                            last: 79,
+                        },
+                        ToyChunk {
+                            first: 80,
+                            last: 99,
+                        },
                     ],
                     real_time: None,
                     start_block: 0,

@@ -21,7 +21,9 @@ pub struct Decoded {
 
 impl Decoded {
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(&name.to_ascii_lowercase()).map(|s| s.as_str())
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(|s| s.as_str())
     }
 
     pub fn block_numbers(&self) -> Vec<u64> {
@@ -85,7 +87,13 @@ async fn decode(resp: reqwest::Response) -> anyhow::Result<Decoded> {
         }
     }
 
-    Ok(Decoded { status, headers, body, lines, decode_errors })
+    Ok(Decoded {
+        status,
+        headers,
+        body,
+        lines,
+        decode_errors,
+    })
 }
 
 pub async fn stream(

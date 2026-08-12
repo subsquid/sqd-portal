@@ -24,15 +24,26 @@ pub fn network_state_json(port: u16, assignment_id: &str, effective_from: u64) -
     .to_string()
 }
 
-pub async fn start(port: u16, network_state: String, artifact_gz: Vec<u8>) -> anyhow::Result<Ledger> {
+pub async fn start(
+    port: u16,
+    network_state: String,
+    artifact_gz: Vec<u8>,
+) -> anyhow::Result<Ledger> {
     let ledger = Ledger::default();
-    let state = PublisherState { network_state, artifact_gz, ledger: ledger.clone() };
+    let state = PublisherState {
+        network_state,
+        artifact_gz,
+        ledger: ledger.clone(),
+    };
     let app = Router::new()
         .route(
             "/network-state-tethys.json",
             get(|State(s): State<PublisherState>| async move {
                 s.ledger.push("network-state");
-                ([("content-type", "application/json")], s.network_state.clone())
+                (
+                    [("content-type", "application/json")],
+                    s.network_state.clone(),
+                )
             }),
         )
         .route(
