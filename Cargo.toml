@@ -96,10 +96,12 @@ sqd-query = { git = "https://github.com/subsquid/data.git", rev = "eaa9f86" }
 
 sql_query_plan = { git = "https://github.com/subsquid/qplan.git", rev = "2e61b51", optional = true }
 
-# Required by the sqd-network bump: its libp2p fork moved to fac3b0c9, which builds its crates
-# against an in-tree libp2p-identity, while `multiaddr` still pulls the crates.io one. Both then
-# land in the graph and libp2p-swarm fails to compile on mismatched `PeerId` types. sqd-network
-# carries this same patch in its own root manifest, but Cargo only honours `[patch]` from the
-# workspace root, so every consumer has to repeat it.
+# Required by the span the sqd-network bump crosses, not by its tip: 541684c ("Migrate worker
+# server behaviour to libp2p-stream") moved the libp2p fork from c0ed330 to fac3b0c9, and the
+# transport pin used to sit below it. That fork builds its crates against an in-tree
+# libp2p-identity while `multiaddr` still pulls the crates.io one; both then land in the graph
+# and libp2p-swarm fails to compile on mismatched `PeerId` types. sqd-network carries this same
+# patch in its own root manifest, but Cargo only honours `[patch]` from the workspace root, so
+# every consumer has to repeat it.
 [patch.crates-io]
 libp2p-identity = { git = "https://github.com/kalabukdima/rust-libp2p.git", rev = "fac3b0c9" }
