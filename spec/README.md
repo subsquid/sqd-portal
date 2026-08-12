@@ -24,6 +24,9 @@ property in that area is vacuous on a Portal the operator has not configured
 for authorization, which is the default and the only mode a self-hosted build has. It is
 spread through the existing documents rather than given one of its own, because it is a
 precondition on the surface those documents already describe, not a second system.
+Commercial usage measurement (REQ-60/61, DC-9) is conditional on that in turn, and on its
+own configuration under it: it records what an authorized request was served and can never
+change it, so it is spread the same way rather than given a document.
 
 ## Document map
 
@@ -63,6 +66,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 | ADR-012 | 2026-07-17 | [Every shed response carries an explicit retry hint](decisions/ADR-012-retry-after-on-shed.md) | Accepted |
 | ADR-014 | 2026-07-17 | [Contract reconciliation: overload hints, conflict precedence, artifact regression, archival finalized head, EMPTY metadata, timestamp frontier, gated debug surface](decisions/ADR-014-contract-reconciliation.md) | Accepted |
 | ADR-015 | 2026-07-21 | [One connection-class replay on the real-time path](decisions/ADR-015-real-time-connection-replay.md) | Accepted |
+| ADR-016 | 2026-08-12 | [Shadow usage measurement: encoded bytes at egress, deltas, and tolerated loss](decisions/ADR-016-shadow-usage-measurement.md) | Accepted |
 | ADR-013 | 2026-07-17 | [Assignment staleness must be bounded and observable](decisions/ADR-013-assignment-staleness-bound.md) | **Proposed** |
 
 ## Conventions

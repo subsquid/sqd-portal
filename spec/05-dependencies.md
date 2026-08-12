@@ -8,7 +8,8 @@ otherwise need.
 **The no-undeclared-dependencies rule.** Every network or system interaction of the
 Portal appears in this document. Any interaction not listed here observed in operation
 is a conformance violation (INV-37). DC-8 is conditional on authorization configuration:
-observing it on a Portal without one is the same violation (REQ-56).
+observing it on a Portal without one is the same violation (REQ-56). DC-9 is conditional
+on usage measurement being configured under it, and the same rule applies one level in.
 
 ## DC-1 — Archival workers
 
@@ -180,6 +181,42 @@ turns on it (INV-31): every replica shares the same authority, so withholding re
 fleet-wide would answer an outage with an outage. Nothing survives restart (NG5), and
 nothing needs to — a cold replica has no bootstrap to do, only a first exchange for each
 credential it serves.
+
+## DC-9 — Commercial usage sink
+
+Exists only where usage measurement is configured (REQ-60); on any other deployment the
+Portal opens no connection to it and this contract is vacuous. It is the same control
+plane DC-8 talks to, reached under the same operator-owned mount point and authenticated
+the same way — but a distinct contract, because its failure mode is the opposite one: DC-8
+is on the request path and fails closed, DC-9 is off it and fails by dropping.
+
+*Role.* Receives usage records (REQ-60). It answers nothing the Portal reads back: no
+grant, no verdict, no state. Ingest attributes every record to the Portal from the
+verified request signature, which is why a record carries no Portal identity of its own —
+a field would be one a Portal could forge, and the signature is free and cannot be.
+
+*Call contract.* Batched delivery from a bounded queue: at most P-USAGE-BATCH-MAX records
+per call, at least once per P-USAGE-FLUSH while records are waiting, queue bounded by
+P-USAGE-QUEUE. Every call carries the DC-8 signing headers over the same canonical
+binding, so a signature made for one endpoint does not verify against the other. Each
+record carries an identifier the ingest deduplicates on: batches are retried, so a
+delivery that timed out after being stored must not count twice. No redirects, for DC-8's
+reason. Never on a request path, never awaited by one.
+
+*Error mapping / degradation.*
+
+| Fault | Own class / action |
+|---|---|
+| Delivery fails, times out, or returns a retryable status | retry with backoff and spread, inside P-USAGE-MAX-RETRY-AGE; past it, drop and count (HZ-14) |
+| Delivery refused on the batch's content | drop the batch and count it: a refusal about the content will be identical next time, and retrying it spends the queue's budget on records that can never land |
+| Queue full | drop the newest record and count it. The queue is the shock absorber; growing it on demand would make measurement a memory hazard (HZ-14) |
+| Sink unreachable for longer than the queue holds | steady-state loss, counted. Totals become a lower bound with respect to loss and are never quoted as revenue |
+| Shutdown with records still queued | one bounded flush, after the serving path has stopped; what does not go out is dropped and counted |
+
+*Degradation.* Lossy by design, and never anything else: there is no spool, no disk, no
+backpressure onto serving, and no error path from here into a response (REQ-61, INV-32).
+The one thing the Portal owes the data is that what *is* reported is accurate about what
+was served, and that what is lost is visible as a number (OB-14).
 
 ## Caches & refreshed snapshots (lifecycle)
 
