@@ -140,6 +140,7 @@ async fn run(fx: &mut Fixture) -> anyhow::Result<()> {
             "not-found",
             WorkerFault::NotFound("still downloading".into()),
         ),
+        ("stale-envelope", WorkerFault::StaleEnvelope),
         ("too-many-requests", WorkerFault::TooManyRequests),
         ("server-overloaded", WorkerFault::ServerOverloaded),
         ("server-error", WorkerFault::ServerError("scripted".into())),

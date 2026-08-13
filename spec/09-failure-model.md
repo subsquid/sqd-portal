@@ -40,6 +40,7 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 | Slow (past adaptive estimate) | mask — speculative parallel attempt (FV-2) |
 | Timeout | mask via reroute + cooldown P-WORKER-TIMEOUT-COOLDOWN; congestion signal |
 | Erroring | mask via reroute + cooldown P-WORKER-ERROR-COOLDOWN |
+| Clock skew (rejects the query envelope as stale) | mask via reroute + cooldown P-WORKER-ERROR-COOLDOWN; a skew on *our* side hits every candidate ⇒ fail-safe RETRIES-EXHAUSTED, never BAD-REQUEST |
 | Rate-limiting | mask via backoff honor; all-candidates-limited ⇒ fail-safe OVERLOADED |
 | Oversized response | fail-safe BAD-REQUEST (advise narrower query) |
 | Equivocating (bad signature / wrong-range data) | integrity: discard, reroute, count (REQ-43); never delivered; all attempts equivocating ⇒ fail-safe WORKER-FAILURE (pages); equivocation mixed with transient failures ⇒ fail-safe RETRIES-EXHAUSTED, the equivocation still counted and alarmed (DC-1) |
