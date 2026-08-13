@@ -86,9 +86,6 @@ tempfile = "3"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
 
-# Only sqd-assignments moves: 67f54cc is where the portal-oriented artifact and its reader
-# live. The rest stay on e9a3434 — the transport revs in between move the libp2p fork and
-# change the worker server's API, which this change has no need for.
 sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", features = ["reader"] }
 sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", version = "1.3.0" }
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", version = "2.1.0", features = ["semver", "bitstring"] }
