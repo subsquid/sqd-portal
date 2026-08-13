@@ -302,9 +302,10 @@ async fn run_congestion(fx: &mut Fixture) -> anyhow::Result<()> {
     // fix, still yields a fresh signature at send.
     let stall = Duration::from_secs(66);
 
-    // Stream A holds a worker's response for `stall`, occupying whatever
-    // scheduler slot it lands on. It queries chunk 1 (blocks 0..=39), off B's
-    // range.
+    // Stream A's first attempt gets its response withheld for `stall`, parking
+    // the portal in the (permit-free) first-byte wait — per the contract under
+    // test it holds NO scheduler slot while it waits. It queries chunk 1
+    // (blocks 0..=39), off B's range.
     fx.worker_faults.queue(WorkerFault::Stall(stall), 1);
     let base_a = base.clone();
     let http_a = http.clone();
@@ -375,12 +376,26 @@ async fn run_congestion(fx: &mut Fixture) -> anyhow::Result<()> {
         b.status,
         String::from_utf8_lossy(&b.body),
     );
+    // Wire-level freshness evidence from the real path: the stub logs the
+    // admission lag of every query it receives, so B's served entry proves the
+    // transmitted timestamp was stamped moments before the send — not at some
+    // earlier enqueue time.
+    let b_entry = fx
+        .worker_ledgers
+        .iter()
+        .flat_map(|l| l.entries())
+        .find(|e| e.contains("range=40-79") && e.contains("fault=none"))
+        .context("no worker ledger shows B's query being served")?;
+    let b_lag_ms: u64 = b_entry
+        .split("lag_ms=")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .context("B's ledger entry carries no parsable lag_ms")?;
     ensure!(
-        fx.worker_ledgers.iter().any(|l| l
-            .entries()
-            .iter()
-            .any(|e| e.contains("range=40-79") && e.contains("fault=none"))),
-        "no worker ledger shows B's query being served"
+        b_lag_ms < 5_000,
+        "B's query arrived at the worker with a {b_lag_ms}ms-old signature — \
+         the wire timestamp was not stamped at send time: {b_entry}"
     );
     // The boundary: a stall does not hold the single slot (see the doc
     // comment), so B's acquire is granted immediately and it serves promptly.

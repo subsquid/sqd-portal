@@ -24,10 +24,11 @@ use sqd_network_transport::{
 use super::Ledger;
 use crate::world::ToyWorld;
 
-/// The real worker's admission-time freshness bound (`protocol::MAX_TIME_LAG`,
-/// 60s in worker-rs). A signed query whose `timestamp_ms` is further than this
-/// from the worker's clock is rejected with `BadRequest`.
-const MAX_TIME_LAG_MS: u64 = 60_000;
+/// The real worker's admission-time freshness bound: a signed query whose
+/// `timestamp_ms` is further than this from the worker's clock is rejected
+/// with `BadRequest`. Derived from the shared protocol constant worker-rs
+/// validates against, so the stub keeps mirroring workers if the bound moves.
+const MAX_TIME_LAG_MS: u64 = sqd_network_transport::protocol::MAX_TIME_LAG.as_millis() as u64;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -178,14 +179,14 @@ pub async fn start(
                     query,
                     resp_chan,
                 } => {
-                    let lag = query.timestamp_ms.abs_diff(now_ms());
-                    // Freshness wins before the fault queue is touched: a naturally
-                    // stale query is rejected at admission and must not consume (and
-                    // silently swallow) the next scripted fault, or every scenario
-                    // queued behind it would shift. `answer` re-checks on its own
-                    // clock read; test staleness margins are seconds, so the two
-                    // reads cannot disagree in practice.
-                    let fault = if lag > MAX_TIME_LAG_MS {
+                    // One clock read decides admission for both the fault dequeue
+                    // and the answer: freshness wins before the fault queue is
+                    // touched — a naturally stale query is rejected at admission
+                    // and must not consume (and silently swallow) the next scripted
+                    // fault — and `answer` receives the same lag, so the decision
+                    // cannot flip between the two.
+                    let lag_ms = query.timestamp_ms.abs_diff(now_ms());
+                    let fault = if lag_ms > MAX_TIME_LAG_MS {
                         None
                     } else {
                         faults.next()
@@ -195,7 +196,7 @@ pub async fn start(
                         chunk = %query.chunk_id,
                         ?fault,
                         signed_ts = query.timestamp_ms,
-                        lag_ms = lag,
+                        lag_ms,
                         "stub worker query"
                     );
                     // A `Stall` defers the send; every other verdict is built now.
@@ -203,7 +204,7 @@ pub async fn start(
                         Some(WorkerFault::Stall(d)) => Some(*d),
                         _ => None,
                     };
-                    let result = answer(&world, &signing_keypair, &query, &ledger2, fault);
+                    let result = answer(&world, &signing_keypair, &query, &ledger2, fault, lag_ms);
                     match stall {
                         Some(dur) => {
                             let handle = handle.clone();
@@ -229,17 +230,20 @@ pub async fn start(
     Ok(WorkerStub { ledger })
 }
 
+/// `lag_ms` is the admission lag the event loop measured with the same clock
+/// read that decided whether to dequeue a fault — passed in rather than
+/// re-measured, so the freshness decision cannot flip between the two.
 fn answer(
     world: &ToyWorld,
     keypair: &Keypair,
     query: &sqd_messages::Query,
     ledger: &Ledger,
     fault: Option<WorkerFault>,
+    lag_ms: u64,
 ) -> sqd_messages::QueryResult {
     let range = query
         .block_range
         .unwrap_or(sqd_messages::Range { begin: 0, end: 0 });
-    let lag_ms = query.timestamp_ms.abs_diff(now_ms());
     ledger.push(format!(
         "query chunk={} range={}-{} dataset={} lag_ms={} fault={}",
         query.chunk_id,
