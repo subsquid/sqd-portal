@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use clap::Parser;
@@ -22,6 +23,18 @@ use sqd_network_transport::{
 
 use super::Ledger;
 use crate::world::ToyWorld;
+
+/// The real worker's admission-time freshness bound (`protocol::MAX_TIME_LAG`,
+/// 60s in worker-rs). A signed query whose `timestamp_ms` is further than this
+/// from the worker's clock is rejected with `BadRequest`.
+const MAX_TIME_LAG_MS: u64 = 60_000;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("after 1970")
+        .as_millis() as u64
+}
 
 #[derive(Parser)]
 struct StubCli {
@@ -51,6 +64,11 @@ pub enum WorkerFault {
     TooManyRequests,
     /// Refuse for capacity: the overload verdict. One DC-1 row with the above.
     ServerOverloaded,
+    /// Hold the response (send no bytes) for the duration, then answer normally.
+    /// Models a worker that received the query fresh (so it passes the
+    /// admission-time timestamp check) but is slow to produce the body.
+    /// Deferred send so the stub's event loop keeps serving other queries.
+    Stall(Duration),
 }
 
 /// A fault queue shared by every stub worker in a test, so a single queued
@@ -136,8 +154,16 @@ pub async fn start(
     let builder = P2PTransportBuilder::from_cli(cli.transport, agent)
         .await
         .context("transport builder")?;
+    // The worker's own request_response uses `query_execution_timeout` as the
+    // per-request deadline; the default (20s) would tear a `Stall` down before a
+    // >60s congestion delay could elapse. Raise it so the stub can hold a
+    // response as long as a test needs.
+    let worker_config = WorkerConfig {
+        query_execution_timeout: Duration::from_secs(300),
+        ..WorkerConfig::default()
+    };
     let (events, handle) = builder
-        .build_worker(WorkerConfig::default())
+        .build_worker(worker_config)
         .await
         .context("build worker")?;
 
@@ -152,11 +178,47 @@ pub async fn start(
                     query,
                     resp_chan,
                 } => {
-                    let fault = faults.next();
-                    tracing::info!(%peer_id, chunk = %query.chunk_id, ?fault, "stub worker query");
+                    let lag = query.timestamp_ms.abs_diff(now_ms());
+                    // Freshness wins before the fault queue is touched: a naturally
+                    // stale query is rejected at admission and must not consume (and
+                    // silently swallow) the next scripted fault, or every scenario
+                    // queued behind it would shift. `answer` re-checks on its own
+                    // clock read; test staleness margins are seconds, so the two
+                    // reads cannot disagree in practice.
+                    let fault = if lag > MAX_TIME_LAG_MS {
+                        None
+                    } else {
+                        faults.next()
+                    };
+                    tracing::info!(
+                        %peer_id,
+                        chunk = %query.chunk_id,
+                        ?fault,
+                        signed_ts = query.timestamp_ms,
+                        lag_ms = lag,
+                        "stub worker query"
+                    );
+                    // A `Stall` defers the send; every other verdict is built now.
+                    let stall = match &fault {
+                        Some(WorkerFault::Stall(d)) => Some(*d),
+                        _ => None,
+                    };
                     let result = answer(&world, &signing_keypair, &query, &ledger2, fault);
-                    if handle.send_query_result(result, resp_chan).is_err() {
-                        tracing::warn!("query result queue full");
+                    match stall {
+                        Some(dur) => {
+                            let handle = handle.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(dur).await;
+                                if handle.send_query_result(result, resp_chan).is_err() {
+                                    tracing::warn!("query result queue full (after stall)");
+                                }
+                            });
+                        }
+                        None => {
+                            if handle.send_query_result(result, resp_chan).is_err() {
+                                tracing::warn!("query result queue full");
+                            }
+                        }
                     }
                 }
                 other => tracing::debug!("ignoring worker event: {other:?}"),
@@ -177,16 +239,32 @@ fn answer(
     let range = query
         .block_range
         .unwrap_or(sqd_messages::Range { begin: 0, end: 0 });
+    let lag_ms = query.timestamp_ms.abs_diff(now_ms());
     ledger.push(format!(
-        "query chunk={} range={}-{} dataset={} fault={}",
+        "query chunk={} range={}-{} dataset={} lag_ms={} fault={}",
         query.chunk_id,
         range.begin,
         range.end,
         query.dataset,
+        lag_ms,
         fault
             .as_ref()
             .map_or("none".to_owned(), |f| format!("{f:?}")),
     ));
+
+    // Admission-time freshness check, exactly as the real worker's `validate_query`
+    // does it (worker-rs src/controller/p2p.rs): a signed timestamp more than
+    // MAX_TIME_LAG from the worker's clock is rejected. Unconditional — it mimics
+    // the real worker rather than being an injectable fault (`StaleEnvelope` is the
+    // injectable variant) — and it runs first, because the real worker validates
+    // before it does anything else with a query.
+    if lag_ms > MAX_TIME_LAG_MS {
+        return verdict_result(
+            query,
+            keypair,
+            query_error::Err::BadRequest("timestamp out of allowed range".to_owned()),
+        );
+    }
 
     match &fault {
         Some(WorkerFault::ServerError(m)) => {

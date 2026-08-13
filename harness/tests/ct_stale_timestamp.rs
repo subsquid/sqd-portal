@@ -1,32 +1,36 @@
 //! Stale-signed-timestamp rejection — the class for the 2026 production
 //! incident where a portal returned hard, non-retriable `400`s for specific
-//! chunk ranges, and for the fix that removed it.
+//! chunk ranges.
 //!
-//! ## The defect (reproduced first, then fixed on this branch)
+//! ## The defect
 //!
 //! `prepare_query` (src/network/client.rs) stamps `timestamp_ms = now` and
 //! signs the worker query; a worker validates that signed timestamp at
 //! admission against `MAX_TIME_LAG = 60s` (worker-rs `validate_query`) and
-//! answers `BadRequest("timestamp out of allowed range")` when it is exceeded —
-//! a rejection that can carry a `retry_after` hint. Two things compounded:
+//! answers `BadRequest("timestamp out of allowed range")` when it is exceeded.
+//! Two things compounded:
 //!
 //! 1. The query was signed *before* `send_to_transport` awaited its
 //!    congestion-scheduler permit, so under load the signature aged in the
 //!    portal's own queue.
 //! 2. The verdict table (`Verdict::of`) mapped *any* worker `BadRequest` — the
-//!    anti-replay rejection included — to a non-retriable client `400`
+//!    stale-envelope rejection included — to a non-retriable client `400`
 //!    (`invalid_request_error` / `malformed_request`), no reroute, no failover.
 //!
-//! ## The fix these tests pin
+//! ## What these tests pin
 //!
-//! - The stale-timestamp rejection is classified retriable: the portal
-//!   reroutes with a freshly signed attempt and the client sees a `200`
-//!   ([`ct_stale_timestamp_is_retried`]). The worker that correctly rejected
-//!   the stale query is not penalized.
-//! - The send permit is acquired *before* the query is stamped and signed
-//!   (`query_worker`), so queue time can no longer age a signature
-//!   ([`ct_stale_timestamp_congestion_queue_boundary`] documents the permit
-//!   lifetimes that make the >60s queue itself unreachable in this harness).
+//! - The verdict side (landed on master as the `clock_skew` row): the
+//!   stale-envelope rejection reroutes on the error cooldown, so the client
+//!   sees a `200` served by another worker, and the rejecting worker's cooldown
+//!   decays instead of latching ([`ct_stale_timestamp_is_retried`] drives the
+//!   genuine wire rejection end to end, plus the stub now applies the real
+//!   admission-time freshness check unconditionally).
+//! - The signing side (this branch): the send permit is acquired *before* the
+//!   query is stamped and signed (`query_worker`), so queue time can no longer
+//!   age a signature ([`ct_stale_timestamp_congestion_queue_boundary`]
+//!   documents the permit lifetimes that make the >60s queue itself
+//!   unreachable in this harness; the ordering is pinned at unit level on the
+//!   `acquire_permit_then_timestamp` seam).
 
 use std::time::{Duration, Instant};
 
@@ -69,9 +73,10 @@ fn is_stale_timestamp_400(d: &Decoded) -> bool {
             .contains("timestamp out of allowed range")
 }
 
-/// A worker's stale-timestamp rejection is transient: the portal must reroute
+/// A worker's stale-envelope rejection is transient: the portal must reroute
 /// with a freshly signed attempt and deliver a `200`, never the pre-fix
-/// terminal `400`.
+/// terminal `400` — and the rejecting worker's error cooldown must decay
+/// rather than latch.
 #[tokio::test(flavor = "multi_thread")]
 async fn ct_stale_timestamp_is_retried() -> anyhow::Result<()> {
     // Two workers, so the reroute has somewhere to go.
@@ -105,7 +110,7 @@ async fn run_retry(fx: &mut Fixture) -> anyhow::Result<()> {
     // The genuine wire rejection: whichever worker the portal picks first
     // answers `BadRequest("timestamp out of allowed range")`, exactly as a real
     // worker does when a signed timestamp is stale at admission.
-    fx.worker_faults.queue(WorkerFault::BadTimestamp, 1);
+    fx.worker_faults.queue(WorkerFault::StaleEnvelope, 1);
     let before = fx.queries_answered();
     let d = driver::stream(
         &http,
@@ -149,10 +154,14 @@ async fn run_retry(fx: &mut Fixture) -> anyhow::Result<()> {
         "a rejected attempt must be rerouted; only {sent} worker query was answered"
     );
 
-    // The rejecting worker was never the problem, so the pool stays healthy:
-    // the very next request serves without cooldown. Issued immediately — the
-    // harness config decays worker penalties after 1s, so a wrongly cooled-down
-    // worker would still be inside its penalty window here.
+    // The rejection draws the DC-1 error cooldown (spec/05: "reroute; cooldown
+    // P-WORKER-ERROR-COOLDOWN") — but the cooldown must decay, never latch. The
+    // pool keeps serving through it via the other worker, and once the harness's
+    // 1s penalty window passes, the rejecting worker itself serves fresh queries
+    // again. Its selection after decay is deterministic: Best-group workers rank
+    // by measured throughput with "no data yet" ahead of any measurement, and
+    // the rejector — whose only interaction was the rejection — is the one
+    // worker without a throughput sample.
     fx.worker_faults.clear();
     let rejecting = rejecting_worker(fx)?;
     let served_before = fresh_serves(&fx.worker_ledgers[rejecting]);
@@ -167,7 +176,7 @@ async fn run_retry(fx: &mut Fixture) -> anyhow::Result<()> {
     .await?;
     ensure!(
         after.status == 200,
-        "the pool must serve right after the rejection, got {} — {}",
+        "the pool must serve right through the rejector's cooldown, got {} — {}",
         after.status,
         String::from_utf8_lossy(&after.body),
     );
@@ -175,27 +184,39 @@ async fn run_retry(fx: &mut Fixture) -> anyhow::Result<()> {
         after.body == baseline.body,
         "follow-up response differs from the unfaulted baseline"
     );
-    // A pool-level 200 alone cannot tell a healthy pool from one that quietly
-    // benched the rejecting worker — the other worker could have served it. The
-    // worker that answered `BadTimestamp` must itself serve the follow-up. That
-    // routing is deterministic, not luck: the pool ranks Best-group workers by
-    // measured throughput with "no data yet" ahead of any measurement, and the
-    // rejecting worker — whose only interaction was the rejection — is the one
-    // worker without a throughput sample, so a healthy pool picks it first. A
-    // cooled-down worker would instead sit in the Unavailable group and the
-    // request would route around it.
-    ensure!(
-        fresh_serves(&fx.worker_ledgers[rejecting]) > served_before,
-        "the rejecting worker was not selected for the follow-up request — it was \
-         cooled down for correctly rejecting a stale query; its ledger: {:?}",
-        fx.worker_ledgers[rejecting].entries(),
-    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut probes = 0usize;
+    while fresh_serves(&fx.worker_ledgers[rejecting]) == served_before {
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "the rejecting worker never served again after {probes} probes — its \
+             error cooldown latched instead of decaying; ledger: {:?}",
+            fx.worker_ledgers[rejecting].entries(),
+        );
+        probes += 1;
+        let probe = driver::stream(
+            &http,
+            &base,
+            "toy",
+            "finalized-stream",
+            &query(FROM, TO),
+            &format!("stale-recovery-{probes}"),
+        )
+        .await?;
+        ensure!(
+            probe.status == 200,
+            "recovery probe {probes} failed with {} — {}",
+            probe.status,
+            String::from_utf8_lossy(&probe.body),
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 
     Ok(())
 }
 
-/// Index of the (single) worker whose ledger recorded the `BadTimestamp`
-/// rejection.
+/// Index of the (single) worker whose ledger recorded the injected
+/// `StaleEnvelope` rejection.
 fn rejecting_worker(fx: &Fixture) -> anyhow::Result<usize> {
     let hits: Vec<usize> = fx
         .worker_ledgers
@@ -204,13 +225,13 @@ fn rejecting_worker(fx: &Fixture) -> anyhow::Result<usize> {
         .filter(|(_, l)| {
             l.entries()
                 .iter()
-                .any(|e| e.starts_with("query ") && e.contains("fault=BadTimestamp"))
+                .any(|e| e.starts_with("query ") && e.contains("fault=StaleEnvelope"))
         })
         .map(|(i, _)| i)
         .collect();
     anyhow::ensure!(
         hits.len() == 1,
-        "exactly one worker must have recorded the BadTimestamp rejection, found {}",
+        "exactly one worker must have recorded the StaleEnvelope rejection, found {}",
         hits.len()
     );
     Ok(hits[0])
