@@ -271,25 +271,25 @@ fn fresh_serves(ledger: &harness::stubs::Ledger) -> usize {
 ///    and the worker actor answers atomically via a `ResponseChannel` — there
 ///    is no "first byte then stall", so body reads are one fast pass on
 ///    loopback.
-/// 3. **The tiny pool fails closed first.** With `max_queries_per_worker: 1`, a
-///    stalled worker's lease exhausts the two-worker pool, so a concurrent
-///    request fails at worker selection with a retriable `no_workers` (503)
-///    long before any congestion permit is involved.
-/// 4. **The stall is bypassed anyway.** The default `retries: 1` plus the 1s
+/// 3. **The stall is bypassed anyway.** The default `retries: 1` plus the 1s
 ///    request-timeout floor fire a speculative retry that gets a fresh answer.
 ///
 /// So this test pins the boundary: under a pinned single-slot window and a
-/// >60s stall, a second request resolves promptly and the stale-timestamp 400
-/// never appears. If a change to the permit lifetimes ever lets a stall hold
-/// the slot, the latency guard flips — the cue to re-examine the sign-after-
-/// acquire ordering end to end.
+/// >60s stall, a second request must still *reach a worker through the
+/// scheduler* and serve promptly. Four workers, because with
+/// `max_queries_per_worker: 1` and `retries: 1` stream A pre-leases two — on a
+/// two-worker pool B would die at worker selection with `no_workers` before
+/// ever calling `acquire`, and the latency guard would pass vacuously. If a
+/// change to the permit lifetimes ever lets a stall hold the slot, B's acquire
+/// blocks for the stall and the guard flips — the cue to re-examine the
+/// sign-after-acquire ordering end to end.
 #[tokio::test(flavor = "multi_thread")]
 async fn ct_stale_timestamp_congestion_queue_boundary() -> anyhow::Result<()> {
     // Single-slot window; transport + read timeouts long enough that, if a stall
     // *did* hold the slot, it would hold it well past 60s rather than being torn
     // down early.
     let tuning = Tuning::single_slot_congestion(120, 120);
-    let mut fx = Fixture::start_tuned(ToyWorld::standard(), 2, tuning).await?;
+    let mut fx = Fixture::start_tuned(ToyWorld::standard(), 4, tuning).await?;
     let result = run_congestion(&mut fx).await;
     fx.finish(result)
 }
@@ -366,19 +366,32 @@ async fn run_congestion(fx: &mut Fixture) -> anyhow::Result<()> {
         stall.as_secs(),
     );
 
-    // The boundary: a stall does not hold the single slot (see the doc
-    // comment), so B resolves promptly — as a fast availability failure or a
-    // served response.
+    // B must have gone through the whole path — sign, acquire, send, serve —
+    // not died early at worker selection: a `no_workers` here would pass the
+    // latency guard without ever touching the scheduler, proving nothing.
     ensure!(
-        b_latency < Duration::from_secs(30),
-        "B resolved in {b_latency:?}; a stall is not expected to hold the congestion slot. \
-         If this now exceeds 60s the permit lifetimes changed — re-examine the \
-         sign-after-acquire ordering (status was {}, body {})",
+        b.status == 200,
+        "B must reach a worker through the scheduler and serve, got {} — {}",
         b.status,
         String::from_utf8_lossy(&b.body),
     );
+    ensure!(
+        fx.worker_ledgers.iter().any(|l| l
+            .entries()
+            .iter()
+            .any(|e| e.contains("range=40-79") && e.contains("fault=none"))),
+        "no worker ledger shows B's query being served"
+    );
+    // The boundary: a stall does not hold the single slot (see the doc
+    // comment), so B's acquire is granted immediately and it serves promptly.
+    ensure!(
+        b_latency < Duration::from_secs(30),
+        "B took {b_latency:?}; a stall is not expected to hold the congestion slot. \
+         If this approaches the stall duration the permit lifetimes changed — \
+         re-examine the sign-after-acquire ordering",
+    );
     // And in no case may the anti-replay rejection surface as the pre-fix
-    // terminal 400 — retriable classification plus sign-after-acquire both
+    // terminal 400 — the clock_skew reroute plus sign-after-acquire both
     // stand in the way.
     ensure!(
         !is_stale_timestamp_400(&b),
