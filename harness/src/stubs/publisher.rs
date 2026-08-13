@@ -4,35 +4,62 @@ use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use serde_json::json;
 
 use super::Ledger;
+use crate::artifact::AssignmentSource;
 
 #[derive(Clone)]
 struct PublisherState {
     network_state: String,
     artifact_gz: Vec<u8>,
+    portal_artifact_gz: Vec<u8>,
     ledger: Ledger,
 }
 
+/// Publishes both artifacts, which is the state the scheduler holds throughout the migration —
+/// so which one the portal reads is decided by its config alone, never by what is on offer.
 pub fn network_state_json(port: u16, assignment_id: &str, effective_from: u64) -> String {
-    json!({
-        "network": "tethys",
-        "assignment": {
+    network_state_json_publishing(
+        port,
+        assignment_id,
+        effective_from,
+        &[AssignmentSource::Legacy, AssignmentSource::Portal],
+    )
+}
+
+/// The same document carrying only `published`. Every descriptor is optional upstream because
+/// migration walks the state through legacy-only, both, then split-only — so a portal has to
+/// cope with the artifact it was pointed at simply not being there.
+pub fn network_state_json_publishing(
+    port: u16,
+    assignment_id: &str,
+    effective_from: u64,
+    published: &[AssignmentSource],
+) -> String {
+    let mut state = json!({ "network": "tethys" });
+    for source in published {
+        let (key, file) = match source {
+            AssignmentSource::Legacy => ("assignment", "assignment.fb.gz"),
+            AssignmentSource::Portal => ("portal_assignment", "portal-assignment.fb.gz"),
+        };
+        state[key] = json!({
             "id": assignment_id,
             "effective_from": effective_from,
-            "fb_url_v1": format!("http://127.0.0.1:{port}/assignment.fb.gz"),
-        }
-    })
-    .to_string()
+            "fb_url_v1": format!("http://127.0.0.1:{port}/{file}"),
+        });
+    }
+    state.to_string()
 }
 
 pub async fn start(
     port: u16,
     network_state: String,
     artifact_gz: Vec<u8>,
+    portal_artifact_gz: Vec<u8>,
 ) -> anyhow::Result<Ledger> {
     let ledger = Ledger::default();
     let state = PublisherState {
         network_state,
         artifact_gz,
+        portal_artifact_gz,
         ledger: ledger.clone(),
     };
     let app = Router::new()
@@ -51,6 +78,14 @@ pub async fn start(
             get(|State(s): State<PublisherState>| async move {
                 s.ledger.push("artifact");
                 s.artifact_gz.clone().into_response()
+            }),
+        )
+        .route(
+            // Prefixed "artifact" so a fetch of either format satisfies the same ledger check.
+            "/portal-assignment.fb.gz",
+            get(|State(s): State<PublisherState>| async move {
+                s.ledger.push("artifact-portal");
+                s.portal_artifact_gz.clone().into_response()
             }),
         )
         .with_state(state);

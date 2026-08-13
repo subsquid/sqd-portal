@@ -4,6 +4,10 @@
 use std::collections::HashMap;
 
 /// Sum all samples of a metric family from OpenMetrics text.
+///
+/// Matches the family name exactly, so this is for gauges. A counter is exposed as
+/// `<family>_total` and reads as `None` here — use [`sum_where`] for those, or an assertion on
+/// a counter silently passes against nothing.
 pub fn family_sum(text: &str, family: &str) -> Option<f64> {
     let mut sum = None;
     for line in text.lines() {

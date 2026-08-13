@@ -6,9 +6,35 @@ use std::io::Write;
 
 use flate2::{write::GzEncoder, Compression};
 use libp2p_identity::PeerId;
-use sqd_assignments::AssignmentBuilder;
+use sqd_assignments::{AssignmentBuilder, PortalAssignmentBuilder};
 
 use crate::world::ToyWorld;
+
+/// Which artifact the portal under test is configured to route from, mirroring its own
+/// `assignment_source`. The stub publishes both, which models the migration window and not the
+/// states either side of it: here this picks which artifact the portal reads, never which ones
+/// exist. A network that has finished migrating publishes only the split pair, and that shape
+/// is not covered by this harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentSource {
+    Legacy,
+    Portal,
+}
+
+impl AssignmentSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Portal => "portal",
+        }
+    }
+}
+
+impl std::fmt::Display for AssignmentSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Build the artifact assigning every archival chunk to every worker, then
 /// gzip it. The portal pre-leases `1 + retries` *distinct* workers per chunk,
@@ -55,7 +81,48 @@ pub fn build_gzipped(world: &ToyWorld, workers: &[PeerId]) -> anyhow::Result<Vec
         );
     }
 
-    let bytes = b.finish();
+    gzip(b.finish())
+}
+
+/// The same world in the portal-oriented format. It carries no download or auth fields at
+/// all, so what the portal routes from here is strictly less than the legacy artifact holds —
+/// which is the point of running the smoke against both.
+pub fn build_portal_gzipped(world: &ToyWorld, workers: &[PeerId]) -> anyhow::Result<Vec<u8>> {
+    let mut workers: Vec<PeerId> = workers.to_vec();
+    workers.sort();
+    let worker_indexes: Vec<u16> = (0..workers.len() as u16).collect();
+
+    let mut b = PortalAssignmentBuilder::new();
+
+    for ds in &world.datasets {
+        let Some(network_id) = &ds.network_id else {
+            continue;
+        };
+        let mut head_hash = None;
+        for chunk in &ds.chunks {
+            b.new_chunk()
+                .id(&chunk.id(&ds.name))
+                .dataset_id(network_id)
+                .block_range(chunk.first..=chunk.last)
+                .last_block_timestamp(world.timestamp(chunk.last))
+                .worker_indexes(&worker_indexes)
+                .finish()
+                .map_err(|e| anyhow::anyhow!("chunk build: {e}"))?;
+            head_hash = Some(world.hash(&ds.name, chunk.last));
+        }
+        // Only the dataset's head hash survives the split; per-chunk hashes were dropped
+        // because no query needs one. Schema ids are inert — the portal doesn't read them yet.
+        b.finish_dataset(0, head_hash.as_deref());
+    }
+
+    for worker in &workers {
+        b.add_worker(*worker, sqd_assignments::WorkerStatus::Ok);
+    }
+
+    gzip(b.finish())
+}
+
+fn gzip(bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(&bytes)?;
     Ok(enc.finish()?)

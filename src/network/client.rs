@@ -323,7 +323,7 @@ impl NetworkClientBuilder {
         if config.ignore_deprecated_workers {
             network_state.ignore_deprecated_workers();
         }
-        network_state.set_prefer_portal_assignment(config.prefer_portal_assignment);
+        network_state.set_assignment_source(config.assignment_source);
 
         let read_scheduler = if config.congestion.enabled {
             let sched = Arc::new(DownloadScheduler::new(config.congestion.clone()));

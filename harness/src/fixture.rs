@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::Context;
 use tempfile::TempDir;
 
+use crate::artifact::AssignmentSource;
 use crate::portal::{Auth, Endpoints, PortalProcess};
 use crate::stubs::control_plane::ControlPlane;
 use crate::stubs::worker::{WorkerFaults, WorkerStub};
@@ -32,12 +33,29 @@ pub struct Fixture {
     scratch: Option<TempDir>,
 }
 
+/// Which artifacts the publisher offers, and which one the portal is pointed at. Defaults to
+/// the migration window: both published, the portal reading the legacy one. Separating the two
+/// is what lets a test put the portal on an artifact that is not on offer.
+pub struct Assignments {
+    pub source: AssignmentSource,
+    pub published: Vec<AssignmentSource>,
+}
+
+impl Default for Assignments {
+    fn default() -> Self {
+        Self {
+            source: AssignmentSource::Legacy,
+            published: vec![AssignmentSource::Legacy, AssignmentSource::Portal],
+        }
+    }
+}
+
 impl Fixture {
     /// `workers` stub workers on the toy world. The portal pre-leases
     /// 1 + retries distinct workers per chunk, so two is the minimum that lets
     /// a reroute actually find somewhere to go.
     pub async fn start(world: ToyWorld, workers: usize) -> anyhow::Result<Self> {
-        Self::start_with(world, workers, None).await
+        Self::start_with(world, workers, None, Assignments::default()).await
     }
 
     /// The same world with an `auth:` block and the DC-8 stub behind it.
@@ -48,13 +66,25 @@ impl Fixture {
         workers: usize,
         auth: Auth,
     ) -> anyhow::Result<Self> {
-        Self::start_with(world, workers, Some(auth)).await
+        Self::start_with(world, workers, Some(auth), Assignments::default()).await
+    }
+
+    /// A fixture whose publisher shape and configured source are set by the caller — the DC-2
+    /// source-selection cases. Note this does not wait for readiness: a portal pointed at an
+    /// artifact nobody publishes never becomes ready, which is the point of those cases.
+    pub async fn start_with_assignments(
+        world: ToyWorld,
+        workers: usize,
+        assignments: Assignments,
+    ) -> anyhow::Result<Self> {
+        Self::start_with(world, workers, None, assignments).await
     }
 
     async fn start_with(
         world: ToyWorld,
         workers: usize,
         auth: Option<Auth>,
+        assignments: Assignments,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(workers >= 1, "need at least one worker");
         // Loopback p2p addresses are filtered as unreachable unless this is set.
@@ -89,11 +119,16 @@ impl Fixture {
             dummy_chain::dummy_data_json(&worker_peers, portal_id.peer_id),
         )?;
 
-        let artifact_gz = artifact::build_gzipped(&world, &worker_peers)?;
         let publisher_ledger = stubs::publisher::start(
             endpoints.publisher_port,
-            stubs::publisher::network_state_json(endpoints.publisher_port, "toy-assignment-1", 0),
-            artifact_gz,
+            stubs::publisher::network_state_json_publishing(
+                endpoints.publisher_port,
+                "toy-assignment-1",
+                0,
+                &assignments.published,
+            ),
+            artifact::build_gzipped(&world, &worker_peers)?,
+            artifact::build_portal_gzipped(&world, &worker_peers)?,
         )
         .await?;
         let _registry_ledger = stubs::registry::start(endpoints.registry_port, &world).await?;
@@ -140,7 +175,13 @@ impl Fixture {
             .map(|(id, port)| format!("{} /ip4/127.0.0.1/udp/{port}/quic-v1", id.peer_id))
             .collect::<Vec<_>>()
             .join(",");
-        let config = portal::write_config(&scratch, &world, &endpoints, auth.as_ref())?;
+        let config = portal::write_config(
+            &scratch,
+            &world,
+            &endpoints,
+            auth.as_ref(),
+            assignments.source,
+        )?;
         let portal = portal::spawn(
             &scratch,
             &config,

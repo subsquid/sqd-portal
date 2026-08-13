@@ -8,6 +8,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context};
+use harness::artifact::AssignmentSource;
 use harness::driver::Decoded;
 use harness::model::{model, Expect, StreamReq};
 use harness::portal::{Endpoints, PortalProcess};
@@ -73,10 +74,23 @@ struct Ctx {
     worker_ledgers: Vec<stubs::Ledger>,
     hotblocks_ledger: stubs::Ledger,
     publisher_ledger: stubs::Ledger,
+    assignment_source: AssignmentSource,
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ct1_smoke() -> anyhow::Result<()> {
+    smoke(AssignmentSource::Legacy).await
+}
+
+/// The same conformance run, routed from the portal-oriented artifact. It carries strictly less
+/// than the legacy one — no per-chunk hashes, sizes, or download urls — so this is what shows
+/// the portal never needed those fields before the network stops publishing them.
+#[tokio::test(flavor = "multi_thread")]
+async fn ct1_smoke_from_portal_assignment() -> anyhow::Result<()> {
+    smoke(AssignmentSource::Portal).await
+}
+
+async fn smoke(assignment_source: AssignmentSource) -> anyhow::Result<()> {
     // Loopback p2p addresses are filtered as unreachable unless this is set.
     std::env::set_var("PRIVATE_NETWORK", "1");
     let _ = tracing_subscriber::fmt()
@@ -115,11 +129,11 @@ async fn ct1_smoke() -> anyhow::Result<()> {
     )?;
 
     // IB-7 stubs.
-    let artifact_gz = artifact::build_gzipped(&world, &worker_peers)?;
     let publisher_ledger = stubs::publisher::start(
         endpoints.publisher_port,
         stubs::publisher::network_state_json(endpoints.publisher_port, "toy-assignment-1", 0),
-        artifact_gz,
+        artifact::build_gzipped(&world, &worker_peers)?,
+        artifact::build_portal_gzipped(&world, &worker_peers)?,
     )
     .await?;
     let _registry_ledger = stubs::registry::start(endpoints.registry_port, &world).await?;
@@ -147,7 +161,7 @@ async fn ct1_smoke() -> anyhow::Result<()> {
         .map(|(id, port)| format!("{} /ip4/127.0.0.1/udp/{port}/quic-v1", id.peer_id))
         .collect::<Vec<_>>()
         .join(",");
-    let config = portal::write_config(&scratch, &world, &endpoints, None)?;
+    let config = portal::write_config(&scratch, &world, &endpoints, None, assignment_source)?;
     let mut portal_proc = portal::spawn(
         &scratch,
         &config,
@@ -164,6 +178,7 @@ async fn ct1_smoke() -> anyhow::Result<()> {
         worker_ledgers,
         hotblocks_ledger,
         publisher_ledger,
+        assignment_source,
     };
 
     let result = run_smoke(&ctx, &mut portal_proc).await;
@@ -481,9 +496,21 @@ async fn run_smoke(ctx: &Ctx, portal_proc: &mut PortalProcess) -> anyhow::Result
         "hotblocks ledger misses stream calls: {:?}",
         ctx.hotblocks_ledger.entries()
     );
+    // Exact entries, not a prefix: "artifact" prefixes "artifact-portal", so a prefix match
+    // would let the portal-source run pass on a legacy fetch. Asserting the other artifact was
+    // never fetched is what pins the selector's no-fallback promise end to end.
+    let (expected, forbidden) = match ctx.assignment_source {
+        AssignmentSource::Legacy => ("artifact", "artifact-portal"),
+        AssignmentSource::Portal => ("artifact-portal", "artifact"),
+    };
+    let fetched = ctx.publisher_ledger.entries();
     ensure!(
-        ctx.publisher_ledger.count_with_prefix("artifact") >= 1,
-        "artifact never fetched"
+        fetched.iter().any(|e| e == expected),
+        "{expected} never fetched: {fetched:?}"
+    );
+    ensure!(
+        !fetched.iter().any(|e| e == forbidden),
+        "fetched {forbidden} while configured for {expected}: {fetched:?}"
     );
 
     // Quiescence (one heartbeat interval, no in-flight work), then the gauge

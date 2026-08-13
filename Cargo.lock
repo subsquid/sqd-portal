@@ -2472,9 +2472,9 @@ checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 
 [[package]]
 name = "flatbuffers"
-version = "25.2.10"
+version = "25.12.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1045398c1bfd89168b5fd3f1fc11f6e70b34f6f66300c87d44d3de849463abf1"
+checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
 dependencies = [
  "bitflags 2.10.0",
  "rustc_version 0.4.1",
@@ -7733,7 +7733,7 @@ dependencies = [
 [[package]]
 name = "sqd-assignments"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=360bbd4#360bbd4f115b44733dbfbf169bd5011f74cecb65"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=67f54cc#67f54ccec1e82a80ef95bd419af2fc20bb942129"
 dependencies = [
  "anyhow",
  "crypto_box",
