@@ -27,6 +27,7 @@ alternatives exist.
 | Worker fault | Own class / action |
 |---|---|
 | invalid-query verdict | BAD-REQUEST (terminal for the request) |
+| stale-envelope verdict (the worker's clock disagrees with ours beyond the protocol's freshness window) | reroute; cooldown P-WORKER-ERROR-COOLDOWN; exhausted ⇒ RETRIES-EXHAUSTED. Never BAD-REQUEST: the query is well-formed and the next worker may accept it unchanged |
 | result exceeds size cap | BAD-REQUEST advising a narrower query |
 | parent-hash mismatch verdict | CONFLICT (real-time mode only — finalized-mode queries carry no parent hash, REQ-3) |
 | server error / not found | reroute; cooldown P-WORKER-ERROR-COOLDOWN; exhausted ⇒ RETRIES-EXHAUSTED |

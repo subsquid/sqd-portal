@@ -114,6 +114,9 @@ enum Health {
     Error,
 }
 
+/// Matched verbatim: the wire carries no code for this verdict (GAP-25).
+const STALE_ENVELOPE: &str = "timestamp out of allowed range";
+
 /// One DC-1 row: how a worker verdict is classified, counted, and charged. The three
 /// were chosen independently in each match arm — eight arms times three decisions — and
 /// they drifted: the two capacity refusals shared a row in the spec while disagreeing
@@ -135,6 +138,10 @@ impl Verdict {
             backs_off,
         };
         match err {
+            // Clock skew, not a bad query: another worker may accept the same bytes.
+            Err::BadRequest(s) if s == STALE_ENVELOPE => {
+                row(QueryError::Retriable(s), "clock_skew", Health::Error, false)
+            }
             Err::BadRequest(s) => row(
                 QueryError::BadRequest(format!("couldn't parse request: {s}")),
                 "bad_request",
@@ -1216,5 +1223,24 @@ mod tests {
     fn parse_base_block_mismatch_malformed_no_number() {
         let msg = "unexpected base block: expected 0xabc, but got #0xdef";
         assert!(parse_base_block_mismatch(msg).is_none());
+    }
+
+    #[test]
+    fn stale_envelope_reroutes() {
+        let verdict = Verdict::of(query_error::Err::BadRequest(STALE_ENVELOPE.to_owned()));
+        assert!(matches!(verdict.error, QueryError::Retriable(_)));
+        assert!(matches!(verdict.health, Health::Error));
+        assert_eq!(verdict.label, "clock_skew");
+        assert!(!verdict.backs_off);
+    }
+
+    #[test]
+    fn other_bad_requests_stay_terminal() {
+        let verdict = Verdict::of(query_error::Err::BadRequest(
+            "invalid query signature".to_owned(),
+        ));
+        assert!(matches!(verdict.error, QueryError::BadRequest(_)));
+        assert!(matches!(verdict.health, Health::Ok));
+        assert_eq!(verdict.label, "bad_request");
     }
 }
