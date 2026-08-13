@@ -161,7 +161,7 @@ async fn smoke(assignment_source: AssignmentSource) -> anyhow::Result<()> {
         .map(|(id, port)| format!("{} /ip4/127.0.0.1/udp/{port}/quic-v1", id.peer_id))
         .collect::<Vec<_>>()
         .join(",");
-    let config = portal::write_config(&scratch, &world, &endpoints, None, assignment_source)?;
+    let config = portal::write_config(&scratch, &world, &endpoints, None, assignment_source, None)?;
     let mut portal_proc = portal::spawn(
         &scratch,
         &config,

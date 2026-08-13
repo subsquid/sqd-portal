@@ -13,7 +13,9 @@ observing it on a Portal without one is the same violation (REQ-56).
 ## DC-1 — Archival workers
 
 *Role.* Serve chunk queries; the archival path of OP-1/OP-5.
-*Call contract.* Signed query per attempt; request deadline P-TRANSPORT-TIMEOUT;
+*Call contract.* Signed query per attempt, stamped and signed only after the attempt's
+send permit (DEF-13) is granted — scheduler queue time must never age the signature
+against the worker's admission window; request deadline P-TRANSPORT-TIMEOUT;
 first-byte wait bounded by the same; body read in bounded reads of at most
 P-CONGESTION-READ-TIMEOUT each under a congestion permit (DEF-13); response size capped
 at P-RESULT-MAX-SIZE; at most P-MAX-QUERIES-PER-WORKER concurrent queries per worker.

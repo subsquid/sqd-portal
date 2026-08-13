@@ -31,8 +31,19 @@ the fault rows of DC-8's error table as injectors. `ct10_authorization` drives f
 portals — enforcing, shadow, no `auth:` block, one whose exchange budget is small enough
 to saturate, and one signing with a dedicated key — because the properties differ by
 configuration rather than by request.
-Coverage outside those three classes is still inline unit tests.
-All three suites run on every pull request: the harness is a separate crate, so it needs a
+**The stale-timestamp class exists**: `ct_stale_timestamp` pins the DC-1 stale-envelope
+row (05 §DC-1, 09 §worker faults) end to end. The worker stub validates admission-time
+freshness unconditionally (mirroring the real worker's 60s anti-replay window) and gained
+a `Stall` injector plus configurable portal tuning (congestion window, transport
+timeout); `ct_stale_timestamp_is_retried` asserts one genuine wire rejection is masked by
+a reroute — client 200, rejected-plus-fresh attempts in the ledgers, and the rejecting
+worker's error cooldown decaying rather than latching — and
+`ct_stale_timestamp_congestion_queue_boundary` pins the permit lifetimes under a pinned
+single-slot congestion window, documenting why a >60s scheduler queue is not inducible
+with atomic-response stubs. The sign-after-permit ordering itself is pinned by unit tests
+on the extracted seam (`acquire_permit_then_timestamp` in the network client).
+Coverage outside those four classes is still inline unit tests.
+All four suites run on every pull request: the harness is a separate crate, so it needs a
 build of the portal and a job of its own — a status this document cites has to be one
 something re-checks.
 
