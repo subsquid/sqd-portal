@@ -575,7 +575,11 @@ Deliberately left open — tests and clients must not pin these:
 
 Closed: **OQ-6** (should the clamp-bypassing debug stream variant be exposed unconditionally,
 or gated behind an operator flag?) — resolved by ADR-014: the variant is gated behind an
-operator flag and disabled by default (GAP-21 until implemented). **OQ-12** (what does an
+operator flag and disabled by default (GAP-21 until implemented). **OQ-8** (ratify the HTTP
+field or header carrying DEF-8's coverage cursor) — dissolved rather than answered: the
+question assumed the wire lacked a cursor, and it never did. Every served chunk's boundary
+blocks ship as records, so the last record is the cursor and there is no field to name
+(GAP-15). **OQ-12** (what does an
 enforcing Portal do once its key set is older than its staleness bound?) — moot since
 the on-demand exchange: there is no mirrored key set to age. Its answer survives as
 the reasoning REQ-54 and INV-31 still rest on — readiness never turns on the control plane's

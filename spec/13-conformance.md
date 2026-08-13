@@ -1,7 +1,7 @@
 # 13 — Conformance & TDD plan
 
-**Mutable doc.** Statuses as of **2026-08-07** (0.12.1,
-`master@e9a1878f863c4d87615bcf21ba1ef79fdf649385`). Statuses: **C** covered · **P** partial ·
+**Mutable doc.** Statuses as of **2026-08-13** (0.13.1,
+`master@ab821f91d5b4345ec6dc6cbf05595867f41eb7de`). Statuses: **C** covered · **P** partial ·
 **U** unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
 **The authorization band (REQ-50..56, DC-8, OP-11 and the invariants scoped to them) has
 landed and is CT-10-covered on its request path.** A deployment with no `auth:` block
@@ -239,7 +239,7 @@ chunk-boundary records FV-6 licenses.
 | REQ-55 | P | CT-10 runs a shadow portal: a request with no credential, one with an ungrammatical token and one the control plane denies are all served, the verdict enforcement would have returned is in the protected log, and the keyless scrape carries only the neutral `shadow_evaluated` series with no code and no exchange counters. The control-plane ledger shows it exchanging on the same cache-miss rule enforcement uses — once, for the only request that presented something to exchange. Indeterminate exchange outcomes are not separately driven |
 | REQ-56 | P | CT-10 runs a portal with no `auth:` block: gated routes are served without a credential, a credential presented anyway is not a reason to refuse, and no authorization series appears in the scrape at all. The empty-block startup error is unit-tested in `auth::config` rather than here, and the startup mode line is logged but not asserted |
 
-## Gap register — 2026-08-07
+## Gap register — 2026-08-13
 
 Priorities: P0 blocks the program · P1 active production risk · P2 correctness hole
 with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
@@ -278,6 +278,13 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-33 | CT-10's harness exists and its request-path rows are driven black-box, but every row whose claim is about *time* is still unwritten: LIV-13's convergence at `refresh_after` and at `expires_at` with the control plane stopped, a retired generation completing after its successor (INV-6), the denial TTL and the grace window, and HZ-12's renewal spread. All of them need either a controllable clock or a run long enough to cross a real one, and the stub has neither | CT-10, DC-8, INV-6, LIV-13, HZ-12 | P2 | give the control-plane stub a settable clock offset, or drive the cases with second-scale lifetimes; `expires_at` convergence with the control plane stopped is the one carrying the security claim |
 
 ### Closed findings
+
+- **GAP-35** (closed 2026-08-07): the commercial band was specification only — the binary
+  carried no authorization code, so REQ-50..56, DC-8, OP-11, INV-6/14/15/38/39 and
+  LIV-13/14 were unmet by absence rather than by defect. The band landed with CT-10
+  covering its request path, which is what the entry asked for. Its unfinished half was
+  never the code but the clock: every row whose claim is about *time* is still unwritten,
+  and that residual is GAP-33, not this entry.
 
 - **GAP-31** (closed 2026-08-06; superseded 2026-08-07): key-snapshot staleness was
   unbounded and unexported, and was closed by exporting an age gauge and alarming on it.
@@ -320,6 +327,14 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
   the common shape when a replica dies with the request still unread — was never
   replayed, and the fix would have missed most of the incident it was written for.
   GAP-22 now tracks only the indicator residual.
+- **GAP-15** (closed 2026-07-19): the HTTP response was believed not to expose DEF-8's
+  coverage cursor, marking REQ-2 known-violated for selective zero-record progress. It was
+  never missing: sqd-query pins the min and max block of every served chunk at weight 0, so
+  the coverage boundary always ships as a record — header-only when it matches no filter —
+  and the last record *is* the cursor. No field or header needed ratifying, which closed
+  OQ-8 with it. Grounding the claim cost a free variable rather than a fix: `Plan::execute`
+  runs per chunk, so a multi-chunk selective response also carries header-only records at
+  interior boundaries, and FV-6 licenses them.
 - **GAP-9** (closed 2026-07-17): EMPTY delay occurs after the stream census permit is
   released. It can occupy an HTTP connection/task (HZ-3), but does not consume the
   stream cap.
