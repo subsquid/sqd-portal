@@ -17,10 +17,10 @@ reads an error code.
 **CT-2 has started**: the worker stub is now a DC-1 fault injector (wrong-range both
 directions, bad signature, server-error and not-found verdicts) shared across workers so
 a fault lands wherever the portal routes, and `Fixture` boots the whole stub world for
-any class that needs it. The rev gap is closed: the portal and the stub both pin the
-transport at 67f54cc, where the server hands raw protobuf to the consumer and the stub
-decodes and answers on the response stream as a production worker does. Its silent drop
-at buffer capacity is still not driven, so that path stays unexercised.
+any class that needs it. Caveat: production workers pin a newer transport rev whose
+server was rewritten (stream-based accept with silent drop at buffer capacity); the stub
+speaks the portal's older pinned rev, so the production server's drop paths are not
+exercised — re-verify on the next transport bump.
 `ct2_worker_faults` covers the worker-fault reroute rows and the exhaustion split, and
 `ct2_publisher_faults` covers the DC-2 row where the publisher omits the artifact the
 portal is configured for; the rest of CT-2 and CT-3..CT-9 remain to be built per the

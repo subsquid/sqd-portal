@@ -86,22 +86,15 @@ tempfile = "3"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
 
+# Only sqd-assignments moves: 67f54cc is where the portal-oriented artifact and its reader
+# live. The rest stay on e9a3434 — the transport revs in between move the libp2p fork and
+# change the worker server's API, which this change has no need for.
 sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", features = ["reader"] }
-sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", version = "1.3.0" }
-sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", version = "2.1.0", features = ["semver", "bitstring"] }
-sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", version = "3.1.0", features = ["portal", "metrics"] }
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", version = "1.3.0" }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", version = "2.1.0", features = ["semver", "bitstring"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", version = "3.1.0", features = ["portal", "metrics"] }
 
 sqd-primitives = { git = "https://github.com/subsquid/data.git", rev = "eaa9f86", features = ["serde"] }
 sqd-query = { git = "https://github.com/subsquid/data.git", rev = "eaa9f86" }
 
 sql_query_plan = { git = "https://github.com/subsquid/qplan.git", rev = "2e61b51", optional = true }
-
-# Required by the span the sqd-network bump crosses, not by its tip: 541684c ("Migrate worker
-# server behaviour to libp2p-stream") moved the libp2p fork from c0ed330 to fac3b0c9, and the
-# transport pin used to sit below it. That fork builds its crates against an in-tree
-# libp2p-identity while `multiaddr` still pulls the crates.io one; both then land in the graph
-# and libp2p-swarm fails to compile on mismatched `PeerId` types. sqd-network carries this same
-# patch in its own root manifest, but Cargo only honours `[patch]` from the workspace root, so
-# every consumer has to repeat it.
-[patch.crates-io]
-libp2p-identity = { git = "https://github.com/kalabukdima/rust-libp2p.git", rev = "fac3b0c9" }

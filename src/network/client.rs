@@ -703,11 +703,6 @@ impl NetworkClient {
             timestamp_ms: timestamp_now_ms(),
             signature: Default::default(),
             compression,
-            // Both defaults, deliberately: `msg_to_sign` only appends these to the signed payload
-            // when one is non-zero, so leaving them alone keeps signatures byte-identical to what
-            // workers that predate the fields already verify.
-            query_engine: sqd_messages::QueryEngine::Default as i32,
-            output_format: sqd_messages::OutputFormat::Jsonl as i32,
         };
         tokio::task::spawn_blocking({
             let keypair = self.keypair.clone();
