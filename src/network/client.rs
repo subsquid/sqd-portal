@@ -26,7 +26,7 @@ use tracing::{debug_span, instrument, Instrument};
 use super::contracts_state::{ContractsState, Status};
 use super::priorities::NoWorker;
 use super::{ChunkNotFound, NetworkState, WorkerLease};
-use crate::controller::download_scheduler::{DownloadScheduler, Outcome, Priority};
+use crate::controller::download_scheduler::{DownloadPermit, DownloadScheduler, Outcome, Priority};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
 use crate::types::{BlockNumber, BlockRange, ChunkId, Compression, DataChunk};
@@ -647,6 +647,17 @@ impl NetworkClient {
         tracing::trace!("Sending query {query_id} to {worker}");
 
         let _guard = QueryGuard::new();
+        // The send permit is acquired *before* the query is stamped and signed: under
+        // congestion `acquire` queues arbitrarily long, and a `timestamp_ms` stamped
+        // ahead of that wait ages against the worker's admission tolerance (60s) while
+        // the query sits in the portal's own queue — surfacing as the stale-envelope
+        // verdict for a query that was fresh when it was built. Signing under the
+        // permit costs microseconds of extra hold time and keeps the timestamp fresh
+        // at send. `prepare_query` consumes the timestamp the helper produced after
+        // the grant, so the ordering is pinned by
+        // `timestamp_is_stamped_after_permit_grant`.
+        let (send_permit, timestamp_ms) =
+            acquire_permit_then_timestamp(self.read_scheduler.as_ref(), priority).await;
         let query = self
             .prepare_query(
                 worker,
@@ -656,10 +667,11 @@ impl NetworkClient {
                 &block_range,
                 query,
                 compression,
+                timestamp_ms,
             )
             .await;
         let result = self
-            .execute_query(worker, query, &block_range, priority)
+            .execute_query(worker, query, &block_range, priority, send_permit)
             .await;
         result
     }
@@ -670,8 +682,9 @@ impl NetworkClient {
         query: Query,
         block_range: &BlockRange,
         priority: Option<u32>,
+        send_permit: Option<DownloadPermit>,
     ) -> QueryResult {
-        let mut stream = self.send_to_transport(worker, query, priority).await?;
+        let mut stream = self.send_to_transport(worker, query, send_permit).await?;
         let network_start = Instant::now();
         let mut buf = self.receive_first_byte(worker, &mut stream).await?;
         let ttfb = network_start.elapsed();
@@ -683,6 +696,12 @@ impl NetworkClient {
             .await
     }
 
+    /// Builds and signs the wire query. `timestamp_ms` is produced by
+    /// `acquire_permit_then_timestamp` *after* the send permit is granted — taking it
+    /// as a parameter rather than reading the clock here is what makes the
+    /// sign-after-permit ordering a property of one function instead of a convention
+    /// spread over two.
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_query(
         &self,
         worker: PeerId,
@@ -692,6 +711,7 @@ impl NetworkClient {
         block_range: &BlockRange,
         query: String,
         compression: Compression,
+        timestamp_ms: u64,
     ) -> Query {
         let compression = match compression {
             Compression::Gzip => sqd_messages::Compression::Gzip,
@@ -707,7 +727,7 @@ impl NetworkClient {
                 end: *block_range.end(),
             }),
             chunk_id: chunk_id.chunk.to_string(),
-            timestamp_ms: timestamp_now_ms(),
+            timestamp_ms,
             signature: Default::default(),
             compression,
         };
@@ -725,20 +745,19 @@ impl NetworkClient {
         .unwrap()
     }
 
+    /// Sends the query over the transport. `send_permit` is the congestion slot the
+    /// caller acquired *before* stamping the query's timestamp (see `query_worker`);
+    /// it still covers the send itself and is released when this returns.
     async fn send_to_transport(
         &self,
         worker: PeerId,
         query: Query,
-        priority: Option<u32>,
+        send_permit: Option<DownloadPermit>,
     ) -> Result<ResponseStream, QueryError> {
         metrics::QUERIES_SENT
             .get_or_create(&vec![("worker".to_string(), worker.to_string())])
             .inc();
 
-        let send_permit = match (&self.read_scheduler, priority) {
-            (Some(sched), Some(prio)) => Some(sched.acquire(prio).await),
-            _ => None,
-        };
         match self
             .transport_handle
             .send_query_request(worker, query)
@@ -1062,6 +1081,22 @@ impl NetworkClient {
     }
 }
 
+/// Awaits the congestion send permit (when scheduling applies) and only then reads
+/// the clock for the query's `timestamp_ms`. Extracted so the ordering — permit
+/// first, timestamp second — is a unit-testable property rather than a convention:
+/// a timestamp taken before the wait ages against the worker's 60s admission bound
+/// for as long as the scheduler queues the attempt.
+async fn acquire_permit_then_timestamp(
+    scheduler: Option<&Arc<DownloadScheduler>>,
+    priority: Option<u32>,
+) -> (Option<DownloadPermit>, u64) {
+    let permit = match (scheduler, priority) {
+        (Some(sched), Some(prio)) => Some(sched.acquire(prio).await),
+        _ => None,
+    };
+    (permit, timestamp_now_ms())
+}
+
 fn is_congestion_failure(failure: &QueryFailure) -> bool {
     matches!(
         failure,
@@ -1242,5 +1277,60 @@ mod tests {
         assert!(matches!(verdict.error, QueryError::BadRequest(_)));
         assert!(matches!(verdict.health, Health::Ok));
         assert_eq!(verdict.label, "bad_request");
+    }
+
+    /// The sign-after-permit regression guard: with the single scheduler slot held,
+    /// a queued attempt's `timestamp_ms` must be read only once the permit is
+    /// granted — never at the moment the attempt started waiting. Under the old
+    /// sign-before-acquire ordering the stamped value would predate the release;
+    /// here it must not. `query_worker` feeds this helper's timestamp straight into
+    /// `prepare_query`, so pinning the helper pins the wire value.
+    #[tokio::test]
+    async fn timestamp_is_stamped_after_permit_grant() {
+        let config = crate::config::CongestionConfig {
+            min_window: 1,
+            max_window: 1,
+            ..Default::default()
+        };
+        let scheduler = Arc::new(DownloadScheduler::new(config));
+
+        // Occupy the only slot, then start an attempt that has to queue.
+        let blocker = scheduler.acquire(0).await;
+        let waiter = tokio::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            async move { acquire_permit_then_timestamp(Some(&scheduler), Some(1)).await }
+        });
+
+        // Let the attempt sit in the queue long enough that a stamp taken at
+        // enqueue time is measurably older than the release.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let released_at = timestamp_now_ms();
+        drop(blocker);
+
+        let (permit, stamped) = waiter.await.expect("waiter task");
+        assert!(
+            permit.is_some(),
+            "scheduling applied, so a permit is granted"
+        );
+        assert!(
+            stamped >= released_at,
+            "timestamp {stamped} was stamped before the permit was released at \
+             {released_at} — the query would age in the scheduler queue"
+        );
+    }
+
+    /// With the scheduler disabled or no priority given, no permit exists and the
+    /// timestamp is simply the current clock — the unscheduled path is unchanged.
+    #[tokio::test]
+    async fn no_scheduler_means_no_permit_and_a_fresh_timestamp() {
+        let before = timestamp_now_ms();
+        let (permit, stamped) = acquire_permit_then_timestamp(None, Some(1)).await;
+        assert!(permit.is_none());
+        assert!(stamped >= before);
+
+        let config = crate::config::CongestionConfig::default();
+        let scheduler = Arc::new(DownloadScheduler::new(config));
+        let (permit, _) = acquire_permit_then_timestamp(Some(&scheduler), None).await;
+        assert!(permit.is_none(), "no priority, no permit — same as before");
     }
 }

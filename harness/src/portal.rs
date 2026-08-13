@@ -35,6 +35,58 @@ pub struct Auth {
 /// Where the fixture writes the dedicated key and where `auth.key_path` points.
 pub const AUTH_KEY_FILE: &str = "auth.key";
 
+/// Optional portal tuning a test threads through the fixture, for classes whose
+/// property depends on configuration rather than on the request (like CT-10's
+/// `auth:` block). Absent, the smoke's defaults hold; present, it can pin the
+/// congestion window and lengthen the transport timeout so a slow worker read
+/// holds a scheduler slot past the worker's 60s freshness bound.
+#[derive(Clone)]
+pub struct Tuning {
+    /// The portal's per-request transport timeout. Must exceed a stall a test
+    /// wants a worker to hold, or the portal tears the query down first.
+    pub transport_timeout_sec: u64,
+    /// `Some` writes a `congestion:` block; `None` leaves the portal's default
+    /// (an AIMD window seeded at 10..=500).
+    pub congestion: Option<Congestion>,
+}
+
+/// The subset of `CongestionConfig` (src/config.rs) a test pins. Field names
+/// match the portal struct; the rest keep their `#[serde(default)]` values.
+#[derive(Clone)]
+pub struct Congestion {
+    pub enabled: bool,
+    pub min_window: u32,
+    pub max_window: u32,
+    /// Per-read deadline inside `read_response_with_permits`; a stalled body read
+    /// holds its scheduler slot up to this long.
+    pub read_timeout_sec: u64,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            transport_timeout_sec: 10,
+            congestion: None,
+        }
+    }
+}
+
+impl Tuning {
+    /// A single-slot congestion window (`min = max = 1`) with a transport timeout
+    /// and read timeout long enough to hold that slot across a multi-second stall.
+    pub fn single_slot_congestion(transport_timeout_sec: u64, read_timeout_sec: u64) -> Self {
+        Self {
+            transport_timeout_sec,
+            congestion: Some(Congestion {
+                enabled: true,
+                min_window: 1,
+                max_window: 1,
+                read_timeout_sec,
+            }),
+        }
+    }
+}
+
 impl Auth {
     pub fn new(portal_id: impl Into<String>) -> Self {
         Self {
@@ -67,6 +119,7 @@ pub fn write_config(
     e: &Endpoints,
     auth: Option<&Auth>,
     assignment_source: AssignmentSource,
+    tuning: Option<&Tuning>,
 ) -> anyhow::Result<PathBuf> {
     let mut datasets = String::new();
     for ds in &world.datasets {
@@ -110,10 +163,27 @@ pub fn write_config(
         _ => String::new(),
     };
 
+    let default_tuning = Tuning::default();
+    let tuning = tuning.unwrap_or(&default_tuning);
+    let congestion_block = match &tuning.congestion {
+        Some(c) => format!(
+            "congestion:\n  \
+             enabled: {enabled}\n  \
+             min_window: {min}\n  \
+             max_window: {max}\n  \
+             read_timeout_sec: {read}\n",
+            enabled = c.enabled,
+            min = c.min_window,
+            max = c.max_window,
+            read = c.read_timeout_sec,
+        ),
+        None => String::new(),
+    };
+
     let config = format!(
         r#"hostname: http://127.0.0.1:{http}
 max_parallel_streams: 64
-transport_timeout_sec: 10
+transport_timeout_sec: {transport_timeout}
 pre_drain_grace_period_sec: 1
 drain_timeout_sec: 2
 assignments_url: http://127.0.0.1:{publisher}
@@ -124,7 +194,7 @@ chain_update_interval_sec: 60
 send_logs: false
 sentry_is_enabled: false
 verify_worker_responses: true
-# Fast penalty decay: an early dial race must not wedge the tiny toy pool for
+{congestion_block}# Fast penalty decay: an early dial race must not wedge the tiny toy pool for
 # minutes. Penalty behavior itself is CT-2's subject, not the smoke's.
 priorities:
   max_queries_per_worker: 1
@@ -142,6 +212,8 @@ datasets:
         registry = e.registry_port,
         datasets = datasets,
         auth_block = auth_block,
+        transport_timeout = tuning.transport_timeout_sec,
+        congestion_block = congestion_block,
     );
     let path = scratch.join("portal.config.yml");
     std::fs::write(&path, config)?;

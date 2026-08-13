@@ -11,7 +11,7 @@ use anyhow::Context;
 use tempfile::TempDir;
 
 use crate::artifact::AssignmentSource;
-use crate::portal::{Auth, Endpoints, PortalProcess};
+use crate::portal::{Auth, Endpoints, PortalProcess, Tuning};
 use crate::stubs::control_plane::ControlPlane;
 use crate::stubs::worker::{WorkerFaults, WorkerStub};
 use crate::{artifact, driver, dummy_chain, keys, portal, stubs, ToyWorld};
@@ -55,7 +55,7 @@ impl Fixture {
     /// 1 + retries distinct workers per chunk, so two is the minimum that lets
     /// a reroute actually find somewhere to go.
     pub async fn start(world: ToyWorld, workers: usize) -> anyhow::Result<Self> {
-        Self::start_with(world, workers, None, Assignments::default()).await
+        Self::start_with(world, workers, None, Assignments::default(), None).await
     }
 
     /// The same world with an `auth:` block and the DC-8 stub behind it.
@@ -66,7 +66,7 @@ impl Fixture {
         workers: usize,
         auth: Auth,
     ) -> anyhow::Result<Self> {
-        Self::start_with(world, workers, Some(auth), Assignments::default()).await
+        Self::start_with(world, workers, Some(auth), Assignments::default(), None).await
     }
 
     /// A fixture whose publisher shape and configured source are set by the caller — the DC-2
@@ -77,7 +77,18 @@ impl Fixture {
         workers: usize,
         assignments: Assignments,
     ) -> anyhow::Result<Self> {
-        Self::start_with(world, workers, None, assignments).await
+        Self::start_with(world, workers, None, assignments, None).await
+    }
+
+    /// The same world with portal tuning (congestion window, transport timeout).
+    /// Used by the stale-timestamp class, whose property depends on how the
+    /// congestion scheduler queues a signed query rather than on the request.
+    pub async fn start_tuned(
+        world: ToyWorld,
+        workers: usize,
+        tuning: Tuning,
+    ) -> anyhow::Result<Self> {
+        Self::start_with(world, workers, None, Assignments::default(), Some(tuning)).await
     }
 
     async fn start_with(
@@ -85,6 +96,7 @@ impl Fixture {
         workers: usize,
         auth: Option<Auth>,
         assignments: Assignments,
+        tuning: Option<Tuning>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(workers >= 1, "need at least one worker");
         // Loopback p2p addresses are filtered as unreachable unless this is set.
@@ -181,6 +193,7 @@ impl Fixture {
             &endpoints,
             auth.as_ref(),
             assignments.source,
+            tuning.as_ref(),
         )?;
         let portal = portal::spawn(
             &scratch,
