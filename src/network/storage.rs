@@ -71,6 +71,11 @@ pub enum ChunkNotFound {
     BeforeFirst { first_block: BlockNumber },
     #[error("Block is after the last block")]
     AfterLast,
+    /// Only the portal artifact can report this: it gives each chunk its own end, so a block
+    /// between two chunks is an answer rather than the preceding chunk. The legacy reader has no
+    /// per-chunk end and silently attributes such a block to the chunk before it.
+    #[error("Block falls in a gap between chunks")]
+    InGap,
     #[error("Invalid chunk ID: {0}")]
     InvalidID(String),
 }
@@ -248,10 +253,10 @@ impl StorageClient {
                     assignment
                         .datasets()
                         .iter()
-                        .map(|d| (d.id(), d.chunks().len(), d.last_block())),
+                        .map(|d| (d.id(), d.chunk_count(), d.last_block())),
                     |id| match prev.as_ref() {
                         Some(ActiveAssignment::Portal(p)) => {
-                            p.get_dataset(id).map(|d| d.chunks().len())
+                            p.get_dataset(id).map(|d| d.chunk_count())
                         }
                         _ => None,
                     },
@@ -304,12 +309,13 @@ impl StorageClient {
             )?
             .id()
             .to_owned(),
-            ActiveAssignment::Portal(assignment) => find_chunk_with(
-                || assignment.find_chunk(dataset_url, block),
-                || assignment.get_dataset(dataset_url).unwrap().first_block(),
-            )?
-            .id()
-            .to_owned(),
+            ActiveAssignment::Portal(assignment) => portal_chunk_id(
+                find_chunk_with(
+                    || find_portal_chunk(assignment, dataset_url, block),
+                    || assignment.get_dataset(dataset_url).unwrap().first_block(),
+                )?
+                .id(),
+            )?,
         };
         chunk_id.parse().map_err(|e| {
             tracing::warn!(error = %e, "Failed to parse chunk ID");
@@ -331,12 +337,13 @@ impl StorageClient {
             )?
             .id()
             .to_owned(),
-            ActiveAssignment::Portal(assignment) => find_chunk_with(
-                || assignment.find_chunk_by_timestamp(dataset_url, ts),
-                || assignment.get_dataset(dataset_url).unwrap().first_block(),
-            )?
-            .id()
-            .to_owned(),
+            ActiveAssignment::Portal(assignment) => portal_chunk_id(
+                find_chunk_with(
+                    || assignment.find_chunk_by_timestamp(dataset_url, ts),
+                    || assignment.get_dataset(dataset_url).unwrap().first_block(),
+                )?
+                .id(),
+            )?,
         };
         chunk_id.parse().map_err(|e| {
             tracing::warn!(error = %e, "Failed to parse chunk ID");
@@ -366,15 +373,13 @@ impl StorageClient {
             }
             ActiveAssignment::Portal(assignment) => {
                 let chunk = find_chunk_with(
-                    || assignment.find_chunk(dataset_url, block),
+                    || find_portal_chunk(assignment, dataset_url, block),
                     || assignment.get_dataset(dataset_url).unwrap().first_block(),
                 )?;
-                Ok(
-                    self.filtered_worker_ids(chunk.worker_indexes().iter(), |idx| {
-                        let w = assignment.get_worker_by_index(idx);
-                        (w.status(), w.peer_id())
-                    }),
-                )
+                Ok(self.filtered_worker_ids(chunk.worker_indexes(), |idx| {
+                    let w = assignment.get_worker_by_index(idx);
+                    (w.status(), w.peer_id())
+                }))
             }
         }
     }
@@ -465,8 +470,14 @@ impl StorageClient {
                 }
             }
             ActiveAssignment::Portal(assignment) => {
-                for c in assignment.get_dataset(dataset_url)?.chunks().iter() {
-                    accumulate_range(&mut ranges, c.id(), c.worker_indexes().iter(), |idx| {
+                for c in assignment.get_dataset(dataset_url)?.chunks() {
+                    // A chunk whose hash isn't UTF-8 has no id to build a range from; reporting
+                    // the rest of the dataset beats reporting none of it.
+                    let Some(id) = c.id() else {
+                        tracing::warn!("Skipped a chunk whose hash is not valid UTF-8");
+                        continue;
+                    };
+                    accumulate_range(&mut ranges, &id, c.worker_indexes(), |idx| {
                         assignment.get_worker_id(idx)
                     });
                 }
@@ -680,6 +691,71 @@ mod tests {
             "20260807T192153_BBBB"
         ));
     }
+
+    const GAPPED_DATASET: &str = "s3://gapped-dataset";
+
+    /// Two chunks covering 0-99 and 200-299, leaving 100-199 covered by neither. Only the portal
+    /// format can express this, and only with the builder's continuity check off.
+    fn gapped_portal_assignment() -> PortalAssignment {
+        let mut builder = sqd_assignments::PortalAssignmentBuilder::new().check_continuity(false);
+        let mut dataset = builder.new_dataset(GAPPED_DATASET, 0);
+        for (first, last) in [(0u64, 99u64), (200, 299)] {
+            let staged = dataset
+                .new_chunk()
+                .id(&format!("0000000000/{first:010}-{last:010}-aaaaa"))
+                .block_range(first..=last)
+                .finish();
+            // With the check off a gap is still reported, but the chunk is staged anyway. Any
+            // other error means the test built something the reader would reject.
+            if let Err(e) = staged {
+                assert!(
+                    e.to_string().contains("must be contiguous"),
+                    "unexpected chunk build error: {e}"
+                );
+            }
+        }
+        dataset.finish(Some("0xhead")).unwrap();
+        PortalAssignment::from_owned(builder.finish()).unwrap()
+    }
+
+    #[test]
+    fn a_block_in_a_gap_resolves_to_the_next_chunk() {
+        // Ending the stream here would drop 200-299, which a worker does hold.
+        let assignment = gapped_portal_assignment();
+
+        let chunk = find_portal_chunk(&assignment, GAPPED_DATASET, 150).unwrap();
+        assert_eq!(chunk.first_block(), 200);
+    }
+
+    #[test]
+    fn the_block_after_a_chunk_crosses_the_gap() {
+        // How `next_chunk` walks a stream forward: without the skip it would return the chunk it
+        // was already on, or nothing at all.
+        let assignment = gapped_portal_assignment();
+
+        let chunk = find_portal_chunk(&assignment, GAPPED_DATASET, 100).unwrap();
+        assert_eq!(chunk.first_block(), 200);
+    }
+
+    #[test]
+    fn a_covered_block_still_resolves_to_its_own_chunk() {
+        let assignment = gapped_portal_assignment();
+
+        for (block, expected) in [(0, 0), (50, 0), (99, 0), (200, 200), (299, 200)] {
+            let chunk = find_portal_chunk(&assignment, GAPPED_DATASET, block).unwrap();
+            assert_eq!(chunk.first_block(), expected, "block {block}");
+        }
+    }
+
+    #[test]
+    fn a_block_past_the_last_chunk_is_still_after_last() {
+        let assignment = gapped_portal_assignment();
+
+        assert_eq!(
+            find_portal_chunk(&assignment, GAPPED_DATASET, 300).err(),
+            Some(sqd_assignments::ChunkNotFound::AfterLast)
+        );
+    }
 }
 
 /// Runs a per-format `find_chunk`/`find_chunk_by_timestamp` call and converts a not-found error,
@@ -702,7 +778,58 @@ fn convert_chunk_not_found(
             first_block: first_block(),
         },
         sqd_assignments::ChunkNotFound::UnknownDataset => ChunkNotFound::UnknownDataset,
+        sqd_assignments::ChunkNotFound::InGap => ChunkNotFound::InGap,
     }
+}
+
+/// A portal chunk's id is rebuilt from its columns rather than stored, and comes back `None` only
+/// when the hash it was built from isn't UTF-8 -- so there is no id to name in the error.
+fn portal_chunk_id(id: Option<String>) -> Result<String, ChunkNotFound> {
+    id.ok_or_else(|| ChunkNotFound::InvalidID("chunk hash is not valid UTF-8".to_owned()))
+}
+
+/// The chunk holding `block`, or -- when `block` falls in a gap between two chunks -- the first
+/// chunk after it.
+///
+/// Only the portal artifact can report a gap: it gives each chunk its own end rather than running
+/// it to the next chunk's start, so a block between two chunks is an answer rather than the chunk
+/// before it. A portal only ever streams forward, so the next chunk that does hold data is the
+/// useful answer -- reporting nothing would end a stream at every gap, and the legacy format
+/// could not express one to begin with.
+fn find_portal_chunk<'a>(
+    assignment: &'a PortalAssignment,
+    dataset_url: &str,
+    block: u64,
+) -> Result<sqd_assignments::PortalChunk<'a>, sqd_assignments::ChunkNotFound> {
+    match assignment.find_chunk(dataset_url, block) {
+        Err(sqd_assignments::ChunkNotFound::InGap) => {
+            let dataset = assignment
+                .get_dataset(dataset_url)
+                .expect("a gap is only reported for a dataset that was found");
+            // A gap past the last chunk is still within `last_block`, which is the dataset's head
+            // rather than the last chunk's end, so there is not always a chunk after one.
+            first_chunk_from(dataset, block).ok_or(sqd_assignments::ChunkNotFound::AfterLast)
+        }
+        other => other,
+    }
+}
+
+/// The first chunk starting at or after `block`, by bisection over `first_blocks` -- the same
+/// ascending column [`PortalAssignment::find_chunk`] bisects.
+fn first_chunk_from(
+    dataset: sqd_assignments::fb::PortalAssignmentDataset<'_>,
+    block: u64,
+) -> Option<sqd_assignments::PortalChunk<'_>> {
+    let (mut low, mut high) = (0u32, dataset.chunk_count() as u32);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if dataset.chunk(mid)?.first_block() < block {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    dataset.chunk(low)
 }
 
 /// Whether `candidate` is older than the applied assignment, and so must not replace it.

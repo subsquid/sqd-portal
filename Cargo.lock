@@ -7732,18 +7732,23 @@ dependencies = [
 
 [[package]]
 name = "sqd-assignments"
-version = "0.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=67f54cc#67f54ccec1e82a80ef95bd419af2fc20bb942129"
+version = "0.3.0"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=339a0d7#339a0d7ed961f2698d65215f37344c1f61024589"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "crypto_box",
+ "curve25519-dalek",
  "flatbuffers",
+ "hmac",
  "libp2p-identity",
  "ouroboros",
  "serde",
  "serde_json",
  "sha2",
+ "thiserror 2.0.17",
  "tracing",
+ "url",
 ]
 
 [[package]]

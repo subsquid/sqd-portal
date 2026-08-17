@@ -98,11 +98,14 @@ pub fn build_portal_gzipped(world: &ToyWorld, workers: &[PeerId]) -> anyhow::Res
         let Some(network_id) = &ds.network_id else {
             continue;
         };
+        // Chunks are staged under the dataset they were opened against rather than naming one
+        // themselves. Schema ids are inert — the portal doesn't read them yet.
+        let mut dataset = b.new_dataset(network_id, 0);
         let mut head_hash = None;
         for chunk in &ds.chunks {
-            b.new_chunk()
+            dataset
+                .new_chunk()
                 .id(&chunk.id(&ds.name))
-                .dataset_id(network_id)
                 .block_range(chunk.first..=chunk.last)
                 .last_block_timestamp(world.timestamp(chunk.last))
                 .worker_indexes(&worker_indexes)
@@ -111,8 +114,10 @@ pub fn build_portal_gzipped(world: &ToyWorld, workers: &[PeerId]) -> anyhow::Res
             head_hash = Some(world.hash(&ds.name, chunk.last));
         }
         // Only the dataset's head hash survives the split; per-chunk hashes were dropped
-        // because no query needs one. Schema ids are inert — the portal doesn't read them yet.
-        b.finish_dataset(0, head_hash.as_deref());
+        // because no query needs one.
+        dataset
+            .finish(head_hash.as_deref())
+            .map_err(|e| anyhow::anyhow!("dataset build: {e}"))?;
     }
 
     for worker in &workers {

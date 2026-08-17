@@ -82,11 +82,14 @@ tower = { version = "0.5", features = ["util"] }
 proptest_async = { version = "0.2.1", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "test-util"] }
 tempfile = "3"
+# Reading an assignment is all the portal does; building one is how a test states the shape it
+# reads -- a gap between chunks has no other way to exist here.
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "339a0d7", features = ["builder", "reader"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
 
-sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "67f54cc", features = ["reader"] }
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "339a0d7", features = ["reader"] }
 sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", version = "1.3.0" }
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", version = "2.1.0", features = ["semver", "bitstring"] }
 sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", version = "3.1.0", features = ["portal", "metrics"] }
