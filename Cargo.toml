@@ -92,12 +92,7 @@ tower = { version = "0.5", features = ["util"] }
 proptest_async = { version = "0.2.1", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "test-util"] }
 tempfile = "3"
-# Reading an assignment is all the portal does; building one is how a test states the shape it
-# reads -- a gap between chunks has no other way to exist here.
 sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "339a0d7", features = ["builder", "reader"] }
 
-# Keep this table to what is genuinely platform-specific -- jemalloc, which has no msvc build.
-# Anything appended below the header is silently gated too, which is how the sqd-* crates ended
-# up here and made an msvc build fail on missing crates rather than on missing jemalloc.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
