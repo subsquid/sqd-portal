@@ -201,6 +201,18 @@ impl<N: StreamingNetwork> StreamController<N> {
             }
         };
 
+        // A gap between chunks resolves forward, so the chunk found for `first_block` can start
+        // past the requested range and share no block with it. `get_next_chunk` already ends the
+        // stream on that; the first chunk is the one path that never checked, and scheduling it
+        // would reach `start_querying_chunk` with nothing to intersect.
+        if request
+            .query
+            .last_block()
+            .is_some_and(|last_block| last_block < first_chunk.first_block)
+        {
+            return Err(RequestError::NoData);
+        }
+
         Ok(Self {
             network,
             buffer: SlidingArray::with_capacity(request.buffer_size),
@@ -1372,6 +1384,28 @@ mod tests {
             compression: Compression::Gzip,
             skip_parent_hash_validation: false,
         }
+    }
+
+    /// A gap between chunks resolves forward, so a query that falls entirely inside one gets
+    /// back the chunk *after* it -- sharing no block with the request. That reached
+    /// `start_querying_chunk`, whose `intersect_with` has nothing to return, and panicked.
+    ///
+    /// `stream_request` asks for 100..=150; the mock stands in for a dataset whose next chunk
+    /// after the gap starts at 200.
+    #[tokio::test(start_paused = true)]
+    async fn a_query_entirely_inside_a_gap_is_no_data() {
+        let network = Arc::new(MockNetwork {
+            chunk: DataChunk::new(0, 200, 299, "aaaaa").unwrap(),
+            backoff_until: Instant::now(),
+            queries_sent: AtomicUsize::new(0),
+        });
+
+        let result = StreamController::new(stream_request(), network, 0, 1);
+
+        let Err(err) = result else {
+            panic!("a range holding no data is not a stream");
+        };
+        assert!(matches!(err, RequestError::NoData), "got {err:?}");
     }
 
     /// Regression test for the duplicated-response incident: a request whose
