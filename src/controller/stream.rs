@@ -201,14 +201,16 @@ impl<N: StreamingNetwork> StreamController<N> {
             }
         };
 
-        // A gap between chunks resolves forward, so the chunk found for `first_block` can start
-        // past the requested range and share no block with it. `get_next_chunk` already ends the
-        // stream on that; the first chunk is the one path that never checked, and scheduling it
-        // would reach `start_querying_chunk` with nothing to intersect.
+        // Neither reader promises a chunk that holds `first_block`, and a gap is how both miss:
+        // the portal resolves forward and can land past the requested range, the legacy format
+        // cannot see the gap at all and hands back the chunk before it. Either way the chunk can
+        // share no block with the query, and scheduling it would reach `start_querying_chunk`
+        // with nothing to intersect. Checked as the intersection itself, so it holds whichever
+        // side the chunk falls on.
         if request
             .query
-            .last_block()
-            .is_some_and(|last_block| last_block < first_chunk.first_block)
+            .intersect_with(&first_chunk.block_range())
+            .is_none()
         {
             return Err(RequestError::NoData);
         }
@@ -1386,26 +1388,32 @@ mod tests {
         }
     }
 
-    /// A gap between chunks resolves forward, so a query that falls entirely inside one gets
-    /// back the chunk *after* it -- sharing no block with the request. That reached
-    /// `start_querying_chunk`, whose `intersect_with` has nothing to return, and panicked.
+    /// Neither reader promises a chunk holding the requested block when a gap is involved, and
+    /// the chunk can then miss the query on either side: the portal resolves a gap forward and
+    /// lands past the range, the legacy format cannot see the gap and hands back the chunk
+    /// before it. Both used to reach `start_querying_chunk`, whose `intersect_with` has nothing
+    /// to return, and panic.
     ///
-    /// `stream_request` asks for 100..=150; the mock stands in for a dataset whose next chunk
-    /// after the gap starts at 200.
+    /// `stream_request` asks for 100..=150, against a dataset holding 0-99 and 200-299.
     #[tokio::test(start_paused = true)]
-    async fn a_query_entirely_inside_a_gap_is_no_data() {
-        let network = Arc::new(MockNetwork {
-            chunk: DataChunk::new(0, 200, 299, "aaaaa").unwrap(),
-            backoff_until: Instant::now(),
-            queries_sent: AtomicUsize::new(0),
-        });
+    async fn a_chunk_sharing_no_block_with_the_query_is_no_data() {
+        for chunk in [
+            DataChunk::new(0, 200, 299, "aaaaa").unwrap(), // portal: the gap resolved forward
+            DataChunk::new(0, 0, 99, "aaaaa").unwrap(),    // legacy: the chunk before the gap
+        ] {
+            let network = Arc::new(MockNetwork {
+                chunk,
+                backoff_until: Instant::now(),
+                queries_sent: AtomicUsize::new(0),
+            });
 
-        let result = StreamController::new(stream_request(), network, 0, 1);
+            let result = StreamController::new(stream_request(), network, 0, 1);
 
-        let Err(err) = result else {
-            panic!("a range holding no data is not a stream");
-        };
-        assert!(matches!(err, RequestError::NoData), "got {err:?}");
+            let Err(err) = result else {
+                panic!("a range holding no data is not a stream ({chunk})");
+            };
+            assert!(matches!(err, RequestError::NoData), "{chunk}: got {err:?}");
+        }
     }
 
     /// Regression test for the duplicated-response incident: a request whose
