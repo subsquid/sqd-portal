@@ -34,8 +34,10 @@ some. Neither resolution skips data a chunk actually holds.
 (identifier, effective-from time, worker set, per-dataset chunk sequences — each chunk
 carrying its block range and the reference (DEF-2) of its last block — and the chunk →
 worker-subset mapping). Identifiers are opaque; artifacts are ordered by their
-effective-from times. The **applied artifact** is the single artifact the Portal
-currently routes by. An artifact is *applied* atomically, never partially (INV-1), no
+effective-from times. An artifact is fetched compressed and decompressed as it streams;
+the published url's suffix names the codec, `.zst` for zstd and gzip otherwise, since the
+network state carries no field for it. The **applied artifact** is the single artifact the
+Portal currently routes by. An artifact is *applied* atomically, never partially (INV-1), no
 earlier than its effective-from time, and never with an effective-from earlier than the
 applied one's (regression guard, INV-2).
 

@@ -559,6 +559,8 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "tokio 1.48.0",
+ "zstd 0.13.3",
+ "zstd-safe 7.2.4",
 ]
 
 [[package]]
@@ -7733,7 +7735,7 @@ dependencies = [
 [[package]]
 name = "sqd-assignments"
 version = "0.3.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=339a0d7#339a0d7ed961f2698d65215f37344c1f61024589"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=625de07#625de07388d90c29799fe3f73f7f65a2bcd64853"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7749,6 +7751,7 @@ dependencies = [
  "thiserror 2.0.17",
  "tracing",
  "url",
+ "zstd 0.13.3",
 ]
 
 [[package]]

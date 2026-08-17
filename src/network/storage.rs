@@ -195,9 +195,7 @@ impl StorageClient {
         url: &str,
         source: AssignmentSource,
     ) -> anyhow::Result<ActiveAssignment> {
-        use async_compression::tokio::bufread::GzipDecoder;
         use futures::TryStreamExt;
-        use tokio::io::AsyncReadExt;
         use tokio_util::io::StreamReader;
 
         let response = self
@@ -208,12 +206,7 @@ impl StorageClient {
             .error_for_status()?;
         let stream = response.bytes_stream();
         let reader = StreamReader::new(stream.map_err(std::io::Error::other));
-        let mut buf = Vec::new();
-        let mut decoder = GzipDecoder::new(reader);
-        decoder
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to decompress assignment: {}", e))?;
+        let buf = decompress_artifact(reader, ArtifactCodec::of(url)).await?;
 
         tracing::debug!("Downloaded assignment from {}", url);
 
@@ -572,6 +565,48 @@ fn convert_chunk_not_found(
         sqd_assignments::ChunkNotFound::UnknownDataset => ChunkNotFound::UnknownDataset,
         sqd_assignments::ChunkNotFound::InGap => ChunkNotFound::InGap,
     }
+}
+
+/// How an artifact is compressed, taken from the url the network state points at: `.zst` for
+/// zstd, anything else gzip -- which is what every artifact was before zstd existed, so an
+/// unsuffixed or unfamiliar url keeps working exactly as it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactCodec {
+    Gzip,
+    Zstd,
+}
+
+impl ArtifactCodec {
+    fn of(url: &str) -> Self {
+        // Object stores hand out urls carrying a query, and the suffix is on the path.
+        let path = match url.split_once(['?', '#']) {
+            Some((path, _)) => path,
+            None => url,
+        };
+        if path.ends_with(".zst") {
+            Self::Zstd
+        } else {
+            Self::Gzip
+        }
+    }
+}
+
+/// Reads an artifact body, decompressing it as `codec` while it streams: the compressed copy is
+/// never held whole, which on mainnet is the difference of a P-ASSIGNMENT-SIZE allocation.
+async fn decompress_artifact(
+    body: impl tokio::io::AsyncBufRead + Unpin,
+    codec: ArtifactCodec,
+) -> anyhow::Result<Vec<u8>> {
+    use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::new();
+    match codec {
+        ArtifactCodec::Gzip => GzipDecoder::new(body).read_to_end(&mut buf).await,
+        ArtifactCodec::Zstd => ZstdDecoder::new(body).read_to_end(&mut buf).await,
+    }
+    .map_err(|e| anyhow!("Failed to decompress {codec:?} assignment: {e}"))?;
+    Ok(buf)
 }
 
 /// The legacy chunk stores its id, and stores no end block of its own, so parsing it is the only
@@ -975,6 +1010,80 @@ mod tests {
             assert_eq!(built, id.parse::<DataChunk>().unwrap(), "block {block}");
             assert_eq!(built.to_string(), id, "block {block}");
         }
+    }
+
+    async fn compress(payload: &[u8], codec: ArtifactCodec) -> Vec<u8> {
+        use async_compression::tokio::write::{GzipEncoder, ZstdEncoder};
+        use tokio::io::AsyncWriteExt;
+
+        let mut out = Vec::new();
+        match codec {
+            ArtifactCodec::Gzip => {
+                let mut enc = GzipEncoder::new(&mut out);
+                enc.write_all(payload).await.unwrap();
+                enc.shutdown().await.unwrap();
+            }
+            ArtifactCodec::Zstd => {
+                let mut enc = ZstdEncoder::new(&mut out);
+                enc.write_all(payload).await.unwrap();
+                enc.shutdown().await.unwrap();
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn an_artifact_is_read_gzipped_or_zstd_compressed() {
+        // Long enough that neither codec's output is the payload itself.
+        let payload = b"portal assignment bytes".repeat(64);
+
+        for codec in [ArtifactCodec::Gzip, ArtifactCodec::Zstd] {
+            let body = compress(&payload, codec).await;
+
+            let read = decompress_artifact(std::io::Cursor::new(body), codec)
+                .await
+                .unwrap();
+
+            assert_eq!(read, payload, "{codec:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_artifact_compressed_the_other_way_is_refused() {
+        // The suffix is trusted, so a publisher that mislabels one fails the fetch and keeps the
+        // assignment already in service, rather than feeding the reader whatever came out.
+        let body = compress(b"portal assignment bytes", ArtifactCodec::Zstd).await;
+
+        let err = decompress_artifact(std::io::Cursor::new(body), ArtifactCodec::Gzip)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Failed to decompress"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn the_url_suffix_names_the_codec() {
+        assert_eq!(
+            ArtifactCodec::of("https://e.test/portal-assignment.fb.zst"),
+            ArtifactCodec::Zstd
+        );
+        assert_eq!(
+            ArtifactCodec::of("https://e.test/assignment.fb.gz"),
+            ArtifactCodec::Gzip
+        );
+        // A query does not hide the suffix, and anything unfamiliar stays on gzip -- which is
+        // what every artifact was before zstd.
+        assert_eq!(
+            ArtifactCodec::of("https://e.test/a.fb.zst?versionId=7&x=1"),
+            ArtifactCodec::Zstd
+        );
+        assert_eq!(
+            ArtifactCodec::of("https://e.test/a.fb"),
+            ArtifactCodec::Gzip
+        );
     }
 
     #[test]

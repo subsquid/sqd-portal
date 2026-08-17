@@ -108,7 +108,7 @@ integrity failure, which is WORKER-FAILURE (DC-1); after the first record ⇒ tr
 | FV-2 | speculative attempt count/timing | ≤ 1 + retries per chunk |
 | FV-3 | truncation point | any record boundary after the first record |
 | FV-4 | coverage extent | contiguous evaluated prefix from `fromBlock`; *matching* records may be empty, but the coverage boundary is always emitted (INV-29), so ≥1 record whenever ≥1 block is evaluated |
-| FV-5 | compression choice/framing | must decode; gzip default, zstd when offered |
+| FV-5 | compression choice/framing | responses: must decode; gzip default, zstd when offered. Artifacts: the publisher picks gzip or zstd and names it in the url suffix (DEF-4); the Portal decodes either, unit-tested both ways |
 | FV-6 | boundary-record granularity | the source emits a header-only coverage boundary per *served chunk* (`Plan::execute` runs per chunk), not only at the response's global first/last; these interior header-only records are licensed. Conformance checks the last record (= coverage cursor, INV-29) and the matched-record set, not exact record-set equality |
 
 Everything else — the content and order of the records that are present, error type/code,
