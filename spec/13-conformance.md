@@ -1,6 +1,6 @@
 # 13 — Conformance & TDD plan
 
-**Mutable doc.** Statuses as of **2026-08-17** (0.13.2,
+**Mutable doc.** Statuses as of **2026-08-18** (0.13.2,
 `master@375911e6695f3512fd2e3508fa08fbfdb4aac9cf`). Statuses: **C** covered · **P** partial ·
 **U** unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
 **The authorization band (REQ-50..56, DC-8, OP-11 and the invariants scoped to them) has
@@ -239,7 +239,7 @@ chunk-boundary records FV-6 licenses.
 | REQ-55 | P | CT-10 runs a shadow portal: a request with no credential, one with an ungrammatical token and one the control plane denies are all served, the verdict enforcement would have returned is in the protected log, and the keyless scrape carries only the neutral `shadow_evaluated` series with no code and no exchange counters. The control-plane ledger shows it exchanging on the same cache-miss rule enforcement uses — once, for the only request that presented something to exchange. Indeterminate exchange outcomes are not separately driven |
 | REQ-56 | P | CT-10 runs a portal with no `auth:` block: gated routes are served without a credential, a credential presented anyway is not a reason to refuse, and no authorization series appears in the scrape at all. The empty-block startup error is unit-tested in `auth::config` rather than here, and the startup mode line is logged but not asserted |
 
-## Gap register — 2026-08-17
+## Gap register — 2026-08-18
 
 Priorities: P0 blocks the program · P1 active production risk · P2 correctness hole
 with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.

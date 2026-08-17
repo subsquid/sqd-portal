@@ -7735,7 +7735,7 @@ dependencies = [
 [[package]]
 name = "sqd-assignments"
 version = "0.3.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=625de07#625de07388d90c29799fe3f73f7f65a2bcd64853"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=4939971#49399718778160b4187715b075762aa9620c3008"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
