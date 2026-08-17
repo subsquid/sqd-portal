@@ -114,8 +114,9 @@ enum Health {
     Error,
 }
 
-/// Matched verbatim: the wire carries no code for this verdict (GAP-25).
+/// Matched verbatim: the wire carries no code for these verdicts (GAP-25).
 const STALE_ENVELOPE: &str = "timestamp out of allowed range";
+const RESPONSE_TOO_LARGE: &str = "Response too large";
 
 /// One DC-1 row: how a worker verdict is classified, counted, and charged. The three
 /// were chosen independently in each match arm — eight arms times three decisions — and
@@ -150,28 +151,30 @@ impl Verdict {
             ),
             // Probably still downloading the chunk.
             Err::NotFound(s) => row(QueryError::Retriable(s), "not_found", Health::Error, false),
-            // Input validation, not a bad response.
-            Err::ServerError(s) if parse_base_block_mismatch(&s).is_some() => row(
-                QueryError::BaseBlockMismatch(parse_base_block_mismatch(&s).expect("just matched")),
-                "block_mismatch",
-                Health::Ok,
-                false,
-            ),
-            // The query covers too much data: narrowing it is the client's move, and
-            // another worker would answer the same.
-            Err::ServerError(s) if s == "Response too large" => row(
-                QueryError::BadRequest(
-                    "the response for this block exceeds the size limit; \
-                     try narrowing the query to request only the necessary data"
-                        .to_owned(),
+            // Three rows share the wire's catch-all class, so they are split here rather than by
+            // guard: a guard would have to re-parse the message to bind what it just matched.
+            Err::ServerError(s) => match parse_base_block_mismatch(&s) {
+                // Input validation, not a bad response.
+                Some(base_block) => row(
+                    QueryError::BaseBlockMismatch(base_block),
+                    "block_mismatch",
+                    Health::Ok,
+                    false,
                 ),
-                "response_too_large",
-                Health::Ok,
-                false,
-            ),
-            Err::ServerError(s) => {
-                row(QueryError::Failure(s), "server_error", Health::Error, false)
-            }
+                // The query covers too much data: narrowing it is the client's move, and
+                // another worker would answer the same.
+                None if s == RESPONSE_TOO_LARGE => row(
+                    QueryError::BadRequest(
+                        "the response for this block exceeds the size limit; \
+                         try narrowing the query to request only the necessary data"
+                            .to_owned(),
+                    ),
+                    "response_too_large",
+                    Health::Ok,
+                    false,
+                ),
+                None => row(QueryError::Failure(s), "server_error", Health::Error, false),
+            },
             // One row, two verdicts: both are capacity refusals.
             Err::ServerOverloaded(()) => row(
                 QueryError::RateLimitExceeded,
@@ -1242,5 +1245,26 @@ mod tests {
         assert!(matches!(verdict.error, QueryError::BadRequest(_)));
         assert!(matches!(verdict.health, Health::Ok));
         assert_eq!(verdict.label, "bad_request");
+    }
+
+    #[test]
+    fn server_errors_split_into_three_rows() {
+        // The wire's catch-all class; only the message tells the three apart.
+        let mismatch = Verdict::of(query_error::Err::ServerError(
+            "unexpected base block: expected 0xabc, but got 42#0xdef".to_owned(),
+        ));
+        assert!(matches!(mismatch.error, QueryError::BaseBlockMismatch(_)));
+        assert_eq!(mismatch.label, "block_mismatch");
+        assert!(matches!(mismatch.health, Health::Ok));
+
+        let too_large = Verdict::of(query_error::Err::ServerError(RESPONSE_TOO_LARGE.to_owned()));
+        assert!(matches!(too_large.error, QueryError::BadRequest(_)));
+        assert_eq!(too_large.label, "response_too_large");
+        assert!(matches!(too_large.health, Health::Ok));
+
+        let other = Verdict::of(query_error::Err::ServerError("disk on fire".to_owned()));
+        assert!(matches!(other.error, QueryError::Failure(_)));
+        assert_eq!(other.label, "server_error");
+        assert!(matches!(other.health, Health::Error));
     }
 }
