@@ -302,25 +302,19 @@ impl StorageClient {
     pub fn find_chunk(&self, dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound> {
         let dataset_url = dataset.to_url();
         let guard = self.assignment.read();
-        let chunk_id = match guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)? {
-            ActiveAssignment::Legacy(assignment) => find_chunk_with(
-                || assignment.find_chunk(dataset_url, block),
-                || legacy_first_block(assignment, dataset_url).unwrap_or(0),
-            )?
-            .id()
-            .to_owned(),
-            ActiveAssignment::Portal(assignment) => portal_chunk_id(
+        match guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)? {
+            ActiveAssignment::Legacy(assignment) => parse_chunk_id(
                 find_chunk_with(
-                    || find_portal_chunk(assignment, dataset_url, block),
-                    || portal_first_block(assignment, dataset_url).unwrap_or(0),
+                    || assignment.find_chunk(dataset_url, block),
+                    || legacy_first_block(assignment, dataset_url).unwrap_or(0),
                 )?
                 .id(),
-            )?,
-        };
-        chunk_id.parse().map_err(|e| {
-            tracing::warn!(error = %e, "Failed to parse chunk ID");
-            ChunkNotFound::InvalidID(chunk_id)
-        })
+            ),
+            ActiveAssignment::Portal(assignment) => portal_data_chunk(find_chunk_with(
+                || find_portal_chunk(assignment, dataset_url, block),
+                || portal_first_block(assignment, dataset_url).unwrap_or(0),
+            )?),
+        }
     }
 
     pub fn find_chunk_by_timestamp(
@@ -330,25 +324,19 @@ impl StorageClient {
     ) -> Result<DataChunk, ChunkNotFound> {
         let dataset_url = dataset.to_url();
         let guard = self.assignment.read();
-        let chunk_id = match guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)? {
-            ActiveAssignment::Legacy(assignment) => find_chunk_with(
-                || assignment.find_chunk_by_timestamp(dataset_url, ts),
-                || legacy_first_block(assignment, dataset_url).unwrap_or(0),
-            )?
-            .id()
-            .to_owned(),
-            ActiveAssignment::Portal(assignment) => portal_chunk_id(
+        match guard.as_ref().ok_or(ChunkNotFound::UnknownDataset)? {
+            ActiveAssignment::Legacy(assignment) => parse_chunk_id(
                 find_chunk_with(
                     || assignment.find_chunk_by_timestamp(dataset_url, ts),
-                    || portal_first_block(assignment, dataset_url).unwrap_or(0),
+                    || legacy_first_block(assignment, dataset_url).unwrap_or(0),
                 )?
                 .id(),
-            )?,
-        };
-        chunk_id.parse().map_err(|e| {
-            tracing::warn!(error = %e, "Failed to parse chunk ID");
-            ChunkNotFound::InvalidID(chunk_id)
-        })
+            ),
+            ActiveAssignment::Portal(assignment) => portal_data_chunk(find_chunk_with(
+                || assignment.find_chunk_by_timestamp(dataset_url, ts),
+                || portal_first_block(assignment, dataset_url).unwrap_or(0),
+            )?),
+        }
     }
 
     pub fn find_workers(
@@ -562,6 +550,146 @@ fn select_assignment(
     }
 }
 
+/// Runs a per-format `find_chunk`/`find_chunk_by_timestamp` call and converts a not-found error,
+/// generic over the chunk type so both `Assignment` and `PortalAssignment` share this instead of
+/// duplicating the `map_err` wrapping in each match arm.
+fn find_chunk_with<C>(
+    find: impl FnOnce() -> Result<C, sqd_assignments::ChunkNotFound>,
+    first_block: impl FnOnce() -> u64,
+) -> Result<C, ChunkNotFound> {
+    find().map_err(|e| convert_chunk_not_found(e, first_block))
+}
+
+fn convert_chunk_not_found(
+    e: sqd_assignments::ChunkNotFound,
+    first_block: impl FnOnce() -> u64,
+) -> ChunkNotFound {
+    match e {
+        sqd_assignments::ChunkNotFound::AfterLast => ChunkNotFound::AfterLast,
+        sqd_assignments::ChunkNotFound::BeforeFirst => ChunkNotFound::BeforeFirst {
+            first_block: first_block(),
+        },
+        sqd_assignments::ChunkNotFound::UnknownDataset => ChunkNotFound::UnknownDataset,
+        sqd_assignments::ChunkNotFound::InGap => ChunkNotFound::InGap,
+    }
+}
+
+/// The legacy chunk stores its id, and stores no end block of its own, so parsing it is the only
+/// way to a `DataChunk`.
+fn parse_chunk_id(chunk_id: &str) -> Result<DataChunk, ChunkNotFound> {
+    chunk_id.parse().map_err(|e| {
+        tracing::warn!(error = %e, "Failed to parse chunk ID");
+        ChunkNotFound::InvalidID(chunk_id.to_owned())
+    })
+}
+
+/// A portal chunk holds those same fields as columns, so the `DataChunk` is built from them.
+/// Its `id()` would format the four into a string that `DataChunk` immediately takes apart again.
+fn portal_data_chunk(chunk: sqd_assignments::PortalChunk<'_>) -> Result<DataChunk, ChunkNotFound> {
+    let hash = chunk
+        .hash()
+        .ok_or_else(|| ChunkNotFound::InvalidID("chunk hash is not valid UTF-8".to_owned()))?;
+    DataChunk::new(chunk.top(), chunk.first_block(), chunk.last_block(), hash).ok_or_else(|| {
+        ChunkNotFound::InvalidID(format!("chunk hash {hash:?} has an unusable length"))
+    })
+}
+
+/// A dataset's first block, or `None` when it holds no chunks -- `first_block()` reads chunk 0 on
+/// both readers, so an empty dataset panics them. Only a malformed artifact has one, but the
+/// portal parses downloaded bytes with `from_owned_unchecked`, so nothing rejects one on the way
+/// in and the callers sit in the request path.
+fn legacy_first_block(assignment: &Assignment, dataset_url: &str) -> Option<u64> {
+    let dataset = assignment.get_dataset(dataset_url)?;
+    (!dataset.chunks().is_empty()).then(|| dataset.first_block())
+}
+
+fn portal_first_block(assignment: &PortalAssignment, dataset_url: &str) -> Option<u64> {
+    let dataset = assignment.get_dataset(dataset_url)?;
+    (dataset.chunk_count() > 0).then(|| dataset.first_block())
+}
+
+/// The chunk holding `block`, or -- when `block` falls in a gap between two chunks -- the first
+/// chunk after it.
+///
+/// Only the portal artifact can report a gap: it gives each chunk its own end rather than running
+/// it to the next chunk's start, so a block between two chunks is an answer rather than the chunk
+/// before it. A portal only ever streams forward, so the next chunk that does hold data is the
+/// useful answer -- reporting nothing would end a stream at every gap, and the legacy format
+/// could not express one to begin with.
+fn find_portal_chunk<'a>(
+    assignment: &'a PortalAssignment,
+    dataset_url: &str,
+    block: u64,
+) -> Result<sqd_assignments::PortalChunk<'a>, sqd_assignments::ChunkNotFound> {
+    match assignment.find_chunk(dataset_url, block) {
+        Err(sqd_assignments::ChunkNotFound::InGap) => {
+            let dataset = assignment
+                .get_dataset(dataset_url)
+                .expect("a gap is only reported for a dataset that was found");
+            // A gap past the last chunk is still within `last_block`, which is the dataset's head
+            // rather than the last chunk's end, so there is not always a chunk after one.
+            first_chunk_from(dataset, block).ok_or(sqd_assignments::ChunkNotFound::AfterLast)
+        }
+        other => other,
+    }
+}
+
+/// The first chunk starting at or after `block`, by bisection over `first_blocks` -- the same
+/// ascending column [`PortalAssignment::find_chunk`] bisects.
+fn first_chunk_from(
+    dataset: sqd_assignments::fb::PortalAssignmentDataset<'_>,
+    block: u64,
+) -> Option<sqd_assignments::PortalChunk<'_>> {
+    let (mut low, mut high) = (0u32, dataset.chunk_count() as u32);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if dataset.chunk(mid)?.first_block() < block {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    dataset.chunk(low)
+}
+
+/// Whether `candidate` is older than the applied assignment, and so must not replace it.
+///
+/// Ids are `<timestamp>_<hash>` with a fixed-width timestamp, so prefixes order lexicographically.
+/// The hash is excluded: it carries no ordering, and would order same-second ids arbitrarily.
+///
+/// Both ids always come from the same source, which is fixed for the process lifetime, so they are
+/// always drawn from one sequence and directly comparable.
+///
+/// Every uncertain case returns false. Wrongly accepting costs one poll; wrongly rejecting freezes
+/// the head until restart.
+fn is_stale(applied_id: &str, candidate: &str) -> bool {
+    let (Some(current), Some(new)) = (timestamp_prefix(applied_id), timestamp_prefix(candidate))
+    else {
+        return false;
+    };
+    // Differing lengths mean differing formats, which lexicographic order cannot span.
+    if current.len() != new.len() {
+        return false;
+    }
+    new < current
+}
+
+/// The ordering-bearing prefix of an id, or `None` if it isn't shaped `<timestamp>_<hash>`.
+fn timestamp_prefix(id: &str) -> Option<&str> {
+    let (timestamp, hash) = id.split_once('_')?;
+    (!timestamp.is_empty() && !hash.is_empty()).then_some(timestamp)
+}
+
+async fn sleep_until(timestamp: u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("time should be after 1970");
+    let until = Duration::from_secs(timestamp);
+    if let Some(delta) = until.checked_sub(now) {
+        tokio::time::sleep(delta).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,6 +900,24 @@ mod tests {
     }
 
     #[test]
+    fn a_portal_chunk_builds_to_what_its_id_parses_to() {
+        // `id()` formats the same four values `DataChunk` holds, so building from the columns
+        // must land on exactly the chunk the round-trip produced -- `top` included, which is a
+        // run lookup rather than a plain column.
+        let assignment = gapped_portal_assignment();
+
+        for block in [0, 250] {
+            let chunk = find_portal_chunk(&assignment, GAPPED_DATASET, block).unwrap();
+            let id = chunk.id().unwrap();
+
+            let built = portal_data_chunk(chunk).unwrap();
+
+            assert_eq!(built, id.parse::<DataChunk>().unwrap(), "block {block}");
+            assert_eq!(built.to_string(), id, "block {block}");
+        }
+    }
+
+    #[test]
     fn an_unpublished_dataset_has_no_first_block() {
         // The empty-chunks half of the same guard can't be built here -- the builder rejects an
         // empty dataset -- but the portal reads downloaded bytes with `from_owned_unchecked`, so
@@ -783,131 +929,5 @@ mod tests {
             portal_first_block(&assignment, "s3://never-published"),
             None
         );
-    }
-}
-
-/// Runs a per-format `find_chunk`/`find_chunk_by_timestamp` call and converts a not-found error,
-/// generic over the chunk type so both `Assignment` and `PortalAssignment` share this instead of
-/// duplicating the `map_err` wrapping in each match arm.
-fn find_chunk_with<C>(
-    find: impl FnOnce() -> Result<C, sqd_assignments::ChunkNotFound>,
-    first_block: impl FnOnce() -> u64,
-) -> Result<C, ChunkNotFound> {
-    find().map_err(|e| convert_chunk_not_found(e, first_block))
-}
-
-fn convert_chunk_not_found(
-    e: sqd_assignments::ChunkNotFound,
-    first_block: impl FnOnce() -> u64,
-) -> ChunkNotFound {
-    match e {
-        sqd_assignments::ChunkNotFound::AfterLast => ChunkNotFound::AfterLast,
-        sqd_assignments::ChunkNotFound::BeforeFirst => ChunkNotFound::BeforeFirst {
-            first_block: first_block(),
-        },
-        sqd_assignments::ChunkNotFound::UnknownDataset => ChunkNotFound::UnknownDataset,
-        sqd_assignments::ChunkNotFound::InGap => ChunkNotFound::InGap,
-    }
-}
-
-/// A portal chunk's id is rebuilt from its columns rather than stored, and comes back `None` only
-/// when the hash it was built from isn't UTF-8 -- so there is no id to name in the error.
-fn portal_chunk_id(id: Option<String>) -> Result<String, ChunkNotFound> {
-    id.ok_or_else(|| ChunkNotFound::InvalidID("chunk hash is not valid UTF-8".to_owned()))
-}
-
-/// A dataset's first block, or `None` when it holds no chunks -- `first_block()` reads chunk 0 on
-/// both readers, so an empty dataset panics them. Only a malformed artifact has one, but the
-/// portal parses downloaded bytes with `from_owned_unchecked`, so nothing rejects one on the way
-/// in and the callers sit in the request path.
-fn legacy_first_block(assignment: &Assignment, dataset_url: &str) -> Option<u64> {
-    let dataset = assignment.get_dataset(dataset_url)?;
-    (!dataset.chunks().is_empty()).then(|| dataset.first_block())
-}
-
-fn portal_first_block(assignment: &PortalAssignment, dataset_url: &str) -> Option<u64> {
-    let dataset = assignment.get_dataset(dataset_url)?;
-    (dataset.chunk_count() > 0).then(|| dataset.first_block())
-}
-
-/// The chunk holding `block`, or -- when `block` falls in a gap between two chunks -- the first
-/// chunk after it.
-///
-/// Only the portal artifact can report a gap: it gives each chunk its own end rather than running
-/// it to the next chunk's start, so a block between two chunks is an answer rather than the chunk
-/// before it. A portal only ever streams forward, so the next chunk that does hold data is the
-/// useful answer -- reporting nothing would end a stream at every gap, and the legacy format
-/// could not express one to begin with.
-fn find_portal_chunk<'a>(
-    assignment: &'a PortalAssignment,
-    dataset_url: &str,
-    block: u64,
-) -> Result<sqd_assignments::PortalChunk<'a>, sqd_assignments::ChunkNotFound> {
-    match assignment.find_chunk(dataset_url, block) {
-        Err(sqd_assignments::ChunkNotFound::InGap) => {
-            let dataset = assignment
-                .get_dataset(dataset_url)
-                .expect("a gap is only reported for a dataset that was found");
-            // A gap past the last chunk is still within `last_block`, which is the dataset's head
-            // rather than the last chunk's end, so there is not always a chunk after one.
-            first_chunk_from(dataset, block).ok_or(sqd_assignments::ChunkNotFound::AfterLast)
-        }
-        other => other,
-    }
-}
-
-/// The first chunk starting at or after `block`, by bisection over `first_blocks` -- the same
-/// ascending column [`PortalAssignment::find_chunk`] bisects.
-fn first_chunk_from(
-    dataset: sqd_assignments::fb::PortalAssignmentDataset<'_>,
-    block: u64,
-) -> Option<sqd_assignments::PortalChunk<'_>> {
-    let (mut low, mut high) = (0u32, dataset.chunk_count() as u32);
-    while low < high {
-        let mid = low + (high - low) / 2;
-        if dataset.chunk(mid)?.first_block() < block {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    dataset.chunk(low)
-}
-
-/// Whether `candidate` is older than the applied assignment, and so must not replace it.
-///
-/// Ids are `<timestamp>_<hash>` with a fixed-width timestamp, so prefixes order lexicographically.
-/// The hash is excluded: it carries no ordering, and would order same-second ids arbitrarily.
-///
-/// Both ids always come from the same source, which is fixed for the process lifetime, so they are
-/// always drawn from one sequence and directly comparable.
-///
-/// Every uncertain case returns false. Wrongly accepting costs one poll; wrongly rejecting freezes
-/// the head until restart.
-fn is_stale(applied_id: &str, candidate: &str) -> bool {
-    let (Some(current), Some(new)) = (timestamp_prefix(applied_id), timestamp_prefix(candidate))
-    else {
-        return false;
-    };
-    // Differing lengths mean differing formats, which lexicographic order cannot span.
-    if current.len() != new.len() {
-        return false;
-    }
-    new < current
-}
-
-/// The ordering-bearing prefix of an id, or `None` if it isn't shaped `<timestamp>_<hash>`.
-fn timestamp_prefix(id: &str) -> Option<&str> {
-    let (timestamp, hash) = id.split_once('_')?;
-    (!timestamp.is_empty() && !hash.is_empty()).then_some(timestamp)
-}
-
-async fn sleep_until(timestamp: u64) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .expect("time should be after 1970");
-    let until = Duration::from_secs(timestamp);
-    if let Some(delta) = until.checked_sub(now) {
-        tokio::time::sleep(delta).await;
     }
 }

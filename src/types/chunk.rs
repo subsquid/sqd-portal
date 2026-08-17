@@ -9,6 +9,7 @@ use super::{BlockRange, DatasetId};
 pub type BlockNumber = u64;
 
 const HASH_MAX_LEN: usize = 8;
+const HASH_MIN_LEN: usize = 5;
 
 /// Chunk ID which uniquely defines chunk in the dataset
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -21,6 +22,31 @@ pub struct DataChunk {
 }
 
 impl DataChunk {
+    /// Builds a chunk from fields a source already holds separately, for callers that would
+    /// otherwise format them into an id only to parse them straight back out.
+    ///
+    /// `None` if the hash cannot appear in an id, since [`Display`] would then produce something
+    /// [`FromStr`] rejects and a worker would not recognise.
+    pub fn new(
+        top_dir: BlockNumber,
+        first_block: BlockNumber,
+        last_block: BlockNumber,
+        hash: &str,
+    ) -> Option<Self> {
+        let bytes = hash.as_bytes();
+        if !(HASH_MIN_LEN..=HASH_MAX_LEN).contains(&bytes.len()) {
+            return None;
+        }
+        let mut last_hash = [0; HASH_MAX_LEN];
+        last_hash[..bytes.len()].copy_from_slice(bytes);
+        Some(Self {
+            first_block,
+            last_block,
+            top_dir,
+            last_hash,
+        })
+    }
+
     pub fn block_range(&self) -> BlockRange {
         self.first_block..=self.last_block
     }
@@ -48,7 +74,6 @@ impl FromStr for DataChunk {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // "0000000000/0000000000-0000000000-xxxxx[xxx]"
         const BLOCK_NUM_LEN: usize = 10;
-        const HASH_MIN_LEN: usize = 5;
         const SLASH_POS: usize = BLOCK_NUM_LEN;
         const SEP1_POS: usize = BLOCK_NUM_LEN + 1 + BLOCK_NUM_LEN;
         const SEP2_POS: usize = BLOCK_NUM_LEN + 1 + BLOCK_NUM_LEN + 1 + BLOCK_NUM_LEN;
@@ -136,5 +161,22 @@ mod tests {
             chunk_str.parse::<DataChunk>().unwrap().to_string(),
             chunk_str
         );
+    }
+
+    #[test]
+    fn test_data_chunk_new_matches_parsing() {
+        let chunk_str = "0000001000/0000001024-0000002047-0xabcdef";
+
+        let built = DataChunk::new(1000, 1024, 2047, "0xabcdef").unwrap();
+
+        assert_eq!(built, DataChunk::from_str(chunk_str).unwrap());
+        assert_eq!(built.to_string(), chunk_str);
+    }
+
+    #[test]
+    fn test_data_chunk_new_rejects_hashes_an_id_cannot_carry() {
+        // Accepting these would let `to_string` emit an id that `from_str` refuses.
+        assert!(DataChunk::new(0, 0, 1, "abcd").is_none());
+        assert!(DataChunk::new(0, 0, 1, "abcdefghi").is_none());
     }
 }
