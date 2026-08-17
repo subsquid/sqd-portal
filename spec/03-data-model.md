@@ -20,7 +20,15 @@ the query's field selection. Per-chain record schemas are explicitly unspecified
 
 **DEF-3 — Chunk.** An immutable, contiguous, non-overlapping range of finalized blocks;
 the archival network's unit of storage, assignment, and query. Chunks of a dataset are
-totally ordered and gap-free from the dataset's start block to the archival head.
+totally ordered and non-overlapping. Coverage is normally continuous from the dataset's
+start block to the archival head, but a **coverage gap** — a block range no chunk holds —
+is legal, and the two published artifacts (P-ASSIGNMENT-SOURCE) differ in what the Portal
+can do about one. The `portal` artifact states each chunk's last block, so a block inside a
+gap is recognised as such and resolves *forward*, to the first chunk after it: a stream
+crosses the hole and continues. The `legacy` artifact is ordered on first blocks alone, so
+the same block resolves *backward*, to the chunk before the gap — which shares none of the
+requested range — and the request yields no data (INV-27) even where later chunks hold
+some. Neither resolution skips data a chunk actually holds.
 
 **DEF-4 — Assignment artifact.** The routing document the network publishes:
 (identifier, effective-from time, worker set, per-dataset chunk sequences — each chunk

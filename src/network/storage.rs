@@ -860,6 +860,66 @@ mod tests {
         PortalAssignment::from_owned(builder.finish()).unwrap()
     }
 
+    /// The same two chunks in the legacy format. Its `Dataset` has no per-chunk end block, so
+    /// nothing here marks 100-199 as absent -- the hole exists only because the ids say so.
+    fn gapped_legacy_assignment() -> Assignment {
+        let mut builder =
+            sqd_assignments::AssignmentBuilder::new("test-secret").check_continuity(false);
+        for (first, last) in [(0u64, 99u64), (200, 299)] {
+            let staged = builder
+                .new_chunk()
+                .id(&format!("0000000000/{first:010}-{last:010}-aaaaa"))
+                .dataset_id(GAPPED_DATASET)
+                .block_range(first..=last)
+                .size(1)
+                .dataset_base_url("s3://gapped")
+                .files(&[])
+                .worker_indexes(&[])
+                .finish();
+            // With the check off a gap is still reported, but the chunk is staged anyway. Any
+            // other error means the fixture built something the reader would reject.
+            if let Err(e) = staged {
+                assert!(
+                    e.to_string().contains("must be contiguous"),
+                    "unexpected chunk build error: {e}"
+                );
+            }
+        }
+        builder.finish_dataset();
+        Assignment::from_owned(builder.finish()).unwrap()
+    }
+
+    #[test]
+    fn the_two_formats_resolve_the_same_gap_in_opposite_directions() {
+        // The behavioural difference this branch turns on, asserted rather than described.
+        let legacy = gapped_legacy_assignment();
+        let portal = gapped_portal_assignment();
+
+        let legacy_chunk = legacy.find_chunk(GAPPED_DATASET, 150).unwrap();
+        let portal_chunk = find_portal_chunk(&portal, GAPPED_DATASET, 150).unwrap();
+
+        // Legacy resolves backward, to the chunk before the hole: it holds no block 150, and
+        // its own id says so -- 0-99 ends well short of the request.
+        assert_eq!(legacy_chunk.first_block(), 0);
+        assert_eq!(legacy_chunk.id(), "0000000000/0000000000-0000000099-aaaaa");
+        // The portal reader sees the per-chunk end, calls it a gap, and resolves forward to the
+        // next chunk that does hold data.
+        assert_eq!(portal_chunk.first_block(), 200);
+    }
+
+    #[test]
+    fn legacy_walks_back_into_the_chunk_that_just_ended() {
+        // `next_chunk` is `find_chunk(last_block + 1)`. Across a gap that resolves backward to
+        // the chunk it just finished, so a legacy stream is handed the same chunk again instead
+        // of advancing -- the portal counterpart crosses the gap
+        // (`the_block_after_a_chunk_crosses_the_gap`).
+        let legacy = gapped_legacy_assignment();
+
+        let after_first = legacy.find_chunk(GAPPED_DATASET, 100).unwrap();
+
+        assert_eq!(after_first.first_block(), 0, "legacy did not advance");
+    }
+
     #[test]
     fn a_block_in_a_gap_resolves_to_the_next_chunk() {
         // Ending the stream here would drop 200-299, which a worker does hold.

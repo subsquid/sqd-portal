@@ -1,7 +1,7 @@
 # 13 — Conformance & TDD plan
 
-**Mutable doc.** Statuses as of **2026-08-13** (0.13.1,
-`master@ab821f91d5b4345ec6dc6cbf05595867f41eb7de`). Statuses: **C** covered · **P** partial ·
+**Mutable doc.** Statuses as of **2026-08-17** (0.13.2,
+`master@375911e6695f3512fd2e3508fa08fbfdb4aac9cf`). Statuses: **C** covered · **P** partial ·
 **U** unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
 **The authorization band (REQ-50..56, DC-8, OP-11 and the invariants scoped to them) has
 landed and is CT-10-covered on its request path.** A deployment with no `auth:` block
@@ -166,7 +166,7 @@ chunk-boundary records FV-6 licenses.
 | INV-24 | CT-5 | P | smoke asserts head markers against stub/artifact heads on success paths |
 | INV-25 | CT-2 | U | truncation never exercised |
 | INV-26 | CT-5 | C | CT-5 asserts the envelope, status, type/code and hint presence across the local and proxied emitters, including the 409 sibling, the OVERLOADED hint floor, replacement of an unusable upstream hint (0, non-numeric, HTTP-date), the classes that get no invented hint (upstream 503/500), a wrong verb keeping 405 with its `Allow`, and normalization of the router's other rejections |
-| INV-27 | CT-1 | P | gap detection tested; proxied 204 smoke-tested; delay untested |
+| INV-27 | CT-1 | P | retention-gap detection tested; coverage-gap resolution unit-tested on both artifacts, as is a range sharing no block with the chunk it resolved to; proxied 204 smoke-tested; delay untested |
 | INV-28 | CT-3 | U | — |
 | INV-29 | CT-1 | P | boundary emission asserted by the CT-1 selective-tail resume on both sources; the network multi-chunk case exercises the per-chunk granularity FV-6 licenses. Interior boundary records are not audited, and the EMPTY case (no block evaluated) is untested. Boundary pinning is a worker-engine behavior — re-prove before adopting new engine/format fields on a dependency bump |
 | INV-30 | CT-3/7 | U | gauge accounting was a past defect class |
@@ -239,7 +239,7 @@ chunk-boundary records FV-6 licenses.
 | REQ-55 | P | CT-10 runs a shadow portal: a request with no credential, one with an ungrammatical token and one the control plane denies are all served, the verdict enforcement would have returned is in the protected log, and the keyless scrape carries only the neutral `shadow_evaluated` series with no code and no exchange counters. The control-plane ledger shows it exchanging on the same cache-miss rule enforcement uses — once, for the only request that presented something to exchange. Indeterminate exchange outcomes are not separately driven |
 | REQ-56 | P | CT-10 runs a portal with no `auth:` block: gated routes are served without a credential, a credential presented anyway is not a reason to refuse, and no authorization series appears in the scrape at all. The empty-block startup error is unit-tested in `auth::config` rather than here, and the startup mode line is logged but not asserted |
 
-## Gap register — 2026-08-13
+## Gap register — 2026-08-17
 
 Priorities: P0 blocks the program · P1 active production risk · P2 correctness hole
 with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
