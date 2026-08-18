@@ -192,7 +192,6 @@ mod tests {
 
     #[test]
     fn test_data_chunk_new_rejects_hashes_an_id_cannot_carry() {
-        // Accepting these would let `to_string` emit an id that `from_str` refuses.
         assert!(DataChunk::new(0, 0, 1, "abcd").is_none());
         assert!(DataChunk::new(0, 0, 1, "abcdefghi").is_none());
     }

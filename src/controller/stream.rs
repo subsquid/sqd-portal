@@ -201,12 +201,7 @@ impl<N: StreamingNetwork> StreamController<N> {
             }
         };
 
-        // Neither reader promises a chunk that holds `first_block`, and a gap is how both miss:
-        // the portal resolves forward and can land past the requested range, the legacy format
-        // cannot see the gap at all and hands back the chunk before it. Either way the chunk can
-        // share no block with the query, and scheduling it would reach `start_querying_chunk`
-        // with nothing to intersect. Checked as the intersection itself, so it holds whichever
-        // side the chunk falls on.
+        // Gap resolution can return a chunk on either side of the requested range.
         if request
             .query
             .intersect_with(&first_chunk.block_range())
@@ -1389,13 +1384,6 @@ mod tests {
         }
     }
 
-    /// Neither reader promises a chunk holding the requested block when a gap is involved, and
-    /// the chunk can then miss the query on either side: the portal resolves a gap forward and
-    /// lands past the range, the legacy format cannot see the gap and hands back the chunk
-    /// before it. Both used to reach `start_querying_chunk`, whose `intersect_with` has nothing
-    /// to return, and panic.
-    ///
-    /// `stream_request` asks for 100..=150, against a dataset holding 0-99 and 200-299.
     #[tokio::test(start_paused = true)]
     async fn a_chunk_sharing_no_block_with_the_query_is_no_data() {
         for chunk in [

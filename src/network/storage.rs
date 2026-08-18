@@ -550,9 +550,6 @@ fn select_assignment(
     }
 }
 
-/// Runs a per-format `find_chunk`/`find_chunk_by_timestamp` call and converts a not-found error,
-/// generic over the chunk type so both `Assignment` and `PortalAssignment` share this instead of
-/// duplicating the `map_err` wrapping in each match arm.
 fn find_chunk_with<C>(
     find: impl FnOnce() -> Result<C, sqd_assignments::ChunkNotFound>,
     first_block: impl FnOnce() -> u64,
@@ -598,8 +595,6 @@ impl ArtifactCodec {
     }
 }
 
-/// Reads an artifact body, decompressing it as `codec` while it streams: the compressed copy is
-/// never held whole, which on mainnet is the difference of a P-ASSIGNMENT-SIZE allocation.
 async fn decompress_artifact(
     body: impl tokio::io::AsyncBufRead + Unpin,
     codec: ArtifactCodec,
@@ -616,8 +611,6 @@ async fn decompress_artifact(
     Ok(buf)
 }
 
-/// The legacy chunk stores its id, and stores no end block of its own, so parsing it is the only
-/// way to a `DataChunk`.
 fn parse_chunk_id(chunk_id: &str) -> Result<DataChunk, ChunkNotFound> {
     chunk_id.parse().map_err(|e| {
         tracing::warn!(error = %e, "Failed to parse chunk ID");
@@ -625,8 +618,6 @@ fn parse_chunk_id(chunk_id: &str) -> Result<DataChunk, ChunkNotFound> {
     })
 }
 
-/// A portal chunk holds those same fields as columns, so the `DataChunk` is built from them.
-/// Its `id()` would format the four into a string that `DataChunk` immediately takes apart again.
 fn portal_data_chunk(chunk: sqd_assignments::PortalChunk<'_>) -> Result<DataChunk, ChunkNotFound> {
     let hash = chunk
         .hash()
@@ -680,8 +671,6 @@ fn find_portal_chunk<'a>(
     }
 }
 
-/// The first chunk starting at or after `block`, by bisection over `first_blocks` -- the same
-/// ascending column [`PortalAssignment::find_chunk`] bisects.
 fn first_chunk_from(
     dataset: sqd_assignments::fb::PortalAssignmentDataset<'_>,
     block: u64,
@@ -882,8 +871,6 @@ mod tests {
 
     const GAPPED_DATASET: &str = "s3://gapped-dataset";
 
-    /// Two chunks covering 0-99 and 200-299, leaving 100-199 covered by neither. Only the portal
-    /// format can express this, and only with the builder's continuity check off.
     fn gapped_portal_assignment() -> PortalAssignment {
         let mut builder = sqd_assignments::PortalAssignmentBuilder::new().check_continuity(false);
         let mut dataset = builder.new_dataset(GAPPED_DATASET, 0);
@@ -906,8 +893,6 @@ mod tests {
         PortalAssignment::from_owned(builder.finish()).unwrap()
     }
 
-    /// The same two chunks in the legacy format. Its `Dataset` has no per-chunk end block, so
-    /// nothing here marks 100-199 as absent -- the hole exists only because the ids say so.
     fn gapped_legacy_assignment() -> Assignment {
         let mut builder =
             sqd_assignments::AssignmentBuilder::new("test-secret").check_continuity(false);
@@ -935,7 +920,6 @@ mod tests {
         Assignment::from_owned(builder.finish()).unwrap()
     }
 
-    /// A one-chunk dataset whose chunk is a re-ingested copy, so its version is not the default.
     fn versioned_portal_assignment() -> PortalAssignment {
         let mut builder = sqd_assignments::PortalAssignmentBuilder::new();
         let mut dataset = builder.new_dataset(GAPPED_DATASET, 0);
@@ -952,9 +936,6 @@ mod tests {
 
     #[test]
     fn only_a_portal_chunk_carries_a_version() {
-        // A query names the copy it wants, and only this artifact says which copy that is. A
-        // legacy chunk has no such column, so it stays at 0 -- the value proto3 leaves off the
-        // wire, which is how the field is absent rather than guessed.
         let portal = versioned_portal_assignment();
         let legacy = gapped_legacy_assignment();
 
@@ -965,25 +946,19 @@ mod tests {
 
         assert_eq!(portal_chunk.version(), 7);
         assert_eq!(legacy_chunk.version(), 0);
-        // The version rides beside the id, never inside it: both name the same chunk.
         assert_eq!(portal_chunk.to_string(), legacy_chunk.to_string());
     }
 
     #[test]
     fn the_two_formats_resolve_the_same_gap_in_opposite_directions() {
-        // The behavioural difference this branch turns on, asserted rather than described.
         let legacy = gapped_legacy_assignment();
         let portal = gapped_portal_assignment();
 
         let legacy_chunk = legacy.find_chunk(GAPPED_DATASET, 150).unwrap();
         let portal_chunk = find_portal_chunk(&portal, GAPPED_DATASET, 150).unwrap();
 
-        // Legacy resolves backward, to the chunk before the hole: it holds no block 150, and
-        // its own id says so -- 0-99 ends well short of the request.
         assert_eq!(legacy_chunk.first_block(), 0);
         assert_eq!(legacy_chunk.id(), "0000000000/0000000000-0000000099-aaaaa");
-        // The portal reader sees the per-chunk end, calls it a gap, and resolves forward to the
-        // next chunk that does hold data.
         assert_eq!(portal_chunk.first_block(), 200);
     }
 
@@ -1005,7 +980,6 @@ mod tests {
 
     #[test]
     fn a_block_in_a_gap_resolves_to_the_next_chunk() {
-        // Ending the stream here would drop 200-299, which a worker does hold.
         let assignment = gapped_portal_assignment();
 
         let chunk = find_portal_chunk(&assignment, GAPPED_DATASET, 150).unwrap();
@@ -1048,9 +1022,6 @@ mod tests {
 
     #[test]
     fn a_portal_chunk_builds_to_what_its_id_parses_to() {
-        // `id()` formats the same four values `DataChunk` holds, so building from the columns
-        // must land on exactly the chunk the round-trip produced -- `top` included, which is a
-        // run lookup rather than a plain column.
         let assignment = gapped_portal_assignment();
 
         for block in [0, 250] {
@@ -1086,7 +1057,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_artifact_is_read_gzipped_or_zstd_compressed() {
-        // Long enough that neither codec's output is the payload itself.
         let payload = b"portal assignment bytes".repeat(64);
 
         for codec in [ArtifactCodec::Gzip, ArtifactCodec::Zstd] {
@@ -1102,8 +1072,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_artifact_compressed_the_other_way_is_refused() {
-        // The suffix is trusted, so a publisher that mislabels one fails the fetch and keeps the
-        // assignment already in service, rather than feeding the reader whatever came out.
         let body = compress(b"portal assignment bytes", ArtifactCodec::Zstd).await;
 
         let err = decompress_artifact(std::io::Cursor::new(body), ArtifactCodec::Gzip)

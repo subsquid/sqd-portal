@@ -734,8 +734,6 @@ impl NetworkClient {
             // 0 for a chunk the legacy artifact produced, which names no version: proto3 leaves
             // the default off the wire, so the field is absent exactly when there is none to send.
             chunk_version: chunk_id.chunk.version(),
-            // Protocol defaults: the portal asks for jsonl from the default engine, which is what
-            // it asked for before these fields existed.
             query_engine: Default::default(),
             output_format: Default::default(),
         };
@@ -856,11 +854,6 @@ impl NetworkClient {
         transfer_time: Duration,
         query_time: Duration,
     ) -> QueryResult {
-        // Decoded from `Bytes`, not `&[u8]`: `QueryOk::data` is a `bytes` field, and prost only
-        // shares the input buffer when the input is itself `Bytes` -- from a slice it allocates
-        // and copies the payload instead. `Bytes::from(Vec)` takes the read buffer's allocation
-        // without copying, so the payload reaches the caller having been copied once, off the
-        // socket, and not again.
         let response_size = buf.len();
         let result = sqd_messages::QueryResult::decode(share_or_copy(buf))
             .map_err(|e| QueryFailure::InvalidResponse(e.to_string()));
