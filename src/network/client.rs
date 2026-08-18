@@ -712,6 +712,13 @@ impl NetworkClient {
             timestamp_ms: timestamp_now_ms(),
             signature: Default::default(),
             compression,
+            // 0 for a chunk the legacy artifact produced, which names no version: proto3 leaves
+            // the default off the wire, so the field is absent exactly when there is none to send.
+            chunk_version: chunk_id.chunk.version(),
+            // Protocol defaults: the portal asks for jsonl from the default engine, which is what
+            // it asked for before these fields existed.
+            query_engine: Default::default(),
+            output_format: Default::default(),
         };
         tokio::task::spawn_blocking({
             let keypair = self.keypair.clone();

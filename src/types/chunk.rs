@@ -19,6 +19,10 @@ pub struct DataChunk {
     top_dir: BlockNumber,
     // TODO: use `SID` from the common library
     last_hash: [u8; HASH_MAX_LEN],
+    /// Which copy of the chunk workers serve. Only the portal artifact carries one; a chunk read
+    /// from the legacy artifact, or parsed from an id, is 0 — the ingested copy, and the value a
+    /// query leaves off the wire.
+    version: u32,
 }
 
 impl DataChunk {
@@ -44,7 +48,19 @@ impl DataChunk {
             last_block,
             top_dir,
             last_hash,
+            version: 0,
         })
+    }
+
+    /// The ingested copy is 0, which is also what an id alone can say — an id names no version.
+    #[must_use]
+    pub fn with_version(mut self, version: u32) -> Self {
+        self.version = version;
+        self
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
     }
 
     pub fn block_range(&self) -> BlockRange {
@@ -100,6 +116,7 @@ impl FromStr for DataChunk {
             last_block,
             top_dir,
             last_hash,
+            version: 0,
         })
     }
 }

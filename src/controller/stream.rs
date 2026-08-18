@@ -1098,7 +1098,7 @@ fn parse_response(
     let last_block = result.last_block;
 
     let state = if last_block == *range.end() {
-        RequestState::Done(Ok(result.data))
+        RequestState::Done(Ok(result.data.to_vec()))
     } else if last_block < *range.start() {
         // Unreachable: `check_response_range` rejects this before the response
         // gets here. Kept because falling through would emit blocks below the
@@ -1109,7 +1109,7 @@ fn parse_response(
         ))))
     } else {
         RequestState::Partial(PartialResult {
-            data: result.data,
+            data: result.data.to_vec(),
             next_range: BlockRange::new(last_block + 1, *range.end()),
         })
     };
@@ -1352,7 +1352,8 @@ mod tests {
                 Ok(QuerySuccess {
                     ok: sqd_messages::QueryOk {
                         data: format!("data-{}-{}", block_range.start(), block_range.end())
-                            .into_bytes(),
+                            .into_bytes()
+                            .into(),
                         last_block: *block_range.end(),
                     },
                     ttfb: Duration::from_millis(1),
@@ -1646,7 +1647,7 @@ mod tests {
                 }
                 Ok(QuerySuccess {
                     ok: sqd_messages::QueryOk {
-                        data: format!("{start}:{last}").into_bytes(),
+                        data: format!("{start}:{last}").into_bytes().into(),
                         last_block: last,
                     },
                     ttfb: Duration::from_millis(1),
@@ -1992,7 +1993,7 @@ mod tests {
         let success = |last_block| {
             Ok(QuerySuccess {
                 ok: sqd_messages::QueryOk {
-                    data: b"data".to_vec(),
+                    data: b"data".to_vec().into(),
                     last_block,
                 },
                 ttfb: Duration::from_millis(1),
