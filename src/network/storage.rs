@@ -391,7 +391,10 @@ impl StorageClient {
     }
 
     pub fn next_chunk(&self, dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
-        self.find_chunk(dataset, chunk.last_block + 1).ok()
+        let next_block = chunk.last_block.checked_add(1)?;
+        self.find_chunk(dataset, next_block)
+            .ok()
+            .filter(|next| advances_past(chunk, next))
     }
 
     pub fn first_block(&self, dataset: &DatasetId) -> Option<BlockNumber> {
@@ -486,6 +489,10 @@ impl StorageClient {
                 .collect(),
         })
     }
+}
+
+fn advances_past(current: &DataChunk, candidate: &DataChunk) -> bool {
+    candidate.first_block > current.last_block
 }
 
 fn accumulate_range(
@@ -943,16 +950,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_walks_back_into_the_chunk_that_just_ended() {
-        // `next_chunk` is `find_chunk(last_block + 1)`. Across a gap that resolves backward to
-        // the chunk it just finished, so a legacy stream is handed the same chunk again instead
-        // of advancing -- the portal counterpart crosses the gap
-        // (`the_block_after_a_chunk_crosses_the_gap`).
+    fn legacy_cannot_advance_across_a_gap() {
+        // The legacy reader resolves the block after the first chunk backward, to that same
+        // chunk. `next_chunk` rejects this non-advancing result, so the stream stops instead of
+        // querying 0-99 repeatedly.
         let legacy = gapped_legacy_assignment();
+        let current = legacy.find_chunk(GAPPED_DATASET, 0).unwrap();
 
         let after_first = legacy.find_chunk(GAPPED_DATASET, 100).unwrap();
 
-        assert_eq!(after_first.first_block(), 0, "legacy did not advance");
+        assert_eq!(after_first.first_block(), current.first_block());
+        let current = current.id().parse::<DataChunk>().unwrap();
+        let after_first = after_first.id().parse::<DataChunk>().unwrap();
+        assert!(!advances_past(&current, &after_first));
     }
 
     #[test]
@@ -966,12 +976,16 @@ mod tests {
 
     #[test]
     fn the_block_after_a_chunk_crosses_the_gap() {
-        // How `next_chunk` walks a stream forward: without the skip it would return the chunk it
-        // was already on, or nothing at all.
+        // The portal reader resolves the block after the first chunk to the next real chunk, so
+        // `next_chunk` accepts it as strict forward progress and the stream crosses the gap.
         let assignment = gapped_portal_assignment();
+        let current = find_portal_chunk(&assignment, GAPPED_DATASET, 0).unwrap();
 
         let chunk = find_portal_chunk(&assignment, GAPPED_DATASET, 100).unwrap();
         assert_eq!(chunk.first_block(), 200);
+        let current = portal_data_chunk(current).unwrap();
+        let chunk = portal_data_chunk(chunk).unwrap();
+        assert!(advances_past(&current, &chunk));
     }
 
     #[test]
