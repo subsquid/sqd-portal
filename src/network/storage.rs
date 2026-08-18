@@ -631,9 +631,13 @@ fn portal_data_chunk(chunk: sqd_assignments::PortalChunk<'_>) -> Result<DataChun
     let hash = chunk
         .hash()
         .ok_or_else(|| ChunkNotFound::InvalidID("chunk hash is not valid UTF-8".to_owned()))?;
-    DataChunk::new(chunk.top(), chunk.first_block(), chunk.last_block(), hash).ok_or_else(|| {
-        ChunkNotFound::InvalidID(format!("chunk hash {hash:?} has an unusable length"))
-    })
+    DataChunk::new(chunk.top(), chunk.first_block(), chunk.last_block(), hash)
+        // Only this artifact states which copy of a chunk workers serve; the legacy one has no
+        // such column, so a chunk from it stays at 0 and the query leaves the field off the wire.
+        .map(|data_chunk| data_chunk.with_version(chunk.version()))
+        .ok_or_else(|| {
+            ChunkNotFound::InvalidID(format!("chunk hash {hash:?} has an unusable length"))
+        })
 }
 
 /// A dataset's first block, or `None` when it holds no chunks -- `first_block()` reads chunk 0 on
@@ -929,6 +933,40 @@ mod tests {
         }
         builder.finish_dataset();
         Assignment::from_owned(builder.finish()).unwrap()
+    }
+
+    /// A one-chunk dataset whose chunk is a re-ingested copy, so its version is not the default.
+    fn versioned_portal_assignment() -> PortalAssignment {
+        let mut builder = sqd_assignments::PortalAssignmentBuilder::new();
+        let mut dataset = builder.new_dataset(GAPPED_DATASET, 0);
+        dataset
+            .new_chunk()
+            .id("0000000000/0000000000-0000000099-aaaaa")
+            .block_range(0..=99)
+            .version(7)
+            .finish()
+            .unwrap();
+        dataset.finish(Some("0xhead")).unwrap();
+        PortalAssignment::from_owned(builder.finish()).unwrap()
+    }
+
+    #[test]
+    fn only_a_portal_chunk_carries_a_version() {
+        // A query names the copy it wants, and only this artifact says which copy that is. A
+        // legacy chunk has no such column, so it stays at 0 -- the value proto3 leaves off the
+        // wire, which is how the field is absent rather than guessed.
+        let portal = versioned_portal_assignment();
+        let legacy = gapped_legacy_assignment();
+
+        let portal_chunk =
+            portal_data_chunk(find_portal_chunk(&portal, GAPPED_DATASET, 50).unwrap()).unwrap();
+        let legacy_chunk =
+            parse_chunk_id(legacy.find_chunk(GAPPED_DATASET, 50).unwrap().id()).unwrap();
+
+        assert_eq!(portal_chunk.version(), 7);
+        assert_eq!(legacy_chunk.version(), 0);
+        // The version rides beside the id, never inside it: both name the same chunk.
+        assert_eq!(portal_chunk.to_string(), legacy_chunk.to_string());
     }
 
     #[test]

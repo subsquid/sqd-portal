@@ -24,14 +24,17 @@ hex = "0.4"
 sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-libp2p-identity = { version = "0.2", features = ["ed25519", "rand", "peerid"] }
+libp2p-identity = { version = "=0.2.12", features = ["ed25519", "rand", "peerid"] }
 
 # Same pinned revs as the portal's Cargo.toml — the stubs must speak the exact wire ABI.
-sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "4939971", features = ["builder", "reader"] }
-sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", features = ["signatures"] }
-sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434", features = ["worker"] }
-sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "e9a3434" }
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "d1ee014", features = ["builder", "reader"] }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "d1ee014", features = ["signatures"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "d1ee014", features = ["worker"] }
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "d1ee014" }
 
 [profile.dev]
 # The libp2p tree is slow at opt-level 0 and QUIC handshakes are timing-sensitive.
 opt-level = 1
+
+[patch.crates-io]
+libp2p-identity = { git = "https://github.com/kalabukdima/rust-libp2p.git", rev = "fac3b0c9" }
