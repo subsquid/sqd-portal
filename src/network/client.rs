@@ -191,6 +191,25 @@ impl Verdict {
     }
 }
 
+/// The response buffer as `Bytes`, adopting its allocation when that is not wasteful.
+///
+/// `QueryOk::data` is a `bytes` field, and prost shares the input buffer for one only when the
+/// input is itself `Bytes`; from a slice it allocates and copies the whole payload. Adopting the
+/// read buffer instead hands the payload onwards having been copied once, off the socket.
+///
+/// The catch is that `Bytes::from(Vec)` takes the allocation whole, capacity included, and the
+/// read buffer starts at a megabyte. A barely-filled one would pin all of it for as long as the
+/// payload sits in a stream's buffer, which is bounded by response *count*, not bytes. So the
+/// buffer is only adopted while it is at least half full, which caps what a payload can hold at
+/// twice its own size; a smaller response is copied, where copying is cheap and the saving large.
+fn share_or_copy(buf: Vec<u8>) -> bytes::Bytes {
+    if buf.len().saturating_mul(2) >= buf.capacity() {
+        bytes::Bytes::from(buf)
+    } else {
+        bytes::Bytes::copy_from_slice(&buf)
+    }
+}
+
 /// The data is opaque, so a `last_block` outside the queried range cannot be trimmed to
 /// it, and the continuation derived from it is inverted or re-covers delivered blocks.
 fn out_of_range(ok: &QueryOk, range: &BlockRange) -> bool {
@@ -837,7 +856,13 @@ impl NetworkClient {
         transfer_time: Duration,
         query_time: Duration,
     ) -> QueryResult {
-        let result = sqd_messages::QueryResult::decode(buf.as_slice())
+        // Decoded from `Bytes`, not `&[u8]`: `QueryOk::data` is a `bytes` field, and prost only
+        // shares the input buffer when the input is itself `Bytes` -- from a slice it allocates
+        // and copies the payload instead. `Bytes::from(Vec)` takes the read buffer's allocation
+        // without copying, so the payload reaches the caller having been copied once, off the
+        // socket, and not again.
+        let response_size = buf.len();
+        let result = sqd_messages::QueryResult::decode(share_or_copy(buf))
             .map_err(|e| QueryFailure::InvalidResponse(e.to_string()));
 
         if let Some(logs_tx) = &self.logs_tx {
@@ -850,7 +875,6 @@ impl NetworkClient {
             }
         }
 
-        let response_size = buf.len();
         let throughput = if transfer_time.as_secs_f64() > 0.0 {
             Some(response_size as f64 / transfer_time.as_secs_f64())
         } else {
@@ -1232,6 +1256,31 @@ mod tests {
     fn parse_base_block_mismatch_malformed_no_number() {
         let msg = "unexpected base block: expected 0xabc, but got #0xdef";
         assert!(parse_base_block_mismatch(msg).is_none());
+    }
+
+    #[test]
+    fn a_response_is_shared_when_that_does_not_pin_much_more_than_it_holds() {
+        // Zero-copy is worth having only where the copy would cost something. A well-filled
+        // buffer is adopted; a barely-filled one is copied, so a small payload cannot hold a
+        // megabyte of read buffer open while it waits in a stream's queue.
+        let mut full = Vec::with_capacity(1024);
+        full.extend(std::iter::repeat_n(7u8, 1024));
+        let full_ptr = full.as_ptr();
+
+        let mut sparse = Vec::with_capacity(1024);
+        sparse.extend_from_slice(&[7u8; 8]);
+        let sparse_ptr = sparse.as_ptr();
+
+        let shared = share_or_copy(full);
+        let copied = share_or_copy(sparse);
+
+        assert_eq!(shared.as_ptr(), full_ptr, "a full buffer should be adopted");
+        assert_ne!(copied.as_ptr(), sparse_ptr, "a sparse one should be copied");
+        assert_eq!(
+            copied.as_ref(),
+            &[7u8; 8],
+            "the copy still carries the payload"
+        );
     }
 
     #[test]
