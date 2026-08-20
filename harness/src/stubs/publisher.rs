@@ -4,7 +4,7 @@ use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use serde_json::json;
 
 use super::Ledger;
-use crate::artifact::AssignmentSource;
+use crate::artifact::AssignmentType;
 
 #[derive(Clone)]
 struct PublisherState {
@@ -15,36 +15,58 @@ struct PublisherState {
 }
 
 /// Publishes both artifacts, which is the state the scheduler holds throughout the migration —
-/// so which one the portal reads is decided by its config alone, never by what is on offer.
+/// so which one the portal reads is decided by its config or by `assignment_type`, never by
+/// what is on offer.
 pub fn network_state_json(port: u16, assignment_id: &str, effective_from: u64) -> String {
     network_state_json_publishing(
         port,
         assignment_id,
         effective_from,
-        &[AssignmentSource::Legacy, AssignmentSource::Portal],
+        &[AssignmentType::Legacy, AssignmentType::Split],
     )
 }
 
-/// The same document carrying only `published`. Every descriptor is optional upstream because
-/// migration walks the state through legacy-only, both, then split-only — so a portal has to
-/// cope with the artifact it was pointed at simply not being there.
+/// The same document carrying only `published`, and naming the first of them as its
+/// `assignment_type` — what an unpinned portal follows. Every descriptor is optional upstream
+/// because migration walks the state through legacy-only, both, then split-only, so a portal
+/// has to cope with the artifact in force simply not being there.
 pub fn network_state_json_publishing(
     port: u16,
     assignment_id: &str,
     effective_from: u64,
-    published: &[AssignmentSource],
+    published: &[AssignmentType],
 ) -> String {
-    let mut state = json!({ "network": "tethys" });
+    let url = |file| format!("http://127.0.0.1:{port}/{file}");
+    let named = published.first().copied().unwrap_or(AssignmentType::Legacy);
+    let mut state = json!({
+        "network": "tethys",
+        "assignment_type": named,
+    });
     for source in published {
-        let (key, file) = match source {
-            AssignmentSource::Legacy => ("assignment", "assignment.fb.gz"),
-            AssignmentSource::Portal => ("portal_assignment", "portal-assignment.fb.gz"),
-        };
-        state[key] = json!({
-            "id": assignment_id,
-            "effective_from": effective_from,
-            "fb_url_v1": format!("http://127.0.0.1:{port}/{file}"),
-        });
+        match source {
+            AssignmentType::Legacy => {
+                state["assignment"] = json!({
+                    "id": assignment_id,
+                    "effective_from": effective_from,
+                    "fb_url_v1": url("assignment.fb.gz"),
+                });
+            }
+            // Both halves at once: the portal half alone does not resolve, and neither does the
+            // pair without a schema bundle the portal itself never reads.
+            AssignmentType::Split => {
+                state["worker_assignment"] = json!({
+                    "id": assignment_id,
+                    "fb_url": url("worker-assignment.fb.gz"),
+                    "version": "2",
+                });
+                state["portal_assignment"] = json!({
+                    "id": assignment_id,
+                    "fb_url": url("portal-assignment.fb.gz"),
+                    "version": "2",
+                });
+                state["schema_bundle"] = json!({ "hash": "toy", "url": url("schema-bundle.json") });
+            }
+        }
     }
     state.to_string()
 }

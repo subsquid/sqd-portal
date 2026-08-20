@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
-use crate::artifact::AssignmentSource;
+use crate::artifact::AssignmentType;
 use crate::world::ToyWorld;
 
 pub struct Endpoints {
@@ -166,7 +166,7 @@ pub fn spawn(
     dummy_client: &Path,
     boot_nodes: &str,
     e: &Endpoints,
-    assignment_source: AssignmentSource,
+    assignment_source: Option<AssignmentType>,
 ) -> anyhow::Result<PortalProcess> {
     let log_path = scratch.join("portal.log");
     let log = std::fs::File::create(&log_path)?;
@@ -189,7 +189,10 @@ pub fn spawn(
         .env("BOOT_NODES", boot_nodes)
         .env("PRIVATE_NETWORK", "1")
         .env("RUST_LOG", "info,sqd_portal=debug")
-        .env("ASSIGNMENT_SOURCE", assignment_source.as_str())
+        // Cleared first: unset is what makes the portal follow the network state, so an
+        // inherited value would quietly pin it.
+        .env_remove("ASSIGNMENT_SOURCE")
+        .envs(assignment_source.map(|s| ("ASSIGNMENT_SOURCE", s.to_string())))
         .env_remove("P2P_LISTEN_ADDRS")
         .env_remove("P2P_PUBLIC_ADDRS")
         .env_remove("SENTRY_DSN")

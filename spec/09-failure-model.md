@@ -55,7 +55,7 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 | Corrupt / truncated artifact | integrity: reject, keep last good, alarm — **intent** (today: adopted unverified — GAP-1, ADR-002) |
 | Stale (identifier never advances) | degrade + alarm past P-ASSIGNMENT-MAX-AGE ⚠ (ADR-013) |
 | Regressive (older identifier republished) | mask — application legality ignores it (INV-2) |
-| Configured artifact absent (P-ASSIGNMENT-SOURCE names one the state does not carry) | refuse: apply nothing, keep last good, count `missing_assignment_source`. Never substitute the other artifact — a silent substitution makes a canary that never ran indistinguishable from one that passed, and leaves the kill switch switching nothing off |
+| Artifact of the source in force absent (P-ASSIGNMENT-SOURCE, else the state's own `assignment_type`, names one the state does not carry) | refuse: apply nothing, keep last good, count `missing_assignment_source`. Never substitute the other artifact — a silent substitution makes a canary that never ran indistinguishable from one that passed, and leaves the kill switch switching nothing off |
 
 ## Real-time source faults (DC-4)
 

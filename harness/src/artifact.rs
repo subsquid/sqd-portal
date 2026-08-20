@@ -10,31 +10,9 @@ use sqd_assignments::{AssignmentBuilder, PortalAssignmentBuilder};
 
 use crate::world::ToyWorld;
 
-/// Which artifact the portal under test is configured to route from, mirroring its own
-/// `assignment_source`. The stub publishes both, which models the migration window and not the
-/// states either side of it: here this picks which artifact the portal reads, never which ones
-/// exist. A network that has finished migrating publishes only the split pair, and that shape
-/// is not covered by this harness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssignmentSource {
-    Legacy,
-    Portal,
-}
-
-impl AssignmentSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            Self::Portal => "portal",
-        }
-    }
-}
-
-impl std::fmt::Display for AssignmentSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// The scheduler's own type, re-exported: it is both what the portal is pinned to and what a
+/// published state names, so the stubs and the CT files spell it the way the portal does.
+pub use sqd_assignments::AssignmentType;
 
 /// Build the artifact assigning every archival chunk to every worker, then
 /// gzip it. The portal pre-leases `1 + retries` *distinct* workers per chunk,

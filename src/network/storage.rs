@@ -1,8 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
-use serde::Deserialize;
-use sqd_assignments::{Assignment, NetworkAssignment, PortalAssignment};
+use sqd_assignments::{Assignment, AssignmentType, PortalAssignment, ResolvedAssignments};
 use sqd_contract_client::{Network, PeerId};
 use sqd_primitives::BlockRef;
 use tracing::instrument;
@@ -14,36 +13,6 @@ use crate::{
     utils::RwLock,
 };
 
-/// Which of the published artifacts the portal routes from.
-///
-/// The scheduler publishes both throughout the migration, so this is an outright choice rather
-/// than a preference: only the selected artifact is ever consulted, and its absence is an error
-/// rather than a reason to serve the other one. That is what keeps [`Legacy`] usable as a kill
-/// switch and [`Portal`] verifiable as a canary.
-///
-/// [`Legacy`]: AssignmentSource::Legacy
-/// [`Portal`]: AssignmentSource::Portal
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum AssignmentSource {
-    // Kept short and free of Rust paths: clap renders these verbatim as the `--help` text for
-    // each possible value.
-    /// The combined assignment, served to workers and portals alike.
-    #[default]
-    Legacy,
-    /// The dedicated portal assignment, carrying only what a portal reads.
-    Portal,
-}
-
-impl std::fmt::Display for AssignmentSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Legacy => "legacy",
-            Self::Portal => "portal",
-        })
-    }
-}
-
 /// The assignment currently held by the client, in whichever wire format it was published in.
 /// See docs/assignment-wire-format.md in network-scheduler for the split rationale.
 enum ActiveAssignment {
@@ -54,13 +23,14 @@ enum ActiveAssignment {
 pub struct StorageClient {
     assignment: RwLock<Option<ActiveAssignment>>,
     datasets_config: Arc<RwLock<Datasets>>,
-    /// Id of the last applied assignment. Ids only order within a single source, but the source
-    /// is fixed for the process lifetime, so the id alone is enough to spot a regression.
+    /// Id of the last applied assignment. Ids only order within a single source, and
+    /// `is_stale` fails open on two it cannot compare, so a change of source costs a poll.
     latest_assignment_id: RwLock<Option<String>>,
     network_state_url: String,
     reqwest_client: reqwest::Client,
     ignore_deprecated_workers: bool,
-    assignment_source: AssignmentSource,
+    /// Overrides the source the network state names; `None` follows it.
+    assignment_source: Option<AssignmentType>,
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -103,7 +73,7 @@ impl StorageClient {
                 .build()
                 .unwrap(),
             ignore_deprecated_workers: false,
-            assignment_source: AssignmentSource::default(),
+            assignment_source: None,
         }
     }
 
@@ -111,7 +81,7 @@ impl StorageClient {
         self.ignore_deprecated_workers = true;
     }
 
-    pub fn set_assignment_source(&mut self, source: AssignmentSource) {
+    pub fn set_assignment_source(&mut self, source: Option<AssignmentType>) {
         self.assignment_source = source;
     }
 
@@ -138,24 +108,22 @@ impl StorageClient {
         let network_state = self.fetch_network_state().await?;
         // Never falls back to the other source: that would make a portal pinned to one format
         // silently serve the other, defeating both the kill switch and the canary.
-        let (selected, assignment_url) = usable_assignment(&network_state, self.assignment_source)
-            .inspect_err(|_| {
+        let selected =
+            select_assignment(network_state, self.assignment_source).inspect_err(|_| {
                 metrics::MISSING_ASSIGNMENT_SOURCE.inc();
             })?;
-        let assignment_id = selected.id.clone();
-        let effective_from = selected.effective_from;
         let latest = self.latest_assignment_id.read().clone();
-        if latest.as_deref() == Some(assignment_id.as_str()) {
+        if latest.as_deref() == Some(selected.id.as_str()) {
             tracing::debug!("Assignment has not been changed");
             return Ok(());
         }
 
         if let Some(latest) = &latest {
-            if is_stale(latest, &assignment_id) {
+            if is_stale(latest, &selected.id) {
                 // Applying it would move the head backwards, dropping already-advertised chunks
                 // and opening a range no source covers. A later poll brings the newer one back.
                 tracing::warn!(
-                    stale_id = %assignment_id,
+                    stale_id = %selected.id,
                     current_id = %latest,
                     "Rejected an assignment older than the current one"
                 );
@@ -165,16 +133,17 @@ impl StorageClient {
         }
 
         let assignment = self
-            .fetch_assignment(&assignment_url, self.assignment_source)
+            .fetch_assignment(&selected.url, selected.source)
             .await?;
 
-        if latest.is_some() {
+        // Only the legacy artifact declares a time to wait for.
+        if let (Some(_), Some(effective_from)) = (&latest, selected.effective_from) {
             sleep_until(effective_from).await;
         }
 
-        self.set_assignment(assignment, &assignment_id);
+        self.set_assignment(assignment, &selected.id);
 
-        tracing::info!("Applied assignment \"{}\"", assignment_id);
+        tracing::info!(source = %selected.source, "Applied assignment \"{}\"", selected.id);
         Ok(())
     }
 
@@ -193,7 +162,7 @@ impl StorageClient {
     async fn fetch_assignment(
         &self,
         url: &str,
-        source: AssignmentSource,
+        source: AssignmentType,
     ) -> anyhow::Result<ActiveAssignment> {
         use futures::TryStreamExt;
         use tokio_util::io::StreamReader;
@@ -211,10 +180,10 @@ impl StorageClient {
         tracing::debug!("Downloaded assignment from {}", url);
 
         Ok(match source {
-            AssignmentSource::Legacy => {
+            AssignmentType::Legacy => {
                 ActiveAssignment::Legacy(Assignment::from_owned_unchecked(buf))
             }
-            AssignmentSource::Portal => {
+            AssignmentType::Split => {
                 ActiveAssignment::Portal(PortalAssignment::from_owned_unchecked(buf))
             }
         })
@@ -513,40 +482,46 @@ fn accumulate_range(
     }
 }
 
-/// The descriptor `source` names together with its download url, or why it yielded nothing this
-/// poll.
-///
-/// A descriptor that is absent and one that carries no `fb_url_v1` are the same event to an
-/// operator — the configured source is unusable — so they share a counter at the call site while
-/// keeping messages that say which it was. The second shape is not hypothetical: `fb_url_v1` has
-/// no `skip_serializing_if`, so a publisher serializing a descriptor that still only has the
-/// deprecated urls writes it out as an explicit null.
-fn usable_assignment(
-    network_state: &sqd_assignments::NetworkState,
-    source: AssignmentSource,
-) -> anyhow::Result<(&NetworkAssignment, String)> {
-    let selected = select_assignment(network_state, source)
-        .ok_or_else(|| anyhow!("network state publishes no {source} assignment"))?;
-    let url = selected
-        .fb_url_v1
-        .clone()
-        .ok_or_else(|| anyhow!("the {source} assignment carries no fb_url_v1"))?;
-    Ok((selected, url))
+/// What one poll resolved to: which reader parses the blob, and what applying it needs.
+struct SelectedAssignment {
+    source: AssignmentType,
+    id: String,
+    url: String,
+    /// Legacy only: the split blob has no such field, so it applies as soon as it is fetched.
+    effective_from: Option<u64>,
 }
 
-/// The artifact descriptor `source` names, or `None` when the publisher hasn't included it.
+/// The assignment `source` names together with its download url, or why it yielded nothing
+/// this poll.
 ///
-/// Every field of the network state is optional, because the migration walks it through three
-/// shapes: legacy alone, both, then the split pair alone. Which of those a given network is in is
-/// the publisher's business -- the portal's is to serve the format it was configured for, or
-/// nothing at all.
+/// Which blobs a state carries says nothing about which are authoritative -- the migration
+/// publishes both sets at once -- so `assignment_type` picks, unless `source` overrides it, and
+/// the blobs it names must be there. That and a legacy descriptor carrying no `fb_url_v1` are
+/// the same event to an operator, so they share a counter at the call site.
 fn select_assignment(
-    network_state: &sqd_assignments::NetworkState,
-    source: AssignmentSource,
-) -> Option<&NetworkAssignment> {
-    match source {
-        AssignmentSource::Legacy => network_state.assignment.as_ref(),
-        AssignmentSource::Portal => network_state.portal_assignment.as_ref(),
+    network_state: sqd_assignments::NetworkState,
+    source: Option<AssignmentType>,
+) -> anyhow::Result<SelectedAssignment> {
+    let resolved = network_state.resolve(source)?;
+
+    match resolved {
+        ResolvedAssignments::Legacy(assignment) => Ok(SelectedAssignment {
+            source: AssignmentType::Legacy,
+            // Not hypothetical: `fb_url_v1` has no `skip_serializing_if`, so a descriptor
+            // carrying only the deprecated urls serializes it as an explicit null.
+            url: assignment
+                .fb_url_v1
+                .ok_or_else(|| anyhow!("the legacy assignment carries no fb_url_v1"))?,
+            id: assignment.id,
+            effective_from: Some(assignment.effective_from),
+        }),
+        // The worker blob and the schema bundle come with it, unread.
+        ResolvedAssignments::Split { portal, .. } => Ok(SelectedAssignment {
+            source: AssignmentType::Split,
+            id: portal.id,
+            url: portal.fb_url,
+            effective_from: None,
+        }),
     }
 }
 
@@ -730,96 +705,85 @@ mod tests {
     use super::*;
 
     #[allow(deprecated)]
-    fn assignment(id: &str) -> NetworkAssignment {
-        NetworkAssignment {
+    fn legacy_assignment(url: Option<&str>) -> sqd_assignments::NetworkAssignment {
+        sqd_assignments::NetworkAssignment {
             url: None,
             fb_url: None,
-            fb_url_v1: Some(format!("https://example.test/{id}.fb.gz")),
-            id: id.to_string(),
+            fb_url_v1: url.map(ToOwned::to_owned),
+            id: "legacy".to_string(),
             effective_from: 123,
         }
     }
 
-    /// A state publishing exactly the artifacts named, so a test can spell out which of the three
-    /// migration shapes it is in.
-    fn network_state(legacy: bool, portal: bool) -> sqd_assignments::NetworkState {
+    fn split_blob(id: &str) -> sqd_assignments::NetworkAssignmentV2 {
+        sqd_assignments::NetworkAssignmentV2 {
+            id: id.to_string(),
+            fb_url: format!("https://example.test/{id}.fb.gz"),
+            version: "2".to_string(),
+        }
+    }
+
+    /// A state carrying exactly the blob sets named, and naming whichever type it likes -- the
+    /// two move independently.
+    fn network_state(
+        assignment_type: AssignmentType,
+        legacy: bool,
+        split: bool,
+    ) -> sqd_assignments::NetworkState {
         sqd_assignments::NetworkState {
             network: "testnet".to_string(),
-            assignment: legacy.then(|| assignment("legacy")),
-            worker_assignment: None,
-            portal_assignment: portal.then(|| assignment("portal")),
-            schema_bundle: None,
+            assignment_type,
+            assignment: legacy
+                .then(|| legacy_assignment(Some("https://example.test/legacy.fb.gz"))),
+            // The pair is published together, and `resolve` refuses it without the bundle.
+            worker_assignment: split.then(|| split_blob("worker")),
+            portal_assignment: split.then(|| split_blob("portal")),
+            schema_bundle: Some(sqd_assignments::SchemaBundle {
+                hash: "a1b2c3".to_string(),
+                url: "https://example.test/schema.bundle.gz".to_string(),
+            }),
         }
     }
 
+    /// Which blobs a type requires, and that an override beats the state's own type, are
+    /// upstream's `resolve` and upstream's tests. What is ours is passing the pin through at
+    /// all rather than always following the state.
     #[test]
-    fn each_source_selects_its_own_artifact() {
-        let state = network_state(true, true);
+    fn the_state_names_the_source_unless_the_portal_pins_one() {
+        let state = || network_state(AssignmentType::Split, true, true);
 
-        let legacy = select_assignment(&state, AssignmentSource::Legacy);
-        let portal = select_assignment(&state, AssignmentSource::Portal);
+        let followed = select_assignment(state(), None).expect("the split pair is published");
+        let pinned =
+            select_assignment(state(), Some(AssignmentType::Legacy)).expect("legacy is published");
 
-        assert_eq!(legacy.map(|a| a.id.as_str()), Some("legacy"));
-        assert_eq!(portal.map(|a| a.id.as_str()), Some("portal"));
+        assert_eq!(followed.source, AssignmentType::Split);
+        assert_eq!(pinned.source, AssignmentType::Legacy);
     }
 
     #[test]
-    fn a_missing_source_never_falls_back_to_the_other() {
-        // The whole point of the selector: pinning to one format must not silently serve the
-        // other, in either direction or in either of the one-sided migration shapes.
-        let legacy_only = network_state(true, false);
-        let portal_only = network_state(false, true);
+    fn each_shape_yields_what_applying_it_needs() {
+        let legacy = select_assignment(network_state(AssignmentType::Legacy, true, false), None)
+            .expect("legacy is published");
+        let split = select_assignment(network_state(AssignmentType::Split, false, true), None)
+            .expect("the split pair is published");
 
-        assert!(select_assignment(&legacy_only, AssignmentSource::Portal).is_none());
-        assert!(select_assignment(&portal_only, AssignmentSource::Legacy).is_none());
-    }
-
-    #[allow(deprecated)]
-    fn assignment_without_url(id: &str) -> NetworkAssignment {
-        NetworkAssignment {
-            url: None,
-            fb_url: None,
-            fb_url_v1: None,
-            id: id.to_string(),
-            effective_from: 123,
-        }
-    }
-
-    #[test]
-    fn a_usable_source_yields_its_download_url() {
-        let state = network_state(true, false);
-
-        let (selected, url) = usable_assignment(&state, AssignmentSource::Legacy).unwrap();
-
-        assert_eq!(selected.id, "legacy");
-        assert_eq!(url, "https://example.test/legacy.fb.gz");
+        assert_eq!(legacy.url, "https://example.test/legacy.fb.gz");
+        // Legacy alone declares a cutover instant; the split blob has no field for one.
+        assert_eq!(legacy.effective_from, Some(123));
+        assert_eq!(split.effective_from, None);
+        // The portal half, not the worker half that resolves alongside it.
+        assert_eq!(split.id, "portal");
+        assert_eq!(split.url, "https://example.test/portal.fb.gz");
     }
 
     #[test]
     fn a_source_carrying_no_v1_url_is_unusable() {
-        // Published but unfetchable is the same event as not published at all, and must reach
-        // the same counter -- an alert cannot tell the two apart and should not have to.
-        let mut state = network_state(true, true);
-        state.portal_assignment = Some(assignment_without_url("portal"));
+        // Published but unfetchable is the same event as not published at all: one counter,
+        // because an alert cannot tell the two apart.
+        let mut state = network_state(AssignmentType::Legacy, true, true);
+        state.assignment = Some(legacy_assignment(None));
 
-        assert!(usable_assignment(&state, AssignmentSource::Portal).is_err());
-        // ...and one source's defect says nothing about the other.
-        assert!(usable_assignment(&state, AssignmentSource::Legacy).is_ok());
-    }
-
-    #[test]
-    fn an_absent_source_is_unusable() {
-        let state = network_state(true, false);
-
-        assert!(usable_assignment(&state, AssignmentSource::Portal).is_err());
-    }
-
-    #[test]
-    fn no_published_artifact_selects_nothing() {
-        let state = network_state(false, false);
-
-        assert!(select_assignment(&state, AssignmentSource::Legacy).is_none());
-        assert!(select_assignment(&state, AssignmentSource::Portal).is_none());
+        assert!(select_assignment(state, None).is_err());
     }
 
     #[test]

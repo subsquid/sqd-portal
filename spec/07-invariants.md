@@ -19,7 +19,8 @@ a partially applied artifact is never observable.
 An artifact is applied only if its identifier differs from the applied one, its
 effective-from time has passed, and its effective-from is not earlier than the applied
 artifact's (a republished older artifact is never re-applied). Application replaces the
-whole artifact.
+whole artifact. The `split` artifacts declare no effective-from, so there the first two
+clauses collapse to the identifier alone (GAP-37).
 *Why:* re-applying identical artifacts churns; early application splits the fleet;
 regression re-serves routing the network already retired.
 *Check:* CT-2 — publisher stub serves future-effective and regressive artifacts; assert

@@ -39,7 +39,9 @@ the published url's suffix names the codec, `.zst` for zstd and gzip otherwise, 
 network state carries no field for it. The **applied artifact** is the single artifact the
 Portal currently routes by. An artifact is *applied* atomically, never partially (INV-1), no
 earlier than its effective-from time, and never with an effective-from earlier than the
-applied one's (regression guard, INV-2).
+applied one's (regression guard, INV-2). Only the `legacy` artifact declares an effective-from:
+the `split` pair has no such field, so its artifacts apply as soon as they are fetched and
+ordering rests on the identifier alone (GAP-37).
 
 **DEF-5 — Heads and the frontier.** Per dataset: the **archival head** (the reference
 of the last assigned chunk's last block), the **real-time head** (reported by the

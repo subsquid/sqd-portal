@@ -46,8 +46,9 @@ and the divergence can take the whole pool out at once (GAP-27).
 *Role.* Source of the assignment artifact (DEF-4); consulted by a background loop only,
 never on a request path.
 *Call contract.* Poll every P-ASSIGNMENT-REFRESH; fetch deadline
-P-ASSIGNMENT-FETCH-TIMEOUT; unchanged identifier ⇒ no re-download; application waits
-for effective-from.
+P-ASSIGNMENT-FETCH-TIMEOUT; the state's `assignment_type` names which artifact to read
+unless P-ASSIGNMENT-SOURCE pins one; unchanged identifier ⇒ no re-download; application
+waits for effective-from where one is declared (`legacy` only — GAP-37).
 *Error mapping.* Fetch/parse failure → keep serving the applied artifact; alarm
 (⚠ today only a log — GAP-2). Never surfaces to clients directly.
 *Degradation.* Serve-stale, currently unbounded; intent bounds it at

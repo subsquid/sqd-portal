@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context};
-use harness::artifact::AssignmentSource;
+use harness::artifact::AssignmentType;
 use harness::driver::Decoded;
 use harness::model::{model, Expect, StreamReq};
 use harness::portal::{Endpoints, PortalProcess};
@@ -74,12 +74,12 @@ struct Ctx {
     worker_ledgers: Vec<stubs::Ledger>,
     hotblocks_ledger: stubs::Ledger,
     publisher_ledger: stubs::Ledger,
-    assignment_source: AssignmentSource,
+    assignment_source: AssignmentType,
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ct1_smoke() -> anyhow::Result<()> {
-    smoke(AssignmentSource::Legacy).await
+    smoke(AssignmentType::Legacy).await
 }
 
 /// The same conformance run, routed from the portal-oriented artifact. It carries strictly less
@@ -87,10 +87,10 @@ async fn ct1_smoke() -> anyhow::Result<()> {
 /// the portal never needed those fields before the network stops publishing them.
 #[tokio::test(flavor = "multi_thread")]
 async fn ct1_smoke_from_portal_assignment() -> anyhow::Result<()> {
-    smoke(AssignmentSource::Portal).await
+    smoke(AssignmentType::Split).await
 }
 
-async fn smoke(assignment_source: AssignmentSource) -> anyhow::Result<()> {
+async fn smoke(assignment_source: AssignmentType) -> anyhow::Result<()> {
     // Loopback p2p addresses are filtered as unreachable unless this is set.
     std::env::set_var("PRIVATE_NETWORK", "1");
     let _ = tracing_subscriber::fmt()
@@ -169,7 +169,9 @@ async fn smoke(assignment_source: AssignmentSource) -> anyhow::Result<()> {
         &dummy_path,
         &boot_nodes,
         &endpoints,
-        assignment_source,
+        // Both runs pin the portal: the state names `legacy`, so the split run also shows the
+        // override winning.
+        Some(assignment_source),
     )?;
 
     let ctx = Ctx {
@@ -501,8 +503,8 @@ async fn run_smoke(ctx: &Ctx, portal_proc: &mut PortalProcess) -> anyhow::Result
     // would let the portal-source run pass on a legacy fetch. Asserting the other artifact was
     // never fetched is what pins the selector's no-fallback promise end to end.
     let (expected, forbidden) = match ctx.assignment_source {
-        AssignmentSource::Legacy => ("artifact", "artifact-portal"),
-        AssignmentSource::Portal => ("artifact-portal", "artifact"),
+        AssignmentType::Legacy => ("artifact", "artifact-portal"),
+        AssignmentType::Split => ("artifact-portal", "artifact"),
     };
     let fetched = ctx.publisher_ledger.entries();
     ensure!(

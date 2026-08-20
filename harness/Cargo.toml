@@ -27,10 +27,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libp2p-identity = { version = "=0.2.12", features = ["ed25519", "rand", "peerid"] }
 
 # Same pinned revs as the portal's Cargo.toml — the stubs must speak the exact wire ABI.
-sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "d1ee014", features = ["builder", "reader"] }
-sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "d1ee014", features = ["signatures"] }
-sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "d1ee014", features = ["worker"] }
-sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "d1ee014" }
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "f38fb09", features = ["builder", "reader"] }
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "f38fb09", features = ["signatures"] }
+sqd-network-transport = { git = "https://github.com/subsquid/sqd-network.git", rev = "f38fb09", features = ["worker"] }
+sqd-contract-client = { git = "https://github.com/subsquid/sqd-network.git", rev = "f38fb09" }
 
 [profile.dev]
 # The libp2p tree is slow at opt-level 0 and QUIC handshakes are timing-sensitive.

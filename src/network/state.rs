@@ -5,7 +5,7 @@ use std::time::Duration;
 use sqd_network_transport::PeerId;
 
 use crate::network::priorities::PrioritiesConfig;
-use crate::network::{AssignmentSource, StorageClient};
+use crate::network::{AssignmentType, StorageClient};
 use crate::types::api_types::WorkerDebugInfo;
 use crate::types::DatasetId;
 use crate::utils::RwLock;
@@ -101,7 +101,7 @@ impl NetworkState {
         self.dataset_storage.ignore_deprecated_workers();
     }
 
-    pub fn set_assignment_source(&mut self, source: AssignmentSource) {
+    pub fn set_assignment_source(&mut self, source: Option<AssignmentType>) {
         self.dataset_storage.set_assignment_source(source);
     }
 

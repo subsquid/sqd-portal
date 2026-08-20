@@ -25,7 +25,7 @@ use tracing::{debug_span, instrument, Instrument};
 
 use super::contracts_state::{ContractsState, Status};
 use super::priorities::NoWorker;
-use super::{AssignmentSource, ChunkNotFound, NetworkState, WorkerLease};
+use super::{AssignmentType, ChunkNotFound, NetworkState, WorkerLease};
 use crate::controller::download_scheduler::{DownloadScheduler, Outcome, Priority};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
@@ -305,7 +305,7 @@ pub struct NetworkClientBuilder {
     network: Network,
     config: Arc<Config>,
     datasets: Arc<RwLock<Datasets>>,
-    assignment_source: AssignmentSource,
+    assignment_source: Option<AssignmentType>,
 }
 
 impl NetworkClientBuilder {
@@ -430,7 +430,7 @@ impl NetworkClient {
         args: TransportArgs,
         config: Arc<Config>,
         datasets: Arc<RwLock<Datasets>>,
-        assignment_source: AssignmentSource,
+        assignment_source: Option<AssignmentType>,
     ) -> anyhow::Result<NetworkClientBuilder> {
         let agent_into = get_agent_info!();
         let network = args.rpc.network;
