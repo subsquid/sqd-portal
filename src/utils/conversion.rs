@@ -32,10 +32,9 @@ pub fn json_lines_to_json(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 pub fn recompress_gzip<S>(stream: S) -> impl futures::Stream<Item = std::io::Result<Bytes>>
 where
-    S: futures::Stream<Item = Vec<u8>>,
+    S: futures::Stream<Item = Bytes>,
 {
-    let reader =
-        StreamReader::new(stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))));
+    let reader = StreamReader::new(stream.map(std::io::Result::Ok));
 
     let mut decoder = GzipDecoder::new(reader);
     decoder.multiple_members(true);

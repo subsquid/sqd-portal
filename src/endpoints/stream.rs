@@ -424,14 +424,13 @@ fn response_body(
     use_gzjoin: bool,
 ) -> Body {
     match compression {
-        // The gzip path owns its input: it hands the buffer to zlib through a raw pointer, so it
-        // cannot take a slice of one shared with the decoded response. That copy is the whole
-        // reason `ResponseChunk` is not `Bytes` all the way down; lifting it means auditing that
-        // `inflate` only ever reads `next_in`, which is not this change's business.
+        // Only this path owns its input: it hands the buffer to zlib through a raw pointer, so
+        // it cannot take a slice of one shared with the decoded response. Lifting the copy means
+        // auditing that `inflate` only ever reads `next_in`, which is not this change's business.
         Compression::Gzip if use_gzjoin => {
             Body::from_stream(join_gzip_default(stream.map(|chunk| chunk.to_vec())))
         }
-        Compression::Gzip => Body::from_stream(recompress_gzip(stream.map(|chunk| chunk.to_vec()))),
+        Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
         Compression::Zstd => Body::from_stream(stream.map(std::io::Result::Ok)),
     }
 }

@@ -22,6 +22,11 @@ pub struct DataChunk {
     /// Which copy of the chunk workers serve. Only the portal artifact carries one; a chunk read
     /// from the legacy artifact, or parsed from an id, is 0 — the ingested copy, and the value a
     /// query leaves off the wire.
+    ///
+    /// Counted by the derived `PartialEq`/`Ord` above, deliberately: two copies of one range are
+    /// different bytes on the workers, so they are different chunks. Note that [`Display`] and
+    /// [`FromStr`] do not carry it, so a chunk that round-trips through its id comes back as
+    /// copy 0 and stops comparing equal to itself.
     version: u32,
 }
 
