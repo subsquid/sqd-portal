@@ -175,13 +175,7 @@ impl Fixture {
             .map(|(id, port)| format!("{} /ip4/127.0.0.1/udp/{port}/quic-v1", id.peer_id))
             .collect::<Vec<_>>()
             .join(",");
-        let config = portal::write_config(
-            &scratch,
-            &world,
-            &endpoints,
-            auth.as_ref(),
-            assignments.source,
-        )?;
+        let config = portal::write_config(&scratch, &world, &endpoints, auth.as_ref())?;
         let portal = portal::spawn(
             &scratch,
             &config,
@@ -189,6 +183,7 @@ impl Fixture {
             &dummy_path,
             &boot_nodes,
             &endpoints,
+            assignments.source,
         )?;
 
         Ok(Self {

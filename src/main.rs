@@ -29,10 +29,16 @@ pub struct Cli {
     #[arg(long, env, value_parser = Config::read)]
     pub config: Config,
 
-    /// Which published assignment artifact to route from. Overrides `assignment_source` in the
-    /// config file, so the format can be switched at deploy time without editing the config.
-    #[arg(long, env = "ASSIGNMENT_SOURCE", value_enum)]
-    pub assignment_source: Option<AssignmentSource>,
+    /// Which published assignment artifact to route from. The scheduler publishes both during
+    /// the migration, and the selected one is the only one consulted -- if it isn't published,
+    /// the portal keeps serving what it already has rather than falling back.
+    #[arg(
+        long,
+        env = "ASSIGNMENT_SOURCE",
+        value_enum,
+        default_value_t = AssignmentSource::Legacy
+    )]
+    pub assignment_source: AssignmentSource,
 
     /// Whether the logs should be structured in JSON format
     #[arg(long, env)]
@@ -187,20 +193,19 @@ async fn main() -> anyhow::Result<()> {
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
 
-    let mut config = args.config;
-    if let Some(source) = args.assignment_source {
-        config.assignment_source = source;
-    }
     // Which wire format routing came from is otherwise invisible: both artifacts describe the
     // same network, so a portal on the wrong one looks healthy while serving the wrong thing.
-    tracing::info!(
-        assignment_source = %config.assignment_source,
-        "assignment source selected"
-    );
-    let config = Arc::new(config);
+    let assignment_source = args.assignment_source;
+    tracing::info!(%assignment_source, "assignment source selected");
+    let config = Arc::new(args.config);
     let hotblocks = Arc::new(sqd_portal::hotblocks::build_client(&config).await?);
-    let network_client_builder =
-        NetworkClient::builder(args.transport, config.clone(), datasets.clone()).await?;
+    let network_client_builder = NetworkClient::builder(
+        args.transport,
+        config.clone(),
+        datasets.clone(),
+        assignment_source,
+    )
+    .await?;
 
     let peer_id = network_client_builder.peer_id();
     sentry::configure_scope(|scope| {

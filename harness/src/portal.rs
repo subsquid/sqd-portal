@@ -66,7 +66,6 @@ pub fn write_config(
     world: &ToyWorld,
     e: &Endpoints,
     auth: Option<&Auth>,
-    assignment_source: AssignmentSource,
 ) -> anyhow::Result<PathBuf> {
     let mut datasets = String::new();
     for ds in &world.datasets {
@@ -118,7 +117,6 @@ pre_drain_grace_period_sec: 1
 drain_timeout_sec: 2
 assignments_url: http://127.0.0.1:{publisher}
 assignments_update_interval_sec: 1
-assignment_source: {assignment_source}
 datasets_update_interval_sec: 600
 chain_update_interval_sec: 60
 send_logs: false
@@ -138,7 +136,6 @@ datasets:
 {datasets}{auth_block}"#,
         http = e.http_port,
         publisher = e.publisher_port,
-        assignment_source = assignment_source.as_str(),
         registry = e.registry_port,
         datasets = datasets,
         auth_block = auth_block,
@@ -169,6 +166,7 @@ pub fn spawn(
     dummy_client: &Path,
     boot_nodes: &str,
     e: &Endpoints,
+    assignment_source: AssignmentSource,
 ) -> anyhow::Result<PortalProcess> {
     let log_path = scratch.join("portal.log");
     let log = std::fs::File::create(&log_path)?;
@@ -191,6 +189,7 @@ pub fn spawn(
         .env("BOOT_NODES", boot_nodes)
         .env("PRIVATE_NETWORK", "1")
         .env("RUST_LOG", "info,sqd_portal=debug")
+        .env("ASSIGNMENT_SOURCE", assignment_source.as_str())
         .env_remove("P2P_LISTEN_ADDRS")
         .env_remove("P2P_PUBLIC_ADDRS")
         .env_remove("SENTRY_DSN")
