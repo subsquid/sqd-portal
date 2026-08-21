@@ -6,7 +6,7 @@ use std::time::Duration;
 use url::Url;
 
 use crate::auth::AuthConfig;
-use crate::network::{AssignmentSource, PrioritiesConfig};
+use crate::network::PrioritiesConfig;
 use crate::types::DatasetRef;
 
 #[serde_as]
@@ -125,13 +125,6 @@ pub struct Config {
 
     #[serde(default)]
     pub ignore_deprecated_workers: bool,
-
-    /// Which published assignment artifact to route from: `legacy` or `portal`. The scheduler
-    /// publishes both during the migration, and the selected one is the only one consulted -- if
-    /// it isn't published, the portal keeps serving what it already has rather than falling back.
-    /// Overridden by `--assignment-source` / `ASSIGNMENT_SOURCE`.
-    #[serde(default)]
-    pub assignment_source: AssignmentSource,
 
     /// Please avoid overriding this value. It may eventually become unsupported.
     #[serde(default = "default_query_size_limit")]

@@ -1,7 +1,7 @@
 # 13 — Conformance & TDD plan
 
-**Mutable doc.** Statuses as of **2026-08-13** (0.13.1,
-`master@ab821f91d5b4345ec6dc6cbf05595867f41eb7de`). Statuses: **C** covered · **P** partial ·
+**Mutable doc.** Statuses as of **2026-08-18** (0.13.2,
+`master@375911e6695f3512fd2e3508fa08fbfdb4aac9cf`). Statuses: **C** covered · **P** partial ·
 **U** unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
 **The authorization band (REQ-50..56, DC-8, OP-11 and the invariants scoped to them) has
 landed and is CT-10-covered on its request path.** A deployment with no `auth:` block
@@ -108,7 +108,7 @@ integrity failure, which is WORKER-FAILURE (DC-1); after the first record ⇒ tr
 | FV-2 | speculative attempt count/timing | ≤ 1 + retries per chunk |
 | FV-3 | truncation point | any record boundary after the first record |
 | FV-4 | coverage extent | contiguous evaluated prefix from `fromBlock`; *matching* records may be empty, but the coverage boundary is always emitted (INV-29), so ≥1 record whenever ≥1 block is evaluated |
-| FV-5 | compression choice/framing | must decode; gzip default, zstd when offered |
+| FV-5 | compression choice/framing | responses: must decode; gzip default, zstd when offered. Artifacts: the publisher picks gzip or zstd and names it in the url suffix (DEF-4); the Portal decodes either, unit-tested both ways |
 | FV-6 | boundary-record granularity | the source emits a header-only coverage boundary per *served chunk* (`Plan::execute` runs per chunk), not only at the response's global first/last; these interior header-only records are licensed. Conformance checks the last record (= coverage cursor, INV-29) and the matched-record set, not exact record-set equality |
 
 Everything else — the content and order of the records that are present, error type/code,
@@ -166,7 +166,7 @@ chunk-boundary records FV-6 licenses.
 | INV-24 | CT-5 | P | smoke asserts head markers against stub/artifact heads on success paths |
 | INV-25 | CT-2 | U | truncation never exercised |
 | INV-26 | CT-5 | C | CT-5 asserts the envelope, status, type/code and hint presence across the local and proxied emitters, including the 409 sibling, the OVERLOADED hint floor, replacement of an unusable upstream hint (0, non-numeric, HTTP-date), the classes that get no invented hint (upstream 503/500), a wrong verb keeping 405 with its `Allow`, and normalization of the router's other rejections |
-| INV-27 | CT-1 | P | gap detection tested; proxied 204 smoke-tested; delay untested |
+| INV-27 | CT-1 | P | retention-gap detection tested; coverage-gap resolution unit-tested on both artifacts, as is a range sharing no block with the chunk it resolved to; proxied 204 smoke-tested; delay untested |
 | INV-28 | CT-3 | U | — |
 | INV-29 | CT-1 | P | boundary emission asserted by the CT-1 selective-tail resume on both sources; the network multi-chunk case exercises the per-chunk granularity FV-6 licenses. Interior boundary records are not audited, and the EMPTY case (no block evaluated) is untested. Boundary pinning is a worker-engine behavior — re-prove before adopting new engine/format fields on a dependency bump |
 | INV-30 | CT-3/7 | U | gauge accounting was a past defect class |
@@ -226,7 +226,7 @@ chunk-boundary records FV-6 licenses.
 | REQ-31 | P | Middleware units only |
 | REQ-32 | P | Internal hiding tested; drift (GAP-11) |
 | REQ-33 | C | Config warn/reject/defaults tested |
-| REQ-40 | P | Variant selection tested; effective-time & outage untested (INV-2, LIV-6); regression guard unimplemented (GAP-20) |
+| REQ-40 | P | Variant selection tested, pinned and from the state's own `assignment_type`; effective-time & outage untested (INV-2, LIV-6), and `split` declares no effective time to test (GAP-37); regression guard unimplemented (GAP-20) |
 | REQ-41 | P | FV-2 attempt bound ledger-checked by the smoke; CT-2 exercises reroute-on-failure and penalty decay (LIV-7) across five verdicts, the two capacity ones included — an exhausted run of those answers OVERLOADED with its hint rather than a bare transient outage. **Known-violated**: a generic worker server-error is classified terminal, so one erroring worker fails the request instead of rerouting (GAP-23). Cooldown durations and priority-group selection remain untested |
 | REQ-42 | P | Scheduler units; headroom refusal untested (INV-4, LIV-8), and its observable — shrink cause, download utilization, headroom-refusal counter (OB-7) — is unasserted |
 | REQ-43 | P | Positive path exercised by the smoke (signed stub responses verified and delivered); CT-2 now drives the rejection path — a wrongly-signed response is not delivered and the attempt is retried elsewhere, meeting the acceptance criterion. Integrity failures are counted per worker but raise no OB-9 alarm state (GAP-24) |
@@ -239,7 +239,7 @@ chunk-boundary records FV-6 licenses.
 | REQ-55 | P | CT-10 runs a shadow portal: a request with no credential, one with an ungrammatical token and one the control plane denies are all served, the verdict enforcement would have returned is in the protected log, and the keyless scrape carries only the neutral `shadow_evaluated` series with no code and no exchange counters. The control-plane ledger shows it exchanging on the same cache-miss rule enforcement uses — once, for the only request that presented something to exchange. Indeterminate exchange outcomes are not separately driven |
 | REQ-56 | P | CT-10 runs a portal with no `auth:` block: gated routes are served without a credential, a credential presented anyway is not a reason to refuse, and no authorization series appears in the scrape at all. The empty-block startup error is unit-tested in `auth::config` rather than here, and the startup mode line is logged but not asserted |
 
-## Gap register — 2026-08-13
+## Gap register — 2026-08-18
 
 Priorities: P0 blocks the program · P1 active production risk · P2 correctness hole
 with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
@@ -276,6 +276,7 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-32 | **Accepted residual.** A credential with no cached grant costs an exchange and so answers more slowly than a cached one. In enforcing mode, under exchange pressure it receives retryable OVERLOADED/UPSTREAM-FAILURE where a cached credential receives BAD-CREDENTIAL, so the accurate retry contract also reveals cache membership in the response; shadow mode admits both and keeps the same neutral public projection. Accepted rather than closed: collapsing the enforcing outcomes means answering a dependency failure with a claim about the key, which REQ-54 forbids. It is not a key-id oracle — the cache is keyed on the whole credential, so an unknown id and a wrong secret miss identically — and public metrics do not amplify it | INV-39 | P3 | revisit only if the channel is shown to be exploitable at scale |
 | GAP-36 | A dataset-scoped key is refused outright on the deprecated direct-worker query route. The path does name its dataset, as a base64 `DatasetId`, and the catalog already resolves one to a canonical name — so the refusal is a decision not to extend authorization onto an NG7 surface, not a missing capability. Fail-closed, and invisible to anyone holding an unscoped key, but a scoped customer meets a 403 on a route that would otherwise work | REQ-53, NG7, IB-2 | P3 | remove the route, or specify it and resolve the id through the catalog on the dataset rung |
 | GAP-33 | CT-10's harness exists and its request-path rows are driven black-box, but every row whose claim is about *time* is still unwritten: LIV-13's convergence at `refresh_after` and at `expires_at` with the control plane stopped, a retired generation completing after its successor (INV-6), the denial TTL and the grace window, and HZ-12's renewal spread. All of them need either a controllable clock or a run long enough to cross a real one, and the stub has neither | CT-10, DC-8, INV-6, LIV-13, HZ-12 | P2 | give the control-plane stub a settable clock offset, or drive the cases with second-scale lifetimes; `expires_at` convergence with the control plane stopped is the one carrying the security claim |
+| GAP-37 | The `split` assignments carry no effective-from — upstream's `NetworkAssignmentV2` has no such field — so a portal on `split` applies each artifact as soon as it has fetched it. The fleet no longer cuts over at one instant, which is what INV-2 and REQ-40 rest on, and ordering falls back to the identifier's timestamp prefix. The window is one P-ASSIGNMENT-REFRESH wide and portals poll unsynchronised, so at worst it is the churn OQ-11 already describes for workers, now portal-side too | INV-2, REQ-40, DEF-4 | P2 | upstream: put a cutover instant back on the split blob, or ratify identifier-only ordering and drop the effective-from clauses |
 
 ### Closed findings
 

@@ -33,7 +33,7 @@ assumes, not knobs it owns.
 | P-HOTBLOCKS-READ-TIMEOUT | Real-time source per-read deadline; must stay < P-CLIENT-TIMEOUT (REQ-22, ADR-010). A replayed request spends it twice (ADR-015) | 20 s | 20 s |
 | P-CLIENT-TIMEOUT | *Environmental:* the request deadline callers default to (ADR-010) | 30 s | ≥ 30 s assumed |
 | P-ASSIGNMENT-REFRESH | Assignment poll interval (REQ-40, REQ-11) | 60 s | 60 s |
-| P-ASSIGNMENT-SOURCE | Which published artifact routing reads: `legacy` or `portal`. Absolute — if the selected one isn't published, nothing is applied and the portal keeps serving what it has | `legacy` | `portal` |
+| P-ASSIGNMENT-SOURCE | Which published artifact routing reads: `legacy` or `split`. Unset follows the `assignment_type` the network state names; set pins the Portal regardless. Absolute either way — if the one in force isn't published, nothing is applied and the Portal keeps serving what it has | unset | unset |
 | P-ASSIGNMENT-FETCH-TIMEOUT | Assignment fetch connect/read deadlines (REQ-22) | 5 s / 5 s | 5 s / 5 s |
 | P-ASSIGNMENT-MAX-AGE | ⚠ Max tolerated assignment age before readiness degrades (REQ-23, ADR-013) | **unbounded — violated in intent** | ⚠ 15 min (draft; ratify via ADR-013) |
 | P-DATASETS-REFRESH | Dataset catalog/metadata poll interval (REQ-12) | 600 s | 600 s |

@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Context;
 use tempfile::TempDir;
 
-use crate::artifact::AssignmentSource;
+use crate::artifact::AssignmentType;
 use crate::portal::{Auth, Endpoints, PortalProcess};
 use crate::stubs::control_plane::ControlPlane;
 use crate::stubs::worker::{WorkerFaults, WorkerStub};
@@ -34,18 +34,19 @@ pub struct Fixture {
 }
 
 /// Which artifacts the publisher offers, and which one the portal is pointed at. Defaults to
-/// the migration window: both published, the portal reading the legacy one. Separating the two
+/// the migration window: both published, the portal following the state. Separating the two
 /// is what lets a test put the portal on an artifact that is not on offer.
 pub struct Assignments {
-    pub source: AssignmentSource,
-    pub published: Vec<AssignmentSource>,
+    /// `None` follows the `assignment_type` the state names, which is the portal's default.
+    pub source: Option<AssignmentType>,
+    pub published: Vec<AssignmentType>,
 }
 
 impl Default for Assignments {
     fn default() -> Self {
         Self {
-            source: AssignmentSource::Legacy,
-            published: vec![AssignmentSource::Legacy, AssignmentSource::Portal],
+            source: None,
+            published: vec![AssignmentType::Legacy, AssignmentType::Split],
         }
     }
 }
@@ -175,13 +176,7 @@ impl Fixture {
             .map(|(id, port)| format!("{} /ip4/127.0.0.1/udp/{port}/quic-v1", id.peer_id))
             .collect::<Vec<_>>()
             .join(",");
-        let config = portal::write_config(
-            &scratch,
-            &world,
-            &endpoints,
-            auth.as_ref(),
-            assignments.source,
-        )?;
+        let config = portal::write_config(&scratch, &world, &endpoints, auth.as_ref())?;
         let portal = portal::spawn(
             &scratch,
             &config,
@@ -189,6 +184,7 @@ impl Fixture {
             &dummy_path,
             &boot_nodes,
             &endpoints,
+            assignments.source,
         )?;
 
         Ok(Self {

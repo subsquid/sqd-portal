@@ -6,7 +6,6 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
 use crate::{
@@ -17,7 +16,7 @@ use crate::{
     http_server::{forward_hotblocks_response, forward_response},
     network::NetworkClient,
     openapi::{BaseBlockConflictResponse, StreamRequestBody},
-    types::{Compression, DatasetId, ErrorResponse, RequestError, StreamRequest},
+    types::{Compression, DatasetId, ErrorResponse, RequestError, ResponseChunk, StreamRequest},
     utils::conversion::{join_gzip_default, recompress_gzip},
 };
 
@@ -420,16 +419,19 @@ async fn stream_after_network_head(network: &NetworkClient, dataset_id: DatasetI
 }
 
 fn response_body(
-    stream: impl Stream<Item = Vec<u8>> + Send + 'static,
+    stream: impl Stream<Item = ResponseChunk> + Send + 'static,
     compression: Compression,
     use_gzjoin: bool,
 ) -> Body {
     match compression {
-        Compression::Gzip if use_gzjoin => Body::from_stream(join_gzip_default(stream)),
-        Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
-        Compression::Zstd => {
-            Body::from_stream(stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))))
+        // Only this path owns its input: it hands the buffer to zlib through a raw pointer, so
+        // it cannot take a slice of one shared with the decoded response. Lifting the copy means
+        // auditing that `inflate` only ever reads `next_in`, which is not this change's business.
+        Compression::Gzip if use_gzjoin => {
+            Body::from_stream(join_gzip_default(stream.map(|chunk| chunk.to_vec())))
         }
+        Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
+        Compression::Zstd => Body::from_stream(stream.map(std::io::Result::Ok)),
     }
 }
 

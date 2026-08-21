@@ -10,31 +10,9 @@ use sqd_assignments::{AssignmentBuilder, PortalAssignmentBuilder};
 
 use crate::world::ToyWorld;
 
-/// Which artifact the portal under test is configured to route from, mirroring its own
-/// `assignment_source`. The stub publishes both, which models the migration window and not the
-/// states either side of it: here this picks which artifact the portal reads, never which ones
-/// exist. A network that has finished migrating publishes only the split pair, and that shape
-/// is not covered by this harness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssignmentSource {
-    Legacy,
-    Portal,
-}
-
-impl AssignmentSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            Self::Portal => "portal",
-        }
-    }
-}
-
-impl std::fmt::Display for AssignmentSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// The scheduler's own type, re-exported: it is both what the portal is pinned to and what a
+/// published state names, so the stubs and the CT files spell it the way the portal does.
+pub use sqd_assignments::AssignmentType;
 
 /// Build the artifact assigning every archival chunk to every worker, then
 /// gzip it. The portal pre-leases `1 + retries` *distinct* workers per chunk,
@@ -98,11 +76,14 @@ pub fn build_portal_gzipped(world: &ToyWorld, workers: &[PeerId]) -> anyhow::Res
         let Some(network_id) = &ds.network_id else {
             continue;
         };
+        // Chunks are staged under the dataset they were opened against rather than naming one
+        // themselves. Schema ids are inert — the portal doesn't read them yet.
+        let mut dataset = b.new_dataset(network_id, 0);
         let mut head_hash = None;
         for chunk in &ds.chunks {
-            b.new_chunk()
+            dataset
+                .new_chunk()
                 .id(&chunk.id(&ds.name))
-                .dataset_id(network_id)
                 .block_range(chunk.first..=chunk.last)
                 .last_block_timestamp(world.timestamp(chunk.last))
                 .worker_indexes(&worker_indexes)
@@ -111,8 +92,10 @@ pub fn build_portal_gzipped(world: &ToyWorld, workers: &[PeerId]) -> anyhow::Res
             head_hash = Some(world.hash(&ds.name, chunk.last));
         }
         // Only the dataset's head hash survives the split; per-chunk hashes were dropped
-        // because no query needs one. Schema ids are inert — the portal doesn't read them yet.
-        b.finish_dataset(0, head_hash.as_deref());
+        // because no query needs one.
+        dataset
+            .finish(head_hash.as_deref())
+            .map_err(|e| anyhow::anyhow!("dataset build: {e}"))?;
     }
 
     for worker in &workers {

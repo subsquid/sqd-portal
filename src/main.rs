@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::Parser;
 use prometheus_client::registry::Registry;
 use sqd_network_transport::TransportArgs;
@@ -11,7 +12,7 @@ use sqd_portal::config::Config;
 use sqd_portal::controller::task_manager::TaskManager;
 use sqd_portal::datasets::Datasets;
 use sqd_portal::http_server::run_server;
-use sqd_portal::network::{AssignmentSource, NetworkClient};
+use sqd_portal::network::{AssignmentType, NetworkClient};
 use sqd_portal::utils::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -29,10 +30,12 @@ pub struct Cli {
     #[arg(long, env, value_parser = Config::read)]
     pub config: Config,
 
-    /// Which published assignment artifact to route from. Overrides `assignment_source` in the
-    /// config file, so the format can be switched at deploy time without editing the config.
-    #[arg(long, env = "ASSIGNMENT_SOURCE", value_enum)]
-    pub assignment_source: Option<AssignmentSource>,
+    /// Which published assignment artifact to route from. Unset follows the `assignment_type`
+    /// the network state names; set pins the portal regardless. Either way the source in force
+    /// is the only one consulted -- if it isn't published, the portal keeps serving what it
+    /// already has rather than falling back.
+    #[arg(long, env = "ASSIGNMENT_SOURCE", value_parser = assignment_source())]
+    pub assignment_source: Option<AssignmentType>,
 
     /// Whether the logs should be structured in JSON format
     #[arg(long, env)]
@@ -46,6 +49,16 @@ pub struct Cli {
     /// `/docs` and `/api-docs/openapi.json`.
     #[arg(long, env = "SHOW_INTERNAL_DOCS")]
     pub show_internal_docs: bool,
+}
+
+/// `AssignmentType` is the scheduler's, so clap can neither derive `ValueEnum` for it nor be
+/// given one: both the trait and the type are foreign. Naming the values here instead is what
+/// keeps them in `--help` and in the error on a bad one.
+fn assignment_source() -> impl TypedValueParser<Value = AssignmentType> {
+    PossibleValuesParser::new(["legacy", "split"]).map(|v| match v.as_str() {
+        "split" => AssignmentType::Split,
+        _ => AssignmentType::Legacy,
+    })
 }
 
 #[cfg(not(target_env = "msvc"))]
@@ -187,20 +200,19 @@ async fn main() -> anyhow::Result<()> {
 
     let datasets = Arc::new(RwLock::new(Datasets::load(&args.config).await?, "datasets"));
 
-    let mut config = args.config;
-    if let Some(source) = args.assignment_source {
-        config.assignment_source = source;
-    }
     // Which wire format routing came from is otherwise invisible: both artifacts describe the
     // same network, so a portal on the wrong one looks healthy while serving the wrong thing.
-    tracing::info!(
-        assignment_source = %config.assignment_source,
-        "assignment source selected"
-    );
-    let config = Arc::new(config);
+    let assignment_source = args.assignment_source;
+    tracing::info!(?assignment_source, "assignment source selected");
+    let config = Arc::new(args.config);
     let hotblocks = Arc::new(sqd_portal::hotblocks::build_client(&config).await?);
-    let network_client_builder =
-        NetworkClient::builder(args.transport, config.clone(), datasets.clone()).await?;
+    let network_client_builder = NetworkClient::builder(
+        args.transport,
+        config.clone(),
+        datasets.clone(),
+        assignment_source,
+    )
+    .await?;
 
     let peer_id = network_client_builder.peer_id();
     sentry::configure_scope(|scope| {

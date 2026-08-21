@@ -139,6 +139,9 @@ pub fn get_chunks_for_range(
                 ))
             })?
         }
+        // `InGap` arrives here too, so a range starting inside a coverage gap yields nothing
+        // instead of resolving forward to the next chunk the way the stream path does (DEF-3).
+        // Only the `sql` feature reaches this, and it is off by default.
         Err(e) => {
             tracing::info!("no chunks found for {}: {:?}", range.start, e);
             return Ok(());

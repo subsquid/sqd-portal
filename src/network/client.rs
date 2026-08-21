@@ -25,7 +25,7 @@ use tracing::{debug_span, instrument, Instrument};
 
 use super::contracts_state::{ContractsState, Status};
 use super::priorities::NoWorker;
-use super::{ChunkNotFound, NetworkState, WorkerLease};
+use super::{AssignmentType, ChunkNotFound, NetworkState, WorkerLease};
 use crate::controller::download_scheduler::{DownloadScheduler, Outcome, Priority};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
@@ -150,28 +150,30 @@ impl Verdict {
             ),
             // Probably still downloading the chunk.
             Err::NotFound(s) => row(QueryError::Retriable(s), "not_found", Health::Error, false),
-            // Input validation, not a bad response.
-            Err::ServerError(s) if parse_base_block_mismatch(&s).is_some() => row(
-                QueryError::BaseBlockMismatch(parse_base_block_mismatch(&s).expect("just matched")),
-                "block_mismatch",
-                Health::Ok,
-                false,
-            ),
-            // The query covers too much data: narrowing it is the client's move, and
-            // another worker would answer the same.
-            Err::ServerError(s) if s == "Response too large" => row(
-                QueryError::BadRequest(
-                    "the response for this block exceeds the size limit; \
-                     try narrowing the query to request only the necessary data"
-                        .to_owned(),
+            // Split inside the arm, not by guard: a guard cannot bind what it matched, so it
+            // had to parse once to test and again to use, behind an `expect`.
+            Err::ServerError(s) => match parse_base_block_mismatch(&s) {
+                // Input validation, not a bad response.
+                Some(base_block) => row(
+                    QueryError::BaseBlockMismatch(base_block),
+                    "block_mismatch",
+                    Health::Ok,
+                    false,
                 ),
-                "response_too_large",
-                Health::Ok,
-                false,
-            ),
-            Err::ServerError(s) => {
-                row(QueryError::Failure(s), "server_error", Health::Error, false)
-            }
+                // The query covers too much data: narrowing it is the client's move, and
+                // another worker would answer the same.
+                None if s == "Response too large" => row(
+                    QueryError::BadRequest(
+                        "the response for this block exceeds the size limit; \
+                         try narrowing the query to request only the necessary data"
+                            .to_owned(),
+                    ),
+                    "response_too_large",
+                    Health::Ok,
+                    false,
+                ),
+                None => row(QueryError::Failure(s), "server_error", Health::Error, false),
+            },
             // One row, two verdicts: both are capacity refusals.
             Err::ServerOverloaded(()) => row(
                 QueryError::RateLimitExceeded,
@@ -186,6 +188,25 @@ impl Verdict {
                 true,
             ),
         }
+    }
+}
+
+/// The response buffer as `Bytes`, adopting its allocation when that is not wasteful.
+///
+/// `QueryOk::data` is a `bytes` field, and prost shares the input buffer for one only when the
+/// input is itself `Bytes`; from a slice it allocates and copies the whole payload. Adopting the
+/// read buffer instead hands the payload onwards having been copied once, off the socket.
+///
+/// The catch is that `Bytes::from(Vec)` takes the allocation whole, capacity included, and the
+/// read buffer starts at a megabyte. A barely-filled one would pin all of it for as long as the
+/// payload sits in a stream's buffer, which is bounded by response *count*, not bytes. So the
+/// buffer is only adopted while it is at least half full, which caps what a payload can hold at
+/// twice its own size; a smaller response is copied, where copying is cheap and the saving large.
+fn share_or_copy(buf: Vec<u8>) -> bytes::Bytes {
+    if buf.len().saturating_mul(2) >= buf.capacity() {
+        bytes::Bytes::from(buf)
+    } else {
+        bytes::Bytes::copy_from_slice(&buf)
     }
 }
 
@@ -284,6 +305,7 @@ pub struct NetworkClientBuilder {
     network: Network,
     config: Arc<Config>,
     datasets: Arc<RwLock<Datasets>>,
+    assignment_source: Option<AssignmentType>,
 }
 
 impl NetworkClientBuilder {
@@ -298,6 +320,7 @@ impl NetworkClientBuilder {
             config,
             datasets,
             transport_builder,
+            assignment_source,
         } = self;
 
         let contract_client = transport_builder.contract_client();
@@ -330,7 +353,7 @@ impl NetworkClientBuilder {
         if config.ignore_deprecated_workers {
             network_state.ignore_deprecated_workers();
         }
-        network_state.set_assignment_source(config.assignment_source);
+        network_state.set_assignment_source(assignment_source);
 
         let read_scheduler = if config.congestion.enabled {
             let sched = Arc::new(DownloadScheduler::new(config.congestion.clone()));
@@ -407,6 +430,7 @@ impl NetworkClient {
         args: TransportArgs,
         config: Arc<Config>,
         datasets: Arc<RwLock<Datasets>>,
+        assignment_source: Option<AssignmentType>,
     ) -> anyhow::Result<NetworkClientBuilder> {
         let agent_into = get_agent_info!();
         let network = args.rpc.network;
@@ -416,6 +440,7 @@ impl NetworkClient {
             config,
             datasets,
             transport_builder,
+            assignment_source,
         })
     }
 
@@ -710,6 +735,11 @@ impl NetworkClient {
             timestamp_ms: timestamp_now_ms(),
             signature: Default::default(),
             compression,
+            // 0 for a chunk the legacy artifact produced, which names no version: proto3 leaves
+            // the default off the wire, so the field is absent exactly when there is none to send.
+            chunk_version: chunk_id.chunk.version(),
+            query_engine: Default::default(),
+            output_format: Default::default(),
         };
         tokio::task::spawn_blocking({
             let keypair = self.keypair.clone();
@@ -828,7 +858,8 @@ impl NetworkClient {
         transfer_time: Duration,
         query_time: Duration,
     ) -> QueryResult {
-        let result = sqd_messages::QueryResult::decode(buf.as_slice())
+        let response_size = buf.len();
+        let result = sqd_messages::QueryResult::decode(share_or_copy(buf))
             .map_err(|e| QueryFailure::InvalidResponse(e.to_string()));
 
         if let Some(logs_tx) = &self.logs_tx {
@@ -841,7 +872,6 @@ impl NetworkClient {
             }
         }
 
-        let response_size = buf.len();
         let throughput = if transfer_time.as_secs_f64() > 0.0 {
             Some(response_size as f64 / transfer_time.as_secs_f64())
         } else {
@@ -1226,6 +1256,31 @@ mod tests {
     }
 
     #[test]
+    fn a_response_is_shared_when_that_does_not_pin_much_more_than_it_holds() {
+        // Zero-copy is worth having only where the copy would cost something. A well-filled
+        // buffer is adopted; a barely-filled one is copied, so a small payload cannot hold a
+        // megabyte of read buffer open while it waits in a stream's queue.
+        let mut full = Vec::with_capacity(1024);
+        full.extend(std::iter::repeat_n(7u8, 1024));
+        let full_ptr = full.as_ptr();
+
+        let mut sparse = Vec::with_capacity(1024);
+        sparse.extend_from_slice(&[7u8; 8]);
+        let sparse_ptr = sparse.as_ptr();
+
+        let shared = share_or_copy(full);
+        let copied = share_or_copy(sparse);
+
+        assert_eq!(shared.as_ptr(), full_ptr, "a full buffer should be adopted");
+        assert_ne!(copied.as_ptr(), sparse_ptr, "a sparse one should be copied");
+        assert_eq!(
+            copied.as_ref(),
+            &[7u8; 8],
+            "the copy still carries the payload"
+        );
+    }
+
+    #[test]
     fn stale_envelope_reroutes() {
         let verdict = Verdict::of(query_error::Err::BadRequest(STALE_ENVELOPE.to_owned()));
         assert!(matches!(verdict.error, QueryError::Retriable(_)));
@@ -1242,5 +1297,26 @@ mod tests {
         assert!(matches!(verdict.error, QueryError::BadRequest(_)));
         assert!(matches!(verdict.health, Health::Ok));
         assert_eq!(verdict.label, "bad_request");
+    }
+
+    #[test]
+    fn server_errors_split_into_three_rows() {
+        // The wire's catch-all class; only the message tells the three apart.
+        let mismatch = Verdict::of(query_error::Err::ServerError(
+            "unexpected base block: expected 0xabc, but got 42#0xdef".to_owned(),
+        ));
+        assert!(matches!(mismatch.error, QueryError::BaseBlockMismatch(_)));
+        assert_eq!(mismatch.label, "block_mismatch");
+
+        let too_large = Verdict::of(query_error::Err::ServerError(
+            "Response too large".to_owned(),
+        ));
+        assert!(matches!(too_large.error, QueryError::BadRequest(_)));
+        assert_eq!(too_large.label, "response_too_large");
+
+        let other = Verdict::of(query_error::Err::ServerError("disk on fire".to_owned()));
+        assert!(matches!(other.error, QueryError::Failure(_)));
+        assert_eq!(other.label, "server_error");
+        assert!(matches!(other.health, Health::Error));
     }
 }

@@ -19,7 +19,8 @@ a partially applied artifact is never observable.
 An artifact is applied only if its identifier differs from the applied one, its
 effective-from time has passed, and its effective-from is not earlier than the applied
 artifact's (a republished older artifact is never re-applied). Application replaces the
-whole artifact.
+whole artifact. The `split` artifacts declare no effective-from, so there the first two
+clauses collapse to the identifier alone (GAP-37).
 *Why:* re-applying identical artifacts churns; early application splits the fleet;
 regression re-serves routing the network already retired.
 *Check:* CT-2 — publisher stub serves future-effective and regressive artifacts; assert
@@ -195,13 +196,18 @@ never carries one; no code outside DEF-10 is emitted.
 *Check:* CT-5 — exhaustive fault matrix → assert type, code, hint presence, body shape.
 
 **INV-27 — Empty-success semantics.** [response]
-For an admitted request, EMPTY is returned iff no conflict takes precedence (INV-23)
-and the first block exceeds the frontier (or falls in the archival/real-time retention
-gap); it is delayed ≥ P-NO-DATA-DELAY, carries current head metadata (DEF-8), and
-implies no skipped data: the client's progress is unchanged.
+For an admitted request, EMPTY is returned iff no conflict takes precedence (INV-23) and
+the requested range holds no data: the first block exceeds the frontier, or falls in the
+archival/real-time retention gap, or the chunk the request resolves to shares no block
+with it (a coverage gap, DEF-3). It is delayed ≥ P-NO-DATA-DELAY, carries current head
+metadata (DEF-8), and implies no skipped data: the client's progress is unchanged.
 *Why:* EMPTY doubles as the head-polling throttle (REQ-5); it must not consume a stream
-census slot while delaying the HTTP response.
-*Check:* CT-1 — frontier boundary sweep; timing assertion.
+census slot while delaying the HTTP response. The coverage-gap arm is the one where the
+throttle reads oddly — that range will never fill, so the delay paces a client that has
+nothing to wait for — but answering it as anything else would mean a class for "never"
+that no client reads today.
+*Check:* CT-1 — frontier boundary sweep; timing assertion; coverage-gap resolution under
+each artifact, and a range sharing no block with the chunk it resolved to.
 
 **INV-28 — Response-content purity.** [response]
 The rule of 04: record content is a function of (request, configuration, dependency

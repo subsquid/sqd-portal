@@ -673,7 +673,7 @@ pub fn register_metrics(registry: &mut Registry) {
     );
     registry.register(
         "missing_assignment_source",
-        "Number of polls where the network state published no assignment of the configured source",
+        "Number of polls where the network state published no assignment of the selected source",
         MISSING_ASSIGNMENT_SOURCE.clone(),
     );
     registry.register(

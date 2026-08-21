@@ -306,15 +306,17 @@ a reason.
 ## Network integration (40–44)
 
 **REQ-40 — Assignment ingestion.** [MUST]
-The Portal polls the assignment publisher every P-ASSIGNMENT-REFRESH, skips unchanged
-artifacts (by identifier), applies new ones atomically no earlier than their declared
-effective time (so the fleet cuts over together), and keeps serving the previous
-artifact on any fetch or validation failure. First applied assignment gates readiness
-(REQ-23).
+The Portal polls the assignment publisher every P-ASSIGNMENT-REFRESH, reads the
+assignment the type in force names (P-ASSIGNMENT-SOURCE, else the `assignment_type` the
+network state declares), skips unchanged artifacts (by identifier), applies new ones
+atomically no earlier than their declared effective time (so the fleet cuts over
+together), and keeps serving the previous artifact on any fetch or validation failure.
+First applied assignment gates readiness (REQ-23).
 *Acceptance:* a new artifact with a future effective time is not visible in routing
 until that time; killing the publisher leaves serving unaffected for the duration of
 the outage (staleness intent: ADR-013). Cutting over together assumes the workers wait
-too, which they do not today (OQ-11).
+too, which they do not today (OQ-11) — and an effective time to wait for, which only the
+`legacy` artifact declares (GAP-37).
 
 **REQ-41 — Worker selection and penalties.** [MUST]
 Chunk queries go to the most promising worker holding the chunk: healthy and fast

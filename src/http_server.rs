@@ -1013,9 +1013,9 @@ async fn execute_query(
     let Ok(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
         return RequestError::NoData.into_response();
     };
-    let range = query
-        .intersect_with(&chunk.block_range())
-        .expect("Found chunk should intersect with query");
+    let Some(range) = query.intersect_with(&chunk.block_range()) else {
+        return RequestError::NoData.into_response();
+    };
 
     let lease = match client.reserve_worker(worker_id) {
         Some(lease) => lease,

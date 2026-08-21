@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use anyhow::ensure;
-use harness::artifact::AssignmentSource;
+use harness::artifact::AssignmentType;
 use harness::fixture::{Assignments, Fixture};
 use harness::{metrics_audit, ToyWorld};
 
@@ -20,24 +20,24 @@ const POLLS: Duration = Duration::from_secs(5);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ct2_portal_source_absent_does_not_fall_back_to_legacy() -> anyhow::Result<()> {
-    absent_source_is_refused(AssignmentSource::Portal, AssignmentSource::Legacy).await
+    absent_source_is_refused(AssignmentType::Split, AssignmentType::Legacy).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ct2_legacy_source_absent_does_not_fall_back_to_portal() -> anyhow::Result<()> {
-    absent_source_is_refused(AssignmentSource::Legacy, AssignmentSource::Portal).await
+    absent_source_is_refused(AssignmentType::Legacy, AssignmentType::Split).await
 }
 
 /// The portal is configured for `configured`; the publisher offers only `published`.
 async fn absent_source_is_refused(
-    configured: AssignmentSource,
-    published: AssignmentSource,
+    configured: AssignmentType,
+    published: AssignmentType,
 ) -> anyhow::Result<()> {
     let mut fx = Fixture::start_with_assignments(
         ToyWorld::standard(),
         2,
         Assignments {
-            source: configured,
+            source: Some(configured),
             published: vec![published],
         },
     )
