@@ -8,10 +8,14 @@ on:
 jobs:
   docker:
     name: Build and publish docker image
-    uses: subsquid/github-workflows/.github/workflows/docker-on-tag.yml@main
+    # Test branch: pinned to the native-runner multi-arch build
+    # (subsquid/github-workflows PR "Build each platform on a native runner and merge the manifest")
+    # instead of @main, with `latest` disabled so a throwaway v* tag only publishes
+    # <version>, <version>-amd64 and <version>-arm64. Not meant to be merged.
+    uses: subsquid/github-workflows/.github/workflows/docker-on-tag.yml@549a42c635189fa9e2b055d54fe3c14ca2a5cef3
     with:
       image_name: subsquid/sqd-portal
-      push_latest: true
+      push_latest: false
     secrets:
       DOCKER_LOGIN: ${{ secrets.DOCKER_LOGIN }}
       DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
