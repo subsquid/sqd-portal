@@ -124,6 +124,7 @@ pub struct DatasetStateResponse {
         crate::http_server::get_metrics,
         // Debug (internal)
         crate::http_server::get_debug_block,
+        crate::http_server::get_chunk_health,
         crate::http_server::get_all_workers,
     ),
     components(

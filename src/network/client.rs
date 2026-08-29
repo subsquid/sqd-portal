@@ -1,5 +1,5 @@
 use std::time::SystemTime;
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{AsyncReadExt, StreamExt};
@@ -24,11 +24,11 @@ use sqd_network_transport::{
 use tracing::{debug_span, instrument, Instrument};
 
 use super::contracts_state::{ContractsState, Status};
-use super::priorities::NoWorker;
+use super::priorities::{NoWorker, VERDICT_OK};
 use super::{AssignmentType, ChunkNotFound, NetworkState, WorkerLease};
 use crate::controller::download_scheduler::{DownloadScheduler, Outcome, Priority};
 use crate::datasets::{DatasetConfig, Datasets};
-use crate::types::api_types::{DatasetState, WorkerDebugInfo};
+use crate::types::api_types::{ChunkHealth, ChunkHealthReport, DatasetState, WorkerDebugInfo};
 use crate::types::{BlockNumber, BlockRange, ChunkId, Compression, DataChunk};
 use crate::utils::{RwLock, UseOnce};
 use crate::{
@@ -102,9 +102,21 @@ impl StreamingNetwork for NetworkClient {
     }
 
     fn report_integrity_failure(&self, worker: PeerId) {
-        metrics::report_query_result(&worker, "integrity");
-        self.network_state.report_query_error(worker);
+        NetworkClient::record_error(self, worker, "integrity");
     }
+}
+
+/// Fewest available holders first, then the most holders that never answered `ok`,
+/// then the lowest block — the order in which a stream would hit them.
+fn keep_scarcest(chunks: &mut Vec<ChunkHealth>, worst: usize) {
+    chunks.sort_by_key(|c| {
+        (
+            c.holders.available,
+            std::cmp::Reverse(c.holders.never_ok),
+            c.first_block,
+        )
+    });
+    chunks.truncate(worst);
 }
 
 /// Whether the worker stays a candidate. Only two outcomes today; the split from the
@@ -651,6 +663,82 @@ impl NetworkClient {
         self.network_state.get_all_workers()
     }
 
+    /// The largest range one scan will walk. A mainnet dataset runs to tens of
+    /// thousands of chunks, and each one takes both the storage and the pool read
+    /// lock — a debug route must not hold those for long while the portal streams.
+    pub const MAX_CHUNK_SCAN: usize = 10_000;
+
+    /// Counts, per chunk in `[from, to]`, how many of its holders the portal could
+    /// actually query. Answers "which chunks will a stream stall on", which the
+    /// assignment's replica count cannot: a chunk keeps all ten holders after nine
+    /// of them go offline.
+    pub fn scan_chunk_health(
+        &self,
+        dataset: &DatasetId,
+        from: Option<BlockNumber>,
+        to: Option<BlockNumber>,
+        limit: usize,
+        worst: usize,
+    ) -> Result<ChunkHealthReport, ChunkNotFound> {
+        let limit = limit.clamp(1, Self::MAX_CHUNK_SCAN);
+        let from = from
+            .or_else(|| self.first_existing_block(dataset))
+            .unwrap_or(0);
+        let to = to.unwrap_or(BlockNumber::MAX);
+
+        let mut available_holders: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut never_ok_holders: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut tail: Vec<ChunkHealth> = Vec::new();
+
+        let mut chunk = self.find_chunk(dataset, from)?;
+        let first_block = chunk.first_block;
+        let mut last_block;
+        let mut scanned = 0usize;
+
+        let truncated = loop {
+            let holders = self
+                .network_state
+                .summarize_holders(dataset, chunk.first_block);
+            *available_holders.entry(holders.available).or_default() += 1;
+            *never_ok_holders.entry(holders.never_ok).or_default() += 1;
+            last_block = chunk.last_block;
+            scanned += 1;
+
+            tail.push(ChunkHealth {
+                chunk: chunk.to_string(),
+                first_block: chunk.first_block,
+                last_block: chunk.last_block,
+                holders,
+            });
+            // Trimmed in batches, so a long scan's memory stays flat.
+            if tail.len() >= worst.saturating_mul(2).max(1) {
+                keep_scarcest(&mut tail, worst);
+            }
+
+            let next = match self.next_chunk(dataset, &chunk) {
+                Some(next) if next.first_block <= to => next,
+                _ => break false,
+            };
+            if scanned >= limit {
+                break true;
+            }
+            chunk = next;
+        };
+
+        keep_scarcest(&mut tail, worst);
+
+        Ok(ChunkHealthReport {
+            dataset: dataset.to_url().to_owned(),
+            first_block,
+            last_block,
+            chunks_scanned: scanned,
+            truncated,
+            available_holders,
+            never_ok_holders,
+            worst: tail,
+        })
+    }
+
     pub fn get_height(&self, dataset: &DatasetId) -> Option<u64> {
         self.network_state.get_height(dataset)
     }
@@ -888,21 +976,39 @@ impl NetworkClient {
             })
     }
 
+    // One worker verdict reaches two places that must name it identically: the fleet
+    // counter and the worker's own health. They were adjacent calls, free to drift.
+
+    fn record_success(&self, peer_id: PeerId, verdict: &'static str, throughput: Option<f64>) {
+        metrics::report_query_result(&peer_id, verdict);
+        self.network_state
+            .report_query_success(peer_id, verdict, throughput);
+    }
+
+    /// The worker answered, and the answer was bad. Charges the `server_errors` cooldown.
+    fn record_error(&self, peer_id: PeerId, verdict: &'static str) {
+        metrics::report_query_result(&peer_id, verdict);
+        self.network_state.report_query_error(peer_id, verdict);
+    }
+
+    /// The query never got an answer. Charges the `timeouts` cooldown.
+    fn record_failure(&self, peer_id: PeerId, verdict: &'static str) {
+        metrics::report_query_result(&peer_id, verdict);
+        self.network_state.report_query_failure(peer_id, verdict);
+    }
+
     fn convert_query_failure(&self, peer_id: PeerId, failure: QueryFailure) -> QueryError {
         match failure {
             QueryFailure::InvalidRequest(e) => {
-                metrics::report_query_result(&peer_id, "invalid");
-                self.network_state.report_query_success(peer_id, None);
+                self.record_success(peer_id, "invalid", None);
                 QueryError::Failure(format!("portal tried to send invalid request: {e}"))
             }
             QueryFailure::InvalidResponse(e) => {
-                metrics::report_query_result(&peer_id, "integrity");
-                self.network_state.report_query_error(peer_id);
+                self.record_error(peer_id, "integrity");
                 QueryError::Integrity(format!("couldn't decode response: {e}"))
             }
             QueryFailure::Timeout(t) => {
-                metrics::report_query_result(&peer_id, "timeout");
-                self.network_state.report_query_failure(peer_id);
+                self.record_failure(peer_id, "timeout");
                 let msg = match t {
                     StreamClientTimeout::Connect => "timed out connecting to the peer",
                     StreamClientTimeout::Request => "timed out reading response",
@@ -910,16 +1016,14 @@ impl NetworkClient {
                 QueryError::Retriable(msg.to_owned())
             }
             QueryFailure::TransportError(e) => {
-                metrics::report_query_result(&peer_id, "transport_error");
-                self.network_state.report_query_failure(peer_id);
+                self.record_failure(peer_id, "transport_error");
                 QueryError::Retriable(format!("transport error: {e}"))
             }
         }
     }
 
     fn convert_read_error(&self, peer_id: PeerId, error: ReadError) -> QueryError {
-        metrics::report_query_result(&peer_id, "transport_error");
-        self.network_state.report_query_failure(peer_id);
+        self.record_failure(peer_id, "transport_error");
         let msg = match error {
             ReadError::TooLarge => "response too large".to_owned(),
             ReadError::Transport(e) => format!("transport error: {e}"),
@@ -937,8 +1041,7 @@ impl NetworkClient {
     ) -> Result<QueryOk, QueryError> {
         match result {
             Ok(q) if self.verify_responses && !verify_signature(&q, peer_id).await => {
-                metrics::report_query_result(&peer_id, "integrity");
-                self.network_state.report_query_failure(peer_id);
+                self.record_failure(peer_id, "integrity");
                 Err(QueryError::Integrity(format!(
                     "invalid worker signature from {peer_id}, result: {q:?}"
                 )))
@@ -958,8 +1061,7 @@ impl NetworkClient {
                     // answer landed in both `ok` and `integrity`, and left its latency
                     // and throughput in the worker's health.
                     query_result::Result::Ok(ok) if out_of_range(&ok, block_range) => {
-                        metrics::report_query_result(&peer_id, "integrity");
-                        self.network_state.report_query_error(peer_id);
+                        self.record_error(peer_id, "integrity");
                         Err(QueryError::Integrity(format!(
                             "worker returned last block {} outside the queried range {}-{}",
                             ok.last_block,
@@ -968,16 +1070,14 @@ impl NetworkClient {
                         )))
                     }
                     query_result::Result::Ok(ok) => {
-                        metrics::report_query_result(&peer_id, "ok");
-                        self.network_state.report_query_success(peer_id, throughput);
+                        self.record_success(peer_id, VERDICT_OK, throughput);
                         Ok(ok)
                     }
                     query_result::Result::Err(sqd_messages::QueryError { err: Some(err) }) => {
                         let verdict = Verdict::of(err);
-                        metrics::report_query_result(&peer_id, verdict.label);
                         match verdict.health {
-                            Health::Ok => self.network_state.report_query_success(peer_id, None),
-                            Health::Error => self.network_state.report_query_error(peer_id),
+                            Health::Ok => self.record_success(peer_id, verdict.label, None),
+                            Health::Error => self.record_error(peer_id, verdict.label),
                         }
                         if verdict.backs_off && retry_after_ms.is_none() {
                             self.network_state
@@ -986,15 +1086,13 @@ impl NetworkClient {
                         Err(verdict.error)
                     }
                     query_result::Result::Err(sqd_messages::QueryError { err: None }) => {
-                        metrics::report_query_result(&peer_id, "invalid");
-                        self.network_state.report_query_error(peer_id);
+                        self.record_error(peer_id, "invalid");
                         Err(QueryError::Retriable("unknown error message".to_string()))
                     }
                 }
             }
             Ok(sqd_messages::QueryResult { result: None, .. }) => {
-                metrics::report_query_result(&peer_id, "invalid");
-                self.network_state.report_query_error(peer_id);
+                self.record_error(peer_id, "invalid");
                 Err(QueryError::Retriable("unknown error message".to_string()))
             }
             Err(failure) => Err(self.convert_query_failure(peer_id, failure)),
