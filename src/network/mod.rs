@@ -9,7 +9,9 @@ pub use client::{
     StreamingNetwork, Workers,
 };
 pub use contracts_state::Status;
-pub use priorities::{HolderSummary, NoWorker, PrioritiesConfig, Priority, PriorityGroup, WorkerHealth};
+pub use priorities::{
+    HolderSummary, NoWorker, PrioritiesConfig, Priority, PriorityGroup, WorkerHealth,
+};
 pub use sqd_assignments::AssignmentType;
 #[cfg(test)]
 pub(crate) use state::TestLeasePool;
