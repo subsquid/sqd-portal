@@ -136,7 +136,6 @@ impl StorageClient {
             .fetch_assignment(&selected.url, selected.source)
             .await?;
 
-        // Only the legacy artifact declares a time to wait for.
         if let (Some(_), Some(effective_from)) = (&latest, selected.effective_from) {
             sleep_until(effective_from).await;
         }
@@ -487,7 +486,7 @@ struct SelectedAssignment {
     source: AssignmentType,
     id: String,
     url: String,
-    /// Legacy only: the split blob has no such field, so it applies as soon as it is fetched.
+    /// Optional on the split blob, which without one applies as soon as it is fetched.
     effective_from: Option<u64>,
 }
 
@@ -520,7 +519,7 @@ fn select_assignment(
             source: AssignmentType::Split,
             id: portal.id,
             url: portal.fb_url,
-            effective_from: None,
+            effective_from: portal.effective_from,
         }),
     }
 }
@@ -720,6 +719,7 @@ mod tests {
             id: id.to_string(),
             fb_url: format!("https://example.test/{id}.fb.gz"),
             version: "2".to_string(),
+            effective_from: None,
         }
     }
 
@@ -764,13 +764,14 @@ mod tests {
     fn each_shape_yields_what_applying_it_needs() {
         let legacy = select_assignment(network_state(AssignmentType::Legacy, true, false), None)
             .expect("legacy is published");
-        let split = select_assignment(network_state(AssignmentType::Split, false, true), None)
-            .expect("the split pair is published");
+        let mut split_state = network_state(AssignmentType::Split, false, true);
+        let portal = split_state.portal_assignment.as_mut().unwrap();
+        portal.effective_from = Some(456);
+        let split = select_assignment(split_state, None).expect("the split pair is published");
 
         assert_eq!(legacy.url, "https://example.test/legacy.fb.gz");
-        // Legacy alone declares a cutover instant; the split blob has no field for one.
         assert_eq!(legacy.effective_from, Some(123));
-        assert_eq!(split.effective_from, None);
+        assert_eq!(split.effective_from, Some(456));
         // The portal half, not the worker half that resolves alongside it.
         assert_eq!(split.id, "portal");
         assert_eq!(split.url, "https://example.test/portal.fb.gz");
