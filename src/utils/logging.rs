@@ -12,6 +12,7 @@ use tower_http::request_id::RequestId;
 use tracing::Instrument;
 
 use crate::{
+    endpoints::stream::DataSource,
     metrics,
     network::NetworkClient,
     types::{coded_response, error_response, ErrorBody, ErrorCode, StreamRequest},
@@ -208,13 +209,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         .get::<EndpointName>()
         .map(|e| e.0.clone())
         .unwrap_or_else(|| path.clone());
-    let data_source = response
-        .headers()
-        .get(crate::endpoints::stream::DATA_SOURCE_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(data_source_metric_label)
-        .unwrap_or(NO_DATA_SOURCE)
-        .to_owned();
+    let data_source = data_source_of(&response).to_owned();
     let error_code = response.extensions().get::<ErrorCode>().copied();
 
     span.in_scope(|| {
@@ -436,6 +431,21 @@ fn stamp_request_id(response: Response, request_id: &str) -> Response {
     Response::from_parts(parts, Body::from(rendered))
 }
 
+/// The [`DataSource`] extension, else the public header, else [`NO_DATA_SOURCE`], which is
+/// left to a response no layer was chosen for.
+fn data_source_of(response: &Response) -> &str {
+    if let Some(source) = response.extensions().get::<DataSource>() {
+        return data_source_metric_label(source.as_str());
+    }
+
+    response
+        .headers()
+        .get(crate::endpoints::stream::DATA_SOURCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(data_source_metric_label)
+        .unwrap_or(NO_DATA_SOURCE)
+}
+
 fn data_source_metric_label(data_source: &str) -> &str {
     match data_source {
         crate::endpoints::stream::DATA_SOURCE_REALTIME_METRIC => "hotblocks",
@@ -497,6 +507,135 @@ mod tests {
     #[test]
     fn data_source_metric_label_preserves_unrecognized_values() {
         assert_eq!(data_source_metric_label("custom"), "custom");
+    }
+
+    /// The extension is the metric's own record of the layer, so it wins over a header an
+    /// upstream may have sent through; the header still labels a response without one.
+    #[tokio::test]
+    async fn the_data_source_label_prefers_the_extension_over_the_header() {
+        use crate::endpoints::stream::{DataSource, DATA_SOURCE_HEADER};
+        use crate::metrics::{http_labels, HTTP_STATUS};
+        use crate::types::RequestError;
+        use axum::{
+            body::Body, http::Request, middleware::from_fn, response::IntoResponse, routing::get,
+            Router,
+        };
+        use tower::ServiceExt;
+        use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
+
+        use super::{NO_DATASET, NO_DATA_SOURCE};
+
+        let app = Router::new()
+            .route(
+                "/source/extension",
+                get(|| async {
+                    (
+                        DataSource::RealTime,
+                        [(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC)],
+                        RequestError::RateLimitExceeded.into_response(),
+                    )
+                }),
+            )
+            .route(
+                "/source/header",
+                get(|| async { [(DATA_SOURCE_HEADER, DATA_SOURCE_REALTIME_METRIC)] }),
+            )
+            .route("/source/nothing", get(|| async { "ok" }))
+            .route_layer(from_fn(super::middleware))
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+
+        let overloaded = Some(crate::types::ErrorCode::Overloaded);
+        for (path, status, code, expected) in [
+            ("/source/extension", 529, overloaded, "hotblocks"),
+            ("/source/header", 200, None, "hotblocks"),
+            ("/source/nothing", 200, None, NO_DATA_SOURCE),
+        ] {
+            let count = || {
+                HTTP_STATUS
+                    .get_or_create(&http_labels(
+                        path.to_owned(),
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        expected.to_owned(),
+                        NO_DATASET.to_owned(),
+                        code,
+                    ))
+                    .get()
+            };
+
+            let before = count();
+            app.clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(count(), before + 1, "{path}");
+        }
+    }
+
+    /// A route one layer answers names it on a request refused before its handler ran, and
+    /// a handler that names a layer itself is not overridden.
+    #[tokio::test]
+    async fn a_route_served_by_one_layer_labels_every_response() {
+        use crate::endpoints::stream::DataSource;
+        use crate::metrics::{http_labels, HTTP_STATUS};
+        use crate::types::ErrorCode;
+        use axum::{body::Body, extract::Path, http::Request, middleware::from_fn, routing::get};
+        use tower::ServiceExt;
+        use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
+
+        use super::{EndpointAnnotationLayer, NO_DATASET};
+
+        let app = axum::Router::new()
+            .route(
+                "/fixed/:number",
+                get(|Path(n): Path<u64>| async move { n.to_string() })
+                    .layer(EndpointAnnotationLayer::new("/fixed").served_by(DataSource::Network)),
+            )
+            .route(
+                "/chosen",
+                get(|| async { (DataSource::RealTime, "ok") })
+                    .layer(EndpointAnnotationLayer::new("/chosen").served_by(DataSource::Network)),
+            )
+            .route_layer(from_fn(super::middleware))
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+
+        let count = |endpoint: &str, status: u16, data_source: &str, code: Option<ErrorCode>| {
+            HTTP_STATUS
+                .get_or_create(&http_labels(
+                    endpoint.to_owned(),
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    data_source.to_owned(),
+                    NO_DATASET.to_owned(),
+                    code,
+                ))
+                .get()
+        };
+        let send = |uri: &'static str| {
+            app.clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        };
+
+        let rejected = || count("/fixed", 400, "network", Some(ErrorCode::MalformedRequest));
+        let before = rejected();
+        send("/fixed/not-a-number").await.unwrap();
+        assert_eq!(
+            rejected(),
+            before + 1,
+            "a rejected request keeps the route's layer"
+        );
+
+        let served = || count("/fixed", 200, "network", None);
+        let before = served();
+        send("/fixed/7").await.unwrap();
+        assert_eq!(served(), before + 1);
+
+        let chosen = || count("/chosen", 200, "hotblocks", None);
+        let before = chosen();
+        send("/chosen").await.unwrap();
+        assert_eq!(
+            chosen(),
+            before + 1,
+            "the handler's layer wins over the route's"
+        );
     }
 
     /// Unique endpoint labels keep the shared global metric family isolated from
@@ -1138,13 +1277,23 @@ pub struct EndpointName(pub String);
 #[derive(Clone)]
 pub struct EndpointAnnotationLayer {
     endpoint: String,
+    data_source: Option<DataSource>,
 }
 
 impl EndpointAnnotationLayer {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            data_source: None,
         }
+    }
+
+    /// The layer a route is served by whatever the request, so every response on it is
+    /// labelled with it — a refusal or a rejected request as well. A handler's own
+    /// [`DataSource`] wins.
+    pub(crate) fn served_by(mut self, data_source: DataSource) -> Self {
+        self.data_source = Some(data_source);
+        self
     }
 }
 
@@ -1155,6 +1304,7 @@ impl<S> Layer<S> for EndpointAnnotationLayer {
         EndpointAnnotationService {
             inner,
             endpoint: self.endpoint.clone(),
+            data_source: self.data_source,
         }
     }
 }
@@ -1163,6 +1313,7 @@ impl<S> Layer<S> for EndpointAnnotationLayer {
 pub struct EndpointAnnotationService<S> {
     inner: S,
     endpoint: String,
+    data_source: Option<DataSource>,
 }
 
 impl<S> Service<Request> for EndpointAnnotationService<S>
@@ -1182,12 +1333,16 @@ where
 
     fn call(&mut self, req: Request) -> Self::Future {
         let endpoint = self.endpoint.clone();
+        let data_source = self.data_source;
         let fut = self.inner.call(req);
 
         Box::pin(async move {
             let mut response = fut.await?;
             // Store the endpoint name in the response extensions for the middleware to use
             response.extensions_mut().insert(EndpointName(endpoint));
+            if let Some(data_source) = data_source {
+                response.extensions_mut().get_or_insert(data_source);
+            }
             Ok(response)
         })
     }
