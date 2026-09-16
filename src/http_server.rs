@@ -544,6 +544,57 @@ async fn get_debug_block(
     }))
 }
 
+#[derive(serde::Deserialize)]
+struct ChunkHealthQuery {
+    from: Option<u64>,
+    to: Option<u64>,
+    #[serde(default = "default_chunk_scan_limit")]
+    limit: usize,
+    #[serde(default = "default_chunk_scan_worst")]
+    worst: usize,
+}
+
+fn default_chunk_scan_limit() -> usize {
+    1000
+}
+
+fn default_chunk_scan_worst() -> usize {
+    20
+}
+
+/// Chunk Health
+///
+/// Per chunk in a block range, how many of its holders the portal can actually query.
+/// A chunk keeps its full holder count after its holders go offline, so the assignment's
+/// replica count cannot tell which chunks a stream will stall on — this can.
+#[utoipa::path(
+    get,
+    path = "/datasets/{dataset}/debug/chunks",
+    params(
+        ("dataset" = String, Path, description = "Dataset name"),
+        ("from" = Option<u64>, Query, description = "First block to scan (default: the dataset's first block)"),
+        ("to" = Option<u64>, Query, description = "Last block to scan (default: the dataset's head)"),
+        ("limit" = Option<usize>, Query, description = "Chunks to scan, capped at 10000 (default 1000)"),
+        ("worst" = Option<usize>, Query, description = "Scarcest chunks to list (default 20)"),
+    ),
+    responses(
+        (status = 200, description = "Chunk health report", body = serde_json::Value),
+        (status = 404, description = "Dataset or block not found", body = ErrorResponse),
+    ),
+    tag = "Debug",
+    extensions(("x-internal" = json!(true))),
+)]
+async fn get_chunk_health(
+    Query(query): Query<ChunkHealthQuery>,
+    dataset_id: DatasetId,
+    Extension(client): Extension<Arc<NetworkClient>>,
+) -> Response {
+    match client.scan_chunk_health(&dataset_id, query.from, query.to, query.limit, query.worst) {
+        Ok(report) => axum::Json(report).into_response(),
+        Err(e) => coded_response(ErrorCode::NotFound, e.to_string()),
+    }
+}
+
 /// Worker Inventory
 ///
 /// Returns information about all workers currently visible to the portal.
@@ -775,6 +826,10 @@ fn gated_routes(auth_gate: Option<Arc<Gate>>, openapi_spec: &utoipa::openapi::Op
         .route(
             "/datasets/:dataset/:block/debug",
             get(get_debug_block).endpoint("/block/debug").no_auth(),
+        )
+        .route(
+            "/datasets/:dataset/debug/chunks",
+            get(get_chunk_health).endpoint("/debug/chunks").no_auth(),
         )
         // Ops probes and the served schema: never gated, or a pod that cannot
         // answer its own readiness check leaves rotation.
@@ -1666,6 +1721,41 @@ mod tests {
         assert_eq!(readiness_verdict(true, Ok(())).0, SHUTTING_DOWN);
     }
 
+    /// `/datasets/:dataset/debug/chunks` and `/datasets/:dataset/:block/debug` are the
+    /// same shape, and a router that resolved the static segment the wrong way would
+    /// send every chunk-health call to the block handler — or refuse to build at all.
+    #[tokio::test]
+    async fn the_chunk_route_does_not_shadow_the_block_route() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/datasets/:dataset/:block/debug", get(|| async { "block" }))
+            .route(
+                "/datasets/:dataset/debug/chunks",
+                get(|| async { "chunks" }),
+            );
+
+        for (uri, expected) in [
+            ("/datasets/base-mainnet/debug/chunks", "chunks"),
+            ("/datasets/base-mainnet/46861204/debug", "block"),
+            // A dataset literally named `debug` still reaches the block handler.
+            ("/datasets/debug/46861204/debug", "block"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body, expected.as_bytes(), "{uri}");
+        }
+    }
+
     /// REQ-51: the whole served surface, and which half of it needs a key.
     ///
     /// `Gated::route` already makes an unclassified route a compile error, but it
@@ -1700,6 +1790,7 @@ mod tests {
             O("/datasets/:dataset/:start_block/worker"),
             O("/debug/workers"),
             O("/datasets/:dataset/:block/debug"),
+            O("/datasets/:dataset/debug/chunks"),
             O("/metrics"),
             O("/ready"),
             O("/api-docs/openapi.json"),
