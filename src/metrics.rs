@@ -192,6 +192,7 @@ lazy_static::lazy_static! {
 
     // Authorizing deployments only: inert without an `auth:` block.
     static ref AUTH_DECISIONS: Family<Labels, Counter> = Default::default();
+    static ref AUTH_CREDENTIAL_CHANNEL: Family<Labels, Counter> = Default::default();
     static ref EXCHANGES: Family<Labels, Counter> = Default::default();
     static ref EXCHANGE_DURATION: Histogram =
         Histogram::new([0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0].into_iter());
@@ -284,6 +285,23 @@ pub(crate) fn auth_decision_labels(decision: AuthDecision, enforcement: &str) ->
 pub fn auth_decisions(decision: AuthDecision, enforcement: &str) -> u64 {
     AUTH_DECISIONS
         .get_or_create(&auth_decision_labels(decision, enforcement))
+        .get()
+}
+
+/// Count one credential presentation by the header it arrived in. Its own
+/// family rather than a label on the decision counter: it carries no verdict,
+/// which is what lets it publish in shadow mode too, and what keeps it out of
+/// INV-39's way.
+pub fn report_credential_channel(channel: &str) {
+    AUTH_CREDENTIAL_CHANNEL
+        .get_or_create(&vec![("channel".to_owned(), channel.to_owned())])
+        .inc();
+}
+
+#[cfg(test)]
+pub fn credential_channels(channel: &str) -> u64 {
+    AUTH_CREDENTIAL_CHANNEL
+        .get_or_create(&vec![("channel".to_owned(), channel.to_owned())])
         .get()
 }
 
@@ -704,6 +722,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "auth_decisions",
         "Authorization evaluations by public outcome; empty unless the portal is configured with an `auth:` block",
         AUTH_DECISIONS.clone(),
+    );
+    registry.register(
+        "auth_credential_channel",
+        "Credential presentations by the header they arrived in; carries no key id and no verdict",
+        AUTH_CREDENTIAL_CHANNEL.clone(),
     );
     registry.register(
         "auth_exchanges",

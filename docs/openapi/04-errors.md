@@ -95,7 +95,10 @@ make the same credential work.
 
 ### Presenting a key
 
-On a portal that requires one, send the key as `Authorization: Bearer <key>`.
+On a portal that requires one, send the key as `Authorization: Bearer <key>`. A portal also
+accepts it as `x-api-key: <key>`, which is what keys issued before portal-side authorization
+carry. When both headers are present `Authorization` is the one read, and an `Authorization`
+header the portal cannot use is refused rather than falling back to `x-api-key`.
 
 Every credential problem answers **403** — no key, wrong key, revoked, expired, or out of scope
 alike. The `code` says which; the status deliberately does not.

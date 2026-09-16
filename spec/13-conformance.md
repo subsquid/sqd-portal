@@ -129,7 +129,7 @@ chunk-boundary records FV-6 licenses.
 | CT-7 | Soak/endurance: S4 churn for hours; leak & cardinality audits | HZ-1/5/6, INV-30, SLI-5 |
 | CT-8 | Isolation/noisy-neighbor: S6 | INV-35 |
 | CT-9 | Fuzz, both surfaces: client inputs and stub responses (payloads, artifacts) | INV-36, FM-1, GAP-1 |
-| CT-10 | Authorization: credential corpus × enforcement mode against a control-plane stub; exchange-fault, lifetime and convergence cases (denial mid-grant, a retired timed-out generation completing after its successor, over-cap lifetime, unreadable claims version, outage across `refresh_after` and `expires_at`); which signing key reaches the wire when `auth.key_path` names one; bracketed metrics scrapes proving no key-id side channel, including neutral shadow-mode projection | INV-6/10/14/15/38/39, INV-31, LIV-13/14, REQ-50..REQ-56, DC-8, IB-9, HZ-10/12/13 |
+| CT-10 | Authorization: credential corpus × enforcement mode against a control-plane stub; exchange-fault, lifetime and convergence cases (denial mid-grant, a retired timed-out generation completing after its successor, over-cap lifetime, unreadable claims version, outage across `refresh_after` and `expires_at`); which signing key reaches the wire when `auth.key_path` names one; bracketed metrics scrapes proving no key-id side channel, including neutral shadow-mode projection; both presentation channels with their precedence, and a present-but-unusable `Authorization` refusing rather than falling through to `x-api-key` | INV-6/10/14/15/38/39, INV-31, LIV-13/14, REQ-50..REQ-56, DC-8, IB-9, HZ-10/12/13 |
 
 ## Structural validators (kind-agnostic, applied to every response)
 
