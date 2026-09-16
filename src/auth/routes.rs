@@ -11,13 +11,13 @@ use std::sync::Arc;
 use axum::{routing::MethodRouter, Router};
 
 use super::{extractor, Gate};
-use crate::utils::logging::EndpointAnnotationLayer;
+use crate::{endpoints::stream::DataSource, utils::logging::EndpointAnnotationLayer};
 
 /// A method router that has declared whether it needs a key.
 pub struct Classified {
     router: MethodRouter,
     gated: bool,
-    endpoint: Option<String>,
+    endpoint: Option<EndpointAnnotationLayer>,
 }
 
 /// A method router carrying the name its metrics go under. [`Gated::route`]
@@ -26,7 +26,15 @@ pub struct Classified {
 /// unauthenticated client invents.
 pub struct Named {
     router: MethodRouter,
-    endpoint: String,
+    endpoint: EndpointAnnotationLayer,
+}
+
+impl Named {
+    /// The one layer that answers this route, for the HTTP metrics.
+    pub(crate) fn served_by(mut self, data_source: DataSource) -> Self {
+        self.endpoint = self.endpoint.served_by(data_source);
+        self
+    }
 }
 
 pub trait EndpointExt {
@@ -38,7 +46,7 @@ impl EndpointExt for MethodRouter {
     fn endpoint(self, endpoint: impl Into<String>) -> Named {
         Named {
             router: self,
-            endpoint: endpoint.into(),
+            endpoint: EndpointAnnotationLayer::new(endpoint),
         }
     }
 }
@@ -145,7 +153,7 @@ impl Gated {
         };
         // Outside the gate, so a short-circuited refusal keeps its name.
         let router = match endpoint {
-            Some(endpoint) => router.layer(EndpointAnnotationLayer::new(endpoint)),
+            Some(endpoint) => router.layer(endpoint),
             None => router,
         };
         self.router = self.router.route(path, router);

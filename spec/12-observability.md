@@ -25,8 +25,13 @@ progress past P-STALL-BUDGET ⚠ is the LIV-2 witness.
 metric), attached to **4xx/5xx only** — a 2xx carries neither, so the routine 204 that
 is the steady state of every polling client cannot inflate an availability alert
 (INV-30). A failure reaching the middleware unclassified is still counted, as
-`unclassified`. The source label is `network`,
-`real_time`, or `none` for pre-routing failures; it does not imply a response header.
+`unclassified`. The source label names the layer that served the request or was
+chosen to, on failures as on successes: `network` or `hotblocks`. A route only the SQD
+Network answers carries `network` on every response; a route that picks per request
+carries the layer it picked, including on a failure after the pick. `none` is left to a
+request refused before a layer was chosen, and to the status, catalogue and probe routes,
+which serve no chain data. The label does not imply a response header; DEF-6 alone
+decides where one appears.
 **Truncations count separately** from completions (SLI-6 is computed from this);
 refusals by code distinguish `overloaded` from `no_workers` — the 2026-07 storm was
 misdiagnosed for lack of this split.

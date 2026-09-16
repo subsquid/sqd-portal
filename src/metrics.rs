@@ -404,6 +404,9 @@ fn occupancy_increments(running: usize, limit: usize, elapsed: Duration) -> (f64
 ///
 /// `dataset` is the configured name of the dataset the path named, on every series, so
 /// a failure rate can be read per dataset as well as per portal.
+///
+/// `data_source` is the layer that served the request or was chosen to, on every series, so
+/// traffic and failures can be split by data path.
 pub fn http_labels(
     endpoint: String,
     status: StatusCode,
@@ -792,6 +795,16 @@ mod tests {
                 Some("ethereum-mainnet"),
                 "{status}"
             );
+        }
+    }
+
+    /// A failure keeps the layer that failed it: a failure rate per data path needs it on
+    /// both sides of the ratio.
+    #[test]
+    fn every_series_names_its_data_source() {
+        for (status, code) in [(200, None), (529, Some(ErrorCode::Overloaded))] {
+            let labels = labels_for(status, code);
+            assert_eq!(get(&labels, "data_source"), Some("network"), "{status}");
         }
     }
 
