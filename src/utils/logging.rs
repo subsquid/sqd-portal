@@ -1,8 +1,10 @@
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{Path, Request},
     response::{IntoResponse, Response},
+    Extension,
 };
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::time::{Duration, Instant};
 use tower::{Layer, Service};
@@ -11,11 +13,16 @@ use tracing::Instrument;
 
 use crate::{
     metrics,
+    network::NetworkClient,
     types::{coded_response, error_response, ErrorBody, ErrorCode, StreamRequest},
 };
 
 const LOG_INTERVAL: Duration = Duration::from_secs(5);
 const NO_DATA_SOURCE: &str = "none";
+
+/// Dataset label for a request whose path names no dataset the portal serves. Constant for
+/// the same reason as [`UNROUTED_ENDPOINT`]: the path segment is client-supplied.
+const NO_DATASET: &str = "none";
 
 /// Endpoint label for a request that never reached a route. Constant because the path is
 /// client-supplied there, and labelling with it would mint a series per request.
@@ -164,6 +171,7 @@ pub async fn reject_non_ascii_request_id(req: Request, next: axum::middleware::N
         UNROUTED_ENDPOINT.to_owned(),
         response.status(),
         NO_DATA_SOURCE.to_owned(),
+        NO_DATASET.to_owned(),
         Some(ErrorCode::MalformedRequest),
         latency.as_secs_f64(),
     );
@@ -189,6 +197,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
 
     let span = tracing::span!(tracing::Level::INFO, "http_request", request_id);
 
+    let (dataset, req) = dataset_of(req).await;
     let response =
         normalize_framework_rejection(next.run(req).instrument(span.clone()).await).await;
 
@@ -225,6 +234,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         endpoint,
         response.status(),
         data_source,
+        dataset,
         error_code,
         latency.as_secs_f64(),
     );
@@ -232,6 +242,39 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
     let mut response = stamp_request_id(response, &request_id);
     response.extensions_mut().insert(Observed);
     response
+}
+
+/// The dataset label of a routed request: the first path parameter, looked up the way the
+/// handlers look it up. Read before the handler runs, since the request is gone after.
+async fn dataset_of(req: Request) -> (String, Request) {
+    use axum::RequestPartsExt;
+
+    let (mut parts, body) = req.into_parts();
+    let alias = parts
+        .extract::<Path<Vec<(String, String)>>>()
+        .await
+        .ok()
+        .and_then(|Path(params)| params.into_iter().next())
+        .map(|(_, alias)| alias);
+    let network = parts.extract::<Extension<Arc<NetworkClient>>>().await.ok();
+
+    let dataset = dataset_label(alias.as_deref(), |alias| {
+        network
+            .as_ref()
+            .and_then(|Extension(network)| network.dataset(alias))
+            .map(|config| config.default_name)
+    });
+
+    (dataset, Request::from_parts(parts, body))
+}
+
+/// The configured name behind what the path said, so an alias counts under its dataset,
+/// and [`NO_DATASET`] for a path without one or with a name the portal does not serve:
+/// labelling with the latter would let a client mint a series per request.
+fn dataset_label(alias: Option<&str>, configured: impl Fn(&str) -> Option<String>) -> String {
+    alias
+        .and_then(configured)
+        .unwrap_or_else(|| NO_DATASET.to_owned())
 }
 
 /// Normalize, log and count a response [`middleware`] never saw.
@@ -280,6 +323,7 @@ pub async fn observe_bypassed(req: Request, next: axum::middleware::Next) -> Res
         UNROUTED_ENDPOINT.to_owned(),
         response.status(),
         NO_DATA_SOURCE.to_owned(),
+        NO_DATASET.to_owned(),
         error_code,
         latency.as_secs_f64(),
     );
@@ -402,8 +446,37 @@ fn data_source_metric_label(data_source: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::data_source_metric_label;
+    use super::{data_source_metric_label, dataset_label, NO_DATASET};
     use crate::endpoints::stream::{DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_REALTIME_METRIC};
+
+    fn configured(alias: &str) -> Option<String> {
+        match alias {
+            "ethereum-mainnet" | "eth-main" => Some("ethereum-mainnet".to_owned()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn dataset_label_is_the_configured_name_behind_an_alias() {
+        assert_eq!(
+            dataset_label(Some("eth-main"), configured),
+            "ethereum-mainnet"
+        );
+        assert_eq!(
+            dataset_label(Some("ethereum-mainnet"), configured),
+            "ethereum-mainnet"
+        );
+    }
+
+    /// A name the portal does not serve is client-supplied text: it must not become a series.
+    #[test]
+    fn dataset_label_is_none_off_the_catalogue_and_off_a_dataset_path() {
+        assert_eq!(
+            dataset_label(Some("no-such-dataset"), configured),
+            NO_DATASET
+        );
+        assert_eq!(dataset_label(None, configured), NO_DATASET);
+    }
 
     #[test]
     fn data_source_metric_label_keeps_network() {
@@ -439,7 +512,7 @@ mod tests {
         use tower::ServiceExt;
         use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
 
-        use super::NO_DATA_SOURCE;
+        use super::{NO_DATASET, NO_DATA_SOURCE};
 
         let app = Router::new()
             .route(
@@ -456,6 +529,7 @@ mod tests {
                     path.to_owned(),
                     axum::http::StatusCode::from_u16(status).unwrap(),
                     NO_DATA_SOURCE.to_owned(),
+                    NO_DATASET.to_owned(),
                     code,
                 ))
                 .get()
@@ -644,7 +718,7 @@ mod tests {
         use tower::ServiceExt;
         use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
 
-        use super::{EndpointAnnotationLayer, NO_DATA_SOURCE};
+        use super::{EndpointAnnotationLayer, NO_DATASET, NO_DATA_SOURCE};
 
         let app = axum::Router::new()
             .route(
@@ -661,6 +735,7 @@ mod tests {
                     endpoint.to_owned(),
                     axum::http::StatusCode::BAD_REQUEST,
                     NO_DATA_SOURCE.to_owned(),
+                    NO_DATASET.to_owned(),
                     Some(ErrorCode::MalformedRequest),
                 ))
                 .get()
@@ -826,7 +901,7 @@ mod tests {
         // deleting its early return would count every request twice and grow a phantom
         // `unrouted` series at full traffic rate, with the suite still green. The routed
         // series is +1 either way, so the `unrouted` one is the only witness.
-        use super::{NO_DATA_SOURCE, UNROUTED_ENDPOINT};
+        use super::{NO_DATASET, NO_DATA_SOURCE, UNROUTED_ENDPOINT};
         use crate::metrics::{http_labels, HTTP_STATUS};
 
         let count = |endpoint: &str| {
@@ -835,6 +910,7 @@ mod tests {
                     endpoint.to_owned(),
                     StatusCode::OK,
                     NO_DATA_SOURCE.to_owned(),
+                    NO_DATASET.to_owned(),
                     None,
                 ))
                 .get()
