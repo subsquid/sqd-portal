@@ -401,16 +401,21 @@ fn occupancy_increments(running: usize, limit: usize, elapsed: Duration) -> (f64
 /// Carries the wire's `code`/`type`, prefixed — a bare `type` label says nothing on a
 /// metric. Errors only, so success series keep their label set. An unclassified error is
 /// still counted rather than dropped.
+///
+/// `dataset` is the configured name of the dataset the path named, on every series, so
+/// a failure rate can be read per dataset as well as per portal.
 pub fn http_labels(
     endpoint: String,
     status: StatusCode,
     data_source: String,
+    dataset: String,
     error_code: Option<ErrorCode>,
 ) -> Labels {
     let mut labels = vec![
         ("endpoint".to_owned(), endpoint),
         ("status".to_owned(), status.as_str().to_owned()),
         ("data_source".to_owned(), data_source),
+        ("dataset".to_owned(), dataset),
     ];
 
     // Only failures carry the taxonomy. A 2xx is not one whatever a handler tagged it
@@ -437,10 +442,11 @@ pub fn report_http_response(
     endpoint: String,
     status: StatusCode,
     data_source: String,
+    dataset: String,
     error_code: Option<ErrorCode>,
     seconds_to_first_byte: f64,
 ) {
-    let labels = http_labels(endpoint, status, data_source, error_code);
+    let labels = http_labels(endpoint, status, data_source, dataset, error_code);
     HTTP_STATUS.get_or_create(&labels).inc();
     HTTP_TTFB
         .get_or_create(&labels)
@@ -757,6 +763,7 @@ mod tests {
             "/stream".to_owned(),
             StatusCode::from_u16(status).unwrap(),
             "network".to_owned(),
+            "ethereum-mainnet".to_owned(),
             code,
         )
     }
@@ -773,6 +780,19 @@ mod tests {
         let labels = labels_for(200, None);
         assert_eq!(get(&labels, "error_code"), None);
         assert_eq!(get(&labels, "error_type"), None);
+    }
+
+    /// Success and failure alike: a share per dataset needs the dataset on both sides.
+    #[test]
+    fn every_series_names_its_dataset() {
+        for (status, code) in [(200, None), (503, Some(ErrorCode::NoWorkers))] {
+            let labels = labels_for(status, code);
+            assert_eq!(
+                get(&labels, "dataset"),
+                Some("ethereum-mainnet"),
+                "{status}"
+            );
+        }
     }
 
     /// A 204 is the steady state of every polling client. Labelling it as an error type
