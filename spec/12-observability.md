@@ -134,9 +134,9 @@ admits either way. The constraint is on movement, not on presence — these fami
 registered for the process, not per deployment mode, so they exist at zero on a shadow and
 on a non-authorizing portal alike. A series pinned at zero is the same series for every
 caller and every credential, which is what the rule protects; a series that moved would not
-be. OB-12's single `shadow_evaluated` outcome is shadow mode's entire public authorization
-projection. The load and cutover evidence it exists to gather remains in protected
-per-exchange events and in the control plane's own telemetry.
+be. OB-12's single `shadow_evaluated` outcome and OB-14's channel counts are shadow mode's
+entire public authorization projection. The load and cutover evidence it exists to gather
+remains in protected per-exchange events and in the control plane's own telemetry.
 
 The enforcing-mode `answered` class deliberately combines grants and denials. The cache is
 keyed on the whole credential (DEF-18), so an unknown key id and a known one presented with
@@ -147,6 +147,14 @@ verdict or either invalid case. Everything finer stays protected: per-exchange e
 (resolved, denied with its rung, rate-limited, over the in-flight cap, failed) go to
 structured logs, and CT-10 uses those plus the control-plane stub ledger as the
 LIV-14/HZ-10 witness.
+
+**OB-14 — Credential channel.** Authorizing deployments only, and in both modes. Every
+presented credential is counted by the header it arrived in (IB-9), whether or not it
+parsed and whatever the verdict was. The count carries no key id and no verdict, and tells
+a caller bracketing two scrapes only what it already knew — which header its own request
+used — which is why it may move where the OB-13 signals may not. It exists because
+withdrawing the legacy channel is a decision about whether anything still presents on it,
+and a deployment that cannot see that keeps the channel forever.
 
 ## Property → observable mapping
 

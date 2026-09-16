@@ -144,8 +144,17 @@ injectors for the CT-2 matrix.
 **IB-9 — Authorization binding.** Authorizing deployments only (REQ-56); on any other
 deployment nothing in this rule is observable.
 
-*Presentation.* A credential is accepted as `Authorization: Bearer <token>` and nowhere
-else. A query-string channel is deliberately not offered: it would exist to serve
+*Presentation.* A credential is accepted in one of two headers: `Authorization: Bearer
+<token>`, the documented form, and `x-api-key: <token>`, the form keys issued before
+portal-side authorization carry. The second is honoured so a deployment can move its gate
+off an edge rule without every client changing a header on the same day; nothing about the
+first changed when it was added. `Authorization` decides whenever it is present at all: one
+that is present but unusable is refused rather than falling through to the other header,
+because a client that authenticates on some requests and not others is far harder to find
+than one that never does. An `x-api-key` value is the whole token and carries no scheme, so
+what the Bearer form rejects in its token half is rejected here outright.
+
+A query-string channel is deliberately not offered: it would exist to serve
 transports that cannot set headers, and this binding has none — every gated route is POST
 but the timestamp lookup, and `fetch` sets headers on both. What it would have is a secret
 in a URL, which browser history, `Referer` and every intermediary's access log record
