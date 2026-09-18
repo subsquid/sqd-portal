@@ -1,8 +1,17 @@
 //! DC-4 stub: the real-time source. Serves heads, status, and streams for
 //! real-time-attached toy datasets, emitting `x-internal-*` noise so the
 //! harness can assert the portal strips it (IB-4).
+//!
+//! Also the harness's only slow producer. [`Trickle`] spreads a stream's body
+//! over time rather than handing it over at once, which is the shape every real
+//! stream has and the only way a test can outlast an interval the portal
+//! measures on (CT-11, P-USAGE-INTERIM).
 
-use std::io::Write;
+use std::{
+    io::Write,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -18,17 +27,45 @@ use serde_json::{json, Value};
 use super::Ledger;
 use crate::world::ToyWorld;
 
+/// How a stream body is paced. Shared with the running stub, so a test can turn
+/// it on between requests without restarting anything.
+#[derive(Clone, Default)]
+pub struct Trickle(Arc<Mutex<Option<(usize, Duration)>>>);
+
+impl Trickle {
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Write the body in `chunks` pieces, waiting `gap` between them. The body
+    /// is byte-identical either way — only its timing changes — so a response
+    /// paced this way still decodes and still oracle-diffs.
+    pub fn set(&self, chunks: usize, gap: Duration) {
+        *self.0.lock().unwrap() = Some((chunks.max(1), gap));
+    }
+
+    pub fn clear(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+
+    fn get(&self) -> Option<(usize, Duration)> {
+        *self.0.lock().unwrap()
+    }
+}
+
 #[derive(Clone)]
 struct HotblocksState {
     world: ToyWorld,
     ledger: Ledger,
+    trickle: Trickle,
 }
 
-pub async fn start(port: u16, world: ToyWorld) -> anyhow::Result<Ledger> {
+pub async fn start(port: u16, world: ToyWorld, trickle: Trickle) -> anyhow::Result<Ledger> {
     let ledger = Ledger::default();
     let state = HotblocksState {
         world,
         ledger: ledger.clone(),
+        trickle,
     };
     let app = Router::new()
         .route("/datasets/:ds/head", get(head))
@@ -140,5 +177,24 @@ fn serve_stream(s: HotblocksState, ds: String, body: String, finalized: bool) ->
 
     headers.insert("content-type", "application/jsonl".parse().unwrap());
     headers.insert("content-encoding", "gzip".parse().unwrap());
-    (StatusCode::OK, headers, Body::from(gz)).into_response()
+    let body = match s.trickle.get() {
+        Some((chunks, gap)) => paced(gz, chunks, gap),
+        None => Body::from(gz),
+    };
+    (StatusCode::OK, headers, body).into_response()
+}
+
+/// The same bytes, handed over in pieces. Split anywhere: the client sees one
+/// concatenated gzip member, and the portal proxies frames as they arrive.
+fn paced(bytes: Vec<u8>, chunks: usize, gap: Duration) -> Body {
+    let size = bytes.len().div_ceil(chunks).max(1);
+    let pieces: Vec<Vec<u8>> = bytes.chunks(size).map(<[u8]>::to_vec).collect();
+    Body::from_stream(futures::stream::unfold(
+        pieces.into_iter(),
+        move |mut pieces| async move {
+            let piece = pieces.next()?;
+            tokio::time::sleep(gap).await;
+            Some((Ok::<_, std::io::Error>(piece), pieces))
+        },
+    ))
 }

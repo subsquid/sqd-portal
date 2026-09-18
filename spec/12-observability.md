@@ -156,6 +156,35 @@ used — which is why it may move where the OB-13 signals may not. It exists bec
 withdrawing the legacy channel is a decision about whether anything still presents on it,
 and a deployment that cannot see that keeps the channel forever.
 
+**OB-15 — Usage measurement health.** Measuring deployments only. The scrape carries what
+was measured and what became of it: records handed to the reporter, records the sink
+accepted, records dropped **by reason** — queue full, aged out past
+P-USAGE-MAX-RETRY-AGE, refused on content, or produced after the reporter stopped —
+deliveries that failed and will be retried, the queue's current depth, and delivery
+latency. Every one of them is bound at construction rather than looked up per record: the
+enqueue happens inside a response, and a metric-family lookup there is work the serving
+path pays for measurement.
+
+Drops are the point of the family. Loss is designed in (DC-9) and therefore has to be a
+number rather than an inference: a total that is a lower bound is usable if the size of
+the gap is known, and unusable otherwise. The reason axis is what separates a sink outage
+(queue full, then aged out) from a contract break (refused on content) — the first is
+operations, the second is a bug in what the Portal is sending, and they page different
+people. Queue depth against the bound is the leading indicator for both.
+
+These families carry no key id, no organization, no dataset and no request path. The
+records do, and they go to the control plane over an authenticated channel; the scrape is
+keyless (IB-9), and a per-customer series there would publish the customer list to anyone
+who can reach `/metrics` — as well as growing without bound at the client's choosing
+(HZ-15, INV-39's argument applied to measurement). Like every other family these are
+registered for the process **unconditionally**, so on a Portal that measures nothing they
+exist and read zero rather than being absent. That is deliberate and is not a hole in
+REQ-61: non-interference is a claim about **data-surface responses** — status, headers,
+body bytes, ending — not about the `/metrics` document, whose shape must not depend on
+configuration. A family that appeared only where measurement was on would make a missing
+counter ambiguous between "not configured" and "nothing reported", which is the harder
+question to answer during an incident.
+
 ## Property → observable mapping
 
 | Property | Decided by |
@@ -172,6 +201,7 @@ and a deployment that cannot see that keeps the channel forever.
 | LIV-13, LIV-14 | enforcing-mode OB-13 grace deadline and exchange outcomes; protected exchange events + stub ledger in both modes |
 | INV-6, INV-15, INV-39 | protected OB-12 reason logs + public non-disclosure; neutral shadow projection and enforcing-only OB-13 classes |
 | INV-30/31 | OB-1, OB-5 (they are the invariant's subject) |
+| INV-32, REQ-60/61 | OB-15 drop reasons and queue depth against the sink stub's ledger |
 | SLI-1..6 | OB-2, OB-3, OB-1 + process RSS |
 
 ## Logging

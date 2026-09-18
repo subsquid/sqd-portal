@@ -53,6 +53,7 @@ pub fn gate_with(enforcement: Enforcement) -> Arc<Gate> {
         key: None,
         enforcement,
         limits: config::Limits::default(),
+        usage: None,
     };
     let signer = config.signer(Keypair::generate_ed25519()).unwrap();
     let cache = GrantCache::new(
@@ -60,7 +61,7 @@ pub fn gate_with(enforcement: Enforcement) -> Arc<Gate> {
         config.limits.clone(),
         config.enforcement,
     );
-    Arc::new(Gate::new(&config, cache, Arc::new(NoCatalog)))
+    Arc::new(Gate::new(&config, cache, Arc::new(NoCatalog), None))
 }
 
 pub async fn cache_for(control_plane: &MockControlPlane) -> Arc<GrantCache> {
@@ -129,6 +130,7 @@ impl MockControlPlane {
             key: None,
             enforcement: Enforcement::Enforce,
             limits,
+            usage: None,
         }
     }
 
