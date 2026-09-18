@@ -32,6 +32,32 @@ const TOKEN_PREFIXES: [&str; 3] = ["sqd_prt_", "sqd_portal_", "prt_"];
 const MAX_KEY_ID_LEN: usize = 64;
 const MAX_SECRET_LEN: usize = 128;
 
+/// The header that keys issued before portal-side authorization travel in. The
+/// edge rule they were minted against matches on it, so honouring it here is
+/// what lets a deployment move its gate without every client changing a header
+/// on the same day (IB-9).
+const API_KEY_HEADER: &str = "x-api-key";
+
+/// Which header a credential arrived in. Named in the log and counted on the
+/// scrape, because withdrawing the legacy channel is a decision about whether
+/// anything still uses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Channel {
+    Authorization,
+    ApiKey,
+}
+
+impl Channel {
+    /// One spelling, carried by the log field and the counter alike, so the
+    /// two cannot drift apart.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authorization => "authorization",
+            Self::ApiKey => "x_api_key",
+        }
+    }
+}
+
 /// The presented token, held only as far as the exchange that carries it. Its
 /// renderings are redacted so the one way it can be disclosed is by asking for
 /// it (INV-38).
@@ -159,6 +185,13 @@ impl Gate {
         // Deferred: canonicalization interns and clones, so it stays behind
         // authentication. Only the dataset rung calls it.
         let dataset = LazyDataset::new(|| self.dataset_for(uri.path(), names_dataset));
+        // Counted before the verdict, and for a credential that never parsed
+        // too: what this answers is which channel a deployment's clients still
+        // use, which is what decides when the legacy one can be withdrawn.
+        let channel = attempted_channel(headers);
+        if let Some(channel) = channel {
+            metrics::report_credential_channel(channel.as_str());
+        }
         let credential = match credential_from_request(headers) {
             Ok(credential) => credential,
             Err(rejection) => {
@@ -167,7 +200,7 @@ impl Gate {
                     denial_reason: None,
                     grant: None,
                 };
-                self.log(&verdict, None, None);
+                self.log(&verdict, None, None, channel);
                 return Admission {
                     decision: verdict.decision,
                     grant: None,
@@ -195,6 +228,7 @@ impl Gate {
                 .as_ref()
                 .map(|credential| credential.key_id.as_str()),
             dataset.peek().as_deref(),
+            channel,
         );
         Admission {
             decision: verdict.decision,
@@ -242,10 +276,18 @@ impl Gate {
 
     /// Log-only mode records every request; enforcing mode records only the
     /// requests it turns away, since admissions are the hot path.
-    fn log(&self, verdict: &Verdict, key_id: Option<&str>, dataset: Option<&str>) {
+    fn log(
+        &self,
+        verdict: &Verdict,
+        key_id: Option<&str>,
+        dataset: Option<&str>,
+        channel: Option<Channel>,
+    ) {
         let enforcing = self.enforcing();
         let key_id = key_id.unwrap_or("none");
         let dataset = dataset.unwrap_or("-");
+        // Absent rather than a channel that failed: nothing was presented.
+        let channel = channel.map_or("-", Channel::as_str);
         let portal_id = self.portal_id.as_str();
         let enforcement = self.enforcement.as_str();
 
@@ -255,6 +297,7 @@ impl Gate {
                     key_id,
                     dataset,
                     portal_id,
+                    channel,
                     decision = "admit",
                     reason = "authorized",
                     enforcement,
@@ -267,6 +310,7 @@ impl Gate {
             key_id,
             dataset,
             portal_id,
+            channel,
             // Shadow mode says what it would have done, since it did not.
             decision = if enforcing { "reject" } else { "would_reject" },
             // The internal rung; the wire and the scrape both coarsen it.
@@ -310,15 +354,52 @@ pub(super) async fn middleware(
     }
 }
 
-/// Bearer header only: a query parameter puts the secret in browser history,
+/// Headers only: a query parameter puts the secret in browser history,
 /// `Referer` and every proxy's log (IB-9). A malformed token rejects rather
 /// than reading as absent, which would hide typos behind another error.
 fn credential_from_request(headers: &HeaderMap) -> Result<Option<Credential>, Rejection> {
-    let Some(token) = bearer_token(headers)? else {
+    let Some(token) = presented_token(headers)? else {
         return Ok(None);
     };
 
     parse_token(&token).map(Some).ok_or(evaluate::MALFORMED)
+}
+
+/// The token as presented, read from the channel `attempted_channel` picked.
+fn presented_token(headers: &HeaderMap) -> Result<Option<String>, Rejection> {
+    match attempted_channel(headers) {
+        None => Ok(None),
+        Some(Channel::Authorization) => bearer_token(headers),
+        Some(Channel::ApiKey) => api_key_token(headers),
+    }
+}
+
+/// The precedence rule, and the only place it is stated: `Authorization` when
+/// it is there at all, so one that is present but unusable is refused rather
+/// than falling through. A client that authenticates on some requests and not
+/// others is far harder to find than one that never does.
+fn attempted_channel(headers: &HeaderMap) -> Option<Channel> {
+    if headers.contains_key(header::AUTHORIZATION) {
+        Some(Channel::Authorization)
+    } else if headers.contains_key(API_KEY_HEADER) {
+        Some(Channel::ApiKey)
+    } else {
+        None
+    }
+}
+
+/// The whole value is the token: this header carries no scheme, so what the
+/// Bearer form rejects in its token half is rejected here outright rather than
+/// read as an absent credential.
+fn api_key_token(headers: &HeaderMap) -> Result<Option<String>, Rejection> {
+    let Some(value) = headers.get(API_KEY_HEADER) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| evaluate::MALFORMED)?;
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return Err(evaluate::MALFORMED);
+    }
+    Ok(Some(value.to_owned()))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<Option<String>, Rejection> {
@@ -660,6 +741,124 @@ mod tests {
                 "{value:?} must be rejected"
             );
         }
+    }
+
+    /// The channel the keys issued before portal-side authorization travel
+    /// in. Refusing it would have made a deployment move its gate and every
+    /// one of its clients change a header on the same day.
+    #[tokio::test]
+    async fn a_key_in_the_api_key_header_is_served() {
+        let app = app(
+            gate_granting(None, Enforcement::Enforce).await,
+            "/datasets/:dataset/stream",
+        );
+
+        let (status, body) = call(
+            app,
+            request("/datasets/base/stream")
+                .header(API_KEY_HEADER, TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "served");
+    }
+
+    /// Both present: the documented channel decides, so an `x-api-key` a client
+    /// forgot to drop cannot displace the key it is now sending.
+    #[tokio::test]
+    async fn authorization_is_read_before_the_api_key_header() {
+        let app = app(
+            gate_granting(None, Enforcement::Enforce).await,
+            "/datasets/:dataset/stream",
+        );
+
+        let (status, body) = call(
+            app,
+            request("/datasets/base/stream")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(API_KEY_HEADER, "sqd_prt_someoneelse_wrongsecret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The direction that matters: a broken `Authorization` refuses rather than
+    /// falling through to a usable `x-api-key`. Falling through would let one
+    /// client authenticate on some requests and not others, which is the
+    /// hardest shape of this bug to reproduce.
+    #[tokio::test]
+    async fn a_malformed_authorization_does_not_fall_through_to_the_api_key_header() {
+        let app = app(
+            gate_granting(None, Enforcement::Enforce).await,
+            "/datasets/:dataset/stream",
+        );
+
+        let (status, body) = call(
+            app,
+            request("/datasets/base/stream")
+                .header(header::AUTHORIZATION, "Basic xyz")
+                .header(API_KEY_HEADER, TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(error_code(&body), "invalid_credential");
+    }
+
+    #[test]
+    fn malformed_api_key_headers_are_rejected() {
+        for value in [
+            HeaderValue::from_static(""),
+            HeaderValue::from_static("   "),
+            HeaderValue::from_static("sqd_prt_k1_with space"),
+            HeaderValue::from_bytes(b"sqd_prt_k1_\xff").unwrap(),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(API_KEY_HEADER, value.clone());
+            assert!(
+                credential_from_request(&headers).is_err(),
+                "{value:?} must be rejected"
+            );
+        }
+    }
+
+    /// Precedence is a property of which headers are present, not of which one
+    /// happened to parse — that is what makes the refusal above structural.
+    #[test]
+    fn the_channel_is_decided_before_either_header_is_read() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(attempted_channel(&headers), None);
+
+        headers.insert(API_KEY_HEADER, HeaderValue::from_static("anything"));
+        assert_eq!(attempted_channel(&headers), Some(Channel::ApiKey));
+
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic xyz"));
+        assert_eq!(attempted_channel(&headers), Some(Channel::Authorization));
+    }
+
+    /// Withdrawing the legacy channel is a decision about whether anything
+    /// still uses it, so a presentation counts even where the credential it
+    /// carried never parsed.
+    #[tokio::test]
+    async fn a_presentation_is_counted_under_the_channel_it_arrived_in() {
+        let cp = MockControlPlane::spawn().await;
+        let (gate, _) = gate_for(&cp, Enforcement::LogOnly).await;
+        let uri: axum::http::Uri = "/datasets/base/stream".parse().unwrap();
+        let before = metrics::credential_channels(Channel::ApiKey.as_str());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(API_KEY_HEADER, HeaderValue::from_static("not-a-token"));
+        gate.decide(&headers, &uri, true).await;
+
+        assert!(metrics::credential_channels(Channel::ApiKey.as_str()) > before);
     }
 
     #[tokio::test]

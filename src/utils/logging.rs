@@ -1,8 +1,10 @@
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{Path, Request},
     response::{IntoResponse, Response},
+    Extension,
 };
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::time::{Duration, Instant};
 use tower::{Layer, Service};
@@ -10,12 +12,18 @@ use tower_http::request_id::RequestId;
 use tracing::Instrument;
 
 use crate::{
+    endpoints::stream::DataSource,
     metrics,
+    network::NetworkClient,
     types::{coded_response, error_response, ErrorBody, ErrorCode, StreamRequest},
 };
 
 const LOG_INTERVAL: Duration = Duration::from_secs(5);
 const NO_DATA_SOURCE: &str = "none";
+
+/// Dataset label for a request whose path names no dataset the portal serves. Constant for
+/// the same reason as [`UNROUTED_ENDPOINT`]: the path segment is client-supplied.
+const NO_DATASET: &str = "none";
 
 /// Endpoint label for a request that never reached a route. Constant because the path is
 /// client-supplied there, and labelling with it would mint a series per request.
@@ -164,6 +172,7 @@ pub async fn reject_non_ascii_request_id(req: Request, next: axum::middleware::N
         UNROUTED_ENDPOINT.to_owned(),
         response.status(),
         NO_DATA_SOURCE.to_owned(),
+        NO_DATASET.to_owned(),
         Some(ErrorCode::MalformedRequest),
         latency.as_secs_f64(),
     );
@@ -189,6 +198,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
 
     let span = tracing::span!(tracing::Level::INFO, "http_request", request_id);
 
+    let (dataset, req) = dataset_of(req).await;
     let response =
         normalize_framework_rejection(next.run(req).instrument(span.clone()).await).await;
 
@@ -199,13 +209,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         .get::<EndpointName>()
         .map(|e| e.0.clone())
         .unwrap_or_else(|| path.clone());
-    let data_source = response
-        .headers()
-        .get(crate::endpoints::stream::DATA_SOURCE_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(data_source_metric_label)
-        .unwrap_or(NO_DATA_SOURCE)
-        .to_owned();
+    let data_source = data_source_of(&response).to_owned();
     let error_code = response.extensions().get::<ErrorCode>().copied();
 
     span.in_scope(|| {
@@ -225,6 +229,7 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
         endpoint,
         response.status(),
         data_source,
+        dataset,
         error_code,
         latency.as_secs_f64(),
     );
@@ -232,6 +237,39 @@ pub async fn middleware(req: Request, next: axum::middleware::Next) -> impl Into
     let mut response = stamp_request_id(response, &request_id);
     response.extensions_mut().insert(Observed);
     response
+}
+
+/// The dataset label of a routed request: the first path parameter, looked up the way the
+/// handlers look it up. Read before the handler runs, since the request is gone after.
+async fn dataset_of(req: Request) -> (String, Request) {
+    use axum::RequestPartsExt;
+
+    let (mut parts, body) = req.into_parts();
+    let alias = parts
+        .extract::<Path<Vec<(String, String)>>>()
+        .await
+        .ok()
+        .and_then(|Path(params)| params.into_iter().next())
+        .map(|(_, alias)| alias);
+    let network = parts.extract::<Extension<Arc<NetworkClient>>>().await.ok();
+
+    let dataset = dataset_label(alias.as_deref(), |alias| {
+        network
+            .as_ref()
+            .and_then(|Extension(network)| network.dataset(alias))
+            .map(|config| config.default_name)
+    });
+
+    (dataset, Request::from_parts(parts, body))
+}
+
+/// The configured name behind what the path said, so an alias counts under its dataset,
+/// and [`NO_DATASET`] for a path without one or with a name the portal does not serve:
+/// labelling with the latter would let a client mint a series per request.
+fn dataset_label(alias: Option<&str>, configured: impl Fn(&str) -> Option<String>) -> String {
+    alias
+        .and_then(configured)
+        .unwrap_or_else(|| NO_DATASET.to_owned())
 }
 
 /// Normalize, log and count a response [`middleware`] never saw.
@@ -280,6 +318,7 @@ pub async fn observe_bypassed(req: Request, next: axum::middleware::Next) -> Res
         UNROUTED_ENDPOINT.to_owned(),
         response.status(),
         NO_DATA_SOURCE.to_owned(),
+        NO_DATASET.to_owned(),
         error_code,
         latency.as_secs_f64(),
     );
@@ -392,6 +431,21 @@ fn stamp_request_id(response: Response, request_id: &str) -> Response {
     Response::from_parts(parts, Body::from(rendered))
 }
 
+/// The [`DataSource`] extension, else the public header, else [`NO_DATA_SOURCE`], which is
+/// left to a response no layer was chosen for.
+fn data_source_of(response: &Response) -> &str {
+    if let Some(source) = response.extensions().get::<DataSource>() {
+        return data_source_metric_label(source.as_str());
+    }
+
+    response
+        .headers()
+        .get(crate::endpoints::stream::DATA_SOURCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(data_source_metric_label)
+        .unwrap_or(NO_DATA_SOURCE)
+}
+
 fn data_source_metric_label(data_source: &str) -> &str {
     match data_source {
         crate::endpoints::stream::DATA_SOURCE_REALTIME_METRIC => "hotblocks",
@@ -402,8 +456,37 @@ fn data_source_metric_label(data_source: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::data_source_metric_label;
+    use super::{data_source_metric_label, dataset_label, NO_DATASET};
     use crate::endpoints::stream::{DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_REALTIME_METRIC};
+
+    fn configured(alias: &str) -> Option<String> {
+        match alias {
+            "ethereum-mainnet" | "eth-main" => Some("ethereum-mainnet".to_owned()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn dataset_label_is_the_configured_name_behind_an_alias() {
+        assert_eq!(
+            dataset_label(Some("eth-main"), configured),
+            "ethereum-mainnet"
+        );
+        assert_eq!(
+            dataset_label(Some("ethereum-mainnet"), configured),
+            "ethereum-mainnet"
+        );
+    }
+
+    /// A name the portal does not serve is client-supplied text: it must not become a series.
+    #[test]
+    fn dataset_label_is_none_off_the_catalogue_and_off_a_dataset_path() {
+        assert_eq!(
+            dataset_label(Some("no-such-dataset"), configured),
+            NO_DATASET
+        );
+        assert_eq!(dataset_label(None, configured), NO_DATASET);
+    }
 
     #[test]
     fn data_source_metric_label_keeps_network() {
@@ -426,6 +509,135 @@ mod tests {
         assert_eq!(data_source_metric_label("custom"), "custom");
     }
 
+    /// The extension is the metric's own record of the layer, so it wins over a header an
+    /// upstream may have sent through; the header still labels a response without one.
+    #[tokio::test]
+    async fn the_data_source_label_prefers_the_extension_over_the_header() {
+        use crate::endpoints::stream::{DataSource, DATA_SOURCE_HEADER};
+        use crate::metrics::{http_labels, HTTP_STATUS};
+        use crate::types::RequestError;
+        use axum::{
+            body::Body, http::Request, middleware::from_fn, response::IntoResponse, routing::get,
+            Router,
+        };
+        use tower::ServiceExt;
+        use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
+
+        use super::{NO_DATASET, NO_DATA_SOURCE};
+
+        let app = Router::new()
+            .route(
+                "/source/extension",
+                get(|| async {
+                    (
+                        DataSource::RealTime,
+                        [(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC)],
+                        RequestError::RateLimitExceeded.into_response(),
+                    )
+                }),
+            )
+            .route(
+                "/source/header",
+                get(|| async { [(DATA_SOURCE_HEADER, DATA_SOURCE_REALTIME_METRIC)] }),
+            )
+            .route("/source/nothing", get(|| async { "ok" }))
+            .route_layer(from_fn(super::middleware))
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+
+        let overloaded = Some(crate::types::ErrorCode::Overloaded);
+        for (path, status, code, expected) in [
+            ("/source/extension", 529, overloaded, "hotblocks"),
+            ("/source/header", 200, None, "hotblocks"),
+            ("/source/nothing", 200, None, NO_DATA_SOURCE),
+        ] {
+            let count = || {
+                HTTP_STATUS
+                    .get_or_create(&http_labels(
+                        path.to_owned(),
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        expected.to_owned(),
+                        NO_DATASET.to_owned(),
+                        code,
+                    ))
+                    .get()
+            };
+
+            let before = count();
+            app.clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(count(), before + 1, "{path}");
+        }
+    }
+
+    /// A route one layer answers names it on a request refused before its handler ran, and
+    /// a handler that names a layer itself is not overridden.
+    #[tokio::test]
+    async fn a_route_served_by_one_layer_labels_every_response() {
+        use crate::endpoints::stream::DataSource;
+        use crate::metrics::{http_labels, HTTP_STATUS};
+        use crate::types::ErrorCode;
+        use axum::{body::Body, extract::Path, http::Request, middleware::from_fn, routing::get};
+        use tower::ServiceExt;
+        use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
+
+        use super::{EndpointAnnotationLayer, NO_DATASET};
+
+        let app = axum::Router::new()
+            .route(
+                "/fixed/:number",
+                get(|Path(n): Path<u64>| async move { n.to_string() })
+                    .layer(EndpointAnnotationLayer::new("/fixed").served_by(DataSource::Network)),
+            )
+            .route(
+                "/chosen",
+                get(|| async { (DataSource::RealTime, "ok") })
+                    .layer(EndpointAnnotationLayer::new("/chosen").served_by(DataSource::Network)),
+            )
+            .route_layer(from_fn(super::middleware))
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+
+        let count = |endpoint: &str, status: u16, data_source: &str, code: Option<ErrorCode>| {
+            HTTP_STATUS
+                .get_or_create(&http_labels(
+                    endpoint.to_owned(),
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    data_source.to_owned(),
+                    NO_DATASET.to_owned(),
+                    code,
+                ))
+                .get()
+        };
+        let send = |uri: &'static str| {
+            app.clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        };
+
+        let rejected = || count("/fixed", 400, "network", Some(ErrorCode::MalformedRequest));
+        let before = rejected();
+        send("/fixed/not-a-number").await.unwrap();
+        assert_eq!(
+            rejected(),
+            before + 1,
+            "a rejected request keeps the route's layer"
+        );
+
+        let served = || count("/fixed", 200, "network", None);
+        let before = served();
+        send("/fixed/7").await.unwrap();
+        assert_eq!(served(), before + 1);
+
+        let chosen = || count("/chosen", 200, "hotblocks", None);
+        let before = chosen();
+        send("/chosen").await.unwrap();
+        assert_eq!(
+            chosen(),
+            before + 1,
+            "the handler's layer wins over the route's"
+        );
+    }
+
     /// Unique endpoint labels keep the shared global metric family isolated from
     /// tests running concurrently.
     #[tokio::test]
@@ -439,7 +651,7 @@ mod tests {
         use tower::ServiceExt;
         use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
 
-        use super::NO_DATA_SOURCE;
+        use super::{NO_DATASET, NO_DATA_SOURCE};
 
         let app = Router::new()
             .route(
@@ -456,6 +668,7 @@ mod tests {
                     path.to_owned(),
                     axum::http::StatusCode::from_u16(status).unwrap(),
                     NO_DATA_SOURCE.to_owned(),
+                    NO_DATASET.to_owned(),
                     code,
                 ))
                 .get()
@@ -644,7 +857,7 @@ mod tests {
         use tower::ServiceExt;
         use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
 
-        use super::{EndpointAnnotationLayer, NO_DATA_SOURCE};
+        use super::{EndpointAnnotationLayer, NO_DATASET, NO_DATA_SOURCE};
 
         let app = axum::Router::new()
             .route(
@@ -661,6 +874,7 @@ mod tests {
                     endpoint.to_owned(),
                     axum::http::StatusCode::BAD_REQUEST,
                     NO_DATA_SOURCE.to_owned(),
+                    NO_DATASET.to_owned(),
                     Some(ErrorCode::MalformedRequest),
                 ))
                 .get()
@@ -826,7 +1040,7 @@ mod tests {
         // deleting its early return would count every request twice and grow a phantom
         // `unrouted` series at full traffic rate, with the suite still green. The routed
         // series is +1 either way, so the `unrouted` one is the only witness.
-        use super::{NO_DATA_SOURCE, UNROUTED_ENDPOINT};
+        use super::{NO_DATASET, NO_DATA_SOURCE, UNROUTED_ENDPOINT};
         use crate::metrics::{http_labels, HTTP_STATUS};
 
         let count = |endpoint: &str| {
@@ -835,6 +1049,7 @@ mod tests {
                     endpoint.to_owned(),
                     StatusCode::OK,
                     NO_DATA_SOURCE.to_owned(),
+                    NO_DATASET.to_owned(),
                     None,
                 ))
                 .get()
@@ -1062,13 +1277,29 @@ pub struct EndpointName(pub String);
 #[derive(Clone)]
 pub struct EndpointAnnotationLayer {
     endpoint: String,
+    data_source: Option<DataSource>,
 }
 
 impl EndpointAnnotationLayer {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            data_source: None,
         }
+    }
+
+    /// The layer a route is served by whatever the request, so every response on it is
+    /// labelled with it — a refusal or a rejected request as well. A handler's own
+    /// [`DataSource`] wins.
+    pub(crate) fn served_by(mut self, data_source: DataSource) -> Self {
+        self.data_source = Some(data_source);
+        self
+    }
+
+    /// The name the route's responses are labelled with, for a caller that needs
+    /// the same name on something other than a metric.
+    pub(crate) fn name(&self) -> &str {
+        &self.endpoint
     }
 }
 
@@ -1079,6 +1310,7 @@ impl<S> Layer<S> for EndpointAnnotationLayer {
         EndpointAnnotationService {
             inner,
             endpoint: self.endpoint.clone(),
+            data_source: self.data_source,
         }
     }
 }
@@ -1087,6 +1319,7 @@ impl<S> Layer<S> for EndpointAnnotationLayer {
 pub struct EndpointAnnotationService<S> {
     inner: S,
     endpoint: String,
+    data_source: Option<DataSource>,
 }
 
 impl<S> Service<Request> for EndpointAnnotationService<S>
@@ -1106,12 +1339,16 @@ where
 
     fn call(&mut self, req: Request) -> Self::Future {
         let endpoint = self.endpoint.clone();
+        let data_source = self.data_source;
         let fut = self.inner.call(req);
 
         Box::pin(async move {
             let mut response = fut.await?;
             // Store the endpoint name in the response extensions for the middleware to use
             response.extensions_mut().insert(EndpointName(endpoint));
+            if let Some(data_source) = data_source {
+                response.extensions_mut().get_or_insert(data_source);
+            }
             Ok(response)
         })
     }

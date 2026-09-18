@@ -1,4 +1,4 @@
-//! Everything slow, on a task of its own (DC-9, OB-14).
+//! Everything slow, on a task of its own (DC-9, OB-15).
 //!
 //! The reporter batches what the tap queued, signs it with the identity the
 //! control plane already knows from the exchange (DC-8), and posts it. It
@@ -145,7 +145,7 @@ impl Reporter {
                 }
             }
             // Read where the reader is, not where the writers are: the hot path
-            // must not pay for a gauge (OB-14).
+            // must not pay for a gauge (OB-15).
             self.signals.queue_depth.set(events.len() as i64);
             if !batch.is_empty() {
                 // A stop during this returns with the batch still in hand; the
@@ -278,7 +278,7 @@ impl Reporter {
     /// refused on its content is `rejected` and reads as a contract break;
     /// everything else — a transport failure, the budget, the stop arriving
     /// mid-post — is `stopped` and reads as shutdown loss. The two page
-    /// different people, which is the whole point of OB-14's reason axis.
+    /// different people, which is the whole point of OB-15's reason axis.
     /// Records still in the queue were never offered to the sink at all, so they
     /// are `stopped` whatever became of the batch.
     fn abandon(

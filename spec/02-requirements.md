@@ -306,15 +306,17 @@ a reason.
 ## Network integration (40–44)
 
 **REQ-40 — Assignment ingestion.** [MUST]
-The Portal polls the assignment publisher every P-ASSIGNMENT-REFRESH, skips unchanged
-artifacts (by identifier), applies new ones atomically no earlier than their declared
-effective time (so the fleet cuts over together), and keeps serving the previous
-artifact on any fetch or validation failure. First applied assignment gates readiness
-(REQ-23).
+The Portal polls the assignment publisher every P-ASSIGNMENT-REFRESH, reads the
+assignment the type in force names (P-ASSIGNMENT-SOURCE, else the `assignment_type` the
+network state declares), skips unchanged artifacts (by identifier), applies new ones
+atomically no earlier than their declared effective time (so the fleet cuts over
+together), and keeps serving the previous artifact on any fetch or validation failure.
+First applied assignment gates readiness (REQ-23).
 *Acceptance:* a new artifact with a future effective time is not visible in routing
 until that time; killing the publisher leaves serving unaffected for the duration of
 the outage (staleness intent: ADR-013). Cutting over together assumes the workers wait
-too, which they do not today (OQ-11).
+too, which they do not today (OQ-11) — and an effective time to wait for, which only the
+`legacy` artifact declares (GAP-37).
 
 **REQ-41 — Worker selection and penalties.** [MUST]
 Chunk queries go to the most promising worker holding the chunk: healthy and fast
@@ -565,7 +567,7 @@ admission already resolved; recording a claim is not acting on it, so no claim r
 here may influence any authorization decision. Reporting is best-effort: records are held
 in a bounded queue, delivered in batches of at most P-USAGE-BATCH-MAX no less often than
 P-USAGE-FLUSH, retried within P-USAGE-MAX-RETRY-AGE, and otherwise dropped and counted
-(DC-9, OB-14). Measurement is independent of the enforcement mode, so it runs during a
+(DC-9, OB-15). Measurement is independent of the enforcement mode, so it runs during a
 `log_only` cutover (REQ-55). A request served without a credential is not measured: there
 is no one to attribute it to.
 Interim records are cut **on a data boundary**, not on a clock: a response that has gone
@@ -582,7 +584,7 @@ produces more than one record, all but the last marked as continuing, whose coun
 exactly that response's encoded bytes; several requests reach the sink in fewer deliveries
 than there were records; a request that presented no credential produces none; and a
 Portal with no usage configuration makes no call to the sink at all and leaves every
-OB-14 signal at zero.
+OB-15 signal at zero.
 *Trace:* ADR-016.
 
 **REQ-61 — Measurement never interferes.** [MUST]
@@ -596,7 +598,7 @@ work to every measured response, which is a budget to measure, not a claim to ma
 *Acceptance:* with the sink refusing every delivery, a gated request's status, headers and
 decoded body are identical to the same request with the sink healthy, and its stream still
 completes; with the queue saturated, responses are served in full and the drops are
-counted (OB-14); no test observes a response outcome that differs by the sink's state.
+counted (OB-15); no test observes a response outcome that differs by the sink's state.
 *Trace:* ADR-016.
 
 ## Explicitly unspecified
@@ -643,7 +645,11 @@ Deliberately left open — tests and clients must not pin these:
 
 Closed: **OQ-6** (should the clamp-bypassing debug stream variant be exposed unconditionally,
 or gated behind an operator flag?) — resolved by ADR-014: the variant is gated behind an
-operator flag and disabled by default (GAP-21 until implemented). **OQ-12** (what does an
+operator flag and disabled by default (GAP-21 until implemented). **OQ-8** (ratify the HTTP
+field or header carrying DEF-8's coverage cursor) — dissolved rather than answered: the
+question assumed the wire lacked a cursor, and it never did. Every served chunk's boundary
+blocks ship as records, so the last record is the cursor and there is no field to name
+(GAP-15). **OQ-12** (what does an
 enforcing Portal do once its key set is older than its staleness bound?) — moot since
 the on-demand exchange: there is no mirrored key set to age. Its answer survives as
 the reasoning REQ-54 and INV-31 still rest on — readiness never turns on the control plane's

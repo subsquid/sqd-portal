@@ -104,7 +104,7 @@ impl ExchangeOutcome {
     }
 }
 
-/// Why one usage record never reached the control plane (OB-14, HZ-14).
+/// Why one usage record never reached the control plane (OB-15, HZ-14).
 /// Closed set, and each value is bound to its own counter at construction — the
 /// hot path increments a pointer it already holds rather than looking a label
 /// family up per event.
@@ -231,9 +231,11 @@ lazy_static::lazy_static! {
     static ref KNOWN_CHUNKS: Family<Labels, Gauge> = Default::default();
     static ref LAST_STORAGE_BLOCK: Family<Labels, Gauge> = Default::default();
     pub static ref STALE_ASSIGNMENTS_REJECTED: Counter = Default::default();
+    pub static ref MISSING_ASSIGNMENT_SOURCE: Counter = Default::default();
 
     // Authorizing deployments only: inert without an `auth:` block.
     static ref AUTH_DECISIONS: Family<Labels, Counter> = Default::default();
+    static ref AUTH_CREDENTIAL_CHANNEL: Family<Labels, Counter> = Default::default();
     static ref EXCHANGES: Family<Labels, Counter> = Default::default();
     static ref EXCHANGE_DURATION: Histogram =
         Histogram::new([0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0].into_iter());
@@ -246,7 +248,7 @@ lazy_static::lazy_static! {
     static ref GRANTS_IN_GRACE: Gauge = Default::default();
     static ref GRACE_MIN_REMAINING: Gauge = Default::default();
 
-    // Usage measurement (OB-14). Registered for the process like every other
+    // Usage measurement (OB-15). Registered for the process like every other
     // family, so they exist at zero on a portal that measures nothing.
     static ref USAGE_ENQUEUED: Counter = Default::default();
     static ref USAGE_DELIVERED: Counter = Default::default();
@@ -307,7 +309,7 @@ pub fn hotblocks_requests(outcome: HotblocksRequestOutcome) -> u64 {
         .get()
 }
 
-/// Every OB-14 signal, bound once at construction.
+/// Every OB-15 signal, bound once at construction.
 ///
 /// Pre-bound rather than looked up: the enqueue path runs inside a response
 /// body's poll, where a metric-family lookup is a lock and a hash per record.
@@ -386,6 +388,23 @@ pub(crate) fn auth_decision_labels(decision: AuthDecision, enforcement: &str) ->
 pub fn auth_decisions(decision: AuthDecision, enforcement: &str) -> u64 {
     AUTH_DECISIONS
         .get_or_create(&auth_decision_labels(decision, enforcement))
+        .get()
+}
+
+/// Count one credential presentation by the header it arrived in. Its own
+/// family rather than a label on the decision counter: it carries no verdict,
+/// which is what lets it publish in shadow mode too, and what keeps it out of
+/// INV-39's way.
+pub fn report_credential_channel(channel: &str) {
+    AUTH_CREDENTIAL_CHANNEL
+        .get_or_create(&vec![("channel".to_owned(), channel.to_owned())])
+        .inc();
+}
+
+#[cfg(test)]
+pub fn credential_channels(channel: &str) -> u64 {
+    AUTH_CREDENTIAL_CHANNEL
+        .get_or_create(&vec![("channel".to_owned(), channel.to_owned())])
         .get()
 }
 
@@ -503,16 +522,24 @@ fn occupancy_increments(running: usize, limit: usize, elapsed: Duration) -> (f64
 /// Carries the wire's `code`/`type`, prefixed — a bare `type` label says nothing on a
 /// metric. Errors only, so success series keep their label set. An unclassified error is
 /// still counted rather than dropped.
+///
+/// `dataset` is the configured name of the dataset the path named, on every series, so
+/// a failure rate can be read per dataset as well as per portal.
+///
+/// `data_source` is the layer that served the request or was chosen to, on every series, so
+/// traffic and failures can be split by data path.
 pub fn http_labels(
     endpoint: String,
     status: StatusCode,
     data_source: String,
+    dataset: String,
     error_code: Option<ErrorCode>,
 ) -> Labels {
     let mut labels = vec![
         ("endpoint".to_owned(), endpoint),
         ("status".to_owned(), status.as_str().to_owned()),
         ("data_source".to_owned(), data_source),
+        ("dataset".to_owned(), dataset),
     ];
 
     // Only failures carry the taxonomy. A 2xx is not one whatever a handler tagged it
@@ -539,10 +566,11 @@ pub fn report_http_response(
     endpoint: String,
     status: StatusCode,
     data_source: String,
+    dataset: String,
     error_code: Option<ErrorCode>,
     seconds_to_first_byte: f64,
 ) {
-    let labels = http_labels(endpoint, status, data_source, error_code);
+    let labels = http_labels(endpoint, status, data_source, dataset, error_code);
     HTTP_STATUS.get_or_create(&labels).inc();
     HTTP_TTFB
         .get_or_create(&labels)
@@ -774,6 +802,11 @@ pub fn register_metrics(registry: &mut Registry) {
         LAST_STORAGE_BLOCK.clone(),
     );
     registry.register(
+        "missing_assignment_source",
+        "Number of polls where the network state published no assignment of the selected source",
+        MISSING_ASSIGNMENT_SOURCE.clone(),
+    );
+    registry.register(
         "stale_assignments_rejected",
         "Number of assignments skipped because they were older than the current one",
         STALE_ASSIGNMENTS_REJECTED.clone(),
@@ -792,6 +825,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "auth_decisions",
         "Authorization evaluations by public outcome; empty unless the portal is configured with an `auth:` block",
         AUTH_DECISIONS.clone(),
+    );
+    registry.register(
+        "auth_credential_channel",
+        "Credential presentations by the header they arrived in; carries no key id and no verdict",
+        AUTH_CREDENTIAL_CHANNEL.clone(),
     );
     registry.register(
         "auth_exchanges",
@@ -884,6 +922,7 @@ mod tests {
             "/stream".to_owned(),
             StatusCode::from_u16(status).unwrap(),
             "network".to_owned(),
+            "ethereum-mainnet".to_owned(),
             code,
         )
     }
@@ -900,6 +939,29 @@ mod tests {
         let labels = labels_for(200, None);
         assert_eq!(get(&labels, "error_code"), None);
         assert_eq!(get(&labels, "error_type"), None);
+    }
+
+    /// Success and failure alike: a share per dataset needs the dataset on both sides.
+    #[test]
+    fn every_series_names_its_dataset() {
+        for (status, code) in [(200, None), (503, Some(ErrorCode::NoWorkers))] {
+            let labels = labels_for(status, code);
+            assert_eq!(
+                get(&labels, "dataset"),
+                Some("ethereum-mainnet"),
+                "{status}"
+            );
+        }
+    }
+
+    /// A failure keeps the layer that failed it: a failure rate per data path needs it on
+    /// both sides of the ratio.
+    #[test]
+    fn every_series_names_its_data_source() {
+        for (status, code) in [(200, None), (529, Some(ErrorCode::Overloaded))] {
+            let labels = labels_for(status, code);
+            assert_eq!(get(&labels, "data_source"), Some("network"), "{status}");
+        }
     }
 
     /// A 204 is the steady state of every polling client. Labelling it as an error type

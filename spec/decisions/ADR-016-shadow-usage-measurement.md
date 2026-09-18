@@ -62,7 +62,7 @@ acceptable and counted.
 4. **Loss is acceptable, bounded, and counted.** Records go into a bounded queue that
    drops rather than waits; delivery retries within an age bound and then drops. There is
    no spool and no disk. Totals are consequently a **lower bound with respect to loss**,
-   which is why the drop counters are part of the contract (OB-14) — a lower bound whose
+   which is why the drop counters are part of the contract (OB-15) — a lower bound whose
    gap is measured is usable; one whose gap is unknown is not.
 
 5. **Attribution comes from the grant, and is recorded rather than acted on.** Records
@@ -102,7 +102,7 @@ normalization instead would put it outside the gate, where there is no attributi
 data volume ever matters, that is scanned-bytes work, reopened as a stated limitation
 rather than smuggled in here.
 
-The measurement metric families (OB-14) are registered unconditionally, like every other
+The measurement metric families (OB-15) are registered unconditionally, like every other
 family the process has, and read zero where no `usage:` block is configured. The
 non-interference guarantee is about **data-surface responses** — status, headers, body,
 ending — and not about the `/metrics` document, which gains a handful of zero-valued

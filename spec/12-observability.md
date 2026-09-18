@@ -25,8 +25,13 @@ progress past P-STALL-BUDGET ⚠ is the LIV-2 witness.
 metric), attached to **4xx/5xx only** — a 2xx carries neither, so the routine 204 that
 is the steady state of every polling client cannot inflate an availability alert
 (INV-30). A failure reaching the middleware unclassified is still counted, as
-`unclassified`. The source label is `network`,
-`real_time`, or `none` for pre-routing failures; it does not imply a response header.
+`unclassified`. The source label names the layer that served the request or was
+chosen to, on failures as on successes: `network` or `hotblocks`. A route only the SQD
+Network answers carries `network` on every response; a route that picks per request
+carries the layer it picked, including on a failure after the pick. `none` is left to a
+request refused before a layer was chosen, and to the status, catalogue and probe routes,
+which serve no chain data. The label does not imply a response header; DEF-6 alone
+decides where one appears.
 **Truncations count separately** from completions (SLI-6 is computed from this);
 refusals by code distinguish `overloaded` from `no_workers` — the 2026-07 storm was
 misdiagnosed for lack of this split.
@@ -129,9 +134,9 @@ admits either way. The constraint is on movement, not on presence — these fami
 registered for the process, not per deployment mode, so they exist at zero on a shadow and
 on a non-authorizing portal alike. A series pinned at zero is the same series for every
 caller and every credential, which is what the rule protects; a series that moved would not
-be. OB-12's single `shadow_evaluated` outcome is shadow mode's entire public authorization
-projection. The load and cutover evidence it exists to gather remains in protected
-per-exchange events and in the control plane's own telemetry.
+be. OB-12's single `shadow_evaluated` outcome and OB-14's channel counts are shadow mode's
+entire public authorization projection. The load and cutover evidence it exists to gather
+remains in protected per-exchange events and in the control plane's own telemetry.
 
 The enforcing-mode `answered` class deliberately combines grants and denials. The cache is
 keyed on the whole credential (DEF-18), so an unknown key id and a known one presented with
@@ -143,7 +148,15 @@ verdict or either invalid case. Everything finer stays protected: per-exchange e
 structured logs, and CT-10 uses those plus the control-plane stub ledger as the
 LIV-14/HZ-10 witness.
 
-**OB-14 — Usage measurement health.** Measuring deployments only. The scrape carries what
+**OB-14 — Credential channel.** Authorizing deployments only, and in both modes. Every
+presented credential is counted by the header it arrived in (IB-9), whether or not it
+parsed and whatever the verdict was. The count carries no key id and no verdict, and tells
+a caller bracketing two scrapes only what it already knew — which header its own request
+used — which is why it may move where the OB-13 signals may not. It exists because
+withdrawing the legacy channel is a decision about whether anything still presents on it,
+and a deployment that cannot see that keeps the channel forever.
+
+**OB-15 — Usage measurement health.** Measuring deployments only. The scrape carries what
 was measured and what became of it: records handed to the reporter, records the sink
 accepted, records dropped **by reason** — queue full, aged out past
 P-USAGE-MAX-RETRY-AGE, refused on content, or produced after the reporter stopped —
@@ -188,7 +201,7 @@ question to answer during an incident.
 | LIV-13, LIV-14 | enforcing-mode OB-13 grace deadline and exchange outcomes; protected exchange events + stub ledger in both modes |
 | INV-6, INV-15, INV-39 | protected OB-12 reason logs + public non-disclosure; neutral shadow projection and enforcing-only OB-13 classes |
 | INV-30/31 | OB-1, OB-5 (they are the invariant's subject) |
-| INV-32, REQ-60/61 | OB-14 drop reasons and queue depth against the sink stub's ledger |
+| INV-32, REQ-60/61 | OB-15 drop reasons and queue depth against the sink stub's ledger |
 | SLI-1..6 | OB-2, OB-3, OB-1 + process RSS |
 
 ## Logging

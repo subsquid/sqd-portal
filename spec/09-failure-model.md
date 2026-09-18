@@ -40,6 +40,7 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 | Slow (past adaptive estimate) | mask — speculative parallel attempt (FV-2) |
 | Timeout | mask via reroute + cooldown P-WORKER-TIMEOUT-COOLDOWN; congestion signal |
 | Erroring | mask via reroute + cooldown P-WORKER-ERROR-COOLDOWN |
+| Clock skew (rejects the query envelope as stale) | mask via reroute + cooldown P-WORKER-ERROR-COOLDOWN; a skew on *our* side hits every candidate ⇒ fail-safe RETRIES-EXHAUSTED, never BAD-REQUEST |
 | Rate-limiting | mask via backoff honor; all-candidates-limited ⇒ fail-safe OVERLOADED |
 | Oversized response | fail-safe BAD-REQUEST (advise narrower query) |
 | Equivocating (bad signature / wrong-range data) | integrity: discard, reroute, count (REQ-43); never delivered; all attempts equivocating ⇒ fail-safe WORKER-FAILURE (pages); equivocation mixed with transient failures ⇒ fail-safe RETRIES-EXHAUSTED, the equivocation still counted and alarmed (DC-1) |
@@ -54,6 +55,7 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 | Corrupt / truncated artifact | integrity: reject, keep last good, alarm — **intent** (today: adopted unverified — GAP-1, ADR-002) |
 | Stale (identifier never advances) | degrade + alarm past P-ASSIGNMENT-MAX-AGE ⚠ (ADR-013) |
 | Regressive (older identifier republished) | mask — application legality ignores it (INV-2) |
+| Artifact of the source in force absent (P-ASSIGNMENT-SOURCE, else the state's own `assignment_type`, names one the state does not carry) | refuse: apply nothing, keep last good, count `missing_assignment_source`. Never substitute the other artifact — a silent substitution makes a canary that never ran indistinguishable from one that passed, and leaves the kill switch switching nothing off |
 
 ## Real-time source faults (DC-4)
 

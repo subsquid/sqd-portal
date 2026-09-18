@@ -26,7 +26,7 @@ use crate::{
     },
 };
 
-use super::stream::{DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK_METRIC, DATA_SOURCE_REALTIME_METRIC};
+use super::stream::{DataSource, DATA_SOURCE_HEADER};
 
 /// Block at Timestamp
 ///
@@ -81,6 +81,7 @@ pub(crate) async fn get_blocknumber_by_timestamp(
     .await
     .map(|resolved| {
         (
+            resolved.data_source,
             [(DATA_SOURCE_HEADER, resolved.data_source.as_str())],
             axum::Json(BlockNumberResponse {
                 block_number: resolved.block_number,
@@ -88,27 +89,20 @@ pub(crate) async fn get_blocknumber_by_timestamp(
         )
             .into_response()
     })
-    .unwrap_or_else(BlockNumberLookupError::into_response)
+    .unwrap_or_else(|failed| (failed.data_source, failed.error.into_response()).into_response())
 }
 
 pub struct ResolvedBlockNumber {
     block_number: u64,
-    data_source: BlockNumberDataSource,
+    data_source: DataSource,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BlockNumberDataSource {
-    Network,
-    Hotblocks,
-}
-
-impl BlockNumberDataSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Network => DATA_SOURCE_NETWORK_METRIC,
-            Self::Hotblocks => DATA_SOURCE_REALTIME_METRIC,
-        }
-    }
+/// A lookup that failed, and the layer that failed it: `None` only when there was no layer
+/// to ask.
+#[derive(Debug)]
+pub struct UnresolvedBlockNumber {
+    error: BlockNumberLookupError,
+    data_source: Option<DataSource>,
 }
 
 /// Failure modes for resolving a block number by timestamp.
@@ -229,7 +223,7 @@ pub async fn resolve(
     config: &Config,
     hotblocks: &HotblocksHandle,
     dataset: &DatasetConfig,
-) -> Result<ResolvedBlockNumber, BlockNumberLookupError> {
+) -> Result<ResolvedBlockNumber, UnresolvedBlockNumber> {
     get_blocknumber_by_timestamp_inner(
         dataset.network_id.is_some(),
         dataset.hotblocks.is_some(),
@@ -266,7 +260,7 @@ async fn get_blocknumber_by_timestamp_inner<
     has_hotblocks: bool,
     archive_lookup: ArchiveLookup,
     hotblocks_lookup: HotblocksLookup,
-) -> Result<ResolvedBlockNumber, BlockNumberLookupError>
+) -> Result<ResolvedBlockNumber, UnresolvedBlockNumber>
 where
     ArchiveLookup: FnOnce() -> ArchiveFuture,
     ArchiveFuture: Future<Output = Result<u64, BlockNumberLookupError>>,
@@ -279,31 +273,44 @@ where
         "resolving block number by timestamp"
     );
 
+    // The layer whose miss the final NotFound reports, if one was asked.
+    let mut missed_by = None;
+
     if has_archive {
         match archive_lookup().await {
             Ok(block_number) => {
                 return Ok(ResolvedBlockNumber {
                     block_number,
-                    data_source: BlockNumberDataSource::Network,
+                    data_source: DataSource::Network,
                 })
             }
-            Err(BlockNumberLookupError::NotFound(_)) => {}
-            Err(e) => return Err(e),
+            Err(BlockNumberLookupError::NotFound(_)) => missed_by = Some(DataSource::Network),
+            Err(error) => {
+                return Err(UnresolvedBlockNumber {
+                    error,
+                    data_source: Some(DataSource::Network),
+                })
+            }
         }
     }
 
     if has_hotblocks {
-        return hotblocks_lookup()
-            .await
-            .map(|block_number| ResolvedBlockNumber {
+        return match hotblocks_lookup().await {
+            Ok(block_number) => Ok(ResolvedBlockNumber {
                 block_number,
-                data_source: BlockNumberDataSource::Hotblocks,
-            });
+                data_source: DataSource::RealTime,
+            }),
+            Err(error) => Err(UnresolvedBlockNumber {
+                error,
+                data_source: Some(DataSource::RealTime),
+            }),
+        };
     }
 
-    Err(BlockNumberLookupError::NotFound(
-        "No block found for timestamp".to_string(),
-    ))
+    Err(UnresolvedBlockNumber {
+        error: BlockNumberLookupError::NotFound("No block found for timestamp".to_string()),
+        data_source: missed_by,
+    })
 }
 
 async fn get_archival_blocknumber_by_timestamp(
@@ -728,7 +735,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.block_number, 42);
-        assert_eq!(result.data_source, BlockNumberDataSource::Network);
+        assert_eq!(result.data_source, DataSource::Network);
         assert_eq!(archive_calls.load(Ordering::Relaxed), 1);
         assert_eq!(hotblocks_calls.load(Ordering::Relaxed), 0);
     }
@@ -762,7 +769,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.block_number, 84);
-        assert_eq!(result.data_source, BlockNumberDataSource::Hotblocks);
+        assert_eq!(result.data_source, DataSource::RealTime);
         assert_eq!(archive_calls.load(Ordering::Relaxed), 1);
         assert_eq!(hotblocks_calls.load(Ordering::Relaxed), 1);
     }
@@ -794,9 +801,58 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.block_number, 168);
-        assert_eq!(result.data_source, BlockNumberDataSource::Hotblocks);
+        assert_eq!(result.data_source, DataSource::RealTime);
         assert_eq!(archive_calls.load(Ordering::Relaxed), 0);
         assert_eq!(hotblocks_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A failure is labelled with the layer that failed it, not with none: a refusal from
+    /// the archive and one from hotblocks are different data paths failing.
+    #[tokio::test]
+    async fn a_failed_lookup_names_the_layer_that_failed_it() {
+        async fn unused() -> Result<u64, BlockNumberLookupError> {
+            unreachable!("the lookup ends before it asks this layer")
+        }
+        let overloaded = || async {
+            Err(BlockNumberLookupError::Refused(
+                RequestError::RateLimitExceeded,
+            ))
+        };
+        let missed = || async {
+            Err(BlockNumberLookupError::NotFound(
+                "No chunk found for timestamp".to_string(),
+            ))
+        };
+        let unavailable = || async {
+            Err(BlockNumberLookupError::Unavailable(
+                "hotblocks down".to_string(),
+            ))
+        };
+
+        let data_source = |result: Result<ResolvedBlockNumber, UnresolvedBlockNumber>| {
+            result.err().expect("the lookup fails").data_source
+        };
+
+        let archive_refused =
+            get_blocknumber_by_timestamp_inner(true, true, overloaded, unused).await;
+        assert_eq!(data_source(archive_refused), Some(DataSource::Network));
+
+        let hotblocks_failed_after_a_miss =
+            get_blocknumber_by_timestamp_inner(true, true, missed, unavailable).await;
+        assert_eq!(
+            data_source(hotblocks_failed_after_a_miss),
+            Some(DataSource::RealTime)
+        );
+
+        let archive_missed_without_fallback =
+            get_blocknumber_by_timestamp_inner(true, false, missed, unused).await;
+        assert_eq!(
+            data_source(archive_missed_without_fallback),
+            Some(DataSource::Network)
+        );
+
+        let nothing_to_ask = get_blocknumber_by_timestamp_inner(false, false, unused, unused).await;
+        assert_eq!(data_source(nothing_to_ask), None);
     }
 
     #[tokio::test]

@@ -33,6 +33,7 @@ use crate::endpoints::{
     block_number_by_timestamp::get_blocknumber_by_timestamp,
     stream::{
         run_archival_stream, run_archival_stream_restricted, run_finalized_stream, run_stream,
+        DataSource,
     },
 };
 use crate::hotblocks::HotblocksErr;
@@ -279,21 +280,23 @@ async fn head_response(
         let Some(dataset_id) = &dataset.network_id else {
             // Without an archival data source there is nothing to fall back to.
             if reports_min_finalized_head(dataset, mode) {
-                return match real_time_head(hotblocks, dataset, mode).await {
+                let response = match real_time_head(hotblocks, dataset, mode).await {
                     Ok(head) => axum::Json(head).into_response(),
                     Err(e) => forward_hotblocks_response(&dataset.default_name, Err(e)).await,
                 };
+                return (DataSource::RealTime, response).into_response();
             }
             // Pass the hotblocks response through unchanged.
-            return forward_hotblocks_response(
+            let response = forward_hotblocks_response(
                 &dataset.default_name,
                 hotblocks.request_head(&dataset.default_name, mode).await,
             )
             .await;
+            return (DataSource::RealTime, response).into_response();
         };
 
         match real_time_head(hotblocks, dataset, mode).await {
-            Ok(Some(head)) => return axum::Json(head).into_response(),
+            Ok(Some(head)) => return (DataSource::RealTime, axum::Json(head)).into_response(),
             Ok(None) => {}
             Err(e) => tracing::warn!(
                 "Couldn't get the real-time head of dataset {}: {e}",
@@ -304,11 +307,11 @@ async fn head_response(
         // Computing the archival head is not free, so it's only done once the real-time
         // head is known to be unavailable. It never exceeds either real-time head, so
         // it's safe to advertise for traceless datasets too.
-        return axum::Json(network.head(dataset_id)).into_response();
+        return (DataSource::Network, axum::Json(network.head(dataset_id))).into_response();
     }
 
     if let Some(dataset_id) = &dataset.network_id {
-        return axum::Json(network.head(dataset_id)).into_response();
+        return (DataSource::Network, axum::Json(network.head(dataset_id))).into_response();
     }
 
     coded_response(
@@ -690,12 +693,14 @@ fn gated_routes(auth_gate: Option<Arc<Gate>>, openapi_spec: &utoipa::openapi::Op
             "/datasets/:dataset/archival-stream",
             post(run_archival_stream_restricted)
                 .endpoint("/archival-stream")
+                .served_by(DataSource::Network)
                 .auth(),
         )
         .route(
             "/datasets/:dataset/archival-stream/debug",
             post(run_archival_stream)
                 .endpoint("/archival-stream/debug")
+                .served_by(DataSource::Network)
                 .auth(),
         )
         .route(
@@ -711,7 +716,10 @@ fn gated_routes(auth_gate: Option<Arc<Gate>>, openapi_spec: &utoipa::openapi::Op
         // Getting head
         .route(
             "/datasets/:dataset/archival-head",
-            get(get_archival_head).endpoint("/archival-head").no_auth(),
+            get(get_archival_head)
+                .endpoint("/archival-head")
+                .served_by(DataSource::Network)
+                .no_auth(),
         )
         .route(
             "/datasets/:dataset/finalized-head",
@@ -726,7 +734,10 @@ fn gated_routes(auth_gate: Option<Arc<Gate>>, openapi_spec: &utoipa::openapi::Op
         // Dataset info
         .route(
             "/datasets/:dataset/state",
-            get(get_dataset_state).endpoint("/state").no_auth(),
+            get(get_dataset_state)
+                .endpoint("/state")
+                .served_by(DataSource::Network)
+                .no_auth(),
         )
         .route(
             "/datasets/:dataset",
@@ -747,25 +758,36 @@ fn gated_routes(auth_gate: Option<Arc<Gate>>, openapi_spec: &utoipa::openapi::Op
             "/datasets/:dataset/finalized-stream/height",
             get(get_finalized_stream_height)
                 .endpoint("/height")
+                .served_by(DataSource::Network)
                 .no_auth(),
         )
         .route(
             "/datasets/:dataset/archival-stream/height",
             get(get_archival_stream_height)
                 .endpoint("/height")
+                .served_by(DataSource::Network)
                 .no_auth(),
         )
         .route(
             "/datasets/:dataset_id/query/:worker_id",
-            post(execute_query).endpoint("/query").auth(),
+            post(execute_query)
+                .endpoint("/query")
+                .served_by(DataSource::Network)
+                .auth(),
         )
         .route(
             "/datasets/:dataset/height",
-            get(get_height).endpoint("/height").no_auth(),
+            get(get_height)
+                .endpoint("/height")
+                .served_by(DataSource::Network)
+                .no_auth(),
         )
         .route(
             "/datasets/:dataset/:start_block/worker",
-            get(get_worker).endpoint("/worker").no_auth(),
+            get(get_worker)
+                .endpoint("/worker")
+                .served_by(DataSource::Network)
+                .no_auth(),
         )
         // Internal routes
         .route(
@@ -774,7 +796,10 @@ fn gated_routes(auth_gate: Option<Arc<Gate>>, openapi_spec: &utoipa::openapi::Op
         )
         .route(
             "/datasets/:dataset/:block/debug",
-            get(get_debug_block).endpoint("/block/debug").no_auth(),
+            get(get_debug_block)
+                .endpoint("/block/debug")
+                .served_by(DataSource::Network)
+                .no_auth(),
         )
         // Ops probes and the served schema: never gated, or a pod that cannot
         // answer its own readiness check leaves rotation.
@@ -791,7 +816,13 @@ fn gated_routes(auth_gate: Option<Arc<Gate>>, openapi_spec: &utoipa::openapi::Op
     // matter, are separate work with a separate measurement.
     #[cfg(feature = "sql")]
     let routes = routes
-        .route("/sql/query", post(sql_query).endpoint("/sql/query").auth())
+        .route(
+            "/sql/query",
+            post(sql_query)
+                .endpoint("/sql/query")
+                .served_by(DataSource::Network)
+                .auth(),
+        )
         .route(
             "/sql/metadata",
             get(sql_metadata).endpoint("/sql/metadata").no_auth(),
@@ -1019,9 +1050,9 @@ async fn execute_query(
     let Ok(chunk) = client.find_chunk(&dataset_id, query.first_block()) else {
         return RequestError::NoData.into_response();
     };
-    let range = query
-        .intersect_with(&chunk.block_range())
-        .expect("Found chunk should intersect with query");
+    let Some(range) = query.intersect_with(&chunk.block_range()) else {
+        return RequestError::NoData.into_response();
+    };
 
     let lease = match client.reserve_worker(worker_id) {
         Some(lease) => lease,
@@ -1717,6 +1748,82 @@ mod tests {
         ));
 
         assert_eq!(routes.inventory(), expected.as_slice());
+    }
+
+    /// Which layer each route declares for the HTTP metrics. A route that only one layer can
+    /// answer names it on every response, refusals included; a route that picks per request,
+    /// or touches no data, declares nothing and is left to its handler. The handlers here fail
+    /// on their missing extensions, so what each response carries is the declaration alone.
+    #[tokio::test]
+    async fn every_route_that_one_layer_answers_declares_it() {
+        use tower::ServiceExt;
+
+        let network = Some(DataSource::Network);
+        #[allow(unused_mut)]
+        let mut expected: Vec<(Method, &str, Option<DataSource>)> = vec![
+            (Method::GET, "/status", None),
+            (Method::GET, "/datasets", None),
+            (Method::POST, "/datasets/eth/archival-stream", network),
+            (Method::POST, "/datasets/eth/archival-stream/debug", network),
+            (Method::POST, "/datasets/eth/finalized-stream", None),
+            (Method::POST, "/datasets/eth/stream", None),
+            (Method::GET, "/datasets/eth/archival-head", network),
+            (Method::GET, "/datasets/eth/finalized-head", None),
+            (Method::GET, "/datasets/eth/head", None),
+            (Method::GET, "/datasets/eth/state", network),
+            (Method::GET, "/datasets/eth", None),
+            (Method::GET, "/datasets/eth/metadata", None),
+            (
+                Method::GET,
+                "/datasets/eth/timestamps/1700000000/block",
+                None,
+            ),
+            (
+                Method::GET,
+                "/datasets/eth/finalized-stream/height",
+                network,
+            ),
+            (Method::GET, "/datasets/eth/archival-stream/height", network),
+            (Method::POST, "/datasets/eth/query/worker", network),
+            (Method::GET, "/datasets/eth/height", network),
+            (Method::GET, "/datasets/eth/1/worker", network),
+            (Method::GET, "/debug/workers", None),
+            (Method::GET, "/datasets/eth/1/debug", network),
+            (Method::GET, "/metrics", None),
+            (Method::GET, "/ready", None),
+        ];
+        #[cfg(feature = "sql")]
+        expected.extend([
+            (Method::POST, "/sql/query", network),
+            (Method::GET, "/sql/metadata", None),
+        ]);
+
+        let app = gated_routes(None, &build_openapi_spec(false)).into_router();
+        for (method, uri, data_source) in expected {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // An unmatched path carries no declaration either, and would pass as `None`.
+            assert_ne!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} is not routed"
+            );
+            assert_eq!(
+                response.extensions().get::<DataSource>().copied(),
+                data_source,
+                "{uri}"
+            );
+        }
     }
 
     #[tokio::test]

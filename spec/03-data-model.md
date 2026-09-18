@@ -20,16 +20,28 @@ the query's field selection. Per-chain record schemas are explicitly unspecified
 
 **DEF-3 — Chunk.** An immutable, contiguous, non-overlapping range of finalized blocks;
 the archival network's unit of storage, assignment, and query. Chunks of a dataset are
-totally ordered and gap-free from the dataset's start block to the archival head.
+totally ordered and non-overlapping. Coverage is normally continuous from the dataset's
+start block to the archival head, but a **coverage gap** — a block range no chunk holds —
+is legal, and the two published artifacts (P-ASSIGNMENT-SOURCE) differ in what the Portal
+can do about one. The `portal` artifact states each chunk's last block, so a block inside a
+gap is recognised as such and resolves *forward*, to the first chunk after it: a stream
+crosses the hole and continues. The `legacy` artifact is ordered on first blocks alone, so
+the same block resolves *backward*, to the chunk before the gap — which shares none of the
+requested range — and the request yields no data (INV-27) even where later chunks hold
+some. Neither resolution skips data a chunk actually holds.
 
 **DEF-4 — Assignment artifact.** The routing document the network publishes:
 (identifier, effective-from time, worker set, per-dataset chunk sequences — each chunk
 carrying its block range and the reference (DEF-2) of its last block — and the chunk →
 worker-subset mapping). Identifiers are opaque; artifacts are ordered by their
-effective-from times. The **applied artifact** is the single artifact the Portal
-currently routes by. An artifact is *applied* atomically, never partially (INV-1), no
+effective-from times. An artifact is fetched compressed and decompressed as it streams;
+the published url's suffix names the codec, `.zst` for zstd and gzip otherwise, since the
+network state carries no field for it. The **applied artifact** is the single artifact the
+Portal currently routes by. An artifact is *applied* atomically, never partially (INV-1), no
 earlier than its effective-from time, and never with an effective-from earlier than the
-applied one's (regression guard, INV-2).
+applied one's (regression guard, INV-2). Only the `legacy` artifact declares an effective-from:
+the `split` pair has no such field, so its artifacts apply as soon as they are fetched and
+ordering rests on the identifier alone (GAP-37).
 
 **DEF-5 — Heads and the frontier.** Per dataset: the **archival head** (the reference
 of the last assigned chunk's last block), the **real-time head** (reported by the

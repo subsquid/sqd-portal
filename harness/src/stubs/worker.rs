@@ -15,7 +15,7 @@ use clap::Parser;
 use flate2::{write::GzEncoder, Compression};
 use futures::StreamExt;
 use libp2p_identity::Keypair;
-use sqd_messages::query_error;
+use sqd_messages::{query_error, ProstMsg};
 use sqd_network_transport::{
     AgentInfo, P2PTransportBuilder, TransportArgs, WorkerConfig, WorkerEvent,
 };
@@ -45,6 +45,8 @@ pub enum WorkerFault {
     /// Answer "chunk not found" — the worker is still downloading it. Same
     /// DC-1 row as ServerError, but the portal treats it as retriable.
     NotFound(String),
+    /// Refuse for clock skew: a bad-request verdict that must still reroute.
+    StaleEnvelope,
     /// Refuse for capacity: the rate-limit verdict.
     TooManyRequests,
     /// Refuse for capacity: the overload verdict. One DC-1 row with the above.
@@ -142,19 +144,31 @@ pub async fn start(
     let ledger = Ledger::default();
     let ledger2 = ledger.clone();
     tokio::spawn(async move {
+        // Responses now go straight down `resp_chan`, so nothing here calls the handle — but
+        // dropping it stops the transport task, so it has to outlive the event loop.
+        let _handle = handle;
         futures::pin_mut!(events);
         while let Some(event) = events.next().await {
             match event {
+                // The transport hands over raw protobuf now: decoding moved to the consumer,
+                // so a stub worker has to do exactly what a real one does with the bytes.
                 WorkerEvent::Query {
                     peer_id,
-                    query,
+                    request,
                     resp_chan,
                 } => {
+                    let query = match sqd_messages::Query::decode(request.as_ref()) {
+                        Ok(query) => query,
+                        Err(e) => {
+                            tracing::warn!(%peer_id, error = %e, "undecodable query");
+                            continue;
+                        }
+                    };
                     let fault = faults.next();
                     tracing::info!(%peer_id, chunk = %query.chunk_id, ?fault, "stub worker query");
                     let result = answer(&world, &signing_keypair, &query, &ledger2, fault);
-                    if handle.send_query_result(result, resp_chan).is_err() {
-                        tracing::warn!("query result queue full");
+                    if let Err(e) = resp_chan.send(&result.encode_to_vec()).await {
+                        tracing::warn!(%peer_id, error = %e, "failed to send query result");
                     }
                 }
                 other => tracing::debug!("ignoring worker event: {other:?}"),
@@ -192,6 +206,13 @@ fn answer(
         }
         Some(WorkerFault::NotFound(m)) => {
             return verdict_result(query, keypair, query_error::Err::NotFound(m.clone()))
+        }
+        Some(WorkerFault::StaleEnvelope) => {
+            return verdict_result(
+                query,
+                keypair,
+                query_error::Err::BadRequest("timestamp out of allowed range".to_owned()),
+            )
         }
         Some(WorkerFault::TooManyRequests) => {
             return verdict_result(query, keypair, query_error::Err::TooManyRequests(()))
@@ -240,7 +261,10 @@ fn answer(
     let mut result = sqd_messages::QueryResult {
         query_id: query.query_id.clone(),
         result: Some(sqd_messages::query_result::Result::Ok(
-            sqd_messages::QueryOk { data, last_block },
+            sqd_messages::QueryOk {
+                data: data.into(),
+                last_block,
+            },
         )),
         ..Default::default()
     };

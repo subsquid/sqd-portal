@@ -201,6 +201,15 @@ impl<N: StreamingNetwork> StreamController<N> {
             }
         };
 
+        // Gap resolution can return a chunk on either side of the requested range.
+        if request
+            .query
+            .intersect_with(&first_chunk.block_range())
+            .is_none()
+        {
+            return Err(RequestError::NoData);
+        }
+
         Ok(Self {
             network,
             buffer: SlidingArray::with_capacity(request.buffer_size),
@@ -1182,7 +1191,7 @@ mod tests {
 
     fn partial_result(end: u64, last_returned: u64, data: &[u8]) -> PartialResult {
         PartialResult {
-            data: data.to_vec(),
+            data: data.to_vec().into(),
             next_range: BlockRange::new(last_returned + 1, end),
         }
     }
@@ -1191,7 +1200,7 @@ mod tests {
         BufferedResponse {
             chunk_index: 0,
             read_range: 100..=149,
-            result: Ok(vec![1, 2, 3]),
+            result: Ok(vec![1, 2, 3].into()),
         }
     }
 
@@ -1205,7 +1214,7 @@ mod tests {
         assert_eq!(response.read_range, BlockRange::new(100, 120));
         assert_eq!(response.chunk_index, 0);
         match response.result {
-            Ok(data) => assert_eq!(data, b"first"),
+            Ok(data) => assert_eq!(data.as_ref(), b"first"),
             Err(_) => panic!("partial data should become an emit-ready response"),
         }
         assert_eq!(continuation.range, BlockRange::new(121, 200));
@@ -1246,7 +1255,7 @@ mod tests {
     fn active_partial_counts_as_stored_result() {
         let chunk_slot = ChunkSlot {
             active: Some(slot(RequestState::Partial(PartialResult {
-                data: vec![1],
+                data: vec![1].into(),
                 next_range: 150..=199,
             }))),
             buffered: VecDeque::new(),
@@ -1259,7 +1268,7 @@ mod tests {
     fn partial_continuation_requires_capacity_for_next_active_result() {
         let mut chunk_slot = ChunkSlot {
             active: Some(slot(RequestState::Partial(PartialResult {
-                data: vec![1],
+                data: vec![1].into(),
                 next_range: 150..=199,
             }))),
             buffered: VecDeque::new(),
@@ -1276,7 +1285,7 @@ mod tests {
     #[test]
     fn terminal_response_can_use_last_capacity_slot() {
         let mut chunk_slot = ChunkSlot {
-            active: Some(slot(RequestState::Done(Ok(vec![4, 5, 6])))),
+            active: Some(slot(RequestState::Done(Ok(vec![4, 5, 6].into())))),
             buffered: VecDeque::new(),
         };
 
@@ -1338,7 +1347,8 @@ mod tests {
                 Ok(QuerySuccess {
                     ok: sqd_messages::QueryOk {
                         data: format!("data-{}-{}", block_range.start(), block_range.end())
-                            .into_bytes(),
+                            .into_bytes()
+                            .into(),
                         last_block: *block_range.end(),
                     },
                     ttfb: Duration::from_millis(1),
@@ -1371,6 +1381,27 @@ mod tests {
             retries: 1,
             compression: Compression::Gzip,
             skip_parent_hash_validation: false,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chunk_sharing_no_block_with_the_query_is_no_data() {
+        for chunk in [
+            DataChunk::new(0, 200, 299, "aaaaa").unwrap(), // portal: the gap resolved forward
+            DataChunk::new(0, 0, 99, "aaaaa").unwrap(),    // legacy: the chunk before the gap
+        ] {
+            let network = Arc::new(MockNetwork {
+                chunk,
+                backoff_until: Instant::now(),
+                queries_sent: AtomicUsize::new(0),
+            });
+
+            let result = StreamController::new(stream_request(), network, 0, 1);
+
+            let Err(err) = result else {
+                panic!("a range holding no data is not a stream ({chunk})");
+            };
+            assert!(matches!(err, RequestError::NoData), "{chunk}: got {err:?}");
         }
     }
 
@@ -1604,7 +1635,7 @@ mod tests {
                 }
                 Ok(QuerySuccess {
                     ok: sqd_messages::QueryOk {
-                        data: format!("{start}:{last}").into_bytes(),
+                        data: format!("{start}:{last}").into_bytes().into(),
                         last_block: last,
                     },
                     ttfb: Duration::from_millis(1),
@@ -1777,7 +1808,7 @@ mod tests {
         while let Some(item) = controller.next().await {
             match item {
                 Ok(bytes) => {
-                    let text = String::from_utf8(bytes).unwrap();
+                    let text = String::from_utf8(bytes.to_vec()).unwrap();
                     let (start, last) = text.split_once(':').unwrap();
                     emissions.push((start.parse().unwrap(), last.parse().unwrap()));
                 }
@@ -1950,7 +1981,7 @@ mod tests {
         let success = |last_block| {
             Ok(QuerySuccess {
                 ok: sqd_messages::QueryOk {
-                    data: b"data".to_vec(),
+                    data: b"data".to_vec().into(),
                     last_block,
                 },
                 ttfb: Duration::from_millis(1),

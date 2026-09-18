@@ -28,6 +28,7 @@ alternatives exist.
 | Worker fault | Own class / action |
 |---|---|
 | invalid-query verdict | BAD-REQUEST (terminal for the request) |
+| stale-envelope verdict (the worker's clock disagrees with ours beyond the protocol's freshness window) | reroute; cooldown P-WORKER-ERROR-COOLDOWN; exhausted ⇒ RETRIES-EXHAUSTED. Never BAD-REQUEST: the query is well-formed and the next worker may accept it unchanged |
 | result exceeds size cap | BAD-REQUEST advising a narrower query |
 | parent-hash mismatch verdict | CONFLICT (real-time mode only — finalized-mode queries carry no parent hash, REQ-3) |
 | server error / not found | reroute; cooldown P-WORKER-ERROR-COOLDOWN; exhausted ⇒ RETRIES-EXHAUSTED |
@@ -46,8 +47,9 @@ and the divergence can take the whole pool out at once (GAP-27).
 *Role.* Source of the assignment artifact (DEF-4); consulted by a background loop only,
 never on a request path.
 *Call contract.* Poll every P-ASSIGNMENT-REFRESH; fetch deadline
-P-ASSIGNMENT-FETCH-TIMEOUT; unchanged identifier ⇒ no re-download; application waits
-for effective-from.
+P-ASSIGNMENT-FETCH-TIMEOUT; the state's `assignment_type` names which artifact to read
+unless P-ASSIGNMENT-SOURCE pins one; unchanged identifier ⇒ no re-download; application
+waits for effective-from where one is declared (`legacy` only — GAP-37).
 *Error mapping.* Fetch/parse failure → keep serving the applied artifact; alarm
 (⚠ today only a log — GAP-2). Never surfaces to clients directly.
 *Degradation.* Serve-stale, currently unbounded; intent bounds it at
@@ -216,9 +218,9 @@ reason. Never on a request path, never awaited by one.
 *Degradation.* Lossy by design, and never anything else: there is no spool, no disk, no
 backpressure onto serving, and no error path from here into a response (REQ-61, INV-32).
 The one thing the Portal owes the data is that what *is* reported is accurate about what
-was served, and that what is lost is visible as a number (OB-14) — including at shutdown,
+was served, and that what is lost is visible as a number (OB-15) — including at shutdown,
 where the records the bounded flush cannot place are counted by cause rather than
-abandoned. On a deployment where this contract is vacuous the OB-14 families are still
+abandoned. On a deployment where this contract is vacuous the OB-15 families are still
 registered and read zero: the non-interference guarantee is over responses, not over the
 scrape's shape.
 

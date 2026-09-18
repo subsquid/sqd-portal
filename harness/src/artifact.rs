@@ -6,9 +6,13 @@ use std::io::Write;
 
 use flate2::{write::GzEncoder, Compression};
 use libp2p_identity::PeerId;
-use sqd_assignments::AssignmentBuilder;
+use sqd_assignments::{AssignmentBuilder, PortalAssignmentBuilder};
 
 use crate::world::ToyWorld;
+
+/// The scheduler's own type, re-exported: it is both what the portal is pinned to and what a
+/// published state names, so the stubs and the CT files spell it the way the portal does.
+pub use sqd_assignments::AssignmentType;
 
 /// Build the artifact assigning every archival chunk to every worker, then
 /// gzip it. The portal pre-leases `1 + retries` *distinct* workers per chunk,
@@ -55,7 +59,53 @@ pub fn build_gzipped(world: &ToyWorld, workers: &[PeerId]) -> anyhow::Result<Vec
         );
     }
 
-    let bytes = b.finish();
+    gzip(b.finish())
+}
+
+/// The same world in the portal-oriented format. It carries no download or auth fields at
+/// all, so what the portal routes from here is strictly less than the legacy artifact holds —
+/// which is the point of running the smoke against both.
+pub fn build_portal_gzipped(world: &ToyWorld, workers: &[PeerId]) -> anyhow::Result<Vec<u8>> {
+    let mut workers: Vec<PeerId> = workers.to_vec();
+    workers.sort();
+    let worker_indexes: Vec<u16> = (0..workers.len() as u16).collect();
+
+    let mut b = PortalAssignmentBuilder::new();
+
+    for ds in &world.datasets {
+        let Some(network_id) = &ds.network_id else {
+            continue;
+        };
+        // Chunks are staged under the dataset they were opened against rather than naming one
+        // themselves. Schema ids are inert — the portal doesn't read them yet.
+        let mut dataset = b.new_dataset(network_id, 0);
+        let mut head_hash = None;
+        for chunk in &ds.chunks {
+            dataset
+                .new_chunk()
+                .id(&chunk.id(&ds.name))
+                .block_range(chunk.first..=chunk.last)
+                .last_block_timestamp(world.timestamp(chunk.last))
+                .worker_indexes(&worker_indexes)
+                .finish()
+                .map_err(|e| anyhow::anyhow!("chunk build: {e}"))?;
+            head_hash = Some(world.hash(&ds.name, chunk.last));
+        }
+        // Only the dataset's head hash survives the split; per-chunk hashes were dropped
+        // because no query needs one.
+        dataset
+            .finish(head_hash.as_deref())
+            .map_err(|e| anyhow::anyhow!("dataset build: {e}"))?;
+    }
+
+    for worker in &workers {
+        b.add_worker(*worker, sqd_assignments::WorkerStatus::Ok);
+    }
+
+    gzip(b.finish())
+}
+
+fn gzip(bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(&bytes)?;
     Ok(enc.finish()?)

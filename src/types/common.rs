@@ -1,4 +1,4 @@
-pub type ResponseChunk = Vec<u8>;
+pub type ResponseChunk = bytes::Bytes;
 
 pub type QueryId = String;
 

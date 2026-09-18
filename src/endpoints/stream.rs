@@ -1,12 +1,11 @@
-use std::{sync::Arc, time::Duration};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
     http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, IntoResponseParts, Response, ResponseParts},
     Extension,
 };
-use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
 use crate::{
@@ -17,7 +16,7 @@ use crate::{
     http_server::{forward_hotblocks_response, forward_response},
     network::NetworkClient,
     openapi::{BaseBlockConflictResponse, StreamRequestBody},
-    types::{Compression, DatasetId, ErrorResponse, RequestError, StreamRequest},
+    types::{Compression, DatasetId, ErrorResponse, RequestError, ResponseChunk, StreamRequest},
     utils::conversion::{join_gzip_default, recompress_gzip},
 };
 
@@ -420,16 +419,19 @@ async fn stream_after_network_head(network: &NetworkClient, dataset_id: DatasetI
 }
 
 fn response_body(
-    stream: impl Stream<Item = Vec<u8>> + Send + 'static,
+    stream: impl Stream<Item = ResponseChunk> + Send + 'static,
     compression: Compression,
     use_gzjoin: bool,
 ) -> Body {
     match compression {
-        Compression::Gzip if use_gzjoin => Body::from_stream(join_gzip_default(stream)),
-        Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
-        Compression::Zstd => {
-            Body::from_stream(stream.map(|result| std::io::Result::Ok(Bytes::from_owner(result))))
+        // Only this path owns its input: it hands the buffer to zlib through a raw pointer, so
+        // it cannot take a slice of one shared with the decoded response. Lifting the copy means
+        // auditing that `inflate` only ever reads `next_in`, which is not this change's business.
+        Compression::Gzip if use_gzjoin => {
+            Body::from_stream(join_gzip_default(stream.map(|chunk| chunk.to_vec())))
         }
+        Compression::Gzip => Body::from_stream(recompress_gzip(stream)),
+        Compression::Zstd => Body::from_stream(stream.map(std::io::Result::Ok)),
     }
 }
 
@@ -511,6 +513,36 @@ pub(crate) const DATA_SOURCE_NETWORK_METRIC: &str = "network";
 pub(crate) const DATA_SOURCE_REALTIME_METRIC: &str = "real_time";
 const DATA_SOURCE_NETWORK: HeaderValue = HeaderValue::from_static(DATA_SOURCE_NETWORK_METRIC);
 const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static(DATA_SOURCE_REALTIME_METRIC);
+
+/// The layer that served a response, or was chosen to serve it.
+///
+/// A response extension read by the HTTP metrics, never written to the wire: DEF-6 puts
+/// `x-sqd-data-source` on stream and timestamp responses only, while the metric names the
+/// layer on every response that has one, errors included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataSource {
+    Network,
+    RealTime,
+}
+
+impl DataSource {
+    /// The `x-sqd-data-source` spelling.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Network => DATA_SOURCE_NETWORK_METRIC,
+            Self::RealTime => DATA_SOURCE_REALTIME_METRIC,
+        }
+    }
+}
+
+impl IntoResponseParts for DataSource {
+    type Error = Infallible;
+
+    fn into_response_parts(self, mut res: ResponseParts) -> Result<ResponseParts, Self::Error> {
+        res.extensions_mut().insert(self);
+        Ok(res)
+    }
+}
 
 #[cfg(test)]
 mod tests {
