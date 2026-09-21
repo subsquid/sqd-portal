@@ -144,25 +144,50 @@ fn statuses(events: &[Value]) -> Vec<String> {
 /// Waits for the reporter's own cadence rather than guessing at it: the flush
 /// interval bounds publication, so a test that asserts before it would be
 /// asserting on the clock.
-async fn wait_for_events(
+async fn wait_for(
     fx: &Fixture,
     key_id: &str,
-    at_least: usize,
+    what: &str,
+    ready: impl Fn(&[Value]) -> bool,
 ) -> anyhow::Result<Vec<Value>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let events = fx.cp().usage_events_for(key_id);
-        if events.len() >= at_least {
+        if ready(&events) {
             return Ok(events);
         }
         ensure!(
             tokio::time::Instant::now() < deadline,
-            "waited 30s for {at_least} usage records for {key_id}, saw {}: {:?}",
+            "waited 30s for {what} for {key_id}, saw {}: {:?}",
             events.len(),
             fx.cp().usage_events(),
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+async fn wait_for_events(
+    fx: &Fixture,
+    key_id: &str,
+    at_least: usize,
+) -> anyhow::Result<Vec<Value>> {
+    wait_for(fx, key_id, &format!("{at_least} usage records"), |events| {
+        events.len() >= at_least
+    })
+    .await
+}
+
+/// Waits for the record that *ends* a response, which is the only thing a
+/// count cannot express: a paced stream publishes interim deltas as it goes, so
+/// "at least two records" arrives well before the terminal one and whatever
+/// asserts on it afterwards is racing the stream. A flake there reads exactly
+/// like a measurement fault, which is the most expensive kind of noise this
+/// suite can make.
+async fn wait_for_completion(fx: &Fixture, key_id: &str) -> anyhow::Result<Vec<Value>> {
+    wait_for(fx, key_id, "a completed usage record", |events| {
+        events.iter().any(|event| event["status"] == "completed")
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +266,6 @@ async fn measuring(fx: &mut Fixture) -> anyhow::Result<()> {
     // six concurrent streams would measure the pool rather than the reporter;
     // six requests of a few milliseconds each land well inside one flush
     // interval either way.
-    let batches_before = fx.cp().usage_batches().len();
     for index in 0..6 {
         let served = stream_as(
             fx,
@@ -258,7 +282,15 @@ async fn measuring(fx: &mut Fixture) -> anyhow::Result<()> {
         );
     }
     let batched = wait_for_events(fx, "batched", 6).await?;
-    let deliveries = fx.cp().usage_batches().len() - batches_before;
+    // Only the deliveries that carried these records. A window count would also
+    // sweep up batches belonging to earlier sections, which is a number about
+    // the rest of the test rather than about batching.
+    let deliveries = fx
+        .cp()
+        .usage_batches()
+        .iter()
+        .filter(|batch| batch.iter().any(|event| event["key_id"] == "batched"))
+        .count();
     ensure!(
         deliveries < batched.len(),
         "six records arrived in {deliveries} deliveries: the sink's call rate is the request rate",
@@ -279,7 +311,12 @@ async fn measuring(fx: &mut Fixture) -> anyhow::Result<()> {
         paced.decode_errors,
     );
 
-    let deltas = wait_for_events(fx, "paced", 2).await?;
+    let deltas = wait_for_completion(fx, "paced").await?;
+    ensure!(
+        deltas.len() >= 2,
+        "a stream outliving P-USAGE-INTERIM reports more than once: {:?}",
+        statuses(&deltas),
+    );
     ensure!(
         statuses(&deltas).last().map(String::as_str) == Some("completed"),
         "the last record ends the response: {:?}",

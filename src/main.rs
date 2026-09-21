@@ -269,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
             .observe_occupancy(cancellation_token.clone()),
     );
 
-    let (server_res, ()) = tokio::try_join!(
+    let served = tokio::try_join!(
         tokio::spawn(run_server(
             task_manager,
             network_client.clone(),
@@ -283,17 +283,24 @@ async fn main() -> anyhow::Result<()> {
             auth_gate,
         )),
         network_client.run(cancellation_token),
-    )?;
-    server_res?;
+    );
 
     // This, and nothing before it, stops the reporter: the drain's own token
     // fires up to a whole drain before serving ends, and the records cut while
     // streams are being closed are the ones worth keeping. Bounded by the
     // reporter's own budget — what does not go out here is dropped and counted,
     // like every other record the sink could not take.
+    //
+    // Ahead of the errors below rather than after them, because an exit is an
+    // exit: the records already cut bought the same bytes either way, and a
+    // flush the failing path skips makes DC-9's bargain a claim about the happy
+    // path only.
     if let Some(authorization) = authorization {
         authorization.finish().await;
     }
+
+    let (server_res, ()) = served?;
+    server_res?;
 
     Ok(())
 }
