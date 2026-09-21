@@ -106,7 +106,9 @@ head-tailing client rather than an edge.
 Framing is a property of the message and no body type can be wrong about it. RFC 9112 §6
 gives three, and each carries its own proof of delivery: a bodiless message (HEAD, 204,
 304) is delivered on arrival; a length-delimited one when the count is reached; a
-stream-delimited one only by ending. The tap fixes which of the three applies before a
+stream-delimited one only by ending. The count is what settles a length-delimited message
+either way — a stream of one that ends short of its own header is a truncation the client
+sees, and the end of the stream does not redeem it. The tap fixes which of the three applies before a
 byte moves, from the same inputs hyper uses — the request method, the status, the framing
 headers, and the body's size hint where no header names a length. A message framed both
 ways is treated as stream-delimited, since that is what hyper honours and nothing may then

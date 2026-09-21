@@ -223,6 +223,15 @@ impl Meter {
         }
         self.finished = true;
         let status = match (stopped, self.framing) {
+            // Ending is not the same as delivering: a body that runs out before
+            // the length its own message declared leaves the client an
+            // incomplete message, however cleanly the stream finished. Asking
+            // the framing here too, rather than taking the end of stream as the
+            // answer, is the mirror of the case this table exists for — and the
+            // quieter one, since it errs toward calling a truncation a success.
+            (Stopped::Eof, Framing::Length(length)) if self.yielded < length => {
+                Status::Disconnected
+            }
             // A stream that ended, or failed, said so itself.
             (Stopped::Eof, _) => Status::Completed,
             (Stopped::Error, _) => Status::Disconnected,
@@ -594,6 +603,32 @@ mod tests {
 
         assert_eq!(poll_one(&mut body).await, 10);
         drop(body);
+
+        let events = drain(&mut events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, Status::Disconnected);
+        assert_eq!(events[0].wire_bytes, 10);
+    }
+
+    /// The quiet half of the same question. A stream that ends is normally the
+    /// strongest proof of delivery there is, except where the message already
+    /// said how much it would carry: ending short of that is a truncation the
+    /// client sees, and recording it as a delivery is the one error that never
+    /// looks like one on a graph.
+    #[tokio::test]
+    async fn a_length_delimited_stream_that_ends_short_is_a_disconnect() {
+        let (response, mut events) = proxied(StatusCode::OK, vec!["0123456789"], Some(20));
+        let mut body = response.into_body();
+
+        assert_eq!(poll_one(&mut body).await, 10);
+        // Polled to the end, unlike every other short case: the stream really
+        // did finish, it just had less in it than the header promised.
+        assert!(
+            std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+                .await
+                .is_none(),
+            "the premise: the stream ended of its own accord"
+        );
 
         let events = drain(&mut events);
         assert_eq!(events.len(), 1);
