@@ -7756,7 +7756,7 @@ dependencies = [
 [[package]]
 name = "sqd-bloom-filter"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=eaa9f86#eaa9f862069390d19a75af13b6f1540800bbae02"
+source = "git+https://github.com/subsquid/data.git?rev=48373fe#48373fe7c00581dbbd77abc816caaf7de243b768"
 dependencies = [
  "xxhash-rust",
 ]
@@ -7834,7 +7834,7 @@ dependencies = [
 [[package]]
 name = "sqd-polars"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=eaa9f86#eaa9f862069390d19a75af13b6f1540800bbae02"
+source = "git+https://github.com/subsquid/data.git?rev=48373fe#48373fe7c00581dbbd77abc816caaf7de243b768"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7845,7 +7845,7 @@ dependencies = [
 
 [[package]]
 name = "sqd-portal"
-version = "0.14.4"
+version = "0.14.5"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -7920,7 +7920,7 @@ dependencies = [
 [[package]]
 name = "sqd-primitives"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=eaa9f86#eaa9f862069390d19a75af13b6f1540800bbae02"
+source = "git+https://github.com/subsquid/data.git?rev=48373fe#48373fe7c00581dbbd77abc816caaf7de243b768"
 dependencies = [
  "serde",
 ]
@@ -7928,7 +7928,7 @@ dependencies = [
 [[package]]
 name = "sqd-query"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/data.git?rev=eaa9f86#eaa9f862069390d19a75af13b6f1540800bbae02"
+source = "git+https://github.com/subsquid/data.git?rev=48373fe#48373fe7c00581dbbd77abc816caaf7de243b768"
 dependencies = [
  "anyhow",
  "arrow",
