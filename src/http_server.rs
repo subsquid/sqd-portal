@@ -2,7 +2,6 @@ use std::future::IntoFuture;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use axum::http::Method;
 use axum::{
     async_trait,
     body::Body,
@@ -12,6 +11,7 @@ use axum::{
     routing::{get, post},
     Extension, RequestExt,
 };
+use axum::{http::Method, ServiceExt as _};
 use prometheus_client::registry::Registry;
 use sentry::integrations::tower as sentry_tower;
 use serde_json::json;
@@ -20,6 +20,7 @@ use sqd_primitives::BlockRef;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tower::ServiceBuilder;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::request_id::{
@@ -100,6 +101,7 @@ pub async fn run_server(
 ) -> anyhow::Result<()> {
     let openapi_spec = build_openapi_spec(show_internal_docs);
     let cors = cors_layer();
+    let usage = auth_gate.as_ref().and_then(|gate| gate.usage());
 
     tracing::info!("Starting HTTP server listening on {addr}");
     let app = gated_routes(auth_gate.clone(), &openapi_spec)
@@ -144,10 +146,26 @@ pub async fn run_server(
         .layer(Extension(hotblocks))
         .layer(Extension(shutting_down));
 
+    // Wrap the completed router: Router::layer would still run before Axum
+    // strips HEAD bodies. Without a usage block, option_layer passes it through.
+    //
+    // The gate hands attribution over on the *response*, so every layer between
+    // here and it has to carry extensions across a rebuild — as
+    // `normalize_framework_rejection` and `stamp_request_id` both do. A layer
+    // added here that built its response from scratch would not break a test or
+    // move a drop counter: the records would simply stop, and OB-15 would read
+    // zero on a portal serving normally.
+    let app =
+        ServiceBuilder::new()
+            .option_layer(usage.map(|sink| {
+                axum::middleware::from_fn_with_state(sink, crate::auth::tap_middleware)
+            }))
+            .service(app.with_state(()));
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     let cancel_for_serve = shutdown_signal.clone();
-    let serve = axum::serve(listener, app)
+    let serve = axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(async move { cancel_for_serve.cancelled().await });
 
     drive_serve_with_drain(serve.into_future(), shutdown_signal, drain_timeout).await?;
@@ -583,11 +601,10 @@ async fn get_metrics(
     Extension(registry): Extension<Arc<Registry>>,
     Extension(auth): Extension<Option<Arc<Gate>>>,
 ) -> impl IntoResponse {
-    // Republished per scrape rather than per exchange: the age of the last
-    // successful one has to climb through an outage, not freeze at whatever it
-    // reached before the control plane went quiet (OB-13).
+    // Exchange age and usage queue depth must keep changing through an outage,
+    // even while delivery is stalled (OB-13/15).
     if let Some(gate) = &auth {
-        gate.publish_freshness();
+        gate.publish_metrics();
     }
     lazy_static::lazy_static! {
         static ref HEADERS: HeaderMap = {
@@ -808,6 +825,12 @@ fn gated_routes(auth_gate: Option<Arc<Gate>>, openapi_spec: &utoipa::openapi::Op
         .route("/api-docs/openapi.json", get(serve_openapi_spec).no_auth());
 
     // SQL Query Engine
+    //
+    // Gated, and therefore measured where usage measurement is on — but what it
+    // returns is a worker/chunk *plan*, not result data, so its usage records
+    // are plan bytes and are excluded from data-volume analysis at read time by
+    // their `/sql/query` endpoint label (ADR-016). Scanned bytes, if they ever
+    // matter, are separate work with a separate measurement.
     #[cfg(feature = "sql")]
     let routes = routes
         .route(

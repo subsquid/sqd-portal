@@ -31,12 +31,52 @@ pub struct Grant {
     #[serde(default)]
     pub datasets: Option<Vec<String>>,
 
+    /// Who the key belongs to, recorded on usage events and never read by the
+    /// ladder (REQ-60). Optional because a control plane that predates the
+    /// claim omits it, and because a portal that acted on it would be enforcing
+    /// on a field this vocabulary does not authorize anything with — which is
+    /// also why adding it is not a [`CLAIMS_VERSION`] bump: recording a claim is
+    /// not acting on it (DC-8, DEF-17).
+    #[serde(default, deserialize_with = "organization_id")]
+    pub organization_id: Option<String>,
+
     /// Unix seconds. Past this the portal renews, still serving meanwhile.
     pub refresh_after: u64,
 
     /// Unix seconds. Past this the grant admits nothing, whatever the control
     /// plane's state.
     pub expires_at: u64,
+}
+
+// Attribution is optional metadata. An unexpected shape must not invalidate
+// the authorization claims, including when usage measurement is disabled.
+//
+// Logged because the silent path is the dangerous one: a control plane that
+// regresses this field's shape would otherwise strip the organization from
+// every record with nothing to read it off. The type only — the value is the
+// control plane's payload and does not belong in a log (INV-38).
+fn organization_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(id) => Some(id),
+        serde_json::Value::Null => None,
+        other => {
+            let kind = match other {
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+                // `String` and `Null` are answered above.
+                _ => "unknown",
+            };
+            tracing::warn!(
+                kind,
+                "grant carried a non-string organization_id; recording it as absent"
+            );
+            None
+        }
+    })
 }
 
 /// Denial reasons this build maps to a specific wire code. Anything else is
@@ -77,6 +117,49 @@ mod tests {
         };
         assert_eq!(grant.key_id, "k1");
         assert_eq!(grant.datasets, None, "absent scope means unrestricted");
+    }
+
+    /// The claim the commercial control plane added (#642). A portal talking to
+    /// one that predates it reads `None` and reports events without an owner —
+    /// the read-time join on the key id is the fallback, and refusing to parse
+    /// the grant would turn a missing attribution field into an outage.
+    #[test]
+    fn an_organization_is_recorded_when_the_control_plane_names_one() {
+        let grant = |value: serde_json::Value| {
+            let mut claims = serde_json::json!({
+                "claims_version": 1,
+                "key_id": "k1",
+                "refresh_after": 1u64,
+                "expires_at": 2u64,
+            });
+            claims["organization_id"] = value;
+            let ExchangeAnswer::Granted { grant } =
+                parse(serde_json::json!({"result": "granted", "grant": claims}))
+                    .expect("the grant parses")
+            else {
+                panic!("expected a grant");
+            };
+            grant.organization_id
+        };
+
+        assert_eq!(grant(serde_json::json!("org-7")), Some("org-7".to_owned()));
+        assert_eq!(
+            grant(serde_json::Value::Null),
+            None,
+            "no organization was claimed"
+        );
+        for value in [
+            serde_json::json!(7),
+            serde_json::json!(true),
+            serde_json::json!(["org-7"]),
+            serde_json::json!({"id": "org-7"}),
+        ] {
+            assert_eq!(
+                grant(value),
+                None,
+                "malformed attribution must not reject a grant"
+            );
+        }
     }
 
     #[test]

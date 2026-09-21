@@ -6,6 +6,7 @@ use sqd_network_transport::Keypair;
 use url::Url;
 
 use super::signing::RequestSigner;
+use super::usage::UsageConfig;
 
 /// Per-deployment portal identity. Every replica of a portal shares one config
 /// file, so the id is normally injected per pod and overrides the file value.
@@ -53,6 +54,14 @@ pub struct AuthConfig {
     /// misspelled limit would keep its default without a warning.
     #[serde(default)]
     pub limits: Limits,
+
+    /// Shadow usage measurement (REQ-60). Absent, nothing is measured and
+    /// nothing is reported; written at all — even with nothing under it — turns
+    /// it on with every knob defaulted, because an operator who wrote the key
+    /// asked for measurement and a template that rendered empty must not read
+    /// as a request for silence.
+    #[serde(default, deserialize_with = "usage_block_that_is_written_is_on")]
+    pub usage: Option<UsageConfig>,
 }
 
 /// What one credential, or a flood of them, can cost. Operator-bindable
@@ -129,6 +138,8 @@ pub struct ResolvedAuth {
     pub(crate) key: Option<KeySource>,
     pub enforcement: Enforcement,
     pub limits: Limits,
+    /// `None` measures nothing (REQ-60).
+    pub usage: Option<UsageConfig>,
 }
 
 impl AuthConfig {
@@ -139,6 +150,7 @@ impl AuthConfig {
             key: self.key_source(),
             enforcement: self.enforcement,
             limits: self.limits.clone(),
+            usage: self.usage.clone(),
         };
         resolved.validate()?;
         Ok(resolved)
@@ -187,6 +199,23 @@ where
         })
 }
 
+/// `usage:` with nothing under it is a block that was written, and writing it
+/// is the request. serde folds YAML null into `None`, which here would mean
+/// "measure nothing" — the one reading nobody typing the key can have intended,
+/// and the one that leaves an operator waiting for rows that never arrive. The
+/// mirror image of `auth:` itself, where the same shape is fatal because there
+/// the silent default is an open door rather than an empty table.
+fn usage_block_that_is_written_is_on<'de, D>(
+    deserializer: D,
+) -> Result<Option<UsageConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Some(
+        Option::<UsageConfig>::deserialize(deserializer)?.unwrap_or_default(),
+    ))
+}
+
 impl ResolvedAuth {
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -209,7 +238,11 @@ impl ResolvedAuth {
             self.control_plane_url.scheme() == "https" || is_loopback(&self.control_plane_url),
             "auth.control_plane_url must be https outside loopback: it carries credentials"
         );
-        self.limits.validate()
+        self.limits.validate()?;
+        match &self.usage {
+            Some(usage) => usage.validate(),
+            None => Ok(()),
+        }
     }
 
     /// By default the portal signs with the identity it already has, so nothing

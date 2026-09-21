@@ -1,7 +1,8 @@
 # 13 — Conformance & TDD plan
 
 **Mutable doc.** Statuses as of **2026-08-18** (0.13.2,
-`master@375911e6695f3512fd2e3508fa08fbfdb4aac9cf`). Statuses: **C** covered · **P** partial ·
+`master@375911e6695f3512fd2e3508fa08fbfdb4aac9cf`); the usage rows (REQ-60/61, CT-11) were
+checked at 0.14.4 on 2026-09-18. Statuses: **C** covered · **P** partial ·
 **U** unchecked; *known-violated* / *known-suspect* where reality contradicts the property.
 **The authorization band (REQ-50..56, DC-8, OP-11 and the invariants scoped to them) has
 landed and is CT-10-covered on its request path.** A deployment with no `auth:` block
@@ -31,8 +32,21 @@ the fault rows of DC-8's error table as injectors. `ct10_authorization` drives f
 portals — enforcing, shadow, no `auth:` block, one whose exchange budget is small enough
 to saturate, and one signing with a dedicated key — because the properties differ by
 configuration rather than by request.
-Coverage outside those three classes is still inline unit tests.
-All three suites run on every pull request: the harness is a separate crate, so it needs a
+**CT-11 exists**: the same stub now mounts DC-9's usage ingest beside the exchange,
+verifying the same signing contract against the usage path and keeping every accepted
+delivery whole and in order, so a test can tell records arriving together from records
+arriving alone. `ct11_usage` drives two portals — one measuring, one with no `usage:`
+block — and the real-time stub gained a pacing injector, the harness's only way to
+produce a response that outlives an interval the portal measures on (P-USAGE-INTERIM).
+The kill-switch case runs both portals side by side and compares the *encoded* body bytes,
+not the decoded ones, so a re-framed response would fail it; and a beyond-head poll gives
+the one shape no unit test can witness honestly — an empty body, which the transport drops
+without ever polling. Each of RFC 9112's three framings is driven on the archival path and
+again on the proxied one, where a stream body never reports its own end; framework errors,
+stamped server errors and HEAD responses assert that records describe the final body after
+response rewriting.
+Coverage outside those four classes is still inline unit tests.
+All four suites run on every pull request: the harness is a separate crate, so it needs a
 build of the portal and a job of its own — a status this document cites has to be one
 something re-checks.
 
@@ -130,6 +144,7 @@ chunk-boundary records FV-6 licenses.
 | CT-8 | Isolation/noisy-neighbor: S6 | INV-35 |
 | CT-9 | Fuzz, both surfaces: client inputs and stub responses (payloads, artifacts) | INV-36, FM-1, GAP-1 |
 | CT-10 | Authorization: credential corpus × enforcement mode against a control-plane stub; exchange-fault, lifetime and convergence cases (denial mid-grant, a retired timed-out generation completing after its successor, over-cap lifetime, unreadable claims version, outage across `refresh_after` and `expires_at`); which signing key reaches the wire when `auth.key_path` names one; bracketed metrics scrapes proving no key-id side channel, including neutral shadow-mode projection; both presentation channels with their precedence, and a present-but-unusable `Authorization` refusing rather than falling through to `x-api-key` | INV-6/10/14/15/38/39, INV-31, LIV-13/14, REQ-50..REQ-56, DC-8, IB-9, HZ-10/12/13 |
+| CT-11 | Usage measurement: attribution, delta accounting, per-framing completion and non-interference against a usage-sink stub; sink healthy, refusing, and absent, with the absent case compared byte-for-byte against a measuring portal | INV-32, REQ-60/61, DC-9, OB-15, HZ-14/15 |
 
 ## Structural validators (kind-agnostic, applied to every response)
 
@@ -147,7 +162,7 @@ chunk-boundary records FV-6 licenses.
    unless the upstream sent one (ADR-014); one status across every credential refusal; no
    data alongside errors (INV-26, IB-5).
 
-## Traceability matrix — properties (2026-08-07)
+## Traceability matrix — properties (2026-08-12)
 
 | Property | CT | Status | Note |
 |---|---|---|---|
@@ -195,8 +210,10 @@ chunk-boundary records FV-6 licenses.
 | LIV-13 | CT-10 | U | needs convergence at `refresh_after` + one exchange with the control plane healthy, and at `expires_at` with it stopped — the second is the one carrying the security claim. Both need a clock the harness does not have (GAP-33) |
 | LIV-14 | CT-10 | C | CT-10 serves a freshly minted key on the request that presents it, and drives a burst of distinct credentials against a bounded budget: the refusals are `overloaded` with a usable hint, never a verdict about a key |
 | DC-8 | CT-10 | P | the stub verifies the signing contract for real — one of each header, an attributable portal, bounded skew, Ed25519 over the canonical binding — and CT-10 asserts the portal never trips it, then that an unattributable portal fails every exchange as `upstream_unavailable`. A portal configured with `auth.key_path` is driven against a stub that registered only that key, so the dedicated key is checked where it matters — on the wire — rather than at the loader. Deadline, single-flight and the lifetime cap are covered, as is every unusable answer failing rather than denying: 500, 503, 404, a truncated grant, an unknown claims version and an answer about another key all reach the client as retryable. Denial-evicts and outage grace need a clock (GAP-33) |
+| INV-32 | CT-11 | P | CT-11 drives a gated request with the usage sink healthy, refusing every delivery, and absent, and asserts status, headers and body are identical across all three — against the absent portal the comparison is on the *encoded* bytes, which is where a re-framing would show — that the stream still delivers its whole range while the sink is down, and that the portal is genuinely still trying rather than passing by having stopped. Queue saturation is asserted at the unit level (the record hand-off drops rather than waits, and every response is served in full); a swarm large enough to saturate the queue black-box belongs with CT-3 |
+| DC-9 | CT-11 | P | the stub verifies the DC-8 signing contract on the ingest too, so a delivery is attributable and a signature made for the exchange does not verify here. Batching, retry-after-refusal, the absent-block case and an empty-bodied response completing rather than reading as a hang-up are covered; the age bound, the content-refusal drop and the shutdown flush — including that what the flush cannot place is counted by cause — are unit-tested rather than driven black-box, all needing either a clock or a kill the harness does not have (GAP-33's shape, on a second dependency) |
 
-## Acceptance matrix — requirements (2026-08-07)
+## Acceptance matrix — requirements (2026-08-12)
 
 | REQ | Status | Note |
 |---|---|---|
@@ -238,6 +255,8 @@ chunk-boundary records FV-6 licenses.
 | REQ-54 | P | Every way an exchange can fail to produce a verdict — 500, 503, 404, a truncated grant, an unknown claims version, an answer about another key, and the deadline — reaches the client as retryable `upstream_unavailable`, never as a claim about the credential. An over-cap lifetime is honoured, shortened and counted. The grace rules are the untested half: serving through an outage and stopping at `expires_at` both need a clock (GAP-33) |
 | REQ-55 | P | CT-10 runs a shadow portal: a request with no credential, one with an ungrammatical token and one the control plane denies are all served, the verdict enforcement would have returned is in the protected log, and the keyless scrape carries only the neutral `shadow_evaluated` series with no code and no exchange counters. The control-plane ledger shows it exchanging on the same cache-miss rule enforcement uses — once, for the only request that presented something to exchange. Indeterminate exchange outcomes are not separately driven |
 | REQ-56 | P | CT-10 runs a portal with no `auth:` block: gated routes are served without a credential, a credential presented anyway is not a reason to refuse, and no authorization series appears in the scrape at all. The empty-block startup error is unit-tested in `auth::config` rather than here, and the startup mode line is logged but not asserted |
+| REQ-60 | P | CT-11 asserts a record per gated request carrying the key id, the organization the grant named, the canonical dataset, the route label and the encoding, with a byte count equal to the encoded body the client received; that a paced stream outliving P-USAGE-INTERIM reports interim deltas whose sum is exactly that response's encoded bytes; that six requests reach the sink in fewer deliveries than there were records; and that a portal with no `usage:` block calls the ingest not at all and leaves every OB-15 signal at zero. Not driven: the drop-on-age path and a queue saturated black-box (unit-tested), and the `/sql/query` route label, which needs the non-default feature build |
+| REQ-61 | P | the response-equality half is CT-11-covered against a refusing sink, including that the stream still completes; the never-blocks half is unit-tested at the hand-off (a full queue drops and the response is served whole) and is not yet driven under a saturating swarm; the per-frame cost the requirement declines to call zero is unmeasured, and belongs to CT-6 |
 
 ## Gap register — 2026-08-18
 
@@ -277,6 +296,7 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-36 | A dataset-scoped key is refused outright on the deprecated direct-worker query route. The path does name its dataset, as a base64 `DatasetId`, and the catalog already resolves one to a canonical name — so the refusal is a decision not to extend authorization onto an NG7 surface, not a missing capability. Fail-closed, and invisible to anyone holding an unscoped key, but a scoped customer meets a 403 on a route that would otherwise work | REQ-53, NG7, IB-2 | P3 | remove the route, or specify it and resolve the id through the catalog on the dataset rung |
 | GAP-33 | CT-10's harness exists and its request-path rows are driven black-box, but every row whose claim is about *time* is still unwritten: LIV-13's convergence at `refresh_after` and at `expires_at` with the control plane stopped, a retired generation completing after its successor (INV-6), the denial TTL and the grace window, and HZ-12's renewal spread. All of them need either a controllable clock or a run long enough to cross a real one, and the stub has neither | CT-10, DC-8, INV-6, LIV-13, HZ-12 | P2 | give the control-plane stub a settable clock offset, or drive the cases with second-scale lifetimes; `expires_at` convergence with the control plane stopped is the one carrying the security claim |
 | GAP-37 | The `split` assignments carry no effective-from — upstream's `NetworkAssignmentV2` has no such field — so a portal on `split` applies each artifact as soon as it has fetched it. The fleet no longer cuts over at one instant, which is what INV-2 and REQ-40 rest on, and ordering falls back to the identifier's timestamp prefix. The window is one P-ASSIGNMENT-REFRESH wide and portals poll unsynchronised, so at worst it is the churn OQ-11 already describes for workers, now portal-side too | INV-2, REQ-40, DEF-4 | P2 | upstream: put a cutover instant back on the split blob, or ratify identifier-only ordering and drop the effective-from clauses |
+| GAP-38 | OB-15 does not state its shadow-mode position. A usage record is cut only where `evaluate` returned a grant, so on a shadow portal the record and queue-depth signals move exactly when the control plane granted the presented credential — and a keyless caller bracketing two scrapes around its own request reads the verdict whose concealment is the point of the mode. OB-14 argues explicitly why the channel counts may move; OB-15 makes no such argument and inherits none. Present since the family was added, not introduced by the tap's move to the response, but sampling queue depth on scrape sharpens it | INV-39, IB-9, REQ-55, OB-15 (spec/12 shadow-mode rule) | P2 | decide whether OB-15 is a permitted shadow projection like OB-14 or must be suppressed there, and say so in 12; CT-10's bracketed-scrape case then covers it either way |
 
 ### Closed findings
 

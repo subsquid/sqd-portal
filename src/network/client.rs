@@ -601,6 +601,16 @@ impl NetworkClient {
         self.datasets.read().get(alias).cloned()
     }
 
+    /// The configured name behind an alias, cloning only the name. For callers
+    /// that want the identity rather than the configuration, on a path where
+    /// copying the rest per request is the whole cost.
+    pub fn canonical_dataset_name(&self, alias: &str) -> Option<String> {
+        self.datasets
+            .read()
+            .get(alias)
+            .map(|dataset| dataset.default_name.clone())
+    }
+
     pub fn datasets(&self) -> &RwLock<Datasets> {
         &self.datasets
     }

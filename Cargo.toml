@@ -1,6 +1,6 @@
 [package]
 name = "sqd-portal"
-version = "0.14.5"
+version = "0.15.0"
 edition = "2021"
 default-run = "sqd-portal"
 
@@ -66,7 +66,11 @@ thiserror = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = "0.1"
 tokio-util = "0.7.11"
-tower = "0.5"
+# `util` for `ServiceBuilder::option_layer`, which mounts the egress tap. It
+# reaches the build through axum today, and a manifest that leaves it out is
+# one axum bump away from failing on a line that has nothing to do with axum.
+# `cargo test` would not catch it: dev-dependencies enable the feature back.
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6.1", features = ["cors", "decompression-gzip", "request-id", "trace"] }
 tracing = { version = "0.1", features = ["async-await"] }
 tracing-futures = { version = "0.2.5", features = ["tokio", "futures-03"] }

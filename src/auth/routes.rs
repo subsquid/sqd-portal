@@ -142,11 +142,19 @@ impl Gated {
         let router = match (self.gate.clone(), gated) {
             (Some(gate), true) => {
                 let dataset = dataset_param(path);
+                // The label a usage record carries. Fixed at mount time and
+                // shared by every request to the route, so the tap copies a
+                // pointer rather than a string.
+                let label: Arc<str> = Arc::from(
+                    endpoint
+                        .as_ref()
+                        .map_or(path, EndpointAnnotationLayer::name),
+                );
                 // `layer`, not `route_layer`: the latter skips undeclared
                 // methods, so a keyless method mismatch would answer 405
                 // without entering the OB-12 accounting.
                 router.layer(axum::middleware::from_fn(move |req, next| {
-                    extractor::middleware(gate.clone(), dataset, req, next)
+                    extractor::middleware(gate.clone(), dataset, label.clone(), req, next)
                 }))
             }
             _ => router,

@@ -92,8 +92,10 @@ impl ControlPlaneClient {
 }
 
 /// Appends the endpoint to a base that carries the control plane's own mount
-/// point, prefix and all.
-fn endpoint_url(base: &Url, segments: &[&str]) -> anyhow::Result<Url> {
+/// point, prefix and all. Shared with the usage sink, which mounts beside the
+/// exchange under the same operator-owned base — two spellings of "append to
+/// `control_plane_url`" is one of them being wrong after a mount point moves.
+pub(super) fn endpoint_url(base: &Url, segments: &[&str]) -> anyhow::Result<Url> {
     let mut url = base.clone();
     url.set_query(None);
     url.set_fragment(None);

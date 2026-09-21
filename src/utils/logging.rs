@@ -1295,6 +1295,12 @@ impl EndpointAnnotationLayer {
         self.data_source = Some(data_source);
         self
     }
+
+    /// The name the route's responses are labelled with, for a caller that needs
+    /// the same name on something other than a metric.
+    pub(crate) fn name(&self) -> &str {
+        &self.endpoint
+    }
 }
 
 impl<S> Layer<S> for EndpointAnnotationLayer {

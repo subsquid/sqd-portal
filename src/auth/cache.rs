@@ -32,6 +32,8 @@ use crate::metrics::{self, ExchangeOutcome};
 pub struct CachedGrant {
     pub key_id: String,
     pub datasets: Option<Vec<String>>,
+    /// Carried for attribution only; nothing in the ladder reads it (REQ-60).
+    pub organization_id: Option<String>,
     /// A request arriving past this is still served.
     pub refresh_after: u64,
     /// When to stop. Nothing serves on this grant afterwards, whatever the
@@ -331,6 +333,7 @@ impl GrantCache {
         let cached = Arc::new(CachedGrant {
             key_id: grant.key_id,
             datasets: grant.datasets,
+            organization_id: grant.organization_id,
             refresh_after,
             expires_at,
         });
@@ -707,6 +710,7 @@ mod tests {
                 CachedGrant {
                     key_id: fingerprint.to_owned(),
                     datasets: None,
+                    organization_id: None,
                     refresh_after,
                     expires_at,
                 },
@@ -759,6 +763,7 @@ mod tests {
         let held = Arc::new(CachedGrant {
             key_id: KEY_ID.to_owned(),
             datasets: None,
+            organization_id: None,
             refresh_after: NOW,
             expires_at: NOW + 900,
         });
@@ -978,6 +983,7 @@ mod tests {
                 CachedGrant {
                     key_id: format!("k{i}"),
                     datasets: None,
+                    organization_id: None,
                     refresh_after: NOW + 300,
                     expires_at: NOW + 900,
                 },
@@ -1016,6 +1022,7 @@ mod tests {
                 CachedGrant {
                     key_id: format!("k{index}"),
                     datasets: None,
+                    organization_id: None,
                     refresh_after: NOW + 300,
                     expires_at: NOW + 900,
                 },

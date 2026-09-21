@@ -237,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
     let task_manager = Arc::new(TaskManager::new(network_client.clone(), &config));
 
     let cancellation_token = CancellationToken::new();
-    let auth_gate = match (&auth, auth_keypair) {
+    let authorization = match (&auth, auth_keypair) {
         (Some(auth), Some(keypair)) => Some(sqd_portal::auth::build(
             auth,
             keypair,
@@ -246,6 +246,9 @@ async fn main() -> anyhow::Result<()> {
         // No block, or shadow mode without a key — which admits either way.
         _ => None,
     };
+    let auth_gate = authorization
+        .as_ref()
+        .map(|authorization| authorization.gate.clone());
     let shutting_down = Arc::new(AtomicBool::new(false));
     let sigterm = {
         use anyhow::Context;
@@ -266,7 +269,11 @@ async fn main() -> anyhow::Result<()> {
             .observe_occupancy(cancellation_token.clone()),
     );
 
-    let (server_res, ()) = tokio::try_join!(
+    // Held back from the join so the failing exit can still stop the listener:
+    // `try_join!` drops the server's handle on the first error, and dropping a
+    // `JoinHandle` detaches the task rather than aborting it.
+    let stop_serving = cancellation_token.clone();
+    let served = tokio::try_join!(
         tokio::spawn(run_server(
             task_manager,
             network_client.clone(),
@@ -280,7 +287,29 @@ async fn main() -> anyhow::Result<()> {
             auth_gate,
         )),
         network_client.run(cancellation_token),
-    )?;
+    );
+
+    // This, and nothing before it, stops the reporter: the drain's own token
+    // fires up to a whole drain before serving ends, and the records cut while
+    // streams are being closed are the ones worth keeping. Bounded by the
+    // reporter's own budget — what does not go out here is dropped and counted,
+    // like every other record the sink could not take.
+    //
+    // Ahead of the errors below rather than after them, because an exit is an
+    // exit: the records already cut bought the same bytes either way, and a
+    // flush the failing path skips makes DC-9's bargain a claim about the happy
+    // path only.
+    //
+    // Cancelled first so the comment on `finalize` holds on that path too. On a
+    // clean exit the server has already returned; on a failing one it is
+    // detached and draining, and a record it cuts from here on finds the queue
+    // shut and is counted as dropped — which is the bargain, not a hole in it.
+    stop_serving.cancel();
+    if let Some(authorization) = authorization {
+        authorization.finish().await;
+    }
+
+    let (server_res, ()) = served?;
     server_res?;
 
     Ok(())
