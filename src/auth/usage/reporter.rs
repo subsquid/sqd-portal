@@ -144,9 +144,6 @@ impl Reporter {
                     () = tokio::time::sleep_until(deadline) => break,
                 }
             }
-            // Read where the reader is, not where the writers are: the hot path
-            // must not pay for a gauge (OB-15).
-            self.signals.queue_depth.set(events.len() as i64);
             if !batch.is_empty() {
                 // A stop during this returns with the batch still in hand; the
                 // loop above takes its biased stop branch on the next turn and
@@ -240,7 +237,13 @@ impl Reporter {
                 }
                 self.expire(batch);
                 if batch.is_empty() {
-                    return None;
+                    if events.is_empty() {
+                        return None;
+                    }
+                    // An expired batch does not mean the queue is exhausted.
+                    // Yield so even an all-expired backlog respects the budget.
+                    tokio::task::yield_now().await;
+                    continue;
                 }
                 // One attempt each: a shutdown that waits out a retry schedule
                 // is a shutdown that misses its deadline.
@@ -720,6 +723,33 @@ mod tests {
             .expect("the reporter task must not panic");
 
         assert_eq!(sink.ids(), ["last-words"]);
+    }
+
+    #[tokio::test]
+    async fn final_flush_skips_expired_batches_and_delivers_fresh_records() {
+        let (sink, config) = Sink::spawn(Vec::new()).await;
+        let reporter = reporter(
+            &config,
+            UsageConfig {
+                batch_max_events: 1,
+                ..UsageConfig::default()
+            },
+        );
+        let expired = |id| Queued {
+            queued_at: Instant::now() - Duration::from_secs(600),
+            ..queued(id)
+        };
+        let (tx, mut events) = mpsc::channel(8);
+        tx.send(expired("expired-in-queue")).await.unwrap();
+        tx.send(queued("fresh")).await.unwrap();
+        let mut batch = vec![expired("expired-in-hand")];
+
+        reporter.finalize(&mut events, &mut batch).await;
+
+        assert_eq!(sink.ids(), ["fresh"]);
+        assert_eq!(sink.attempts(), 1);
+        assert!(batch.is_empty());
+        assert!(events.is_empty());
     }
 
     /// A sink that is down at shutdown must not hold the process: the flush is

@@ -37,7 +37,7 @@ pub struct Grant {
     /// on a field this vocabulary does not authorize anything with — which is
     /// also why adding it is not a [`CLAIMS_VERSION`] bump: recording a claim is
     /// not acting on it (DC-8, DEF-17).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "organization_id")]
     pub organization_id: Option<String>,
 
     /// Unix seconds. Past this the portal renews, still serving meanwhile.
@@ -46,6 +46,37 @@ pub struct Grant {
     /// Unix seconds. Past this the grant admits nothing, whatever the control
     /// plane's state.
     pub expires_at: u64,
+}
+
+// Attribution is optional metadata. An unexpected shape must not invalidate
+// the authorization claims, including when usage measurement is disabled.
+//
+// Logged because the silent path is the dangerous one: a control plane that
+// regresses this field's shape would otherwise strip the organization from
+// every record with nothing to read it off. The type only — the value is the
+// control plane's payload and does not belong in a log (INV-38).
+fn organization_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(id) => Some(id),
+        serde_json::Value::Null => None,
+        other => {
+            let kind = match other {
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+                // `String` and `Null` are answered above.
+                _ => "unknown",
+            };
+            tracing::warn!(
+                kind,
+                "grant carried a non-string organization_id; recording it as absent"
+            );
+            None
+        }
+    })
 }
 
 /// Denial reasons this build maps to a specific wire code. Anything else is
@@ -101,9 +132,7 @@ mod tests {
                 "refresh_after": 1u64,
                 "expires_at": 2u64,
             });
-            if !value.is_null() {
-                claims["organization_id"] = value;
-            }
+            claims["organization_id"] = value;
             let ExchangeAnswer::Granted { grant } =
                 parse(serde_json::json!({"result": "granted", "grant": claims}))
                     .expect("the grant parses")
@@ -117,8 +146,20 @@ mod tests {
         assert_eq!(
             grant(serde_json::Value::Null),
             None,
-            "an older control plane"
+            "no organization was claimed"
         );
+        for value in [
+            serde_json::json!(7),
+            serde_json::json!(true),
+            serde_json::json!(["org-7"]),
+            serde_json::json!({"id": "org-7"}),
+        ] {
+            assert_eq!(
+                grant(value),
+                None,
+                "malformed attribution must not reject a grant"
+            );
+        }
     }
 
     #[test]

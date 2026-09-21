@@ -38,22 +38,18 @@ mod reporter;
 mod tap;
 
 pub use config::UsageConfig;
-pub(super) use tap::tap_layer;
+pub(crate) use tap::tap_middleware;
 
 use event::UsageEvent;
 
-/// Who a request is being served to, deposited into the request extensions by
-/// the gate and read back by the egress tap (REQ-60).
+/// Who a request was served to, carried in response extensions from the gate
+/// to the outer egress tap (REQ-60).
 ///
 /// Holds the grant rather than copying out of it: the claims are already behind
-/// an `Arc` in the cache, they outlive the request, and a record is cut at most
-/// twice a minute per response — so the per-request cost is three pointer
-/// clones and the string copies happen only where a record is actually made.
+/// an `Arc` in the cache and outlive the request. The tap takes this attribution
+/// out of the response; claim strings are copied only when a record is made.
 #[derive(Debug, Clone)]
-pub(crate) struct Attribution(Arc<Attributed>);
-
-#[derive(Debug)]
-struct Attributed {
+pub(crate) struct Attribution {
     grant: Arc<CachedGrant>,
     /// The canonical name, resolved by the gate, where the route names a
     /// dataset at all.
@@ -69,27 +65,27 @@ impl Attribution {
         dataset: Option<String>,
         endpoint: Arc<str>,
     ) -> Self {
-        Self(Arc::new(Attributed {
+        Self {
             grant,
             dataset,
             endpoint,
-        }))
+        }
     }
 
     pub(super) fn key_id(&self) -> &str {
-        &self.0.grant.key_id
+        &self.grant.key_id
     }
 
     pub(super) fn organization_id(&self) -> Option<&str> {
-        self.0.grant.organization_id.as_deref()
+        self.grant.organization_id.as_deref()
     }
 
     pub(super) fn dataset(&self) -> Option<&str> {
-        self.0.dataset.as_deref()
+        self.dataset.as_deref()
     }
 
     pub(super) fn endpoint(&self) -> &str {
-        &self.0.endpoint
+        &self.endpoint
     }
 }
 
@@ -115,6 +111,13 @@ pub struct UsageSink {
 }
 
 impl UsageSink {
+    /// Sample on scrape, so a stalled delivery cannot freeze the queue gauge.
+    pub(super) fn publish_queue_depth(&self) {
+        self.signals
+            .queue_depth
+            .set((self.events.max_capacity() - self.events.capacity()) as i64);
+    }
+
     /// Never blocks, never allocates beyond the event, never looks up a metric
     /// family: the counters were bound at construction, and a full queue costs
     /// one increment and the drop (HZ-14). Deliberately silent — a per-drop log

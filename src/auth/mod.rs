@@ -33,6 +33,7 @@ mod usage;
 pub mod test_support;
 
 pub use config::{AuthConfig, Enforcement, ResolvedAuth};
+pub(crate) use usage::tap_middleware;
 pub use usage::UsageConfig;
 
 use config::KeySource;

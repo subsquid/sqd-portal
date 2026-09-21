@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::{routing::MethodRouter, Router};
 
-use super::{extractor, usage, Gate};
+use super::{extractor, Gate};
 use crate::{endpoints::stream::DataSource, utils::logging::EndpointAnnotationLayer};
 
 /// A method router that has declared whether it needs a key.
@@ -150,15 +150,6 @@ impl Gated {
                         .as_ref()
                         .map_or(path, EndpointAnnotationLayer::name),
                 );
-                // The egress tap goes on *inside* the gate: it reads the
-                // attribution the gate deposits on the request, which only an
-                // inner layer can see. With no `usage:` block there is no sink
-                // and nothing is wrapped at all — the route is byte-for-byte
-                // what it is on a portal that never heard of measurement.
-                let router = match gate.usage() {
-                    Some(sink) => router.layer(usage::tap_layer(sink)),
-                    None => router,
-                };
                 // `layer`, not `route_layer`: the latter skips undeclared
                 // methods, so a keyless method mismatch would answer 405
                 // without entering the OB-12 accounting.

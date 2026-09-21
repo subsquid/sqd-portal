@@ -20,7 +20,7 @@
 //!
 //! **What it costs.** One `Instant::now()` and one add per data frame, plus a
 //! `try_send` per record. Frames here are chunk-sized, so the per-byte cost is
-//! nil, but the per-frame cost is real and is the budget CT-11 asserts against.
+//! nil, but the per-frame cost still needs to be measured (CT-6).
 
 use std::{
     pin::Pin,
@@ -29,78 +29,33 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use axum::{body::Body, extract::Request, response::Response};
+use axum::{
+    body::Body,
+    extract::{Request, State},
+    middleware::Next,
+    response::Response,
+};
 use bytes::Buf;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use tokio::time::Instant;
-use tower::{Layer, Service};
 
 use super::{
     event::{unix_seconds, Encoding, Status, UsageEvent, Window},
     Attribution, UsageSink,
 };
 
-/// Installs the tap on one gated route. Applied *inside* the gate, which is the
-/// only position that can see the attribution the gate deposits — a layer
-/// wrapping the gate sees the request as it arrived, before any of it existed.
-pub(in crate::auth) fn tap_layer(sink: Arc<UsageSink>) -> TapLayer {
-    TapLayer { sink }
-}
-
-#[derive(Clone)]
-pub struct TapLayer {
-    sink: Arc<UsageSink>,
-}
-
-impl<S> Layer<S> for TapLayer {
-    type Service = TapService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        TapService {
-            inner,
-            sink: self.sink.clone(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct TapService<S> {
-    inner: S,
-    sink: Arc<UsageSink>,
-}
-
-impl<S> Service<Request> for TapService<S>
-where
-    S: Service<Request, Response = Response> + Clone + Send + 'static,
-    S::Future: Send + 'static,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-    >;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: Request) -> Self::Future {
-        // Cloned out here rather than carried through: the response no longer
-        // has the request's extensions to read it from.
-        let attribution = req.extensions().get::<Attribution>().cloned();
-        let sink = self.sink.clone();
-        let fut = self.inner.call(req);
-
-        Box::pin(async move {
-            let response = fut.await?;
-            // No grant, no record (D3): an unattributed request is one shadow
-            // mode admitted without a credential, and inventing an owner for it
-            // would put unattributable bytes in a table used to price keys.
-            let Some(attribution) = attribution else {
-                return Ok(response);
-            };
-            Ok(measure(sink, attribution, response))
-        })
+/// Runs outside the router and response-rewriting middleware, so the tap sees
+/// the final body, including stamped errors and HEAD's empty response. Only
+/// responses attributed by the gate are measured.
+pub(crate) async fn tap_middleware(
+    State(sink): State<Arc<UsageSink>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    match response.extensions_mut().remove::<Attribution>() {
+        Some(attribution) => measure(sink, attribution, response),
+        None => response,
     }
 }
 
@@ -294,12 +249,12 @@ mod tests {
     use axum::{
         body::Body,
         http::{header, HeaderValue, StatusCode},
-        routing::get,
+        routing::{get, MethodRouter},
         Router,
     };
     use futures::StreamExt;
     use tokio::sync::mpsc;
-    use tower::ServiceExt;
+    use tower::{ServiceBuilder, ServiceExt};
 
     use super::*;
     use crate::auth::{cache::CachedGrant, usage::Queued};
@@ -351,6 +306,93 @@ mod tests {
 
     fn total(events: &[UsageEvent]) -> u64 {
         events.iter().map(|event| event.wire_bytes).sum()
+    }
+
+    /// Same boundary as the HTTP server: attribution inside the method router,
+    /// normalization and request-ID stamping, then a tap around the whole service.
+    async fn serve(
+        route: MethodRouter,
+        sink: Option<Arc<UsageSink>>,
+        method: &str,
+        uri: &str,
+    ) -> Response {
+        use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
+
+        let app = Router::new()
+            .route(
+                "/probe",
+                route.layer(axum::middleware::from_fn(
+                    |req: Request, next: Next| async move {
+                        let mut response = next.run(req).await;
+                        response.extensions_mut().insert(attribution());
+                        response
+                    },
+                )),
+            )
+            .route_layer(axum::middleware::from_fn(crate::utils::logging::middleware))
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+        ServiceBuilder::new()
+            .option_layer(
+                sink.map(|sink| axum::middleware::from_fn_with_state(sink, tap_middleware)),
+            )
+            .service(app)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("x-request-id", "usage-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rewritten_errors_report_the_bytes_actually_served() {
+        use crate::types::{coded_response, ErrorCode};
+        use axum::extract::Query;
+
+        for (route, status) in [
+            (
+                get(|| async { coded_response(ErrorCode::UpstreamUnavailable, "upstream failed") }),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                get(|Query(_): Query<std::collections::HashMap<String, u64>>| async { "unused" }),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let (sink, mut events) = UsageSink::for_test(8, INTERIM);
+            let response = serve(route, Some(sink), "GET", "/probe?count=invalid").await;
+            assert_eq!(response.status(), status);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["error"].is_object());
+            if status.is_server_error() {
+                assert_eq!(body["error"]["request_id"], "usage-test");
+            }
+            let events = drain(&mut events);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].wire_bytes, bytes.len() as u64);
+            assert_eq!(events[0].status, Status::Completed);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_head_request_reports_a_completed_empty_response() {
+        let (sink, mut events) = UsageSink::for_test(8, INTERIM);
+        let response = serve(get(|| async { "served" }), Some(sink), "HEAD", "/probe").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "6");
+        assert_eq!(read(response.into_body()).await, 0);
+        let events = drain(&mut events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].wire_bytes, 0);
+        assert_eq!(events[0].status, Status::Completed);
     }
 
     /// hyper never polls a fixed-length body to `None`: it reads
@@ -540,28 +582,7 @@ mod tests {
             )
         }
         let (sink, _events) = UsageSink::for_test(8, INTERIM);
-        // Mirrors the mount: the tap sits inside the layer that attributes.
-        let attributed = Router::new()
-            .route("/probe", get(handler))
-            .layer(tap_layer(sink))
-            .layer(axum::middleware::from_fn(
-                |mut req: Request, next: axum::middleware::Next| async move {
-                    req.extensions_mut().insert(attribution());
-                    next.run(req).await
-                },
-            ));
-        let bare = Router::new().route("/probe", get(handler));
-
-        let served = |app: Router| async move {
-            let response = app
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri("/probe")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
+        let served = |response: Response| async move {
             let status = response.status();
             let headers = response.headers().clone();
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -570,7 +591,9 @@ mod tests {
             (status, headers, body)
         };
 
-        assert_eq!(served(attributed).await, served(bare).await);
+        let measured = serve(get(handler), Some(sink), "GET", "/probe").await;
+        let plain = serve(get(handler), None, "GET", "/probe").await;
+        assert_eq!(served(measured).await, served(plain).await);
     }
 
     /// Shadow mode admits requests that presented no credential at all. There is
@@ -579,9 +602,9 @@ mod tests {
     #[tokio::test]
     async fn a_request_the_gate_did_not_attribute_is_not_measured() {
         let (sink, mut events) = UsageSink::for_test(8, INTERIM);
-        let app = Router::new()
-            .route("/probe", get(|| async { "served" }))
-            .layer(tap_layer(sink));
+        let app = ServiceBuilder::new()
+            .layer(axum::middleware::from_fn_with_state(sink, tap_middleware))
+            .service(Router::new().route("/probe", get(|| async { "served" })));
 
         let response = app
             .oneshot(

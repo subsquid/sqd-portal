@@ -89,13 +89,10 @@ stream that has gone quiet reports what it already served only at its next frame
 end (REQ-60). Nothing is lost by that, only delayed, and the delay is bounded by the
 stream's own idle gap.
 
-One class of response is counted before it is rewritten. Errors the router raises before
-any handler runs are normalized into the published envelope by a layer that sits *outside*
-the tap: it reads the original body — only ever a short buffered one, bounded at 8 KB —
-and builds a new one. The record therefore counts the bytes the handler produced, not the
-bytes the client received. The gap is bounded by that same 8 KB, applies only to framework
-rejections, and is not worth a second tap to close; moving the tap outside the
-normalization instead would put it outside the gate, where there is no attribution to read.
+The gate carries attribution in response extensions. The tap wraps the completed router
+as a service, after framework rejection normalization, request-ID stamping and HEAD body
+stripping, so it counts the final body. `Router::layer` is too far inside: Axum still
+strips HEAD bodies after those layers return.
 
 `/sql/query` returns a worker/chunk **plan**, not result data. Its records carry the
 `/sql/query` route label and are excluded from data-volume analysis at read time. If SQL

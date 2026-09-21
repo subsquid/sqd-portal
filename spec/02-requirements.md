@@ -564,8 +564,10 @@ response still open after P-USAGE-INTERIM is recorded then, and once more when i
 including when it ends because the client went away — so the sum of a group's records is
 that group's total with nothing counted twice. Attribution comes from the grant the
 admission already resolved; recording a claim is not acting on it, so no claim recorded
-here may influence any authorization decision. Reporting is best-effort: records are held
-in a bounded queue, delivered in batches of at most P-USAGE-BATCH-MAX no less often than
+here may influence any authorization decision. Missing or malformed organization metadata
+is treated as absent and does not invalidate a grant, whether measurement is on or off.
+Reporting is best-effort: records are held in a bounded queue, delivered in batches of at
+most P-USAGE-BATCH-MAX no less often than
 P-USAGE-FLUSH, retried within P-USAGE-MAX-RETRY-AGE, and otherwise dropped and counted
 (DC-9, OB-15). Measurement is independent of the enforcement mode, so it runs during a
 `log_only` cutover (REQ-55). A request served without a credential is not measured: there

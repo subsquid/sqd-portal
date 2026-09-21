@@ -156,14 +156,17 @@ used — which is why it may move where the OB-13 signals may not. It exists bec
 withdrawing the legacy channel is a decision about whether anything still presents on it,
 and a deployment that cannot see that keeps the channel forever.
 
-**OB-15 — Usage measurement health.** Measuring deployments only. The scrape carries what
-was measured and what became of it: records handed to the reporter, records the sink
+**OB-15 — Usage measurement health.** Measuring deployments only, in both modes — though
+whether these signals may *move* on a shadow portal's keyless scrape is unsettled, since a
+record is cut only where a grant was issued and they therefore track the verdict that mode
+conceals (GAP-38). The scrape carries what was measured and what became of it: records handed to the reporter, records the sink
 accepted, records dropped **by reason** — queue full, aged out past
 P-USAGE-MAX-RETRY-AGE, refused on content, or produced after the reporter stopped —
 deliveries that failed and will be retried, the queue's current depth, and delivery
-latency. Every one of them is bound at construction rather than looked up per record: the
-enqueue happens inside a response, and a metric-family lookup there is work the serving
-path pays for measurement.
+latency. Queue depth is sampled on scrape in both enforcement modes, so it stays current
+while delivery is stalled or retrying. Every signal is bound at construction rather than
+looked up per record: the enqueue happens inside a response, and a metric-family lookup
+there is work the serving path pays for measurement.
 
 Drops are the point of the family. Loss is designed in (DC-9) and therefore has to be a
 number rather than an inference: a total that is a lower bound is usable if the size of

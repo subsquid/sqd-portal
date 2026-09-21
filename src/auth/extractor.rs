@@ -150,9 +150,8 @@ impl Gate {
         }
     }
 
-    /// The usage sink, where one is configured. Read by the router, which mounts
-    /// the egress tap only on the routes this gate wraps.
-    pub(super) fn usage(&self) -> Option<Arc<UsageSink>> {
+    /// The HTTP server installs the outer egress tap only when configured.
+    pub(crate) fn usage(&self) -> Option<Arc<UsageSink>> {
         self.usage.clone()
     }
 
@@ -162,9 +161,12 @@ impl Gate {
         self.enforcement == Enforcement::Enforce
     }
 
-    /// Republished on scrape so it climbs through an outage rather than
-    /// freezing at the last value (OB-13).
-    pub fn publish_freshness(&self) {
+    /// Sample on scrape so exchange age and queue depth remain current during
+    /// outages. Usage measurement also runs in log-only mode (OB-13/15).
+    pub fn publish_metrics(&self) {
+        if let Some(usage) = &self.usage {
+            usage.publish_queue_depth();
+        }
         if !self.enforcing() {
             return;
         }
@@ -335,23 +337,27 @@ pub(super) async fn middleware(
     gate: Arc<Gate>,
     names_dataset: bool,
     endpoint: Arc<str>,
-    mut req: Request,
+    req: Request,
     next: Next,
 ) -> Response {
     let admission = gate.decide(req.headers(), req.uri(), names_dataset).await;
     let decision = admission.decision;
     gate.count(decision);
-    if let (Some(_), Some(grant)) = (&gate.usage, admission.grant) {
-        // Deposited on the request, where the egress tap — mounted inside this
-        // middleware — is the only thing that reads it. Nothing on the request
-        // path acts on it: a claim recorded is not a claim enforced.
-        req.extensions_mut()
-            .insert(Attribution::new(grant, admission.dataset, endpoint));
+    if let (Decision::Reject(rejection), Enforcement::Enforce) = (decision, gate.enforcement) {
+        return rejection.into_response();
     }
-    match (decision, gate.enforcement) {
-        (Decision::Reject(rejection), Enforcement::Enforce) => rejection.into_response(),
-        _ => next.run(req).await,
+
+    let attribution = match (&gate.usage, admission.grant) {
+        (Some(_), Some(grant)) => Some(Attribution::new(grant, admission.dataset, endpoint)),
+        _ => None,
+    };
+    let mut response = next.run(req).await;
+    if let Some(attribution) = attribution {
+        // Response extensions survive normalization and HEAD body stripping,
+        // allowing the outer tap to measure the body actually sent.
+        response.extensions_mut().insert(attribution);
     }
+    response
 }
 
 /// Headers only: a query parameter puts the secret in browser history,
@@ -1363,57 +1369,26 @@ mod tests {
         })
     }
 
-    /// What a usage record is built from, and the one place it is assembled:
-    /// the ladder already resolved every claim, so the tap downstream reads a
-    /// request extension rather than the cache (REQ-60).
+    /// Attribution follows the response to the outer tap without another cache lookup.
     #[tokio::test]
-    async fn an_admitted_request_carries_its_attribution_to_the_handler() {
+    async fn an_admitted_response_carries_its_attribution_to_the_tap() {
         let gate = gate_measuring(Some("org-7")).await;
-        let seen = Arc::new(std::sync::Mutex::new(None));
-        let recorded = seen.clone();
-        let app = Router::new().route(
-            "/datasets/:dataset/stream",
-            post(move |req: HttpRequest<Body>| {
-                let recorded = recorded.clone();
-                async move {
-                    *recorded.lock().unwrap() =
-                        req.extensions().get::<Attribution>().map(|attribution| {
-                            (
-                                attribution.key_id().to_owned(),
-                                attribution.organization_id().map(str::to_owned),
-                                attribution.dataset().map(str::to_owned),
-                                attribution.endpoint().to_owned(),
-                            )
-                        });
-                    "served"
-                }
-            })
-            .route_layer(from_fn(move |req, next| {
-                middleware(gate.clone(), true, Arc::from("/stream"), req, next)
-            })),
-        );
+        let response = app(gate, "/datasets/:dataset/stream")
+            .oneshot(
+                request("/datasets/base/stream")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-        let (status, _) = call(
-            app,
-            request("/datasets/base/stream")
-                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            seen.lock().unwrap().clone(),
-            Some((
-                KEY_ID.to_owned(),
-                Some("org-7".to_owned()),
-                // The canonical name behind the alias the request used: an
-                // event naming an alias is not comparable across deployments.
-                Some("base-mainnet".to_owned()),
-                "/stream".to_owned(),
-            ))
-        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let attribution = response.extensions().get::<Attribution>().unwrap();
+        assert_eq!(attribution.key_id(), KEY_ID);
+        assert_eq!(attribution.organization_id(), Some("org-7"));
+        assert_eq!(attribution.dataset(), Some("base-mainnet"));
+        assert_eq!(attribution.endpoint(), "/probe");
     }
 
     /// The kill switch, from the gate's side: with no `auth.usage:` block there
@@ -1422,37 +1397,98 @@ mod tests {
     #[tokio::test]
     async fn without_a_usage_block_nothing_is_attributed() {
         let gate = gate_granting(None, Enforcement::Enforce).await;
-        let seen = Arc::new(std::sync::Mutex::new(true));
-        let recorded = seen.clone();
-        let app = Router::new().route(
-            "/datasets/:dataset/stream",
-            post(move |req: HttpRequest<Body>| {
-                let recorded = recorded.clone();
-                async move {
-                    *recorded.lock().unwrap() = req.extensions().get::<Attribution>().is_some();
-                    "served"
-                }
-            })
-            .route_layer(from_fn(move |req, next| {
-                middleware(gate.clone(), true, Arc::from("/stream"), req, next)
-            })),
-        );
+        let response = app(gate, "/datasets/:dataset/stream")
+            .oneshot(
+                request("/datasets/base/stream")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-        let (status, body) = call(
-            app,
-            request("/datasets/base/stream")
-                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
-                .body(Body::empty())
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.extensions().get::<Attribution>().is_none());
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
                 .unwrap(),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, "served");
-        assert!(
-            !*seen.lock().unwrap(),
-            "a portal that measures nothing must not even name who it served"
+            "served"
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_organization_metadata_never_changes_admission() {
+        let cp = MockControlPlane::spawn().await;
+        cp.raw(
+            KEY_ID,
+            serde_json::json!({
+                "result": "granted",
+                "grant": {
+                    "claims_version": crate::auth::types::CLAIMS_VERSION,
+                    "key_id": KEY_ID,
+                    "organization_id": {"unexpected": "shape"},
+                    "refresh_after": NOW + 86_400,
+                    "expires_at": NOW + 86_400,
+                }
+            }),
+        );
+        for measuring in [false, true] {
+            let (mut gate, _) = gate_for(&cp, Enforcement::Enforce).await;
+            if measuring {
+                let (sink, _events) = UsageSink::for_test(8, std::time::Duration::from_secs(30));
+                Arc::get_mut(&mut gate).unwrap().usage = Some(sink);
+            }
+            let admission = gate
+                .decide(
+                    &header_map(&format!("Bearer {TOKEN}")),
+                    &"/datasets/base/stream".parse().unwrap(),
+                    true,
+                )
+                .await;
+            assert_eq!(admission.decision, Decision::Admit, "measuring={measuring}");
+            assert_eq!(admission.grant.unwrap().organization_id, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn scrapes_report_queue_growth_and_drain_in_both_modes() {
+        let signals = crate::metrics::UsageSignals::bind();
+        for mode in [Enforcement::Enforce, Enforcement::LogOnly] {
+            let mut gate = gate_granting(None, mode).await;
+            let (sink, mut events) = UsageSink::for_test(8, std::time::Duration::from_secs(30));
+            Arc::get_mut(&mut gate).unwrap().usage = Some(sink.clone());
+            let service = tower::ServiceBuilder::new()
+                .layer(axum::middleware::from_fn_with_state(
+                    sink,
+                    crate::auth::tap_middleware,
+                ))
+                .service(app(gate.clone(), "/datasets/:dataset/stream"));
+
+            // The reporter is stalled: responses keep adding records without a dequeue.
+            for expected in 1..=2 {
+                let response = service
+                    .clone()
+                    .oneshot(
+                        request("/datasets/base/stream")
+                            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                gate.publish_metrics();
+                assert_eq!(signals.queue_depth.get(), expected, "{mode:?}");
+            }
+            for expected in [1, 0] {
+                events.try_recv().unwrap();
+                gate.publish_metrics();
+                assert_eq!(signals.queue_depth.get(), expected, "{mode:?}");
+            }
+        }
     }
 
     /// A grant with no owner is the answer an older control plane gives, and it

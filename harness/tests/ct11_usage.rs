@@ -1,7 +1,7 @@
 //! CT-11 — shadow usage measurement, end to end against the portal as a black
 //! box (REQ-60, DC-9, INV-32).
 //!
-//! Four claims, and they are the ones the design rests on:
+//! Five claims, and they are the ones the design rests on:
 //!
 //! 1. **Records arrive attributed and batched.** A gated request produces a
 //!    record naming the key, its owner and the route, delivered to the ingest
@@ -17,6 +17,8 @@
 //! 4. **An empty body is a delivery.** A response that is already at end of
 //!    stream when its head is written is never polled — hyper drops it — so a
 //!    real server is the only witness to what the tap makes of it.
+//! 5. **The final response is measured.** Framework errors, stamped server
+//!    errors and HEAD responses are counted after the router finishes them.
 //!
 //! Two portals, because the property differs by configuration: one measuring,
 //! and one with no `usage:` block at all — which must report nothing while
@@ -30,6 +32,7 @@ use harness::driver::Decoded;
 use harness::fixture::Fixture;
 use harness::portal::Auth;
 use harness::stubs::control_plane::Answer;
+use harness::stubs::worker::WorkerFault;
 use harness::{driver, ToyWorld};
 use serde_json::{json, Value};
 
@@ -362,6 +365,68 @@ async fn measuring(fx: &mut Fixture) -> anyhow::Result<()> {
     fx.cp().accept_usage();
     stream_as(fx, "toy", "finalized-stream", "recovered", "ct11-recovered").await?;
     wait_for_events(fx, "recovered", 1).await?;
+
+    // Framework rejection normalization and HEAD stripping both happen after
+    // the gate. Count the final body, not the one those layers discarded.
+    for (method, key) in [
+        (reqwest::Method::GET, "framework"),
+        (reqwest::Method::HEAD, "head"),
+    ] {
+        let response = fx
+            .http
+            .request(
+                method,
+                format!("{}/datasets/toy/timestamps/invalid/block", fx.base),
+            )
+            .header("authorization", bearer(key))
+            .header("x-request-id", format!("ct11-{key}"))
+            .send()
+            .await?;
+        ensure!(
+            response.status().as_u16() == 400,
+            "expected a framework rejection"
+        );
+        let bytes = response.bytes().await?;
+        ensure!(
+            bytes.is_empty() == (key == "head"),
+            "only HEAD omits the body"
+        );
+        let events = wait_for_events(fx, key, 1).await?;
+        ensure!(
+            statuses(&events) == ["completed"] && wire_bytes(&events) == bytes.len() as u64,
+            "{key}: final body was {} bytes, reported {events:?}",
+            bytes.len()
+        );
+    }
+
+    // The logging layer rebuilds 5xx bodies to include the request ID.
+    fx.worker_faults
+        .always(WorkerFault::ServerError("usage test".to_owned()));
+    let failed = stream_as(
+        fx,
+        "toy",
+        "finalized-stream",
+        "server-error",
+        "ct11-server-error",
+    )
+    .await?;
+    fx.worker_faults.clear();
+    ensure!(
+        failed.status >= 500,
+        "expected a server error, got {}",
+        failed.status
+    );
+    let error: Value = serde_json::from_slice(&failed.body)?;
+    ensure!(
+        error["error"]["request_id"] == "ct11-server-error",
+        "the error must be stamped"
+    );
+    let events = wait_for_events(fx, "server-error", 1).await?;
+    ensure!(
+        statuses(&events) == ["completed"] && wire_bytes(&events) == failed.encoded_len() as u64,
+        "server error: final body was {} bytes, reported {events:?}",
+        failed.encoded_len()
+    );
 
     Ok(())
 }
