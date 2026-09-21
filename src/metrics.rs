@@ -137,13 +137,16 @@ impl UsageDrop {
         }
     }
 
-    const fn index(self) -> usize {
-        match self {
-            Self::QueueFull => 0,
-            Self::Expired => 1,
-            Self::Rejected => 2,
-            Self::Stopped => 3,
-        }
+    /// Derived from [`Self::ALL`], which is the order `bind` fills the counters
+    /// in. Hand-numbering it alongside was a second list to keep in step, and
+    /// getting it out of step is silent: a queue overflow would increment the
+    /// counter labelled `expired`, and OB-15's reason axis exists precisely
+    /// because those two page different people.
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|reason| *reason == self)
+            .expect("every variant is in ALL")
     }
 }
 

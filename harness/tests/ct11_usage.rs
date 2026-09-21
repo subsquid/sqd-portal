@@ -591,9 +591,11 @@ async fn unmeasured(fx: &mut Fixture, measured: &mut Fixture) -> anyhow::Result<
         stable_headers(&against),
     );
 
-    // Longer than any flush interval a default block would use, so this is a
-    // portal that reports nothing rather than one that has not reported yet.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Longer than the 5s `default_flush_interval_ms`, so this is a portal that
+    // reports nothing rather than one that has not reported yet. Two seconds
+    // was short of it, which made the assertion unfailable: a regression that
+    // defaulted `usage:` to on would post at ~5s and still pass here.
+    tokio::time::sleep(Duration::from_secs(7)).await;
     ensure!(
         fx.cp().usage_attempts() == 0,
         "REQ-60: with no `usage:` block the portal must not call the ingest at all: {:?}",

@@ -269,6 +269,10 @@ async fn main() -> anyhow::Result<()> {
             .observe_occupancy(cancellation_token.clone()),
     );
 
+    // Held back from the join so the failing exit can still stop the listener:
+    // `try_join!` drops the server's handle on the first error, and dropping a
+    // `JoinHandle` detaches the task rather than aborting it.
+    let stop_serving = cancellation_token.clone();
     let served = tokio::try_join!(
         tokio::spawn(run_server(
             task_manager,
@@ -295,6 +299,12 @@ async fn main() -> anyhow::Result<()> {
     // exit: the records already cut bought the same bytes either way, and a
     // flush the failing path skips makes DC-9's bargain a claim about the happy
     // path only.
+    //
+    // Cancelled first so the comment on `finalize` holds on that path too. On a
+    // clean exit the server has already returned; on a failing one it is
+    // detached and draining, and a record it cuts from here on finds the queue
+    // shut and is counted as dropped — which is the bargain, not a hole in it.
+    stop_serving.cancel();
     if let Some(authorization) = authorization {
         authorization.finish().await;
     }

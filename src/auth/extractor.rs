@@ -106,7 +106,12 @@ pub trait DatasetCatalog: Send + Sync {
 
 impl DatasetCatalog for NetworkClient {
     fn canonical_name(&self, alias: &str) -> Option<String> {
-        self.dataset(alias).map(|dataset| dataset.default_name)
+        // Not `dataset()`: that clones the whole `DatasetConfig` — alias list,
+        // real-time settings and an arbitrarily large metadata blob — to keep
+        // one `String`. Measurement resolves on every admitted request, so the
+        // serving path would pay that copy for the measuring configuration and
+        // not the other, which is the interference INV-32 forbids.
+        self.canonical_dataset_name(alias)
     }
 }
 
@@ -239,8 +244,13 @@ impl Gate {
         }
     }
 
-    /// Grants carry canonical names, so an alias is resolved first; an
-    /// unresolvable one is compared as written and fails to match.
+    /// Grants carry canonical names, so an alias is resolved first. One the
+    /// portal does not serve resolves to nothing, which fails every scope match
+    /// (`evaluate_scope` refuses a `None`) and leaves the usage record's dataset
+    /// unset rather than carrying whatever the client typed. That fallback put
+    /// an unbounded caller-controlled value in a control-plane column and broke
+    /// the premise the claim cap rests on — the same reason `dataset_label`
+    /// counts an unknown alias as `none` rather than minting a series for it.
     fn dataset_for(&self, path: &str, names_dataset: bool) -> Option<String> {
         if !names_dataset {
             return None;
@@ -253,11 +263,7 @@ impl Gate {
         let decoded = percent_encoding::percent_decode_str(raw)
             .decode_utf8()
             .ok()?;
-        Some(
-            self.catalog
-                .canonical_name(&decoded)
-                .unwrap_or_else(|| decoded.into_owned()),
-        )
+        self.catalog.canonical_name(&decoded)
     }
 
     /// OB-12's public half: the wire code and nothing finer. Shadow mode served
@@ -529,7 +535,15 @@ mod tests {
         let gate = Arc::new(Gate {
             cache: cache_with(cp, enforcement).await,
             catalog: Arc::new(StaticCatalog {
-                aliases: HashMap::from([("base".to_string(), "base-mainnet".to_string())]),
+                // A dataset resolves by its own name as well as by its aliases:
+                // `Datasets::parse` chains the default name onto the alias list,
+                // so a stub carrying only the alias would answer `None` where
+                // the portal answers the name, and a test would be passing on a
+                // fallback production never needs.
+                aliases: HashMap::from([
+                    ("base".to_string(), "base-mainnet".to_string()),
+                    ("base-mainnet".to_string(), "base-mainnet".to_string()),
+                ]),
                 lookups: lookups.clone(),
             }),
             portal_id: PORTAL.to_string(),
@@ -1507,6 +1521,33 @@ mod tests {
         let grant = admission.grant.expect("an admitted request has its grant");
         assert_eq!(grant.key_id, KEY_ID);
         assert_eq!(grant.organization_id, None);
+    }
+
+    /// An unscoped key admits whatever the path names, so the dataset a usage
+    /// record carries is the one thing on it a caller can choose. It has to be
+    /// a name the portal actually serves or nothing at all: the fallback that
+    /// echoed the path put an unbounded caller-supplied string in a
+    /// control-plane column, on a request the handler answers 404.
+    #[tokio::test]
+    async fn a_dataset_the_portal_does_not_serve_is_not_attributed() {
+        let gate = gate_measuring(None).await;
+        // Decodes cleanly and is simply not a dataset: the undecodable case is
+        // refused a rung earlier and would not exercise this at all.
+        let uri: axum::http::Uri = "/datasets/not-a-dataset-1234/stream".parse().unwrap();
+
+        let admission = gate
+            .decide(&header_map(&format!("Bearer {TOKEN}")), &uri, true)
+            .await;
+
+        assert_eq!(
+            admission.decision,
+            Decision::Admit,
+            "an unscoped key is not refused for naming an unknown dataset"
+        );
+        assert_eq!(
+            admission.dataset, None,
+            "an unresolvable alias must not reach a usage record"
+        );
     }
 
     /// An enforced refusal is not silent, though, or the cutover is blind. Goes
