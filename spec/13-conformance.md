@@ -41,8 +41,10 @@ produce a response that outlives an interval the portal measures on (P-USAGE-INT
 The kill-switch case runs both portals side by side and compares the *encoded* body bytes,
 not the decoded ones, so a re-framed response would fail it; and a beyond-head poll gives
 the one shape no unit test can witness honestly — an empty body, which the transport drops
-without ever polling. Framework errors, stamped server errors and HEAD responses also
-assert that records describe the final body after response rewriting.
+without ever polling. Each of RFC 9112's three framings is driven on the archival path and
+again on the proxied one, where a stream body never reports its own end; framework errors,
+stamped server errors and HEAD responses assert that records describe the final body after
+response rewriting.
 Coverage outside those four classes is still inline unit tests.
 All four suites run on every pull request: the harness is a separate crate, so it needs a
 build of the portal and a job of its own — a status this document cites has to be one
@@ -142,7 +144,7 @@ chunk-boundary records FV-6 licenses.
 | CT-8 | Isolation/noisy-neighbor: S6 | INV-35 |
 | CT-9 | Fuzz, both surfaces: client inputs and stub responses (payloads, artifacts) | INV-36, FM-1, GAP-1 |
 | CT-10 | Authorization: credential corpus × enforcement mode against a control-plane stub; exchange-fault, lifetime and convergence cases (denial mid-grant, a retired timed-out generation completing after its successor, over-cap lifetime, unreadable claims version, outage across `refresh_after` and `expires_at`); which signing key reaches the wire when `auth.key_path` names one; bracketed metrics scrapes proving no key-id side channel, including neutral shadow-mode projection; both presentation channels with their precedence, and a present-but-unusable `Authorization` refusing rather than falling through to `x-api-key` | INV-6/10/14/15/38/39, INV-31, LIV-13/14, REQ-50..REQ-56, DC-8, IB-9, HZ-10/12/13 |
-| CT-11 | Usage measurement: attribution, delta accounting, empty-body completion and non-interference against a usage-sink stub; sink healthy, refusing, and absent, with the absent case compared byte-for-byte against a measuring portal | INV-32, REQ-60/61, DC-9, OB-15, HZ-14/15 |
+| CT-11 | Usage measurement: attribution, delta accounting, per-framing completion and non-interference against a usage-sink stub; sink healthy, refusing, and absent, with the absent case compared byte-for-byte against a measuring portal | INV-32, REQ-60/61, DC-9, OB-15, HZ-14/15 |
 
 ## Structural validators (kind-agnostic, applied to every response)
 

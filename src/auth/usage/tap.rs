@@ -32,6 +32,7 @@ use std::{
 use axum::{
     body::Body,
     extract::{Request, State},
+    http::{header, HeaderMap, Method, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -52,11 +53,69 @@ pub(crate) async fn tap_middleware(
     req: Request,
     next: Next,
 ) -> Response {
+    let method = req.method().clone();
     let mut response = next.run(req).await;
     match response.extensions_mut().remove::<Attribution>() {
-        Some(attribution) => measure(sink, attribution, response),
+        Some(attribution) => measure(sink, attribution, &method, response),
         None => response,
     }
+}
+
+/// How this response's body is delimited, and therefore what counts as having
+/// delivered all of it (RFC 9112 §6). Decided once, from the same three inputs
+/// hyper decides it from, before a byte moves.
+///
+/// This is deliberately *not* `Body::is_end_stream`. That is an optional hint
+/// whose trait default is `false`, so a body is free to never admit it has
+/// ended — `axum::body::Body::from_stream` never does. Asking it turns every
+/// fixed-length proxied response into an apparent hang-up. Framing is a
+/// property of the message, and no body type can be wrong about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// The message cannot carry a body at all, whatever its headers say.
+    Empty,
+    /// Delimited by a byte count, from `Content-Length` or from an exact size
+    /// hint — the latter being what hyper would put in the header itself.
+    Length(u64),
+    /// Delimited by the end of the stream, so only the stream ending proves it.
+    Chunked,
+}
+
+impl Framing {
+    fn of(method: &Method, status: StatusCode, headers: &HeaderMap, hint: &SizeHint) -> Self {
+        // A response to HEAD is bodiless however it is framed, and 204/304 may
+        // not carry one. Axum has already dropped the body by the time the tap
+        // sees it, so the bytes are genuinely zero and zero is the whole of it.
+        if method == Method::HEAD
+            || status == StatusCode::NO_CONTENT
+            || status == StatusCode::NOT_MODIFIED
+        {
+            return Self::Empty;
+        }
+        // Chunked wins over a length, so a message carrying both is delimited
+        // by its stream and nothing may be concluded from the count.
+        if headers.contains_key(header::TRANSFER_ENCODING) {
+            return Self::Chunked;
+        }
+        headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| hint.exact())
+            .map_or(Self::Chunked, Self::Length)
+    }
+}
+
+/// Why the body stopped yielding — the other half of the completion question.
+#[derive(Debug, Clone, Copy)]
+enum Stopped {
+    /// The stream ended of its own accord.
+    Eof,
+    /// The body failed mid-flight.
+    Error,
+    /// The transport let the body go without polling it to either. Whether that
+    /// is delivery or a hang-up is what [`Framing`] answers.
+    Dropped,
 }
 
 /// Wraps the response body so its frames are counted on the way out. The status
@@ -65,9 +124,18 @@ pub(crate) async fn tap_middleware(
 /// including the size hint — a lost hint would let the transport re-frame a
 /// fixed-length response as chunked, which is a client-visible change no
 /// measurement is allowed to make.
-fn measure(sink: Arc<UsageSink>, attribution: Attribution, response: Response) -> Response {
+fn measure(
+    sink: Arc<UsageSink>,
+    attribution: Attribution,
+    method: &Method,
+    response: Response,
+) -> Response {
     let (parts, body) = response.into_parts();
-    let meter = Meter::new(sink, attribution, Encoding::of(&parts.headers));
+    // The hint is read before wrapping because that is what hyper will read: a
+    // body with an exact size and no `Content-Length` gets one from hyper, and
+    // is then length-delimited on the wire.
+    let framing = Framing::of(method, parts.status, &parts.headers, &body.size_hint());
+    let meter = Meter::new(sink, attribution, Encoding::of(&parts.headers), framing);
     Response::from_parts(parts, Body::new(MeasuredBody { inner: body, meter }))
 }
 
@@ -86,11 +154,21 @@ struct Meter {
     window: Instant,
     /// Bytes yielded since the last record.
     pending: u64,
+    /// Bytes yielded by this response in total. Distinct from `pending`, which
+    /// an interim record resets — a length-delimited response that outlives
+    /// `P-USAGE-INTERIM` would otherwise never be seen to reach its length.
+    yielded: u64,
+    framing: Framing,
     finished: bool,
 }
 
 impl Meter {
-    fn new(sink: Arc<UsageSink>, attribution: Attribution, encoding: Encoding) -> Self {
+    fn new(
+        sink: Arc<UsageSink>,
+        attribution: Attribution,
+        encoding: Encoding,
+        framing: Framing,
+    ) -> Self {
         let interim = sink.interim();
         let started = Instant::now();
         Self {
@@ -102,6 +180,8 @@ impl Meter {
             started,
             window: started,
             pending: 0,
+            yielded: 0,
+            framing,
             finished: false,
         }
     }
@@ -119,6 +199,7 @@ impl Meter {
             return;
         }
         self.pending = self.pending.saturating_add(bytes as u64);
+        self.yielded = self.yielded.saturating_add(bytes as u64);
         let now = Instant::now();
         if now.duration_since(self.window) >= self.interim {
             self.cut(now, Status::Open);
@@ -133,11 +214,29 @@ impl Meter {
     ///
     /// Idempotent: a body that reaches EOF and is then dropped — the ordinary
     /// case — must not report its tail twice.
-    fn finish(&mut self, status: Status) {
+    ///
+    /// The ending is derived, not asserted by the caller: only the body knows
+    /// *how* it stopped, and only the framing knows what stopping there means.
+    fn finish(&mut self, stopped: Stopped) {
         if self.finished {
             return;
         }
         self.finished = true;
+        let status = match (stopped, self.framing) {
+            // A stream that ended, or failed, said so itself.
+            (Stopped::Eof, _) => Status::Completed,
+            (Stopped::Error, _) => Status::Disconnected,
+            // Everything below is a body the transport dropped without polling
+            // to either, which is the ordinary end of every response hyper can
+            // frame in advance — not a hang-up.
+            (Stopped::Dropped, Framing::Empty) => Status::Completed,
+            (Stopped::Dropped, Framing::Length(length)) if self.yielded >= length => {
+                Status::Completed
+            }
+            // Short of its declared length, or delimited by a stream that never
+            // ended: the client did not get an ending.
+            (Stopped::Dropped, _) => Status::Disconnected,
+        };
         self.cut(Instant::now(), status);
     }
 
@@ -170,10 +269,10 @@ fn offset(started: Instant, at: Instant) -> f64 {
 /// would systematically under-report exactly the responses that carry the most
 /// bytes.
 ///
-/// The bound is on the struct rather than the impls because `Drop` needs it:
-/// deciding how a dropped body ended means asking the inner body, and a `Drop`
-/// impl may not require more than the type it drops.
-struct MeasuredBody<B: HttpBody> {
+/// How a dropped body ended is answered from the response's framing, fixed at
+/// wrap time, so `Drop` never has to interrogate the body it is dropping — and
+/// the bound stays on the impls that actually need it.
+struct MeasuredBody<B> {
     inner: B,
     meter: Meter,
 }
@@ -196,20 +295,12 @@ where
                 if let Some(data) = frame.data_ref() {
                     this.meter.observed(data.remaining());
                 }
-                // A fixed-length body is never polled to `None`: hyper reads
-                // `is_end_stream` after the final frame and stops, so waiting
-                // for EOF would hand every Content-Length response — error
-                // envelopes included — to `Drop`, which cannot tell delivery
-                // from a hang-up and would label it disconnected.
-                if this.inner.is_end_stream() {
-                    this.meter.finish(Status::Completed);
-                }
             }
             // The body failed mid-flight. The response is already committed, so
             // this is a truncation (INV-25) — the bytes that did go out still
             // happened, and the record says the client did not get an ending.
-            Poll::Ready(Some(Err(_))) => this.meter.finish(Status::Disconnected),
-            Poll::Ready(None) => this.meter.finish(Status::Completed),
+            Poll::Ready(Some(Err(_))) => this.meter.finish(Stopped::Error),
+            Poll::Ready(None) => this.meter.finish(Stopped::Eof),
             Poll::Pending => {}
         }
         polled
@@ -225,20 +316,14 @@ where
     }
 }
 
-impl<B: HttpBody> Drop for MeasuredBody<B> {
+impl<B> Drop for MeasuredBody<B> {
     fn drop(&mut self) {
-        // The same question `poll_frame` asks after a frame, asked again for the
-        // body that never gets one: a body already at end of stream when the
-        // head is written — a 204, a HEAD, an empty stream — is never polled at
-        // all, hyper drops it straight away. An unconditional `Disconnected`
-        // here would label every fully delivered empty response a hang-up, and
-        // on the head-tailing clients that poll into an empty range that is the
-        // steady state rather than an edge.
-        self.meter.finish(if self.inner.is_end_stream() {
-            Status::Completed
-        } else {
-            Status::Disconnected
-        });
+        // Reached by every response hyper can frame in advance, because it stops
+        // polling the moment its encoder is satisfied and drops the body: a
+        // 204, a HEAD, an empty stream, and every `Content-Length` response
+        // including the error envelopes. Only the framing separates those from
+        // a client that went away, and it is the framing that is asked.
+        self.meter.finish(Stopped::Dropped);
     }
 }
 
@@ -289,7 +374,7 @@ mod tests {
                 HeaderValue::from_str(encoding).unwrap(),
             );
         }
-        (measure(sink, attribution(), response), events)
+        (measure(sink, attribution(), &Method::GET, response), events)
     }
 
     async fn read(body: Body) -> usize {
@@ -395,10 +480,10 @@ mod tests {
         assert_eq!(events[0].status, Status::Completed);
     }
 
-    /// hyper never polls a fixed-length body to `None`: it reads
-    /// `is_end_stream` after the final frame and stops. Caught live — a fully
-    /// delivered 400 envelope recorded as `disconnected` — because every prior
-    /// test polled to EOF by hand, which only chunked bodies experience.
+    /// hyper never polls a fixed-length body to `None`: it stops the moment its
+    /// encoder is satisfied. Caught live — a fully delivered 400 envelope
+    /// recorded as `disconnected` — because every prior test polled to EOF by
+    /// hand, which only chunked bodies experience.
     #[tokio::test]
     async fn a_fixed_length_body_completes_when_hyper_stops_at_end_stream() {
         let (response, mut events) = measured(Body::from("0123456789"), None, INTERIM);
@@ -416,6 +501,184 @@ mod tests {
         assert_eq!(events.len(), 1, "one terminal record, not one per path");
         assert_eq!(events[0].status, Status::Completed);
         assert_eq!(events[0].wire_bytes, 10);
+    }
+
+    /// A response shaped like `stream_response`'s: a stream body carrying
+    /// whatever framing headers the upstream sent, forwarded verbatim.
+    fn proxied(
+        status: StatusCode,
+        chunks: Vec<&'static str>,
+        content_length: Option<usize>,
+    ) -> (Response, mpsc::Receiver<Queued>) {
+        let (sink, events) = UsageSink::for_test(64, INTERIM);
+        let body =
+            Body::from_stream(futures::stream::iter(chunks.into_iter().map(|chunk| {
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(chunk.as_bytes()))
+            })));
+        let mut builder = Response::builder().status(status);
+        if let Some(length) = content_length {
+            builder = builder.header(header::CONTENT_LENGTH, length.to_string());
+        }
+        let response = builder.body(body).unwrap();
+        (measure(sink, attribution(), &Method::GET, response), events)
+    }
+
+    async fn poll_one(body: &mut Body) -> usize {
+        std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx))
+            .await
+            .expect("one frame")
+            .expect("no error")
+            .data_ref()
+            .expect("data")
+            .remaining()
+    }
+
+    /// The defect this framing exists to remove. `Body::from_stream` never
+    /// admits end of stream — the trait default is `false` and axum's
+    /// `StreamBody` does not override it — so every `Content-Length` response
+    /// on the proxied real-time path reached `Drop` looking like a hang-up.
+    #[tokio::test]
+    async fn a_length_delimited_stream_completes_though_it_never_admits_end_of_stream() {
+        let (response, mut events) = proxied(StatusCode::OK, vec!["0123456789"], Some(10));
+        let mut body = response.into_body();
+
+        assert_eq!(poll_one(&mut body).await, 10);
+        assert!(
+            !body.is_end_stream(),
+            "the premise: a stream body never admits it ended"
+        );
+        drop(body);
+
+        let events = drain(&mut events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, Status::Completed);
+        assert_eq!(events[0].wire_bytes, 10);
+    }
+
+    /// The head-tailing steady state: a client polling past the head gets a 204
+    /// whose body hyper never polls at all.
+    #[tokio::test]
+    async fn a_bodiless_proxied_response_completes_without_ever_being_polled() {
+        let (response, mut events) = proxied(StatusCode::NO_CONTENT, vec![], None);
+        drop(response.into_body());
+
+        let events = drain(&mut events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, Status::Completed);
+        assert_eq!(events[0].wire_bytes, 0);
+    }
+
+    /// The other half, and the one that stops the fix from being "call
+    /// everything completed": a body delimited by its stream proves delivery
+    /// only by ending, so one that stops early is a hang-up.
+    #[tokio::test]
+    async fn a_chunked_stream_dropped_early_is_still_a_disconnect() {
+        let (response, mut events) = proxied(StatusCode::OK, vec!["0123456789", "rest"], None);
+        let mut body = response.into_body();
+
+        assert_eq!(poll_one(&mut body).await, 10);
+        drop(body);
+
+        let events = drain(&mut events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, Status::Disconnected);
+        assert_eq!(events[0].wire_bytes, 10);
+    }
+
+    /// Short of its declared length is a hang-up too — the count is what
+    /// separates the two, not the mere presence of a length.
+    #[tokio::test]
+    async fn a_length_delimited_stream_dropped_short_is_a_disconnect() {
+        let (response, mut events) = proxied(StatusCode::OK, vec!["0123456789", "rest"], Some(14));
+        let mut body = response.into_body();
+
+        assert_eq!(poll_one(&mut body).await, 10);
+        drop(body);
+
+        let events = drain(&mut events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, Status::Disconnected);
+        assert_eq!(events[0].wire_bytes, 10);
+    }
+
+    /// The taxonomy itself (RFC 9112 §6), including the two cases no body type
+    /// can report: a HEAD response, and a message framed both ways at once.
+    #[test]
+    fn framing_follows_the_message_not_the_body() {
+        let headers = |pairs: &[(&str, &str)]| {
+            let mut headers = HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(
+                    axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            headers
+        };
+        let none = SizeHint::default();
+
+        for (method, status, pairs, hint, expected) in [
+            // A response to HEAD is bodiless however it is framed.
+            (
+                Method::HEAD,
+                StatusCode::OK,
+                vec![("content-length", "6")],
+                &none,
+                Framing::Empty,
+            ),
+            (
+                Method::GET,
+                StatusCode::NO_CONTENT,
+                vec![],
+                &none,
+                Framing::Empty,
+            ),
+            (
+                Method::GET,
+                StatusCode::NOT_MODIFIED,
+                vec![],
+                &none,
+                Framing::Empty,
+            ),
+            // Chunked wins, so nothing may be concluded from the count.
+            (
+                Method::GET,
+                StatusCode::OK,
+                vec![("content-length", "10"), ("transfer-encoding", "chunked")],
+                &none,
+                Framing::Chunked,
+            ),
+            (
+                Method::GET,
+                StatusCode::OK,
+                vec![("content-length", "10")],
+                &none,
+                Framing::Length(10),
+            ),
+            // No header, but hyper would write one from the hint.
+            (
+                Method::GET,
+                StatusCode::OK,
+                vec![],
+                &SizeHint::with_exact(10),
+                Framing::Length(10),
+            ),
+            (Method::GET, StatusCode::OK, vec![], &none, Framing::Chunked),
+            // Unreadable framing is no framing: fall back to the stream.
+            (
+                Method::GET,
+                StatusCode::OK,
+                vec![("content-length", "not-a-number")],
+                &none,
+                Framing::Chunked,
+            ),
+        ] {
+            assert_eq!(
+                Framing::of(&method, status, &headers(&pairs), hint),
+                expected,
+                "{method} {status} {pairs:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -631,6 +894,7 @@ mod tests {
             let response = measure(
                 sink.clone(),
                 attribution(),
+                &Method::GET,
                 Response::new(Body::from("0123456789")),
             );
             served.push(read(response.into_body()).await);

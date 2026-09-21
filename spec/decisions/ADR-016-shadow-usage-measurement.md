@@ -94,6 +94,29 @@ as a service, after framework rejection normalization, request-ID stamping and H
 stripping, so it counts the final body. `Router::layer` is too far inside: Axum still
 strips HEAD bodies after those layers return.
 
+**Whether a response was delivered is read from its framing, not from the body.** hyper
+stops polling the moment its encoder is satisfied and drops the body, so most responses
+never reach end of stream: the terminal record has to decide what that drop meant. The
+obvious signal, `http_body::Body::is_end_stream`, is the wrong one — it is an optional
+hint whose trait default is `false`, and `axum::body::Body::from_stream`, which carries
+every proxied real-time response, never overrides it. Reading it as an answer marks every
+length-delimited and bodiless proxied response a hang-up, which is the steady state of a
+head-tailing client rather than an edge.
+
+Framing is a property of the message and no body type can be wrong about it. RFC 9112 §6
+gives three, and each carries its own proof of delivery: a bodiless message (HEAD, 204,
+304) is delivered on arrival; a length-delimited one when the count is reached; a
+stream-delimited one only by ending. The tap fixes which of the three applies before a
+byte moves, from the same inputs hyper uses — the request method, the status, the framing
+headers, and the body's size hint where no header names a length. A message framed both
+ways is treated as stream-delimited, since that is what hyper honours and nothing may then
+be concluded from a count.
+
+The residue is stated rather than fixed: bytes are counted as the body yields them, not as
+the socket drains them, so a connection dying with data buffered still reads as delivered.
+Closing that means metering at the connection, where keep-alive multiplexes responses and
+attribution would mean reimplementing the parser.
+
 `/sql/query` returns a worker/chunk **plan**, not result data. Its records carry the
 `/sql/query` route label and are excluded from data-volume analysis at read time. If SQL
 data volume ever matters, that is scanned-bytes work, reopened as a stated limitation

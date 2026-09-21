@@ -14,9 +14,12 @@
 //! 3. **Interim deltas plus the residual are the total.** A stream paced to
 //!    outlive `P-USAGE-INTERIM` reports more than once, and those records sum
 //!    to exactly the encoded bytes the client received.
-//! 4. **An empty body is a delivery.** A response that is already at end of
-//!    stream when its head is written is never polled — hyper drops it — so a
-//!    real server is the only witness to what the tap makes of it.
+//! 4. **Completion follows the message's framing.** Each of the three ways
+//!    HTTP delimits a body — bodiless, length-delimited, stream-delimited — is
+//!    driven on both the archival path and the proxied one, and each is
+//!    recorded as a delivery. hyper stops polling the moment its encoder is
+//!    satisfied, so only a real server witnesses what the tap makes of the end,
+//!    and only the proxy witnesses a body that never reports one.
 //! 5. **The final response is measured.** Framework errors, stamped server
 //!    errors and HEAD responses are counted after the router finishes them.
 //!
@@ -331,6 +334,58 @@ async fn measuring(fx: &mut Fixture) -> anyhow::Result<()> {
         wire_bytes(&empty_records) == 0,
         "an empty body carries no bytes: {:?}",
         empty_records,
+    );
+
+    // The same two shapes again on the proxied path, which is where they are
+    // not the same at all: a hotblocks response is forwarded over a stream body
+    // that never reports end of stream, and it carries the upstream's framing
+    // headers. Measured on the archival path alone, both shapes pass while
+    // every length-delimited and bodiless real-time response reads as a hang-up
+    // — which is what this pair caught.
+    let proxied_empty = query_as(
+        fx,
+        "toy-rt",
+        "finalized-stream",
+        "rt-empty",
+        "ct11-rt-empty",
+        &beyond_head_query(),
+    )
+    .await?;
+    ensure!(
+        proxied_empty.status == 204 && proxied_empty.encoded.is_empty(),
+        "the fixture must be an empty-bodied proxied response: {} with {} bytes",
+        proxied_empty.status,
+        proxied_empty.encoded_len(),
+    );
+    let proxied_empty_records = wait_for_events(fx, "rt-empty", 1).await?;
+    ensure!(
+        statuses(&proxied_empty_records) == ["completed"]
+            && wire_bytes(&proxied_empty_records) == 0,
+        "a proxied 204 was fully delivered: {proxied_empty_records:?}",
+    );
+
+    // Not paced, so the stub hands the portal one buffered body and the forwarded
+    // `content-length` delimits it — the shape hyper never polls to the end.
+    let proxied = stream_as(
+        fx,
+        "toy-rt",
+        "finalized-stream",
+        "rt-length",
+        "ct11-rt-length",
+    )
+    .await?;
+    ensure!(
+        proxied.status == 200 && !proxied.encoded.is_empty(),
+        "the fixture must be a served proxied stream: {} with {} bytes",
+        proxied.status,
+        proxied.encoded_len(),
+    );
+    let proxied_records = wait_for_events(fx, "rt-length", 1).await?;
+    ensure!(
+        statuses(&proxied_records) == ["completed"]
+            && wire_bytes(&proxied_records) == proxied.encoded_len() as u64,
+        "a length-delimited proxied response was fully delivered, {} bytes: {proxied_records:?}",
+        proxied.encoded_len(),
     );
 
     // ---- 5. A sink outage is invisible to the client ------------------------
