@@ -45,12 +45,13 @@ use event::UsageEvent;
 /// Who a request was served to, carried in response extensions from the gate
 /// to the outer egress tap (REQ-60).
 ///
-/// Holds the grant rather than copying out of it: the claims are already behind
-/// an `Arc` in the cache and outlive the request. The tap takes this attribution
-/// out of the response; claim strings are copied only when a record is made.
+/// Keeps only bounded attribution strings. Keeping the entire cached grant
+/// would pin its dataset scopes after eviction or refresh for the lifetime of
+/// a stream, bypassing the cache's memory bound.
 #[derive(Debug, Clone)]
 pub(crate) struct Attribution {
-    grant: Arc<CachedGrant>,
+    key_id: String,
+    organization_id: Option<String>,
     /// The canonical name, resolved by the gate, where the route names a
     /// dataset at all.
     dataset: Option<String>,
@@ -66,18 +67,19 @@ impl Attribution {
         endpoint: Arc<str>,
     ) -> Self {
         Self {
-            grant,
-            dataset,
+            key_id: grant.key_id.clone(),
+            organization_id: grant.organization_id.as_deref().map(event::capped),
+            dataset: dataset.as_deref().map(event::capped),
             endpoint,
         }
     }
 
     pub(super) fn key_id(&self) -> &str {
-        &self.grant.key_id
+        &self.key_id
     }
 
     pub(super) fn organization_id(&self) -> Option<&str> {
-        self.grant.organization_id.as_deref()
+        self.organization_id.as_deref()
     }
 
     pub(super) fn dataset(&self) -> Option<&str> {
@@ -214,4 +216,28 @@ pub(super) fn start(
     let stop = CancellationToken::new();
     let task = tokio::spawn(reporter.run(receiver, stop.clone()));
     Ok((sink, Reporting { stop, task }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_stream_does_not_pin_an_evicted_grants_scopes() {
+        let grant = Arc::new(CachedGrant {
+            key_id: "key-7".into(),
+            datasets: Some((0..10_000).map(|i| format!("dataset-{i}")).collect()),
+            organization_id: Some("org-7".into()),
+            refresh_after: 1,
+            expires_at: 2,
+        });
+        let evicted = Arc::downgrade(&grant);
+        let attribution = Attribution::new(grant, Some("dataset-1".into()), Arc::from("/stream"));
+        assert!(
+            evicted.upgrade().is_none(),
+            "measurement must not retain scopes after the cache releases a grant"
+        );
+        assert_eq!(attribution.key_id(), "key-7");
+        assert_eq!(attribution.organization_id(), Some("org-7"));
+    }
 }

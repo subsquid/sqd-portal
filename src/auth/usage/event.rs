@@ -110,7 +110,7 @@ pub struct UsageEvent {
 /// bytes and slicing one in half would panic.
 const MAX_CLAIM_BYTES: usize = 256;
 
-fn capped(value: &str) -> String {
+pub(super) fn capped(value: &str) -> String {
     let mut end = MAX_CLAIM_BYTES.min(value.len());
     while !value.is_char_boundary(end) {
         end -= 1;
@@ -283,6 +283,11 @@ mod tests {
             Some(long),
             std::sync::Arc::from("/stream"),
         );
+
+        // The response may stay open for hours. Apply the bound before it
+        // retains these strings, not only when an event is finally emitted.
+        assert_eq!(attribution.organization_id().unwrap().len(), 255);
+        assert_eq!(attribution.dataset().unwrap().len(), 255);
 
         let event = UsageEvent::new(
             &attribution,
