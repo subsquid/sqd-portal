@@ -140,16 +140,34 @@ impl Default for UsageConfig {
     }
 }
 
+/// The reporter runs once per process, so a fleet reporting on a timer inserts
+/// at replica count divided by this interval however little data it carries --
+/// the one term that grows with customers rather than with traffic. At 5 s a
+/// fully gated fleet was the busiest inserter on a ClickHouse cluster that also
+/// holds billing, for records nothing reads on a serving path; at 30 s it is
+/// comparable to the tables already there. What it costs is publication lag and
+/// a wider `received_at - started_at`, neither of which a shadow measurement is
+/// read quickly enough to notice.
 fn default_flush_interval_ms() -> u64 {
-    5_000
+    30_000
 }
 
+/// The ingest contract's ceiling, and deliberately equal to it: a full batch is
+/// one insert either way, and stopping short only splits the same records over
+/// more of them. `MAX_BATCH_MAX_EVENTS` keeps this side from ever being
+/// configured above what the sink accepts, so the equality is checked at load
+/// rather than discovered as a batch that is refused on its content forever.
 fn default_batch_max_events() -> usize {
-    256
+    1_000
 }
 
+/// Sized so the queue outlives `default_max_retry_age_secs` rather than filling
+/// inside it: at the busiest per-replica rate measured across the fleet, 16384
+/// filled in about three minutes, so an outage began costing counted drops
+/// before the retry window it is supposed to bound had expired. The memory this
+/// buys back is single-digit megabytes.
 fn default_queue_capacity() -> usize {
-    16_384
+    32_768
 }
 
 fn default_max_retry_age_secs() -> u64 {
@@ -195,15 +213,27 @@ portal_id: portal-premium-eu
 
         let usage = config.usage.expect("the block is present");
         // P-USAGE-FLUSH
-        assert_eq!(usage.flush_interval(), Duration::from_secs(5));
+        assert_eq!(usage.flush_interval(), Duration::from_secs(30));
         // P-USAGE-BATCH-MAX
-        assert_eq!(usage.batch_max_events, 256);
+        assert_eq!(usage.batch_max_events, 1_000);
         // P-USAGE-QUEUE
-        assert_eq!(usage.queue_capacity, 16_384);
+        assert_eq!(usage.queue_capacity, 32_768);
         // P-USAGE-MAX-RETRY-AGE
         assert_eq!(usage.max_retry_age(), Duration::from_secs(300));
         // P-USAGE-INTERIM
         assert_eq!(usage.interim_interval(), Duration::from_secs(30));
+    }
+
+    /// The default batch is the contract ceiling, so the boundary the sink
+    /// checks is the one every full batch lands on. A ceiling lowered on either
+    /// side without the other turns each of them into a permanent refusal, which
+    /// `validate` catches only because the two are equal here.
+    #[test]
+    fn the_default_batch_is_the_contract_ceiling() {
+        assert_eq!(default_batch_max_events(), MAX_BATCH_MAX_EVENTS);
+        UsageConfig::default()
+            .validate()
+            .expect("the shipped defaults validate");
     }
 
     #[test]

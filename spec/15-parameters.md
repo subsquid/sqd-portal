@@ -79,9 +79,9 @@ assumes, not knobs it owns.
 | Parameter | Role (where used) | Observed | Target |
 |---|---|---|---|
 | P-LOGS-QUEUE | Usage-log queue bound; overflow drops (REQ-44) | 10000 *(fixed)* | 10000 |
-| P-USAGE-QUEUE | Commercial usage records held before the hot path drops them (REQ-60, DC-9, HZ-14). Separate from P-LOGS-QUEUE on purpose: a shared bound makes either sink's outage the other's | 16384 | ⚠ 16384 (draft; ratify against a measured record rate) |
-| P-USAGE-BATCH-MAX | Records per delivery to the usage sink (DC-9) | 256 | ⚠ 256 (draft) |
-| P-USAGE-FLUSH | Longest a record waits for company before its batch goes out (DC-9); a full batch leaves sooner | 5 s | ⚠ 5 s (draft) |
+| P-USAGE-QUEUE | Commercial usage records held before the hot path drops them (REQ-60, DC-9, HZ-14). Separate from P-LOGS-QUEUE on purpose: a shared bound makes either sink's outage the other's. Ratified against a measured record rate: sized to outlive P-USAGE-MAX-RETRY-AGE rather than fill inside it | 32768 | 32768 |
+| P-USAGE-BATCH-MAX | Records per delivery to the usage sink (DC-9). Equal to the sink's ceiling by construction — a full batch is one insert either way, and the config validator refuses anything above it | 1000 | 1000 |
+| P-USAGE-FLUSH | Longest a record waits for company before its batch goes out (DC-9); a full batch leaves sooner. Sets the timer-driven insert floor, which scales with replica count rather than traffic; ratified at 30 s against the measured fleet | 30 s | 30 s |
 | P-USAGE-MAX-RETRY-AGE | How long an undelivered record is retried before it is dropped and counted (DC-9, HZ-14) | 300 s | ⚠ 300 s (draft) |
 | P-USAGE-INTERIM | Longest measured window one delta record may cover; the streaming-bias correction ADR-016 rests on (REQ-60) | 30 s | ⚠ 30 s (draft; confirm against the stream-duration histogram phase 2's own data produces) |
 | P-ERROR-SAMPLE-RATE | Error-report trace sampling (REQ-31) | 0.01 | 0.01 |
