@@ -1086,6 +1086,8 @@ async fn execute_query(
         query.into_string(),
         Compression::Gzip,
         None,
+        // A debug query, not a stream's: no OB-16 attempt to charge.
+        None,
     );
     let result = match fut.await {
         Ok(success) => success.ok,

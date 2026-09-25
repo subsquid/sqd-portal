@@ -188,6 +188,20 @@ configuration. A family that appeared only where measurement was on would make a
 counter ambiguous between "not configured" and "nothing reported", which is the harder
 question to answer during an incident.
 
+**OB-16 — Fan-out efficiency.** Every worker query a stream sends is counted when handed
+to the transport, by why: first query for a chunk's range, continuation of a partial
+answer, retry after failure, or speculative attempt raced against one in flight (DC-1).
+It is counted again when settled: delivered, failed, superseded (cancelled because
+another attempt was used), discarded (its answer had arrived, but another was used), or
+abandoned (the stream ended first). A query cancelled while waiting for a congestion
+permit (DEF-13) is counted as withdrawn, so the sent count is worker load. The bytes each
+query read are counted under its outcome, so every downloaded byte that never reached a
+client has a cause; chunks a query was dispatched for are counted once each, the same
+way, by dataset — so the datasets wasting the most read-ahead can be ranked. The OB-4
+per-worker counts cannot stand in: to the transport, a speculative attempt that loses is
+a successful query. Delivered means handed to the response body. No family carries a
+worker or request label (GAP-6, HZ-6).
+
 ## Property → observable mapping
 
 | Property | Decided by |
@@ -205,6 +219,7 @@ question to answer during an incident.
 | INV-6, INV-15, INV-39 | protected OB-12 reason logs + public non-disclosure; neutral shadow projection and enforcing-only OB-13 classes |
 | INV-30/31 | OB-1, OB-5 (they are the invariant's subject) |
 | INV-32, REQ-60/61 | OB-15 drop reasons and queue depth against the sink stub's ledger |
+| REQ-41, FV-2 | OB-16 queries by kind against settled outcomes |
 | SLI-1..6 | OB-2, OB-3, OB-1 + process RSS |
 
 ## Logging

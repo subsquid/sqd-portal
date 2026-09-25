@@ -150,6 +150,89 @@ impl UsageDrop {
     }
 }
 
+/// Why a stream dispatched one worker query (OB-16).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptKind {
+    /// The first query for a chunk's range.
+    First,
+    /// The first query for the rest of a range a worker answered in part.
+    Continuation,
+    /// Sent after every earlier attempt at the range had failed.
+    Retry,
+    /// Sent while an earlier attempt at the same range was still in flight.
+    Hedge,
+}
+
+impl AttemptKind {
+    pub const ALL: [Self; 4] = [Self::First, Self::Continuation, Self::Retry, Self::Hedge];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Continuation => "continuation",
+            Self::Retry => "retry",
+            Self::Hedge => "hedge",
+        }
+    }
+}
+
+/// What became of one worker query that reached the transport (OB-16).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptOutcome {
+    /// Its payload was handed to the client's response body.
+    Delivered,
+    /// It ended in an error.
+    Failed,
+    /// Cancelled mid-flight because another attempt at the range was used.
+    Superseded,
+    /// Its answer had arrived, but another attempt's was used: noticed too late.
+    Discarded,
+    /// The stream ended first, with the query in flight or its answer unsent.
+    Abandoned,
+}
+
+impl AttemptOutcome {
+    pub const ALL: [Self; 5] = [
+        Self::Delivered,
+        Self::Failed,
+        Self::Superseded,
+        Self::Discarded,
+        Self::Abandoned,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+            Self::Superseded => "superseded",
+            Self::Discarded => "discarded",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Whether a chunk a stream dispatched a query for reached the client (OB-16).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChunkOutcome {
+    Delivered,
+    /// The stream ended on this chunk's error.
+    Failed,
+    /// The stream ended before the chunk was fully handed on.
+    Abandoned,
+}
+
+impl ChunkOutcome {
+    pub const ALL: [Self; 3] = [Self::Delivered, Self::Failed, Self::Abandoned];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
 /// Final transport outcome of one logical DC-4 request (ADR-015, OB-4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HotblocksRequestOutcome {
@@ -224,6 +307,13 @@ lazy_static::lazy_static! {
     pub static ref STREAM_BLOCKS_PER_SECOND: Family<Labels, Histogram> =
         Family::new_with_constructor(|| Histogram::new(exponential_buckets(1., 3.0, 20)));
     pub static ref STREAM_THROTTLED_RATIO: Histogram = Histogram::new(iter::empty());
+
+    // Stream fan-out (OB-16).
+    static ref STREAM_QUERIES_SENT: Family<Labels, Counter> = Default::default();
+    static ref STREAM_QUERIES_SETTLED: Family<Labels, Counter> = Default::default();
+    static ref STREAM_QUERIES_WITHDRAWN: Family<Labels, Counter> = Default::default();
+    static ref STREAM_WORKER_BYTES: Family<Labels, Counter> = Default::default();
+    static ref STREAM_CHUNKS_SETTLED: Family<Labels, Counter> = Default::default();
 
     static ref HOTBLOCKS_REQUESTS: Family<Labels, Counter> = Default::default();
 
@@ -360,6 +450,121 @@ impl UsageSignals {
 
 fn usage_drop_labels(reason: UsageDrop) -> Labels {
     vec![("reason".to_owned(), reason.as_str().to_owned())]
+}
+
+/// The OB-16 families. A default one is unregistered, so a test can count into its own
+/// while other tests move the registered families.
+#[derive(Clone, Default)]
+pub struct AttemptSignals {
+    sent: Family<Labels, Counter>,
+    settled: Family<Labels, Counter>,
+    withdrawn: Family<Labels, Counter>,
+    bytes: Family<Labels, Counter>,
+    chunks: Family<Labels, Counter>,
+}
+
+impl AttemptSignals {
+    /// The registered families; a clone shares their series.
+    pub fn bind() -> Self {
+        Self {
+            sent: STREAM_QUERIES_SENT.clone(),
+            settled: STREAM_QUERIES_SETTLED.clone(),
+            withdrawn: STREAM_QUERIES_WITHDRAWN.clone(),
+            bytes: STREAM_WORKER_BYTES.clone(),
+            chunks: STREAM_CHUNKS_SETTLED.clone(),
+        }
+    }
+
+    pub fn sent(&self, kind: AttemptKind) {
+        self.sent.get_or_create(&kind_labels(kind)).inc();
+    }
+
+    pub fn settled(&self, kind: AttemptKind, outcome: AttemptOutcome) {
+        self.settled
+            .get_or_create(&settled_labels(kind, outcome))
+            .inc();
+    }
+
+    pub fn withdrawn(&self, kind: AttemptKind) {
+        self.withdrawn.get_or_create(&kind_labels(kind)).inc();
+    }
+
+    pub fn bytes(&self, outcome: AttemptOutcome, bytes: u64) {
+        self.bytes
+            .get_or_create(&outcome_labels(outcome.as_str()))
+            .inc_by(bytes);
+    }
+
+    pub fn chunk(&self, dataset: &str, outcome: ChunkOutcome) {
+        self.chunks
+            .get_or_create(&chunk_labels(dataset, outcome))
+            .inc();
+    }
+}
+
+#[cfg(test)]
+impl AttemptSignals {
+    pub fn sent_count(&self, kind: AttemptKind) -> u64 {
+        self.sent.get_or_create(&kind_labels(kind)).get()
+    }
+
+    pub fn settled_count(&self, kind: AttemptKind, outcome: AttemptOutcome) -> u64 {
+        self.settled
+            .get_or_create(&settled_labels(kind, outcome))
+            .get()
+    }
+
+    pub fn withdrawn_count(&self, kind: AttemptKind) -> u64 {
+        self.withdrawn.get_or_create(&kind_labels(kind)).get()
+    }
+
+    pub fn byte_count(&self, outcome: AttemptOutcome) -> u64 {
+        self.bytes
+            .get_or_create(&outcome_labels(outcome.as_str()))
+            .get()
+    }
+
+    pub fn chunk_count(&self, dataset: &str, outcome: ChunkOutcome) -> u64 {
+        self.chunks
+            .get_or_create(&chunk_labels(dataset, outcome))
+            .get()
+    }
+}
+
+fn kind_labels(kind: AttemptKind) -> Labels {
+    vec![("kind".to_owned(), kind.as_str().to_owned())]
+}
+
+fn outcome_labels(outcome: &str) -> Labels {
+    vec![("outcome".to_owned(), outcome.to_owned())]
+}
+
+fn settled_labels(kind: AttemptKind, outcome: AttemptOutcome) -> Labels {
+    let mut labels = kind_labels(kind);
+    labels.extend(outcome_labels(outcome.as_str()));
+    labels
+}
+
+/// `dataset` is the configured name, as on `http_status`: bounded by config.
+fn chunk_labels(dataset: &str, outcome: ChunkOutcome) -> Labels {
+    let mut labels = vec![("dataset".to_owned(), dataset.to_owned())];
+    labels.extend(outcome_labels(outcome.as_str()));
+    labels
+}
+
+/// Creates the OB-16 series that carry no dataset at zero. A series first exposed at one
+/// hides that increment from `rate()`, which matters for rare outcomes like `discarded`.
+fn init_attempt_series() {
+    for kind in AttemptKind::ALL {
+        drop(STREAM_QUERIES_SENT.get_or_create(&kind_labels(kind)));
+        drop(STREAM_QUERIES_WITHDRAWN.get_or_create(&kind_labels(kind)));
+        for outcome in AttemptOutcome::ALL {
+            drop(STREAM_QUERIES_SETTLED.get_or_create(&settled_labels(kind, outcome)));
+        }
+    }
+    for outcome in AttemptOutcome::ALL {
+        drop(STREAM_WORKER_BYTES.get_or_create(&outcome_labels(outcome.as_str())));
+    }
 }
 
 /// Count one authorization evaluation (OB-12).
@@ -651,6 +856,7 @@ pub fn report_mutex_held_duration(
 }
 
 pub fn register_metrics(registry: &mut Registry) {
+    init_attempt_series();
     registry.register(
         "http_status",
         "Number of sent HTTP responses",
@@ -770,6 +976,32 @@ pub fn register_metrics(registry: &mut Registry) {
         "stream_throttled_ratio",
         "Throttled time of completed streams relative to their duration",
         STREAM_THROTTLED_RATIO.clone(),
+    );
+
+    registry.register(
+        "stream_queries_sent",
+        "Worker queries streams handed to the transport, by kind: first, continuation, retry, or hedge",
+        STREAM_QUERIES_SENT.clone(),
+    );
+    registry.register(
+        "stream_queries_settled",
+        "Sent stream worker queries by kind and outcome: delivered, failed, superseded, discarded, or abandoned",
+        STREAM_QUERIES_SETTLED.clone(),
+    );
+    registry.register(
+        "stream_queries_withdrawn",
+        "Stream worker queries cancelled before reaching the transport; no worker saw them",
+        STREAM_QUERIES_WITHDRAWN.clone(),
+    );
+    registry.register(
+        "stream_worker_bytes",
+        "Bytes read from workers by stream queries, by the query's outcome",
+        STREAM_WORKER_BYTES.clone(),
+    );
+    registry.register(
+        "stream_chunks_settled",
+        "Chunks streams dispatched a query for, by dataset and whether they reached the client: delivered, failed, or abandoned",
+        STREAM_CHUNKS_SETTLED.clone(),
     );
 
     registry.register(
@@ -1041,6 +1273,42 @@ mod tests {
         let distinct: std::collections::HashSet<_> =
             reasons.iter().map(|(_, wire)| *wire).collect();
         assert_eq!(distinct.len(), reasons.len());
+    }
+
+    /// OB-16's labels are what waste ratios and alerts are written against.
+    #[test]
+    fn attempt_labels_are_frozen() {
+        let kinds = AttemptKind::ALL.map(AttemptKind::as_str);
+        assert_eq!(kinds, ["first", "continuation", "retry", "hedge"]);
+        let outcomes = AttemptOutcome::ALL.map(AttemptOutcome::as_str);
+        let want = [
+            "delivered",
+            "failed",
+            "superseded",
+            "discarded",
+            "abandoned",
+        ];
+        assert_eq!(outcomes, want);
+        let chunks = ChunkOutcome::ALL.map(ChunkOutcome::as_str);
+        assert_eq!(chunks, ["delivered", "failed", "abandoned"]);
+    }
+
+    /// Before any query, so a rare outcome's first occurrence is visible to `rate()`.
+    #[test]
+    fn attempt_series_are_exposed_at_zero_from_registration() {
+        let mut registry = Registry::default();
+        register_metrics(&mut registry);
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
+
+        for series in [
+            r#"stream_queries_sent_total{kind="hedge"}"#,
+            r#"stream_queries_settled_total{kind="hedge",outcome="discarded"}"#,
+            r#"stream_queries_withdrawn_total{kind="first"}"#,
+            r#"stream_worker_bytes_total{outcome="superseded"}"#,
+        ] {
+            assert!(text.contains(series), "{series} missing");
+        }
     }
 
     /// A rolling deploy fails /ready on every pod; that must not read as an api_error.

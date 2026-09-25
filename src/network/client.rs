@@ -1,3 +1,5 @@
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::SystemTime;
 use std::{sync::Arc, time::Duration};
 
@@ -26,6 +28,7 @@ use tracing::{debug_span, instrument, Instrument};
 use super::contracts_state::{ContractsState, Status};
 use super::priorities::NoWorker;
 use super::{AssignmentType, ChunkNotFound, NetworkState, WorkerLease};
+use crate::controller::attempt::AttemptMeter;
 use crate::controller::download_scheduler::{DownloadScheduler, Outcome, Priority};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
@@ -58,6 +61,7 @@ pub trait StreamingNetwork: Send + Sync + 'static {
         query: String,
         compression: Compression,
         priority: Option<u32>,
+        meter: AttemptMeter,
     ) -> futures::future::BoxFuture<'static, QueryResult>;
 
     /// A response the controller rejected as contract-violating. The transport
@@ -88,6 +92,7 @@ impl StreamingNetwork for NetworkClient {
         query: String,
         compression: Compression,
         priority: Option<u32>,
+        meter: AttemptMeter,
     ) -> futures::future::BoxFuture<'static, QueryResult> {
         Box::pin(NetworkClient::query_worker(
             self,
@@ -98,6 +103,7 @@ impl StreamingNetwork for NetworkClient {
             query,
             compression,
             priority,
+            Some(meter),
         ))
     }
 
@@ -232,6 +238,30 @@ enum ReadError {
 }
 
 type ResponseStream = Box<dyn futures::AsyncRead + Unpin + Send>;
+
+/// A worker's response stream, counting what it yields into the attempt's meter.
+///
+/// Counted at the read rather than from the finished buffer, so an attempt aborted
+/// mid-body is still charged the bytes it had pulled off the wire (OB-16).
+struct Metered<R> {
+    inner: R,
+    meter: Option<AttemptMeter>,
+}
+
+impl<R: futures::AsyncRead + Unpin> futures::AsyncRead for Metered<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let (Poll::Ready(Ok(read)), Some(meter)) = (&poll, &this.meter) {
+            meter.record(*read);
+        }
+        poll
+    }
+}
 
 struct QueryGuard {}
 
@@ -665,6 +695,9 @@ impl NetworkClient {
         self.network_state.get_height(dataset)
     }
 
+    /// `meter` records, for a stream's OB-16 accounting, whether the query reached the
+    /// transport and the bytes read for it; a query no stream sent has none.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, level = "debug", fields(query_id))]
     pub async fn query_worker(
         self: Arc<Self>,
@@ -675,6 +708,7 @@ impl NetworkClient {
         query: String,
         compression: Compression,
         priority: Option<u32>,
+        meter: Option<AttemptMeter>,
     ) -> QueryResult {
         let query_id = generate_query_id();
         let worker = lease.worker();
@@ -694,7 +728,7 @@ impl NetworkClient {
             )
             .await;
         let result = self
-            .execute_query(worker, query, &block_range, priority)
+            .execute_query(worker, query, &block_range, priority, meter)
             .await;
         result
     }
@@ -705,8 +739,15 @@ impl NetworkClient {
         query: Query,
         block_range: &BlockRange,
         priority: Option<u32>,
+        meter: Option<AttemptMeter>,
     ) -> QueryResult {
-        let mut stream = self.send_to_transport(worker, query, priority).await?;
+        let stream = self
+            .send_to_transport(worker, query, priority, meter.as_ref())
+            .await?;
+        let mut stream = Metered {
+            inner: stream,
+            meter,
+        };
         let network_start = Instant::now();
         let mut buf = self.receive_first_byte(worker, &mut stream).await?;
         let ttfb = network_start.elapsed();
@@ -770,6 +811,7 @@ impl NetworkClient {
         worker: PeerId,
         query: Query,
         priority: Option<u32>,
+        meter: Option<&AttemptMeter>,
     ) -> Result<ResponseStream, QueryError> {
         metrics::QUERIES_SENT
             .get_or_create(&vec![("worker".to_string(), worker.to_string())])
@@ -779,6 +821,11 @@ impl NetworkClient {
             (Some(sched), Some(prio)) => Some(sched.acquire(prio).await),
             _ => None,
         };
+        // Past the permit wait: a stream that gives up on this query from here on has
+        // cost a worker something, so it counts as sent rather than withdrawn (OB-16).
+        if let Some(meter) = meter {
+            meter.mark_sent();
+        }
         match self
             .transport_handle
             .send_query_request(worker, query)
@@ -807,7 +854,7 @@ impl NetworkClient {
     async fn receive_first_byte(
         &self,
         worker: PeerId,
-        stream: &mut ResponseStream,
+        stream: &mut (impl futures::AsyncRead + Unpin),
     ) -> Result<Vec<u8>, QueryError> {
         // Intentionally not behind a download-scheduler permit.
         // The constrained portal-side resource is the network bandwidth,
@@ -833,7 +880,7 @@ impl NetworkClient {
     async fn download_body(
         &self,
         worker: PeerId,
-        stream: &mut ResponseStream,
+        stream: &mut (impl futures::AsyncRead + Unpin),
         buf: &mut Vec<u8>,
         priority: Option<u32>,
     ) -> Result<Duration, QueryError> {
