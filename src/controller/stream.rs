@@ -596,6 +596,9 @@ impl<N: StreamingNetwork> StreamController<N> {
                 let request = self.send_query(data_range, lease, kind);
                 *req = WorkerRequest::Running(request);
                 pending.set_timeout(self.timeouts.current_timeout(), ctx);
+                // A task wakes only for what it has polled, and this query has not been
+                // polled yet: ask for another pass, so its answer wakes the stream.
+                ctx.waker().wake_by_ref();
                 break;
             }
         }
@@ -2671,10 +2674,11 @@ mod tests {
         use AttemptKind::*;
         use AttemptOutcome::*;
         let cases = [
-            // Too slow: a hedge answers at t=1100 and is read on the next timeout
-            // (the late read is a bug of its own); the first is cut off mid-body.
+            // Too slow: a hedge answers at t=1100 and wins; the first is cut off
+            // mid-body. Were new queries left unpolled, the hedge would be read only
+            // once the first finished at t=1500, and lose to it.
             (
-                vec![QueryEvent::Slow(3000), QueryEvent::Slow(100)],
+                vec![QueryEvent::Slow(1500), QueryEvent::Slow(100)],
                 1,
                 vec![(First, Superseded, Incomplete), (Hedge, Delivered, Ok)],
             ),
@@ -2692,17 +2696,17 @@ mod tests {
                 1,
                 vec![(First, Delivered, Ok), (Hedge, Superseded, Error)],
             ),
-            // A hedge that fails while the first is still running is read at the next
-            // timeout and failed; the first goes on to deliver.
+            // A hedge that fails while the first is still running is read as soon as it
+            // fails; the first goes on to deliver.
             (
-                vec![QueryEvent::Slow(3000), QueryEvent::FailAfter(100)],
+                vec![QueryEvent::Slow(1500), QueryEvent::FailAfter(100)],
                 1,
                 vec![(First, Delivered, Ok), (Hedge, Failed, Error)],
             ),
-            // A terminal error, read at the next timeout, ends the range with no winner:
+            // A terminal error, read as soon as it lands, ends the range with no winner:
             // the first, still running, is cancelled, not beaten.
             (
-                vec![QueryEvent::Slow(3000), QueryEvent::Fatal],
+                vec![QueryEvent::Slow(1500), QueryEvent::Fatal],
                 1,
                 vec![(First, Cancelled, Incomplete), (Hedge, Failed, Error)],
             ),
