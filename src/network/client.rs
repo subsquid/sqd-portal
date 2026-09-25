@@ -242,13 +242,15 @@ type ResponseStream = Box<dyn futures::AsyncRead + Unpin + Send>;
 /// A worker's response stream, counting what it yields into the attempt's meter.
 ///
 /// Counted at the read rather than from the finished buffer, so an attempt aborted
-/// mid-body is still charged the bytes it had pulled off the wire (OB-16).
-struct Metered<R> {
+/// mid-body is still charged the bytes it had pulled off the wire (OB-16). Only what the
+/// application read: data the transport had buffered but nobody read is not counted,
+/// and neither is anything the worker spent producing it.
+struct Metered<'a, R> {
     inner: R,
-    meter: Option<AttemptMeter>,
+    meter: Option<&'a AttemptMeter>,
 }
 
-impl<R: futures::AsyncRead + Unpin> futures::AsyncRead for Metered<R> {
+impl<R: futures::AsyncRead + Unpin> futures::AsyncRead for Metered<'_, R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -696,7 +698,8 @@ impl NetworkClient {
     }
 
     /// `meter` records, for a stream's OB-16 accounting, whether the query reached the
-    /// transport and the bytes read for it; a query no stream sent has none.
+    /// transport, the bytes read for it, and whether it returned an answer or an error;
+    /// a query no stream sent has none.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, level = "debug", fields(query_id))]
     pub async fn query_worker(
@@ -728,8 +731,12 @@ impl NetworkClient {
             )
             .await;
         let result = self
-            .execute_query(worker, query, &block_range, priority, meter)
+            .execute_query(worker, query, &block_range, priority, meter.as_ref())
             .await;
+        // Reached only by a task that returns: an aborted one stays incomplete.
+        if let Some(meter) = &meter {
+            meter.complete(result.is_ok());
+        }
         result
     }
 
@@ -739,10 +746,10 @@ impl NetworkClient {
         query: Query,
         block_range: &BlockRange,
         priority: Option<u32>,
-        meter: Option<AttemptMeter>,
+        meter: Option<&AttemptMeter>,
     ) -> QueryResult {
         let stream = self
-            .send_to_transport(worker, query, priority, meter.as_ref())
+            .send_to_transport(worker, query, priority, meter)
             .await?;
         let mut stream = Metered {
             inner: stream,

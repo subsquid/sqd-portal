@@ -189,18 +189,58 @@ counter ambiguous between "not configured" and "nothing reported", which is the 
 question to answer during an incident.
 
 **OB-16 — Fan-out efficiency.** Every worker query a stream sends is counted when handed
-to the transport, by why: first query for a chunk's range, continuation of a partial
-answer, retry after failure, or speculative attempt raced against one in flight (DC-1).
-It is counted again when settled: delivered, failed, superseded (cancelled because
-another attempt was used), discarded (its answer had arrived, but another was used), or
-abandoned (the stream ended first). A query cancelled while waiting for a congestion
-permit (DEF-13) is counted as withdrawn, so the sent count is worker load. The bytes each
-query read are counted under its outcome, so every downloaded byte that never reached a
-client has a cause; chunks a query was dispatched for are counted once each, the same
-way, by dataset — so the datasets wasting the most read-ahead can be ranked. The OB-4
-per-worker counts cannot stand in: to the transport, a speculative attempt that loses is
-a successful query. Delivered means handed to the response body. No family carries a
-worker or request label (GAP-6, HZ-6).
+to the transport, by dataset and by why: first query for a chunk's range, continuation of
+a partial answer, retry after failure, or speculative attempt raced against one in flight
+(DC-1). It is counted again when settled, by three facts recorded by the two parties that
+know them. The **outcome** is why the controller let go: delivered (handed to the response
+body), failed (the controller read and rejected its result), superseded (another
+attempt's answer was used for the range), cancelled (the range settled on another
+attempt's terminal error, so nobody won), or abandoned (the stream ended first) — the last
+split by what the controller knows of the end: `abandoned_error` after an error it had
+yielded, `abandoned_unknown` when the consumer let go of a stream that had not ended. A
+client disconnect is the usual cause of the latter, but it cannot be established from
+inside the Portal, so no value claims it. The **stage** is whether the controller had
+taken the task's result when it let go: `read`, or `in_flight`. The **completion** is
+what the query task had done by then: `ok` (returned an answer), `error` (returned an
+error), or `incomplete` (neither; aborted in flight). The three are kept apart because
+folded together they lie. A hedge that lost is superseded either way, and only the
+completion says whether a whole answer was downloaded and thrown away, it had failed
+anyway, or it was cut off. And the completion alone cannot say whether an abandoned
+answer had been buffered: a task can answer after the controller let its query go and
+before the abort lands, so only the stage, which the controller owns, says whether it
+ever held that answer. A query cancelled while waiting for a congestion permit (DEF-13)
+is counted as withdrawn, so the sent count is worker load. The bytes each query read are
+counted by the same five labels, so every downloaded byte that never reached a client
+has a cause and a kind; chunks a
+query was dispatched for are counted once each, by dataset and outcome — so the datasets
+wasting the most read-ahead can be ranked. The OB-4 per-worker counts cannot stand in: to
+the transport, a speculative attempt that loses is a successful query. No family carries a
+worker or request label (GAP-6, HZ-6); `dataset` is the configured name, as on
+`http_status`, so cardinality is a constant per configured dataset.
+
+The family's boundaries, so it is not read as claiming more than it measures:
+
+- *Sent* is submission to the transport after the congestion permit. It is not proof the
+  worker received, executed, or answered the query; a query lost in transit or refused
+  on arrival is still sent. It is the Portal's demand on the network, not the network's
+  work.
+- *Bytes* are what the application read off the response stream. Data the transport had
+  buffered when the read stopped is not counted, and nothing of the worker's CPU, storage
+  or egress is. A query aborted mid-body is charged what it had pulled, no more.
+- *Delivered* means handed to the response body, not received by the client. Compression,
+  HTTP framing and the connection sit between; a client that disconnects after the last
+  hand-off leaves that payload delivered.
+- Worker-response bytes and client-egress bytes (the usage measurement, REQ-60/61) are
+  not interchangeable. The response is read whole as the worker compressed it; egress is
+  what the Portal encoded on the wire after its own compression and framing. A ratio
+  between them is a compression ratio, not a waste ratio.
+- A dataset's series exist at zero from its first stream in the process, so a rare
+  outcome's first occurrence is visible to `rate()` — except on that very first stream,
+  before the next scrape.
+
+Recipes over these families — unused bytes, waste fractions, amplification, hedge win
+rate, and how to read the abandoned split — are in
+[docs/observability/fan-out-efficiency.md](../docs/observability/fan-out-efficiency.md).
 
 ## Property → observable mapping
 

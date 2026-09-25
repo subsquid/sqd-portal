@@ -26,8 +26,10 @@
 //! drains a buffered part.
 //! ```
 //!
-//! Every worker query is an [`Attempt`], settled once by what became of it (OB-16). A winning
-//! answer carries its attempt until handed on, so read-ahead the client never takes is abandoned.
+//! Every worker query is an [`Attempt`], settled once by why the controller let go of it
+//! (OB-16). A winning answer carries its attempt until handed on, so read-ahead the client
+//! never takes is abandoned; the controller's drop abandons everything it still holds with
+//! the one thing it knows about the stream's end, whether an error had been yielded.
 
 #![allow(unstable_name_collisions)]
 
@@ -47,7 +49,9 @@ use tracing::{instrument, Instrument};
 
 use crate::{
     controller::{attempt::Attempt, timeouts::TimeoutManager},
-    metrics::{self, AttemptKind, AttemptOutcome, AttemptSignals, ChunkOutcome, RefusalReason},
+    metrics::{
+        self, AttemptKind, AttemptOutcome, AttemptSignals, ChunkOutcome, RefusalReason, StreamEnd,
+    },
     network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult, StreamingNetwork, WorkerLease},
     types::{
         BlockRange, ChunkId, DataChunk, ErrorCode, ExhaustionClass, QueryError, RequestError,
@@ -67,8 +71,13 @@ pub struct StreamController<N: StreamingNetwork = NetworkClient> {
     stats: StreamStats,
     span: tracing::Span,
     last_error: Option<String>,
+    /// An error was yielded; consumers stop at the first one, so the stream is over and
+    /// whatever is still held is abandoned because of it.
+    ended_in_error: bool,
     stream_index: u32,
     priority_stride: u32,
+    /// The configured dataset name every attempt is charged to.
+    dataset: Arc<str>,
     signals: Arc<AttemptSignals>,
 }
 
@@ -226,18 +235,22 @@ impl<N: StreamingNetwork> StreamController<N> {
             return Err(RequestError::NoData);
         }
 
+        let signals = AttemptSignals::bind();
+        signals.prime(&request.dataset_name);
         Ok(Self {
             network,
             buffer: SlidingArray::with_capacity(request.buffer_size),
             next_chunk: Some(first_chunk),
             timeouts: TimeoutManager::new(request.timeout_quantile),
+            dataset: Arc::from(request.dataset_name.as_str()),
             request,
             stats: StreamStats::new(),
             span: tracing::Span::current(),
             last_error: None,
+            ended_in_error: false,
             stream_index,
             priority_stride,
-            signals: Arc::new(AttemptSignals::bind()),
+            signals: Arc::new(signals),
         })
     }
 
@@ -284,6 +297,7 @@ impl<N: StreamingNetwork> StreamController<N> {
 
         if let Poll::Ready(Some(Err(e))) = &result {
             self.last_error = Some(e.to_string());
+            self.ended_in_error = true;
         }
 
         result
@@ -383,8 +397,14 @@ impl<N: StreamingNetwork> StreamController<N> {
             self.poll_worker_request(data_range, request, &mut summary, ctx)
         });
         if let Err(state) = polled {
-            // The range is settled: whatever else is still running lost the race.
-            pending.supersede_running();
+            // The range is settled, and whatever else is still running is let go. Only an
+            // answer wins a race; a terminal error ends the range with no winner, and
+            // the rest are cancelled, not beaten.
+            let outcome = match &state {
+                RequestState::Done(Err(_)) => AttemptOutcome::Cancelled,
+                _ => AttemptOutcome::Superseded,
+            };
+            pending.settle_running(outcome);
             return Err(state);
         }
 
@@ -410,6 +430,9 @@ impl<N: StreamingNetwork> StreamController<N> {
                 };
                 summary.newly_finished += 1;
                 let attempt = running.attempt.take().expect("taken only once finished");
+                // From here the controller holds the result; a task can also answer
+                // after its query is let go, which the stage keeps apart from this.
+                attempt.mark_read();
 
                 // This is intentionally measured when the result has been polled, not when it's ready.
                 // If the stream is consumed slower than generated, this duration may get
@@ -675,7 +698,7 @@ impl<N: StreamingNetwork> StreamController<N> {
 
     fn settle_chunk(&self, chunk_slot: &ChunkSlot, outcome: ChunkOutcome) {
         if chunk_slot.dispatched {
-            self.signals.chunk(&self.request.dataset_name, outcome);
+            self.signals.chunk(&self.dataset, outcome);
         }
     }
 
@@ -945,7 +968,7 @@ impl<N: StreamingNetwork> StreamController<N> {
         let priority = self.stream_index * self.priority_stride + range.chunk_index as u32;
 
         let worker = lease.worker();
-        let (attempt, meter) = Attempt::start(kind, &self.signals);
+        let (attempt, meter) = Attempt::start(kind, &self.dataset, &self.signals);
         let fut = self
             .network
             .clone()
@@ -974,8 +997,21 @@ impl<N: StreamingNetwork> StreamController<N> {
 impl<N: StreamingNetwork> Drop for StreamController<N> {
     fn drop(&mut self) {
         let _enter = self.span.enter();
-        for chunk_slot in self.buffer.data() {
-            self.settle_chunk(chunk_slot, ChunkOutcome::Abandoned);
+        // Everything still held is abandoned, with the one thing known about why: an
+        // error had been yielded, or the consumer let go of a stream that had not ended.
+        // Settled here, in place, so each attempt carries that reason rather than the
+        // unknown its own drop would fall back to once the buffer goes.
+        let end = if self.ended_in_error {
+            StreamEnd::Error
+        } else {
+            StreamEnd::Unknown
+        };
+        for chunk_slot in self.buffer.iter_mut() {
+            if chunk_slot.dispatched {
+                self.signals
+                    .chunk(&self.dataset, ChunkOutcome::Abandoned(end));
+            }
+            chunk_slot.abandon(end);
         }
         self.stats
             .write_summary(&self.request, self.last_error.take());
@@ -1051,6 +1087,19 @@ impl ChunkSlot {
         self.buffered.len() + 1 < max_stored_results
     }
 
+    /// The stream ended with this chunk in hand: every attempt it still holds, answered
+    /// and buffered or still in flight, is abandoned for that reason.
+    fn abandon(&mut self, end: StreamEnd) {
+        if let Some(slot) = &mut self.active {
+            slot.state.abandon(end);
+        }
+        for response in &mut self.buffered {
+            if let Ok(payload) = &mut response.result {
+                payload.attempt.abandon(end);
+            }
+        }
+    }
+
     fn debug_symbol(&self) -> char {
         if !self.buffered.is_empty() && self.active.is_some() {
             '+'
@@ -1115,6 +1164,15 @@ impl RequestState {
     fn has_stored_response(&self) -> bool {
         matches!(self, RequestState::Partial(_) | RequestState::Done(_))
     }
+
+    fn abandon(&mut self, end: StreamEnd) {
+        match self {
+            RequestState::Pending(pending) => pending.abandon(end),
+            RequestState::Partial(partial) => partial.data.attempt.abandon(end),
+            RequestState::Done(Ok(payload)) => payload.attempt.abandon(end),
+            RequestState::Done(Err(_)) | RequestState::NoWorkers | RequestState::Paused(_) => {}
+        }
+    }
 }
 
 impl PausedState {
@@ -1149,15 +1207,19 @@ impl PendingRequests {
         assert!(self.timeout.poll_unpin(ctx).is_pending()); // pass the context to wake
     }
 
-    /// Settles every attempt still running as having lost to the one that settled the range.
-    fn supersede_running(&mut self) {
+    /// Settles every attempt still running, once the range no longer needs any of them.
+    fn settle_running(&mut self, outcome: AttemptOutcome) {
         for request in &mut self.requests {
             if let WorkerRequest::Running(running) = request {
                 if let Some(attempt) = running.attempt.take() {
-                    attempt.settle(AttemptOutcome::Superseded);
+                    attempt.settle(outcome);
                 }
             }
         }
+    }
+
+    fn abandon(&mut self, end: StreamEnd) {
+        self.settle_running(AttemptOutcome::Abandoned(end));
     }
 }
 
@@ -1423,6 +1485,7 @@ mod tests {
     use futures::{future::BoxFuture, StreamExt};
 
     use crate::controller::attempt::AttemptMeter;
+    use crate::metrics::{AttemptCompletion, AttemptStage};
     use crate::network::QuerySuccess;
     use crate::types::{Compression, DatasetId, ParsedQuery, StreamRequest};
 
@@ -1613,7 +1676,12 @@ mod tests {
         /// other event resolves instantly under the paused clock.
         Slow(u64),
         Retriable,
+        /// Fail with a retriable error, but only after `ms` of (virtual) time: a query
+        /// whose failure can land after another attempt has already settled the range.
+        FailAfter(u64),
         RateLimited,
+        /// Fail with a terminal error: the range ends with it, and so does the stream.
+        Fatal,
         /// Never respond. Only used by the cancellation test; including it in
         /// the random generator would (correctly) fail the liveness property,
         /// because a slot whose every attempt hangs waits forever — in
@@ -1745,49 +1813,68 @@ mod tests {
                     meter.record(bytes);
                     ledger.fetch_add(bytes as u64, Ordering::SeqCst);
                 };
-                let (start, end) = (*block_range.start(), *block_range.end());
-                let last = match event {
-                    QueryEvent::Hang => {
-                        read(1);
-                        futures::future::pending::<()>().await;
-                        unreachable!("pending future never resolves")
+                let result: QueryResult = async {
+                    let (start, end) = (*block_range.start(), *block_range.end());
+                    let last = match event {
+                        QueryEvent::Hang => {
+                            read(1);
+                            futures::future::pending::<()>().await;
+                            unreachable!("pending future never resolves")
+                        }
+                        QueryEvent::Retriable => {
+                            read(ERROR_BYTES);
+                            return Err(QueryError::Retriable("scripted failure".to_owned()));
+                        }
+                        QueryEvent::FailAfter(ms) => {
+                            read(1);
+                            tokio::time::sleep(Duration::from_millis(ms)).await;
+                            read(ERROR_BYTES);
+                            return Err(QueryError::Retriable("scripted late failure".to_owned()));
+                        }
+                        QueryEvent::RateLimited => {
+                            read(ERROR_BYTES);
+                            return Err(QueryError::RateLimitExceeded);
+                        }
+                        QueryEvent::Fatal => {
+                            read(ERROR_BYTES);
+                            return Err(QueryError::Failure(
+                                "scripted terminal failure".to_owned(),
+                            ));
+                        }
+                        QueryEvent::Full => end,
+                        QueryEvent::Slow(ms) => {
+                            read(1); // part of the body, so a cancelled one has read something
+                            tokio::time::sleep(Duration::from_millis(ms)).await;
+                            end
+                        }
+                        QueryEvent::Overshoot(extra) => end + extra,
+                        QueryEvent::Undershoot(below) => start.saturating_sub(below.max(1)),
+                        QueryEvent::Partial(_) if start == end => end,
+                        QueryEvent::Partial(pct) => start + (end - start) * (pct as u64) / 100,
+                    };
+                    if (start..=end).contains(&last) {
+                        self.ok_ranges
+                            .lock()
+                            .unwrap()
+                            .push((request_id, (start, last)));
                     }
-                    QueryEvent::Retriable => {
-                        read(ERROR_BYTES);
-                        return Err(QueryError::Retriable("scripted failure".to_owned()));
-                    }
-                    QueryEvent::RateLimited => {
-                        read(ERROR_BYTES);
-                        return Err(QueryError::RateLimitExceeded);
-                    }
-                    QueryEvent::Full => end,
-                    QueryEvent::Slow(ms) => {
-                        read(1); // part of the body, so a cancelled one has read something
-                        tokio::time::sleep(Duration::from_millis(ms)).await;
-                        end
-                    }
-                    QueryEvent::Overshoot(extra) => end + extra,
-                    QueryEvent::Undershoot(below) => start.saturating_sub(below.max(1)),
-                    QueryEvent::Partial(_) if start == end => end,
-                    QueryEvent::Partial(pct) => start + (end - start) * (pct as u64) / 100,
-                };
-                if (start..=end).contains(&last) {
-                    self.ok_ranges
-                        .lock()
-                        .unwrap()
-                        .push((request_id, (start, last)));
+                    let data = format!("{start}:{last}").into_bytes();
+                    read(data.len() - usize::from(matches!(event, QueryEvent::Slow(_))));
+                    Ok(QuerySuccess {
+                        ok: sqd_messages::QueryOk {
+                            data: data.into(),
+                            last_block: last,
+                        },
+                        ttfb: Duration::from_millis(1),
+                        transfer_time: Duration::from_millis(1),
+                        response_size: 10,
+                    })
                 }
-                let data = format!("{start}:{last}").into_bytes();
-                read(data.len() - usize::from(matches!(event, QueryEvent::Slow(_))));
-                Ok(QuerySuccess {
-                    ok: sqd_messages::QueryOk {
-                        data: data.into(),
-                        last_block: last,
-                    },
-                    ttfb: Duration::from_millis(1),
-                    transfer_time: Duration::from_millis(1),
-                    response_size: 10,
-                })
+                .await;
+                // Reached only by a task that returns, as in production: an aborted one
+                // stays incomplete.
+                meter.complete(result.is_ok());
+                result
             })
         }
 
@@ -1888,6 +1975,7 @@ mod tests {
             1 => (1u64..=20).prop_map(QueryEvent::Overshoot),
             1 => (1u64..=20).prop_map(QueryEvent::Undershoot),
             1 => Just(QueryEvent::Retriable),
+            1 => (200u64..=2500).prop_map(QueryEvent::FailAfter),
         ];
         (1usize..=4)
             .prop_flat_map(move |n_chunks| {
@@ -2140,24 +2228,54 @@ mod tests {
                 "worker leases leaked after all streams finished"
             );
 
-            // OB-16 against ledger truth: every sent query settles once, delivered is
-            // exactly what clients got, every byte read has one outcome, and every
-            // chunk a query was dispatched for settles once.
+            // OB-16 against ledger truth: every sent query settles once, nothing lands
+            // outside the reachable label set (a delivered or failed query was read, a
+            // superseded or cancelled one was not, a query read and held had answered),
+            // delivered is exactly what clients got, every byte read has one outcome,
+            // and every chunk a query was dispatched for settles once.
             let signals = &outcome.signals;
-            let settled = |kind| AttemptOutcome::ALL.map(|o| signals.settled_count(kind, o));
+            let settled =
+                |kind| AttemptOutcome::ALL.map(|o| signals.settled_by_outcome(DATASET, kind, o));
             for kind in AttemptKind::ALL {
-                prop_assert_eq!(settled(kind).iter().sum::<u64>(), signals.sent_count(kind));
+                let sent = signals.sent_count(DATASET, kind);
+                prop_assert_eq!(settled(kind).iter().sum::<u64>(), sent);
+                for outcome in AttemptOutcome::ALL {
+                    for stage in AttemptStage::ALL {
+                        for completion in AttemptCompletion::ALL {
+                            let reachable = outcome.stages().contains(&stage)
+                                && outcome.completions(stage).contains(&completion);
+                            if reachable {
+                                continue;
+                            }
+                            let count =
+                                signals.settled_count(DATASET, kind, outcome, stage, completion);
+                            prop_assert_eq!(
+                                count,
+                                0,
+                                "{:?}/{:?}/{:?}/{:?} is unreachable",
+                                kind,
+                                outcome,
+                                stage,
+                                completion
+                            );
+                        }
+                    }
+                }
             }
             let delivered: u64 = AttemptKind::ALL.map(|k| settled(k)[0]).iter().sum();
             let emissions: usize = outcome.streams.iter().map(|s| s.emissions.len()).sum();
             prop_assert_eq!(delivered, emissions as u64);
             let emitted: u64 = outcome.streams.iter().map(|s| s.emitted_bytes).sum();
-            prop_assert_eq!(signals.byte_count(AttemptOutcome::Delivered), emitted);
-            let read: u64 = AttemptOutcome::ALL.map(|o| signals.byte_count(o)).iter().sum();
+            let delivered_bytes = signals.bytes_by_outcome(DATASET, AttemptOutcome::Delivered);
+            prop_assert_eq!(delivered_bytes, emitted);
+            let read: u64 = AttemptOutcome::ALL
+                .map(|o| signals.bytes_by_outcome(DATASET, o))
+                .iter()
+                .sum();
             prop_assert_eq!(read, outcome.bytes_read);
             let chunks: u64 = ChunkOutcome::ALL.map(|o| signals.chunk_count(DATASET, o)).iter().sum();
-            let first = signals.sent_count(AttemptKind::First)
-                + signals.withdrawn_count(AttemptKind::First);
+            let first = signals.sent_count(DATASET, AttemptKind::First)
+                + signals.withdrawn_count(DATASET, AttemptKind::First);
             prop_assert_eq!(chunks, first);
         }
     }
@@ -2545,34 +2663,65 @@ mod tests {
         );
     }
 
-    /// Each kind of query and each outcome, from a script that produces it.
+    /// Each kind of query, each outcome and each completion, from a script that
+    /// produces it.
     #[test]
-    fn queries_are_counted_by_kind_and_outcome() {
+    fn queries_are_counted_by_kind_outcome_and_completion() {
+        use AttemptCompletion::*;
         use AttemptKind::*;
         use AttemptOutcome::*;
         let cases = [
             // Too slow: a hedge answers at t=1100 and is read on the next timeout
-            // (the late read is a bug of its own); the first query is cancelled.
+            // (the late read is a bug of its own); the first is cut off mid-body.
             (
                 vec![QueryEvent::Slow(3000), QueryEvent::Slow(100)],
                 1,
-                vec![(First, Superseded), (Hedge, Delivered)],
+                vec![(First, Superseded, Incomplete), (Hedge, Delivered, Ok)],
             ),
             // A tie: both answers are in when the stream looks and it reads the first.
+            // The hedge's answer had arrived and goes unread: a download wasted.
             (
                 vec![QueryEvent::Slow(1500), QueryEvent::Slow(500)],
                 1,
-                vec![(First, Delivered), (Hedge, Discarded)],
+                vec![(First, Delivered, Ok), (Hedge, Superseded, Ok)],
+            ),
+            // A hedge that had failed by the time the first answered is let go the same
+            // way, but no answer was thrown away: its cost is a failure's.
+            (
+                vec![QueryEvent::Slow(1500), QueryEvent::FailAfter(500)],
+                1,
+                vec![(First, Delivered, Ok), (Hedge, Superseded, Error)],
+            ),
+            // A hedge that fails while the first is still running is read at the next
+            // timeout and failed; the first goes on to deliver.
+            (
+                vec![QueryEvent::Slow(3000), QueryEvent::FailAfter(100)],
+                1,
+                vec![(First, Delivered, Ok), (Hedge, Failed, Error)],
+            ),
+            // A terminal error, read at the next timeout, ends the range with no winner:
+            // the first, still running, is cancelled, not beaten.
+            (
+                vec![QueryEvent::Slow(3000), QueryEvent::Fatal],
+                1,
+                vec![(First, Cancelled, Incomplete), (Hedge, Failed, Error)],
             ),
             (
                 vec![QueryEvent::Retriable, QueryEvent::Full],
                 1,
-                vec![(First, Failed), (Retry, Delivered)],
+                vec![(First, Failed, Error), (Retry, Delivered, Ok)],
+            ),
+            // An answer the controller rejects: the task returned one, the controller
+            // failed it.
+            (
+                vec![QueryEvent::Overshoot(5), QueryEvent::Full],
+                1,
+                vec![(First, Failed, Ok), (Retry, Delivered, Ok)],
             ),
             (
                 vec![QueryEvent::Partial(50), QueryEvent::Full],
                 0,
-                vec![(First, Delivered), (Continuation, Delivered)],
+                vec![(First, Delivered, Ok), (Continuation, Delivered, Ok)],
             ),
         ];
         for (script, retries, want) in cases {
@@ -2589,27 +2738,52 @@ mod tests {
             let signals = run_scenario(&scenario).signals;
             for kind in AttemptKind::ALL {
                 for outcome in AttemptOutcome::ALL {
-                    let expected = u64::from(want.contains(&(kind, outcome)));
-                    let got = signals.settled_count(kind, outcome);
-                    assert_eq!(got, expected, "{script:?}: {kind:?}/{outcome:?}");
+                    for stage in AttemptStage::ALL {
+                        for completion in AttemptCompletion::ALL {
+                            // None of these scripts abandons anything, so every
+                            // outcome here has exactly one stage it can be at.
+                            let expected = u64::from(
+                                want.contains(&(kind, outcome, completion))
+                                    && outcome.stages() == [stage],
+                            );
+                            let got =
+                                signals.settled_count(DATASET, kind, outcome, stage, completion);
+                            assert_eq!(
+                                got, expected,
+                                "{script:?}: {kind:?}/{outcome:?}/{stage:?}/{completion:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
     }
 
-    /// Leaves after the first chunk, having let the others' queries run or not.
-    async fn leave_after_first_chunk(queries_run: bool) -> (Arc<AttemptSignals>, u64) {
-        let scenario = Scenario {
+    fn read_ahead_scenario(script: Vec<QueryEvent>) -> Scenario {
+        Scenario {
             n_chunks: 3,
             streams: vec![StreamSpec { from: 100, to: 399 }],
             find_worker_script: Vec::new(),
-            query_script: Vec::new(),
+            query_script: script,
             buffer_size: 3,
             retries: 0,
             max_stored_results_per_chunk: 1,
             max_chunks: None,
-        };
-        let network = ScriptedNetwork::new(scenario.build_chunks(), Vec::new(), Vec::new());
+        }
+    }
+
+    /// Takes the first of three read-ahead chunks and leaves, having let the others'
+    /// queries run or not.
+    async fn leave_after_first_chunk(
+        queries_run: bool,
+        script: Vec<QueryEvent>,
+    ) -> (Arc<AttemptSignals>, u64) {
+        let scenario = read_ahead_scenario(script);
+        let network = ScriptedNetwork::new(
+            scenario.build_chunks(),
+            Vec::new(),
+            scenario.query_script.clone(),
+        );
         let signals = Arc::<AttemptSignals>::default();
         let request = scenario.request(&scenario.streams[0], 0);
         let mut controller = StreamController::new(request, network.clone(), 0, 1)
@@ -2634,29 +2808,131 @@ mod tests {
         (signals, network.bytes_read.load(Ordering::SeqCst))
     }
 
-    /// Read-ahead fetched for a client that left: requested, downloaded, never sent.
+    /// Read-ahead fetched for a client that left: requested, downloaded, read into the
+    /// buffer, never sent. The reason is unknown, since all the controller saw was a
+    /// healthy stream let go of.
     #[tokio::test(start_paused = true)]
     async fn read_ahead_the_client_never_takes_is_abandoned() {
-        let (signals, _) = leave_after_first_chunk(true).await;
+        let (signals, _) = leave_after_first_chunk(true, Vec::new()).await;
 
-        assert_eq!(signals.chunk_count(DATASET, ChunkOutcome::Abandoned), 2);
-        assert_eq!(
-            signals.settled_count(AttemptKind::First, AttemptOutcome::Abandoned),
-            2
-        );
+        let abandoned = AttemptOutcome::Abandoned(StreamEnd::Unknown);
+        let chunk = ChunkOutcome::Abandoned(StreamEnd::Unknown);
+        assert_eq!(signals.chunk_count(DATASET, chunk), 2);
+        let (read, ok) = (AttemptStage::Read, AttemptCompletion::Ok);
+        let count = signals.settled_count(DATASET, AttemptKind::First, abandoned, read, ok);
+        assert_eq!(count, 2);
         let unsent = "200:299".len() + "300:399".len();
-        assert_eq!(signals.byte_count(AttemptOutcome::Abandoned), unsent as u64);
+        let bytes = signals.byte_count(DATASET, AttemptKind::First, abandoned, read, ok);
+        assert_eq!(bytes, unsent as u64);
+    }
+
+    /// Queries still in flight when the client left are abandoned incomplete, charged
+    /// only what they had read: outstanding work, not a buffered answer thrown away.
+    #[tokio::test(start_paused = true)]
+    async fn queries_outstanding_when_the_client_leaves_are_abandoned_incomplete() {
+        let script = vec![QueryEvent::Full, QueryEvent::Hang, QueryEvent::Hang];
+        let (signals, _) = leave_after_first_chunk(true, script).await;
+
+        let abandoned = AttemptOutcome::Abandoned(StreamEnd::Unknown);
+        let count = |stage, completion| {
+            signals.settled_count(DATASET, AttemptKind::First, abandoned, stage, completion)
+        };
+        let (in_flight, incomplete) = (AttemptStage::InFlight, AttemptCompletion::Incomplete);
+        assert_eq!(count(in_flight, incomplete), 2);
+        assert_eq!(count(AttemptStage::Read, AttemptCompletion::Ok), 0);
+        // Each hanging query had read one byte.
+        let bytes = signals.byte_count(
+            DATASET,
+            AttemptKind::First,
+            abandoned,
+            in_flight,
+            incomplete,
+        );
+        assert_eq!(bytes, 2);
+    }
+
+    /// An answer that lands after the controller last looked. The task had answered,
+    /// so its completion is `ok`, but the controller never took the answer: by its
+    /// stage the query was still in flight. Bandwidth spent, and not a buffered answer,
+    /// which the completion alone would have called it.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_landing_after_the_controller_last_looked_is_abandoned_in_flight() {
+        let script = vec![QueryEvent::Full, QueryEvent::Slow(100), QueryEvent::Hang];
+        let scenario = read_ahead_scenario(script);
+        let network = ScriptedNetwork::new(
+            scenario.build_chunks(),
+            Vec::new(),
+            scenario.query_script.clone(),
+        );
+        let signals = Arc::<AttemptSignals>::default();
+        let request = scenario.request(&scenario.streams[0], 0);
+        let mut controller = StreamController::new(request, network.clone(), 0, 1)
+            .unwrap()
+            .with_signals(signals.clone());
+        controller.next().await.unwrap().unwrap();
+        // The second chunk's answer lands while nobody polls the stream.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(controller);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let abandoned = AttemptOutcome::Abandoned(StreamEnd::Unknown);
+        let count = |stage, completion| {
+            signals.settled_count(DATASET, AttemptKind::First, abandoned, stage, completion)
+        };
+        let (in_flight, ok) = (AttemptStage::InFlight, AttemptCompletion::Ok);
+        assert_eq!(count(in_flight, ok), 1);
+        assert_eq!(count(AttemptStage::Read, ok), 0);
+        assert_eq!(count(in_flight, AttemptCompletion::Incomplete), 1);
+        let bytes = signals.byte_count(DATASET, AttemptKind::First, abandoned, in_flight, ok);
+        assert_eq!(bytes, "200:299".len() as u64);
     }
 
     /// A client gone before any query reached the transport, as when queued behind a
     /// full congestion window: the chunks are abandoned, but no worker saw a query.
     #[tokio::test(start_paused = true)]
     async fn queries_cancelled_before_the_transport_are_withdrawn_not_sent() {
-        let (signals, bytes_read) = leave_after_first_chunk(false).await;
+        let (signals, bytes_read) = leave_after_first_chunk(false, Vec::new()).await;
 
-        assert_eq!(signals.withdrawn_count(AttemptKind::First), 3);
-        assert_eq!(signals.sent_count(AttemptKind::First), 0);
+        assert_eq!(signals.withdrawn_count(DATASET, AttemptKind::First), 3);
+        assert_eq!(signals.sent_count(DATASET, AttemptKind::First), 0);
         assert_eq!(bytes_read, 0);
-        assert_eq!(signals.chunk_count(DATASET, ChunkOutcome::Abandoned), 3);
+        let chunk = ChunkOutcome::Abandoned(StreamEnd::Unknown);
+        assert_eq!(signals.chunk_count(DATASET, chunk), 3);
+    }
+
+    /// A stream that ends on an error abandons its read-ahead for that reason, so this
+    /// waste can be told from a client that left.
+    #[tokio::test(start_paused = true)]
+    async fn read_ahead_behind_a_stream_error_is_abandoned_for_the_error() {
+        let scenario = read_ahead_scenario(vec![QueryEvent::Fatal]);
+        let network = ScriptedNetwork::new(
+            scenario.build_chunks(),
+            Vec::new(),
+            scenario.query_script.clone(),
+        );
+        let signals = Arc::<AttemptSignals>::default();
+        let request = scenario.request(&scenario.streams[0], 0);
+        let outcome = collect_stream_with(request, network.clone(), 0, signals.clone()).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(outcome.error.is_some());
+        assert!(outcome.emissions.is_empty());
+        use AttemptKind::First;
+        let (failed, read) = (AttemptOutcome::Failed, AttemptStage::Read);
+        let count = signals.settled_count(DATASET, First, failed, read, AttemptCompletion::Error);
+        assert_eq!(count, 1);
+        assert_eq!(signals.chunk_count(DATASET, ChunkOutcome::Failed), 1);
+        // The other two had answered and were buffered behind the failure.
+        let abandoned = AttemptOutcome::Abandoned(StreamEnd::Error);
+        let count = signals.settled_count(DATASET, First, abandoned, read, AttemptCompletion::Ok);
+        assert_eq!(count, 2);
+        let chunk = ChunkOutcome::Abandoned(StreamEnd::Error);
+        assert_eq!(signals.chunk_count(DATASET, chunk), 2);
+        let unknown = ChunkOutcome::Abandoned(StreamEnd::Unknown);
+        assert_eq!(signals.chunk_count(DATASET, unknown), 0);
     }
 }

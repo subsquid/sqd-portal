@@ -1,4 +1,9 @@
-use std::{iter, time::Duration};
+use std::{
+    collections::HashSet,
+    iter,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
 use prometheus_client::{
     metrics::{
@@ -176,28 +181,58 @@ impl AttemptKind {
     }
 }
 
-/// What became of one worker query that reached the transport (OB-16).
+/// How a stream ended, as far as the controller can tell (OB-16).
+///
+/// The controller sees its own output and its own drop, nothing else. It cannot tell a
+/// client that disconnected from a consumer that stopped for any other reason, so there
+/// is no `disconnect` value: claiming one would be a guess dressed as a measurement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamEnd {
+    /// The stream had yielded an error; consumers stop at the first one.
+    Error,
+    /// The consumer dropped a stream that had not ended. A client disconnect is the
+    /// usual cause, but it cannot be established from inside the Portal.
+    Unknown,
+}
+
+impl StreamEnd {
+    pub const ALL: [Self; 2] = [Self::Error, Self::Unknown];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Why the controller let go of one worker query (OB-16). Says nothing about what the
+/// query task had done by then; that is [`AttemptCompletion`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttemptOutcome {
     /// Its payload was handed to the client's response body.
     Delivered,
-    /// It ended in an error.
+    /// The controller read its result and rejected it: an error, or an answer outside
+    /// the queried range.
     Failed,
-    /// Cancelled mid-flight because another attempt at the range was used.
+    /// Another attempt's answer was used for the range, so this one was let go without
+    /// being read.
     Superseded,
-    /// Its answer had arrived, but another attempt's was used: noticed too late.
-    Discarded,
-    /// The stream ended first, with the query in flight or its answer unsent.
-    Abandoned,
+    /// The range settled on another attempt's terminal error, so this one was let go
+    /// without being read. Nobody won.
+    Cancelled,
+    /// The stream ended with this attempt in hand: in flight, or answered but unsent.
+    Abandoned(StreamEnd),
 }
 
 impl AttemptOutcome {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Delivered,
         Self::Failed,
         Self::Superseded,
-        Self::Discarded,
-        Self::Abandoned,
+        Self::Cancelled,
+        Self::Abandoned(StreamEnd::Error),
+        Self::Abandoned(StreamEnd::Unknown),
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -205,8 +240,84 @@ impl AttemptOutcome {
             Self::Delivered => "delivered",
             Self::Failed => "failed",
             Self::Superseded => "superseded",
-            Self::Discarded => "discarded",
-            Self::Abandoned => "abandoned",
+            Self::Cancelled => "cancelled",
+            Self::Abandoned(StreamEnd::Error) => "abandoned_error",
+            Self::Abandoned(StreamEnd::Unknown) => "abandoned_unknown",
+        }
+    }
+
+    /// The stages this outcome can be published at. The controller has read the result
+    /// of every query it delivers or fails, and has not read one it supersedes or
+    /// cancels; only a stream's end can catch a query either way.
+    pub const fn stages(self) -> &'static [AttemptStage] {
+        match self {
+            Self::Delivered | Self::Failed => &[AttemptStage::Read],
+            Self::Superseded | Self::Cancelled => &[AttemptStage::InFlight],
+            Self::Abandoned(_) => &AttemptStage::ALL,
+        }
+    }
+
+    /// The completions this outcome can be published with at `stage`. A delivered
+    /// query's task returned an answer. So did the task of a query the controller had
+    /// read and was still holding when the stream ended, since a read error is failed on
+    /// the spot. Every other pair can find the task in any state.
+    pub const fn completions(self, stage: AttemptStage) -> &'static [AttemptCompletion] {
+        match (self, stage) {
+            (Self::Delivered, _) | (Self::Abandoned(_), AttemptStage::Read) => {
+                &[AttemptCompletion::Ok]
+            }
+            _ => &AttemptCompletion::ALL,
+        }
+    }
+}
+
+/// Whether the controller had taken the query task's result when it let go (OB-16).
+///
+/// Controller-owned, so it says what the controller held, not what the task had done:
+/// a task can answer after the controller has already let its query go, and its answer
+/// then lands with nobody to take it. An abandoned query that was `read` was a buffered
+/// answer; one `in_flight` was outstanding work, whatever its task had managed by then.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptStage {
+    /// The controller had polled the task and taken its result.
+    Read,
+    /// The controller had not; from where it stood, the query was still running.
+    InFlight,
+}
+
+impl AttemptStage {
+    pub const ALL: [Self; 2] = [Self::Read, Self::InFlight];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::InFlight => "in_flight",
+        }
+    }
+}
+
+/// What the query task had done when the controller let go of its query (OB-16).
+///
+/// Recorded by the task itself, so an answer or an error the controller never read is
+/// still known to have arrived.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptCompletion {
+    /// The task returned an answer.
+    Ok,
+    /// The task returned an error.
+    Error,
+    /// The task had not returned; it was aborted, or ended without a result.
+    Incomplete,
+}
+
+impl AttemptCompletion {
+    pub const ALL: [Self; 3] = [Self::Ok, Self::Error, Self::Incomplete];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Incomplete => "incomplete",
         }
     }
 }
@@ -218,17 +329,23 @@ pub enum ChunkOutcome {
     /// The stream ended on this chunk's error.
     Failed,
     /// The stream ended before the chunk was fully handed on.
-    Abandoned,
+    Abandoned(StreamEnd),
 }
 
 impl ChunkOutcome {
-    pub const ALL: [Self; 3] = [Self::Delivered, Self::Failed, Self::Abandoned];
+    pub const ALL: [Self; 4] = [
+        Self::Delivered,
+        Self::Failed,
+        Self::Abandoned(StreamEnd::Error),
+        Self::Abandoned(StreamEnd::Unknown),
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Delivered => "delivered",
             Self::Failed => "failed",
-            Self::Abandoned => "abandoned",
+            Self::Abandoned(StreamEnd::Error) => "abandoned_error",
+            Self::Abandoned(StreamEnd::Unknown) => "abandoned_unknown",
         }
     }
 }
@@ -314,6 +431,8 @@ lazy_static::lazy_static! {
     static ref STREAM_QUERIES_WITHDRAWN: Family<Labels, Counter> = Default::default();
     static ref STREAM_WORKER_BYTES: Family<Labels, Counter> = Default::default();
     static ref STREAM_CHUNKS_SETTLED: Family<Labels, Counter> = Default::default();
+    /// Datasets whose OB-16 series exist at zero in the registered families.
+    static ref PRIMED_DATASETS: Arc<Mutex<HashSet<String>>> = Default::default();
 
     static ref HOTBLOCKS_REQUESTS: Family<Labels, Counter> = Default::default();
 
@@ -454,6 +573,11 @@ fn usage_drop_labels(reason: UsageDrop) -> Labels {
 
 /// The OB-16 families. A default one is unregistered, so a test can count into its own
 /// while other tests move the registered families.
+///
+/// Every series carries `dataset`, the configured name as on `http_status`: bounded by
+/// configuration, never by clients. No series carries a worker or request id (GAP-6,
+/// HZ-6). The full label product is `dataset × kind × outcome × stage × completion`,
+/// all but the first drawn from enums, so cardinality is a constant per dataset.
 #[derive(Clone, Default)]
 pub struct AttemptSignals {
     sent: Family<Labels, Counter>,
@@ -461,6 +585,7 @@ pub struct AttemptSignals {
     withdrawn: Family<Labels, Counter>,
     bytes: Family<Labels, Counter>,
     chunks: Family<Labels, Counter>,
+    primed: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AttemptSignals {
@@ -472,26 +597,75 @@ impl AttemptSignals {
             withdrawn: STREAM_QUERIES_WITHDRAWN.clone(),
             bytes: STREAM_WORKER_BYTES.clone(),
             chunks: STREAM_CHUNKS_SETTLED.clone(),
+            primed: PRIMED_DATASETS.clone(),
         }
     }
 
-    pub fn sent(&self, kind: AttemptKind) {
-        self.sent.get_or_create(&kind_labels(kind)).inc();
+    /// Creates every reachable series for `dataset` at zero, once. A series first
+    /// exposed at one hides that increment from `rate()`, which matters for rare
+    /// outcomes; a dataset's series exist from its first stream, so only an event on
+    /// that very stream, before the next scrape, can be missed.
+    pub fn prime(&self, dataset: &str) {
+        let fresh = self
+            .primed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(dataset.to_owned());
+        if !fresh {
+            return;
+        }
+        for kind in AttemptKind::ALL {
+            drop(self.sent.get_or_create(&kind_labels(dataset, kind)));
+            drop(self.withdrawn.get_or_create(&kind_labels(dataset, kind)));
+            for outcome in AttemptOutcome::ALL {
+                for &stage in outcome.stages() {
+                    for &completion in outcome.completions(stage) {
+                        let labels = settled_labels(dataset, kind, outcome, stage, completion);
+                        drop(self.settled.get_or_create(&labels));
+                        drop(self.bytes.get_or_create(&labels));
+                    }
+                }
+            }
+        }
+        for outcome in ChunkOutcome::ALL {
+            drop(self.chunks.get_or_create(&chunk_labels(dataset, outcome)));
+        }
     }
 
-    pub fn settled(&self, kind: AttemptKind, outcome: AttemptOutcome) {
+    pub fn sent(&self, dataset: &str, kind: AttemptKind) {
+        self.sent.get_or_create(&kind_labels(dataset, kind)).inc();
+    }
+
+    pub fn settled(
+        &self,
+        dataset: &str,
+        kind: AttemptKind,
+        outcome: AttemptOutcome,
+        stage: AttemptStage,
+        completion: AttemptCompletion,
+    ) {
         self.settled
-            .get_or_create(&settled_labels(kind, outcome))
+            .get_or_create(&settled_labels(dataset, kind, outcome, stage, completion))
             .inc();
     }
 
-    pub fn withdrawn(&self, kind: AttemptKind) {
-        self.withdrawn.get_or_create(&kind_labels(kind)).inc();
+    pub fn withdrawn(&self, dataset: &str, kind: AttemptKind) {
+        self.withdrawn
+            .get_or_create(&kind_labels(dataset, kind))
+            .inc();
     }
 
-    pub fn bytes(&self, outcome: AttemptOutcome, bytes: u64) {
+    pub fn bytes(
+        &self,
+        dataset: &str,
+        kind: AttemptKind,
+        outcome: AttemptOutcome,
+        stage: AttemptStage,
+        completion: AttemptCompletion,
+        bytes: u64,
+    ) {
         self.bytes
-            .get_or_create(&outcome_labels(outcome.as_str()))
+            .get_or_create(&settled_labels(dataset, kind, outcome, stage, completion))
             .inc_by(bytes);
     }
 
@@ -504,24 +678,71 @@ impl AttemptSignals {
 
 #[cfg(test)]
 impl AttemptSignals {
-    pub fn sent_count(&self, kind: AttemptKind) -> u64 {
-        self.sent.get_or_create(&kind_labels(kind)).get()
+    pub fn sent_count(&self, dataset: &str, kind: AttemptKind) -> u64 {
+        self.sent.get_or_create(&kind_labels(dataset, kind)).get()
     }
 
-    pub fn settled_count(&self, kind: AttemptKind, outcome: AttemptOutcome) -> u64 {
+    pub fn settled_count(
+        &self,
+        dataset: &str,
+        kind: AttemptKind,
+        outcome: AttemptOutcome,
+        stage: AttemptStage,
+        completion: AttemptCompletion,
+    ) -> u64 {
         self.settled
-            .get_or_create(&settled_labels(kind, outcome))
+            .get_or_create(&settled_labels(dataset, kind, outcome, stage, completion))
             .get()
     }
 
-    pub fn withdrawn_count(&self, kind: AttemptKind) -> u64 {
-        self.withdrawn.get_or_create(&kind_labels(kind)).get()
+    /// Settled under `outcome`, whatever the controller held and the task had done.
+    pub fn settled_by_outcome(
+        &self,
+        dataset: &str,
+        kind: AttemptKind,
+        outcome: AttemptOutcome,
+    ) -> u64 {
+        AttemptStage::ALL
+            .iter()
+            .flat_map(|&s| {
+                AttemptCompletion::ALL
+                    .iter()
+                    .map(move |&c| self.settled_count(dataset, kind, outcome, s, c))
+            })
+            .sum()
     }
 
-    pub fn byte_count(&self, outcome: AttemptOutcome) -> u64 {
+    pub fn withdrawn_count(&self, dataset: &str, kind: AttemptKind) -> u64 {
+        self.withdrawn
+            .get_or_create(&kind_labels(dataset, kind))
+            .get()
+    }
+
+    pub fn byte_count(
+        &self,
+        dataset: &str,
+        kind: AttemptKind,
+        outcome: AttemptOutcome,
+        stage: AttemptStage,
+        completion: AttemptCompletion,
+    ) -> u64 {
         self.bytes
-            .get_or_create(&outcome_labels(outcome.as_str()))
+            .get_or_create(&settled_labels(dataset, kind, outcome, stage, completion))
             .get()
+    }
+
+    /// Bytes under `outcome`, whatever the kind, the stage and the completion.
+    pub fn bytes_by_outcome(&self, dataset: &str, outcome: AttemptOutcome) -> u64 {
+        AttemptKind::ALL
+            .iter()
+            .flat_map(|&k| {
+                AttemptStage::ALL.iter().flat_map(move |&s| {
+                    AttemptCompletion::ALL
+                        .iter()
+                        .map(move |&c| self.byte_count(dataset, k, outcome, s, c))
+                })
+            })
+            .sum()
     }
 
     pub fn chunk_count(&self, dataset: &str, outcome: ChunkOutcome) -> u64 {
@@ -531,40 +752,32 @@ impl AttemptSignals {
     }
 }
 
-fn kind_labels(kind: AttemptKind) -> Labels {
-    vec![("kind".to_owned(), kind.as_str().to_owned())]
+fn kind_labels(dataset: &str, kind: AttemptKind) -> Labels {
+    vec![
+        ("dataset".to_owned(), dataset.to_owned()),
+        ("kind".to_owned(), kind.as_str().to_owned()),
+    ]
 }
 
-fn outcome_labels(outcome: &str) -> Labels {
-    vec![("outcome".to_owned(), outcome.to_owned())]
-}
-
-fn settled_labels(kind: AttemptKind, outcome: AttemptOutcome) -> Labels {
-    let mut labels = kind_labels(kind);
-    labels.extend(outcome_labels(outcome.as_str()));
+fn settled_labels(
+    dataset: &str,
+    kind: AttemptKind,
+    outcome: AttemptOutcome,
+    stage: AttemptStage,
+    completion: AttemptCompletion,
+) -> Labels {
+    let mut labels = kind_labels(dataset, kind);
+    labels.push(("outcome".to_owned(), outcome.as_str().to_owned()));
+    labels.push(("stage".to_owned(), stage.as_str().to_owned()));
+    labels.push(("completion".to_owned(), completion.as_str().to_owned()));
     labels
 }
 
-/// `dataset` is the configured name, as on `http_status`: bounded by config.
 fn chunk_labels(dataset: &str, outcome: ChunkOutcome) -> Labels {
-    let mut labels = vec![("dataset".to_owned(), dataset.to_owned())];
-    labels.extend(outcome_labels(outcome.as_str()));
-    labels
-}
-
-/// Creates the OB-16 series that carry no dataset at zero. A series first exposed at one
-/// hides that increment from `rate()`, which matters for rare outcomes like `discarded`.
-fn init_attempt_series() {
-    for kind in AttemptKind::ALL {
-        drop(STREAM_QUERIES_SENT.get_or_create(&kind_labels(kind)));
-        drop(STREAM_QUERIES_WITHDRAWN.get_or_create(&kind_labels(kind)));
-        for outcome in AttemptOutcome::ALL {
-            drop(STREAM_QUERIES_SETTLED.get_or_create(&settled_labels(kind, outcome)));
-        }
-    }
-    for outcome in AttemptOutcome::ALL {
-        drop(STREAM_WORKER_BYTES.get_or_create(&outcome_labels(outcome.as_str())));
-    }
+    vec![
+        ("dataset".to_owned(), dataset.to_owned()),
+        ("outcome".to_owned(), outcome.as_str().to_owned()),
+    ]
 }
 
 /// Count one authorization evaluation (OB-12).
@@ -856,7 +1069,6 @@ pub fn report_mutex_held_duration(
 }
 
 pub fn register_metrics(registry: &mut Registry) {
-    init_attempt_series();
     registry.register(
         "http_status",
         "Number of sent HTTP responses",
@@ -980,27 +1192,27 @@ pub fn register_metrics(registry: &mut Registry) {
 
     registry.register(
         "stream_queries_sent",
-        "Worker queries streams handed to the transport, by kind: first, continuation, retry, or hedge",
+        "Worker queries streams handed to the transport after the congestion permit, by dataset and kind (first, continuation, retry, hedge). Submission, not proof the worker executed it",
         STREAM_QUERIES_SENT.clone(),
     );
     registry.register(
         "stream_queries_settled",
-        "Sent stream worker queries by kind and outcome: delivered, failed, superseded, discarded, or abandoned",
+        "Sent stream worker queries by dataset, kind, why the controller let go (outcome: delivered, failed, superseded, cancelled, abandoned_error, abandoned_unknown), whether it had taken the task's result (stage: read, in_flight) and what the task had done by then (completion: ok, error, incomplete)",
         STREAM_QUERIES_SETTLED.clone(),
     );
     registry.register(
         "stream_queries_withdrawn",
-        "Stream worker queries cancelled before reaching the transport; no worker saw them",
+        "Stream worker queries cancelled before reaching the transport, by dataset and kind; no worker saw them",
         STREAM_QUERIES_WITHDRAWN.clone(),
     );
     registry.register(
         "stream_worker_bytes",
-        "Bytes read from workers by stream queries, by the query's outcome",
+        "Bytes the Portal read from worker responses for stream queries, by dataset, kind, outcome, stage and completion. Application reads only: excludes data buffered in the transport but never read, and is not client egress",
         STREAM_WORKER_BYTES.clone(),
     );
     registry.register(
         "stream_chunks_settled",
-        "Chunks streams dispatched a query for, by dataset and whether they reached the client: delivered, failed, or abandoned",
+        "Chunks streams dispatched a query for, by dataset and whether they reached the response body: delivered, failed, abandoned_error, or abandoned_unknown",
         STREAM_CHUNKS_SETTLED.clone(),
     );
 
@@ -1285,29 +1497,53 @@ mod tests {
             "delivered",
             "failed",
             "superseded",
-            "discarded",
-            "abandoned",
+            "cancelled",
+            "abandoned_error",
+            "abandoned_unknown",
         ];
         assert_eq!(outcomes, want);
+        let stages = AttemptStage::ALL.map(AttemptStage::as_str);
+        assert_eq!(stages, ["read", "in_flight"]);
+        let completions = AttemptCompletion::ALL.map(AttemptCompletion::as_str);
+        assert_eq!(completions, ["ok", "error", "incomplete"]);
         let chunks = ChunkOutcome::ALL.map(ChunkOutcome::as_str);
-        assert_eq!(chunks, ["delivered", "failed", "abandoned"]);
+        let want = [
+            "delivered",
+            "failed",
+            "abandoned_error",
+            "abandoned_unknown",
+        ];
+        assert_eq!(chunks, want);
     }
 
-    /// Before any query, so a rare outcome's first occurrence is visible to `rate()`.
+    /// From a dataset's first stream, so a rare outcome's first occurrence is visible to
+    /// `rate()`; and only the combinations that can happen, so a dashboard never shows
+    /// a delivered query whose task returned an error, or a superseded one the
+    /// controller had read.
     #[test]
-    fn attempt_series_are_exposed_at_zero_from_registration() {
+    fn attempt_series_are_exposed_at_zero_once_a_dataset_streams() {
         let mut registry = Registry::default();
         register_metrics(&mut registry);
+        AttemptSignals::bind().prime("primed-dataset");
         let mut text = String::new();
         prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
 
         for series in [
-            r#"stream_queries_sent_total{kind="hedge"}"#,
-            r#"stream_queries_settled_total{kind="hedge",outcome="discarded"}"#,
-            r#"stream_queries_withdrawn_total{kind="first"}"#,
-            r#"stream_worker_bytes_total{outcome="superseded"}"#,
+            r#"stream_queries_sent_total{dataset="primed-dataset",kind="hedge"}"#,
+            r#"stream_queries_settled_total{dataset="primed-dataset",kind="hedge",outcome="superseded",stage="in_flight",completion="ok"}"#,
+            r#"stream_queries_withdrawn_total{dataset="primed-dataset",kind="first"}"#,
+            r#"stream_worker_bytes_total{dataset="primed-dataset",kind="first",outcome="abandoned_unknown",stage="read",completion="ok"}"#,
+            r#"stream_worker_bytes_total{dataset="primed-dataset",kind="first",outcome="abandoned_unknown",stage="in_flight",completion="ok"}"#,
+            r#"stream_chunks_settled_total{dataset="primed-dataset",outcome="abandoned_error"}"#,
         ] {
             assert!(text.contains(series), "{series} missing");
+        }
+        for impossible in [
+            r#"outcome="delivered",stage="read",completion="error""#,
+            r#"outcome="superseded",stage="read""#,
+            r#"outcome="abandoned_error",stage="read",completion="incomplete""#,
+        ] {
+            assert!(!text.contains(impossible), "{impossible} is unreachable");
         }
     }
 
