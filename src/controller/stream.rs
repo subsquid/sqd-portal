@@ -25,6 +25,11 @@
 //! leaves room for the next active response. Otherwise the active partial is held until the client
 //! drains a buffered part.
 //! ```
+//!
+//! Every worker query is an [`Attempt`], settled once by why the controller let go of it
+//! (OB-16). A winning answer carries its attempt until handed on, so read-ahead the client
+//! never takes is abandoned; the controller's drop abandons everything it still holds with
+//! the one thing it knows about the stream's end, whether an error had been yielded.
 
 #![allow(unstable_name_collisions)]
 
@@ -43,8 +48,10 @@ use tokio::time::Instant;
 use tracing::{instrument, Instrument};
 
 use crate::{
-    controller::timeouts::TimeoutManager,
-    metrics::{self, RefusalReason},
+    controller::{attempt::Attempt, timeouts::TimeoutManager},
+    metrics::{
+        self, AttemptKind, AttemptOutcome, AttemptSignals, ChunkOutcome, RefusalReason, StreamEnd,
+    },
     network::{ChunkNotFound, NetworkClient, NoWorker, QueryResult, StreamingNetwork, WorkerLease},
     types::{
         BlockRange, ChunkId, DataChunk, ErrorCode, ExhaustionClass, QueryError, RequestError,
@@ -64,8 +71,14 @@ pub struct StreamController<N: StreamingNetwork = NetworkClient> {
     stats: StreamStats,
     span: tracing::Span,
     last_error: Option<String>,
+    /// An error was yielded; consumers stop at the first one, so the stream is over and
+    /// whatever is still held is abandoned because of it.
+    ended_in_error: bool,
     stream_index: u32,
     priority_stride: u32,
+    /// The configured dataset name every attempt is charged to.
+    dataset: Arc<str>,
+    signals: Arc<AttemptSignals>,
 }
 
 #[derive(Clone)]
@@ -73,6 +86,8 @@ pub struct DataRange {
     pub range: BlockRange,
     pub chunk: DataChunk,
     pub chunk_index: usize,
+    /// The rest of a range a worker answered in part.
+    pub continuation: bool,
 }
 
 struct Slot {
@@ -83,12 +98,20 @@ struct Slot {
 struct ChunkSlot {
     active: Option<Slot>,
     buffered: VecDeque<BufferedResponse>,
+    /// A query was dispatched for this chunk, so it settles as an OB-16 chunk outcome.
+    dispatched: bool,
 }
 
 struct BufferedResponse {
     chunk_index: usize,
     read_range: BlockRange,
-    result: Result<ResponseChunk, RequestError>,
+    result: Result<Payload, RequestError>,
+}
+
+/// A worker's answer, with the attempt that fetched it.
+struct Payload {
+    data: ResponseChunk,
+    attempt: Attempt,
 }
 
 enum RequestState {
@@ -104,7 +127,7 @@ enum RequestState {
     /// range. A continuation request can be sent once buffering it won't exceed the per-chunk cap.
     Partial(PartialResult),
     /// Either a successful result has been received, or all the attempts have failed.
-    Done(Result<ResponseChunk, RequestError>),
+    Done(Result<Payload, RequestError>),
 }
 
 struct PausedState {
@@ -119,7 +142,7 @@ struct PendingRequests {
 }
 
 struct PartialResult {
-    data: ResponseChunk,
+    data: Payload,
     next_range: BlockRange,
 }
 
@@ -137,6 +160,8 @@ struct RunningWorkerRequest {
     resp: tokio::task::JoinHandle<QueryResult>,
     start_time: tokio::time::Instant,
     worker: PeerId,
+    /// Taken when the request finishes or loses; if still here on drop, abandoned.
+    attempt: Option<Attempt>,
 }
 
 struct FinishedWorkerRequest {
@@ -210,18 +235,29 @@ impl<N: StreamingNetwork> StreamController<N> {
             return Err(RequestError::NoData);
         }
 
+        let signals = AttemptSignals::bind();
+        signals.prime(&request.dataset_name);
         Ok(Self {
             network,
             buffer: SlidingArray::with_capacity(request.buffer_size),
             next_chunk: Some(first_chunk),
             timeouts: TimeoutManager::new(request.timeout_quantile),
+            dataset: Arc::from(request.dataset_name.as_str()),
             request,
             stats: StreamStats::new(),
             span: tracing::Span::current(),
             last_error: None,
+            ended_in_error: false,
             stream_index,
             priority_stride,
+            signals: Arc::new(signals),
         })
+    }
+
+    #[cfg(test)]
+    fn with_signals(mut self, signals: Arc<AttemptSignals>) -> Self {
+        self.signals = signals;
+        self
     }
 
     pub fn poll_next(
@@ -261,6 +297,7 @@ impl<N: StreamingNetwork> StreamController<N> {
 
         if let Poll::Ready(Some(Err(e))) = &result {
             self.last_error = Some(e.to_string());
+            self.ended_in_error = true;
         }
 
         result
@@ -275,6 +312,7 @@ impl<N: StreamingNetwork> StreamController<N> {
 
         if let Some(mut slot) = chunk_slot.active.take() {
             updated |= self.poll_slot(&mut slot, ctx).updated();
+            chunk_slot.dispatched |= slot.is_querying();
             chunk_slot.active = Some(slot);
         }
 
@@ -355,8 +393,19 @@ impl<N: StreamingNetwork> StreamController<N> {
             newly_finished: 0,
         };
 
-        for request in pending.requests.iter_mut() {
-            self.poll_worker_request(data_range, request, &mut summary, ctx)?;
+        let polled = pending.requests.iter_mut().try_for_each(|request| {
+            self.poll_worker_request(data_range, request, &mut summary, ctx)
+        });
+        if let Err(state) = polled {
+            // The range is settled, and whatever else is still running is let go. Only an
+            // answer wins a race; a terminal error ends the range with no winner, and
+            // the rest are cancelled, not beaten.
+            let outcome = match &state {
+                RequestState::Done(Err(_)) => AttemptOutcome::Cancelled,
+                _ => AttemptOutcome::Superseded,
+            };
+            pending.settle_running(outcome);
+            return Err(state);
         }
 
         Ok(summary)
@@ -380,6 +429,10 @@ impl<N: StreamingNetwork> StreamController<N> {
                     return Ok(());
                 };
                 summary.newly_finished += 1;
+                let attempt = running.attempt.take().expect("taken only once finished");
+                // From here the controller holds the result; a task can also answer
+                // after its query is let go, which the stage keeps apart from this.
+                attempt.mark_read();
 
                 // This is intentionally measured when the result has been polled, not when it's ready.
                 // If the stream is consumed slower than generated, this duration may get
@@ -397,6 +450,7 @@ impl<N: StreamingNetwork> StreamController<N> {
                             running.worker,
                             join_err,
                         );
+                        attempt.settle(AttemptOutcome::Failed);
                         return Err(RequestState::Done(Err(RequestError::Internal(format!(
                             "worker query task failed: {join_err}"
                         )))));
@@ -426,6 +480,7 @@ impl<N: StreamingNetwork> StreamController<N> {
                         running.worker,
                         response.as_ref().unwrap_err().to_string(),
                     );
+                    attempt.settle(AttemptOutcome::Failed);
                     *request = WorkerRequest::Finished(FinishedWorkerRequest {
                         result: response,
                         worker: running.worker,
@@ -437,6 +492,7 @@ impl<N: StreamingNetwork> StreamController<N> {
                         &data_range.range,
                         running.worker,
                         duration,
+                        attempt,
                     ));
                 }
             }
@@ -460,7 +516,16 @@ impl<N: StreamingNetwork> StreamController<N> {
         let should_retry = summary.newly_finished > 0 || timed_out || summary.running == 0;
 
         if should_retry && summary.not_started > 0 {
-            self.start_next_attempt(data_range, pending, timed_out, summary.running, ctx);
+            let kind = match (
+                summary.not_started == pending.requests.len(),
+                summary.running,
+            ) {
+                (true, _) if data_range.continuation => AttemptKind::Continuation,
+                (true, _) => AttemptKind::First,
+                (false, 0) => AttemptKind::Retry,
+                (false, _) => AttemptKind::Hedge,
+            };
+            self.start_next_attempt(data_range, pending, timed_out, kind, ctx);
             return PendingSlotPoll::NotUpdated;
         }
 
@@ -512,7 +577,7 @@ impl<N: StreamingNetwork> StreamController<N> {
         data_range: &DataRange,
         pending: &mut PendingRequests,
         timed_out: bool,
-        running: usize,
+        kind: AttemptKind,
         ctx: &mut Context<'_>,
     ) {
         if timed_out {
@@ -524,12 +589,11 @@ impl<N: StreamingNetwork> StreamController<N> {
 
         for req in &mut pending.requests {
             if let WorkerRequest::NotStarted(worker) = req {
-                let is_speculative = running > 0;
                 let lease = worker
                     .lease
                     .take()
                     .expect("worker lease should only be used once");
-                let request = self.send_query(data_range, lease, is_speculative);
+                let request = self.send_query(data_range, lease, kind);
                 *req = WorkerRequest::Running(request);
                 pending.set_timeout(self.timeouts.current_timeout(), ctx);
                 break;
@@ -547,7 +611,9 @@ impl<N: StreamingNetwork> StreamController<N> {
 
         if let Some(response) = chunk_slot.buffered.pop_front() {
             self.buffer_active_response(&mut chunk_slot, ctx);
-            if !chunk_slot.is_empty() {
+            if chunk_slot.is_empty() {
+                self.settle_chunk(&chunk_slot, chunk_outcome(&response.result));
+            } else {
                 self.buffer.push_front(chunk_slot);
             }
             return self.ready_response(response);
@@ -559,8 +625,13 @@ impl<N: StreamingNetwork> StreamController<N> {
 
         let chunk_index = slot.data_range.chunk_index;
         let (result, read_range, next_slot) = match slot.state {
-            RequestState::Done(result) => (Poll::Ready(Some(result)), slot.data_range.range, None),
+            RequestState::Done(result) => {
+                self.settle_chunk(&chunk_slot, chunk_outcome(&result));
+                let result = result.map(Payload::deliver);
+                (Poll::Ready(Some(result)), slot.data_range.range, None)
+            }
             RequestState::NoWorkers => {
+                self.settle_chunk(&chunk_slot, ChunkOutcome::Failed);
                 // We don't know how long we'll have to wait, so give up immediately
                 return Poll::Ready(Some(Err(RequestError::Unavailable)));
             }
@@ -569,6 +640,7 @@ impl<N: StreamingNetwork> StreamController<N> {
                 let duration = s.until.duration_since(Instant::now());
                 if duration > MAX_IDLE_TIME {
                     metrics::report_stream_refused(RefusalReason::WorkersPaused);
+                    self.settle_chunk(&chunk_slot, ChunkOutcome::Failed);
                     return Poll::Ready(Some(Err(RequestError::BusyFor(duration))));
                 } else {
                     // TODO: fix calculation in case we're polling the same paused slot multiple times
@@ -601,6 +673,7 @@ impl<N: StreamingNetwork> StreamController<N> {
                         slot
                     }
                 };
+                let result = result.map(Payload::deliver);
                 (Poll::Ready(Some(result)), read_range, Some(slot))
             }
         };
@@ -618,9 +691,15 @@ impl<N: StreamingNetwork> StreamController<N> {
         &mut self,
         response: BufferedResponse,
     ) -> Poll<Option<Result<ResponseChunk, RequestError>>> {
-        let result = Poll::Ready(Some(response.result));
+        let result = Poll::Ready(Some(response.result.map(Payload::deliver)));
         self.observe_response(response.chunk_index, &response.read_range, &result);
         result
+    }
+
+    fn settle_chunk(&self, chunk_slot: &ChunkSlot, outcome: ChunkOutcome) {
+        if chunk_slot.dispatched {
+            self.signals.chunk(&self.dataset, outcome);
+        }
     }
 
     fn observe_response(
@@ -722,6 +801,7 @@ impl<N: StreamingNetwork> StreamController<N> {
                     range: chunk.block_range(),
                     chunk,
                     chunk_index: next_index,
+                    continuation: false,
                 },
                 ctx,
             ) {
@@ -868,11 +948,11 @@ impl<N: StreamingNetwork> StreamController<N> {
         &mut self,
         range: &DataRange,
         lease: WorkerLease,
-        is_speculative: bool,
+        kind: AttemptKind,
     ) -> RunningWorkerRequest {
         tracing::debug!(
-            "Sending {}query for chunk {} ({}-{}) to worker {}",
-            if is_speculative { "another " } else { "" },
+            "Sending {} query for chunk {} ({}-{}) to worker {}",
+            kind.as_str(),
             range.chunk_index,
             range.range.start(),
             range.range.end(),
@@ -888,6 +968,7 @@ impl<N: StreamingNetwork> StreamController<N> {
         let priority = self.stream_index * self.priority_stride + range.chunk_index as u32;
 
         let worker = lease.worker();
+        let (attempt, meter) = Attempt::start(kind, &self.dataset, &self.signals);
         let fut = self
             .network
             .clone()
@@ -899,6 +980,7 @@ impl<N: StreamingNetwork> StreamController<N> {
                 query,
                 self.request.compression,
                 Some(priority),
+                meter,
             )
             .in_current_span();
 
@@ -907,6 +989,7 @@ impl<N: StreamingNetwork> StreamController<N> {
             resp: tokio::spawn(fut),
             start_time,
             worker,
+            attempt: Some(attempt),
         }
     }
 }
@@ -914,6 +997,22 @@ impl<N: StreamingNetwork> StreamController<N> {
 impl<N: StreamingNetwork> Drop for StreamController<N> {
     fn drop(&mut self) {
         let _enter = self.span.enter();
+        // Everything still held is abandoned, with the one thing known about why: an
+        // error had been yielded, or the consumer let go of a stream that had not ended.
+        // Settled here, in place, so each attempt carries that reason rather than the
+        // unknown its own drop would fall back to once the buffer goes.
+        let end = if self.ended_in_error {
+            StreamEnd::Error
+        } else {
+            StreamEnd::Unknown
+        };
+        for chunk_slot in self.buffer.iter_mut() {
+            if chunk_slot.dispatched {
+                self.signals
+                    .chunk(&self.dataset, ChunkOutcome::Abandoned(end));
+            }
+            chunk_slot.abandon(end);
+        }
         self.stats
             .write_summary(&self.request, self.last_error.take());
     }
@@ -946,6 +1045,7 @@ impl DataRange {
             range,
             chunk: self.chunk,
             chunk_index: self.chunk_index,
+            continuation: self.continuation,
         }
     }
 }
@@ -953,6 +1053,7 @@ impl DataRange {
 impl ChunkSlot {
     fn new(active: Slot) -> Self {
         Self {
+            dispatched: active.is_querying(),
             active: Some(active),
             buffered: VecDeque::new(),
         }
@@ -986,6 +1087,19 @@ impl ChunkSlot {
         self.buffered.len() + 1 < max_stored_results
     }
 
+    /// The stream ended with this chunk in hand: every attempt it still holds, answered
+    /// and buffered or still in flight, is abandoned for that reason.
+    fn abandon(&mut self, end: StreamEnd) {
+        if let Some(slot) = &mut self.active {
+            slot.state.abandon(end);
+        }
+        for response in &mut self.buffered {
+            if let Ok(payload) = &mut response.result {
+                payload.attempt.abandon(end);
+            }
+        }
+    }
+
     fn debug_symbol(&self) -> char {
         if !self.buffered.is_empty() && self.active.is_some() {
             '+'
@@ -1007,6 +1121,25 @@ impl Slot {
     fn is_paused(&self) -> bool {
         matches!(&self.state, RequestState::Paused(_))
     }
+
+    /// Pending is entered only by dispatching the range's first query.
+    fn is_querying(&self) -> bool {
+        matches!(&self.state, RequestState::Pending(_))
+    }
+}
+
+impl Payload {
+    fn deliver(self) -> ResponseChunk {
+        self.attempt.settle(AttemptOutcome::Delivered);
+        self.data
+    }
+}
+
+fn chunk_outcome<T>(result: &Result<T, RequestError>) -> ChunkOutcome {
+    match result {
+        Ok(_) => ChunkOutcome::Delivered,
+        Err(_) => ChunkOutcome::Failed,
+    }
 }
 
 fn into_partial_continuation(
@@ -1015,7 +1148,10 @@ fn into_partial_continuation(
 ) -> (BufferedResponse, DataRange) {
     let PartialResult { data, next_range } = partial;
     let read_range = BlockRange::new(*data_range.range.start(), *next_range.start() - 1);
-    let next_data_range = data_range.with_range(next_range);
+    let next_data_range = DataRange {
+        continuation: true,
+        ..data_range.with_range(next_range)
+    };
     let response = BufferedResponse {
         chunk_index: next_data_range.chunk_index,
         read_range,
@@ -1027,6 +1163,15 @@ fn into_partial_continuation(
 impl RequestState {
     fn has_stored_response(&self) -> bool {
         matches!(self, RequestState::Partial(_) | RequestState::Done(_))
+    }
+
+    fn abandon(&mut self, end: StreamEnd) {
+        match self {
+            RequestState::Pending(pending) => pending.abandon(end),
+            RequestState::Partial(partial) => partial.data.attempt.abandon(end),
+            RequestState::Done(Ok(payload)) => payload.attempt.abandon(end),
+            RequestState::Done(Err(_)) | RequestState::NoWorkers | RequestState::Paused(_) => {}
+        }
     }
 }
 
@@ -1061,6 +1206,21 @@ impl PendingRequests {
         self.timeout_duration = timeout;
         assert!(self.timeout.poll_unpin(ctx).is_pending()); // pass the context to wake
     }
+
+    /// Settles every attempt still running, once the range no longer needs any of them.
+    fn settle_running(&mut self, outcome: AttemptOutcome) {
+        for request in &mut self.requests {
+            if let WorkerRequest::Running(running) = request {
+                if let Some(attempt) = running.attempt.take() {
+                    attempt.settle(outcome);
+                }
+            }
+        }
+    }
+
+    fn abandon(&mut self, end: StreamEnd) {
+        self.settle_running(AttemptOutcome::Abandoned(end));
+    }
 }
 
 fn parse_response(
@@ -1068,10 +1228,12 @@ fn parse_response(
     range: &BlockRange,
     worker: PeerId,
     duration: Duration,
+    attempt: Attempt,
 ) -> RequestState {
     let s = match response {
         Ok(success) => success,
         Err(e) => {
+            attempt.settle(AttemptOutcome::Failed);
             let error = RequestError::from_query_error(e, worker);
             tracing::debug!(
                 "Got error in {}ms from {}: {}",
@@ -1093,18 +1255,25 @@ fn parse_response(
     let last_block = result.last_block;
 
     let state = if last_block == *range.end() {
-        RequestState::Done(Ok(result.data))
+        RequestState::Done(Ok(Payload {
+            data: result.data,
+            attempt,
+        }))
     } else if last_block < *range.start() {
         // Unreachable: `check_response_range` rejects this before the response
         // gets here. Kept because falling through would emit blocks below the
         // requested start (INV-21) instead of failing.
+        attempt.settle(AttemptOutcome::Failed);
         RequestState::Done(Err(RequestError::Failure(format!(
             "worker {worker} returned last block {last_block} below the first queried block {}",
             range.start(),
         ))))
     } else {
         RequestState::Partial(PartialResult {
-            data: result.data,
+            data: Payload {
+                data: result.data,
+                attempt,
+            },
             next_range: BlockRange::new(last_block + 1, *range.end()),
         })
     };
@@ -1170,6 +1339,9 @@ mod tests {
 
     use super::*;
 
+    /// The configured name every test stream carries.
+    const DATASET: &str = "test-dataset";
+
     fn test_chunk() -> DataChunk {
         DataChunk::from_str("0000000000/0000000100-0000000200-abcde").unwrap()
     }
@@ -1179,6 +1351,14 @@ mod tests {
             range: BlockRange::new(start, end),
             chunk: test_chunk(),
             chunk_index: 0,
+            continuation: false,
+        }
+    }
+
+    fn payload(data: &[u8]) -> Payload {
+        Payload {
+            data: data.to_vec().into(),
+            attempt: Attempt::detached(),
         }
     }
 
@@ -1191,7 +1371,7 @@ mod tests {
 
     fn partial_result(end: u64, last_returned: u64, data: &[u8]) -> PartialResult {
         PartialResult {
-            data: data.to_vec().into(),
+            data: payload(data),
             next_range: BlockRange::new(last_returned + 1, end),
         }
     }
@@ -1200,7 +1380,7 @@ mod tests {
         BufferedResponse {
             chunk_index: 0,
             read_range: 100..=149,
-            result: Ok(vec![1, 2, 3].into()),
+            result: Ok(payload(&[1, 2, 3])),
         }
     }
 
@@ -1214,7 +1394,7 @@ mod tests {
         assert_eq!(response.read_range, BlockRange::new(100, 120));
         assert_eq!(response.chunk_index, 0);
         match response.result {
-            Ok(data) => assert_eq!(data.as_ref(), b"first"),
+            Ok(payload) => assert_eq!(payload.data.as_ref(), b"first"),
             Err(_) => panic!("partial data should become an emit-ready response"),
         }
         assert_eq!(continuation.range, BlockRange::new(121, 200));
@@ -1229,6 +1409,7 @@ mod tests {
         let mut chunk_slot = ChunkSlot {
             active: None,
             buffered: VecDeque::new(),
+            dispatched: true,
         };
         chunk_slot.buffered.push_back(response);
         chunk_slot.active = Some(Slot {
@@ -1255,10 +1436,11 @@ mod tests {
     fn active_partial_counts_as_stored_result() {
         let chunk_slot = ChunkSlot {
             active: Some(slot(RequestState::Partial(PartialResult {
-                data: vec![1].into(),
+                data: payload(&[1]),
                 next_range: 150..=199,
             }))),
             buffered: VecDeque::new(),
+            dispatched: true,
         };
 
         assert_eq!(chunk_slot.stored_result_count(), 1);
@@ -1268,10 +1450,11 @@ mod tests {
     fn partial_continuation_requires_capacity_for_next_active_result() {
         let mut chunk_slot = ChunkSlot {
             active: Some(slot(RequestState::Partial(PartialResult {
-                data: vec![1].into(),
+                data: payload(&[1]),
                 next_range: 150..=199,
             }))),
             buffered: VecDeque::new(),
+            dispatched: true,
         };
 
         assert!(!chunk_slot.has_capacity_for_eager_continuation(1));
@@ -1285,8 +1468,9 @@ mod tests {
     #[test]
     fn terminal_response_can_use_last_capacity_slot() {
         let mut chunk_slot = ChunkSlot {
-            active: Some(slot(RequestState::Done(Ok(vec![4, 5, 6].into())))),
+            active: Some(slot(RequestState::Done(Ok(payload(&[4, 5, 6]))))),
             buffered: VecDeque::new(),
+            dispatched: true,
         };
 
         assert!(chunk_slot.can_buffer_terminal_response(1));
@@ -1300,6 +1484,8 @@ mod tests {
 
     use futures::{future::BoxFuture, StreamExt};
 
+    use crate::controller::attempt::AttemptMeter;
+    use crate::metrics::{AttemptCompletion, AttemptStage};
     use crate::network::QuerySuccess;
     use crate::types::{Compression, DatasetId, ParsedQuery, StreamRequest};
 
@@ -1341,6 +1527,7 @@ mod tests {
             _query: String,
             _compression: Compression,
             _priority: Option<u32>,
+            _meter: AttemptMeter,
         ) -> BoxFuture<'static, QueryResult> {
             self.queries_sent.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
@@ -1448,7 +1635,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicI64;
+    use std::sync::atomic::{AtomicI64, AtomicU64};
     use std::sync::Mutex as StdMutex;
 
     use proptest::prelude::*;
@@ -1466,6 +1653,9 @@ mod tests {
         /// No workers at all: the stream gives up with `Unavailable`.
         Unavailable,
     }
+
+    /// What a scripted error response reads off the wire.
+    const ERROR_BYTES: usize = 3;
 
     /// Scripted outcome of one worker query.
     #[derive(Debug, Clone)]
@@ -1486,7 +1676,12 @@ mod tests {
         /// other event resolves instantly under the paused clock.
         Slow(u64),
         Retriable,
+        /// Fail with a retriable error, but only after `ms` of (virtual) time: a query
+        /// whose failure can land after another attempt has already settled the range.
+        FailAfter(u64),
         RateLimited,
+        /// Fail with a terminal error: the range ends with it, and so does the stream.
+        Fatal,
         /// Never respond. Only used by the cancellation test; including it in
         /// the random generator would (correctly) fail the liveness property,
         /// because a slot whose every attempt hangs waits forever — in
@@ -1528,6 +1723,8 @@ mod tests {
         live_queries: Arc<AtomicI64>,
         /// Workers the controller reported as returning contract-violating data.
         integrity_failures: StdMutex<Vec<PeerId>>,
+        /// Every byte any query read, wherever it ended up: OB-16's ledger truth.
+        bytes_read: Arc<AtomicU64>,
     }
 
     impl ScriptedNetwork {
@@ -1544,6 +1741,7 @@ mod tests {
                 ok_ranges: StdMutex::new(Vec::new()),
                 live_queries: Arc::new(AtomicI64::new(0)),
                 integrity_failures: StdMutex::new(Vec::new()),
+                bytes_read: Arc::default(),
             })
         }
     }
@@ -1597,6 +1795,7 @@ mod tests {
             _query: String,
             _compression: Compression,
             _priority: Option<u32>,
+            meter: AttemptMeter,
         ) -> BoxFuture<'static, QueryResult> {
             let event = self
                 .query_script
@@ -1605,43 +1804,77 @@ mod tests {
                 .pop_front()
                 .unwrap_or(QueryEvent::Full);
             let guard = LiveQueryGuard::new(&self.live_queries);
+            let ledger = self.bytes_read.clone();
             Box::pin(async move {
                 let _guard = guard;
-                let (start, end) = (*block_range.start(), *block_range.end());
-                let last = match event {
-                    QueryEvent::Hang => {
-                        futures::future::pending::<()>().await;
-                        unreachable!("pending future never resolves")
-                    }
-                    QueryEvent::Retriable => {
-                        return Err(QueryError::Retriable("scripted failure".to_owned()))
-                    }
-                    QueryEvent::RateLimited => return Err(QueryError::RateLimitExceeded),
-                    QueryEvent::Full => end,
-                    QueryEvent::Slow(ms) => {
-                        tokio::time::sleep(Duration::from_millis(ms)).await;
-                        end
-                    }
-                    QueryEvent::Overshoot(extra) => end + extra,
-                    QueryEvent::Undershoot(below) => start.saturating_sub(below.max(1)),
-                    QueryEvent::Partial(_) if start == end => end,
-                    QueryEvent::Partial(pct) => start + (end - start) * (pct as u64) / 100,
+                // Sent once the task runs; a task aborted before it runs is withdrawn.
+                meter.mark_sent();
+                let read = |bytes: usize| {
+                    meter.record(bytes);
+                    ledger.fetch_add(bytes as u64, Ordering::SeqCst);
                 };
-                if (start..=end).contains(&last) {
-                    self.ok_ranges
-                        .lock()
-                        .unwrap()
-                        .push((request_id, (start, last)));
+                let result: QueryResult = async {
+                    let (start, end) = (*block_range.start(), *block_range.end());
+                    let last = match event {
+                        QueryEvent::Hang => {
+                            read(1);
+                            futures::future::pending::<()>().await;
+                            unreachable!("pending future never resolves")
+                        }
+                        QueryEvent::Retriable => {
+                            read(ERROR_BYTES);
+                            return Err(QueryError::Retriable("scripted failure".to_owned()));
+                        }
+                        QueryEvent::FailAfter(ms) => {
+                            read(1);
+                            tokio::time::sleep(Duration::from_millis(ms)).await;
+                            read(ERROR_BYTES);
+                            return Err(QueryError::Retriable("scripted late failure".to_owned()));
+                        }
+                        QueryEvent::RateLimited => {
+                            read(ERROR_BYTES);
+                            return Err(QueryError::RateLimitExceeded);
+                        }
+                        QueryEvent::Fatal => {
+                            read(ERROR_BYTES);
+                            return Err(QueryError::Failure(
+                                "scripted terminal failure".to_owned(),
+                            ));
+                        }
+                        QueryEvent::Full => end,
+                        QueryEvent::Slow(ms) => {
+                            read(1); // part of the body, so a cancelled one has read something
+                            tokio::time::sleep(Duration::from_millis(ms)).await;
+                            end
+                        }
+                        QueryEvent::Overshoot(extra) => end + extra,
+                        QueryEvent::Undershoot(below) => start.saturating_sub(below.max(1)),
+                        QueryEvent::Partial(_) if start == end => end,
+                        QueryEvent::Partial(pct) => start + (end - start) * (pct as u64) / 100,
+                    };
+                    if (start..=end).contains(&last) {
+                        self.ok_ranges
+                            .lock()
+                            .unwrap()
+                            .push((request_id, (start, last)));
+                    }
+                    let data = format!("{start}:{last}").into_bytes();
+                    read(data.len() - usize::from(matches!(event, QueryEvent::Slow(_))));
+                    Ok(QuerySuccess {
+                        ok: sqd_messages::QueryOk {
+                            data: data.into(),
+                            last_block: last,
+                        },
+                        ttfb: Duration::from_millis(1),
+                        transfer_time: Duration::from_millis(1),
+                        response_size: 10,
+                    })
                 }
-                Ok(QuerySuccess {
-                    ok: sqd_messages::QueryOk {
-                        data: format!("{start}:{last}").into_bytes().into(),
-                        last_block: last,
-                    },
-                    ttfb: Duration::from_millis(1),
-                    transfer_time: Duration::from_millis(1),
-                    response_size: 10,
-                })
+                .await;
+                // Reached only by a task that returns, as in production: an aborted one
+                // stays incomplete.
+                meter.complete(result.is_ok());
+                result
             })
         }
 
@@ -1742,6 +1975,7 @@ mod tests {
             1 => (1u64..=20).prop_map(QueryEvent::Overshoot),
             1 => (1u64..=20).prop_map(QueryEvent::Undershoot),
             1 => Just(QueryEvent::Retriable),
+            1 => (200u64..=2500).prop_map(QueryEvent::FailAfter),
         ];
         (1usize..=4)
             .prop_flat_map(move |n_chunks| {
@@ -1782,6 +2016,7 @@ mod tests {
     struct StreamOutcome {
         /// (first_block, last_block) of every response chunk, in emission order.
         emissions: Vec<(u64, u64)>,
+        emitted_bytes: u64,
         error: Option<String>,
         /// What the client is actually told. The message is prose and carries a random
         /// PeerId, so two runs differ whatever they were classified as — only the code
@@ -1794,6 +2029,8 @@ mod tests {
         timed_out: bool,
         ok_ranges: Vec<(String, (u64, u64))>,
         leases_outstanding: usize,
+        signals: Arc<AttemptSignals>,
+        bytes_read: u64,
     }
 
     async fn collect_stream<N: StreamingNetwork>(
@@ -1801,13 +2038,26 @@ mod tests {
         network: Arc<N>,
         stream_index: u32,
     ) -> StreamOutcome {
-        let mut controller = StreamController::new(request, network, stream_index, 1).unwrap();
+        collect_stream_with(request, network, stream_index, Arc::default()).await
+    }
+
+    async fn collect_stream_with<N: StreamingNetwork>(
+        request: StreamRequest,
+        network: Arc<N>,
+        stream_index: u32,
+        signals: Arc<AttemptSignals>,
+    ) -> StreamOutcome {
+        let mut controller = StreamController::new(request, network, stream_index, 1)
+            .unwrap()
+            .with_signals(signals);
+        let mut emitted_bytes = 0;
         let mut emissions = Vec::new();
         let mut error = None;
         let mut code = None;
         while let Some(item) = controller.next().await {
             match item {
                 Ok(bytes) => {
+                    emitted_bytes += bytes.len() as u64;
                     let text = String::from_utf8(bytes.to_vec()).unwrap();
                     let (start, last) = text.split_once(':').unwrap();
                     emissions.push((start.parse().unwrap(), last.parse().unwrap()));
@@ -1821,6 +2071,7 @@ mod tests {
         }
         StreamOutcome {
             emissions,
+            emitted_bytes,
             error,
             code,
         }
@@ -1838,10 +2089,12 @@ mod tests {
                 scenario.find_worker_script.clone(),
                 scenario.query_script.clone(),
             );
+            let signals = Arc::<AttemptSignals>::default();
 
             let collect_all =
                 futures::future::join_all(scenario.streams.iter().enumerate().map(|(i, spec)| {
-                    collect_stream(scenario.request(spec, i), network.clone(), i as u32)
+                    let request = scenario.request(spec, i);
+                    collect_stream_with(request, network.clone(), i as u32, signals.clone())
                 }));
 
             // Virtual-time deadline: liveness. A stream stuck without timers
@@ -1859,6 +2112,8 @@ mod tests {
                         timed_out: false,
                         ok_ranges: network.ok_ranges.lock().unwrap().clone(),
                         leases_outstanding: network.lease_pool.outstanding(),
+                        signals,
+                        bytes_read: network.bytes_read.load(Ordering::SeqCst),
                     }
                 }
                 Err(_) => ScenarioOutcome {
@@ -1866,6 +2121,8 @@ mod tests {
                     timed_out: true,
                     ok_ranges: network.ok_ranges.lock().unwrap().clone(),
                     leases_outstanding: network.lease_pool.outstanding(),
+                    signals,
+                    bytes_read: network.bytes_read.load(Ordering::SeqCst),
                 },
             }
         })
@@ -1970,6 +2227,56 @@ mod tests {
                 0,
                 "worker leases leaked after all streams finished"
             );
+
+            // OB-16 against ledger truth: every sent query settles once, nothing lands
+            // outside the reachable label set (a delivered or failed query was read, a
+            // superseded or cancelled one was not, a query read and held had answered),
+            // delivered is exactly what clients got, every byte read has one outcome,
+            // and every chunk a query was dispatched for settles once.
+            let signals = &outcome.signals;
+            let settled =
+                |kind| AttemptOutcome::ALL.map(|o| signals.settled_by_outcome(DATASET, kind, o));
+            for kind in AttemptKind::ALL {
+                let sent = signals.sent_count(DATASET, kind);
+                prop_assert_eq!(settled(kind).iter().sum::<u64>(), sent);
+                for outcome in AttemptOutcome::ALL {
+                    for stage in AttemptStage::ALL {
+                        for completion in AttemptCompletion::ALL {
+                            let reachable = outcome.stages().contains(&stage)
+                                && outcome.completions(stage).contains(&completion);
+                            if reachable {
+                                continue;
+                            }
+                            let count =
+                                signals.settled_count(DATASET, kind, outcome, stage, completion);
+                            prop_assert_eq!(
+                                count,
+                                0,
+                                "{:?}/{:?}/{:?}/{:?} is unreachable",
+                                kind,
+                                outcome,
+                                stage,
+                                completion
+                            );
+                        }
+                    }
+                }
+            }
+            let delivered: u64 = AttemptKind::ALL.map(|k| settled(k)[0]).iter().sum();
+            let emissions: usize = outcome.streams.iter().map(|s| s.emissions.len()).sum();
+            prop_assert_eq!(delivered, emissions as u64);
+            let emitted: u64 = outcome.streams.iter().map(|s| s.emitted_bytes).sum();
+            let delivered_bytes = signals.bytes_by_outcome(DATASET, AttemptOutcome::Delivered);
+            prop_assert_eq!(delivered_bytes, emitted);
+            let read: u64 = AttemptOutcome::ALL
+                .map(|o| signals.bytes_by_outcome(DATASET, o))
+                .iter()
+                .sum();
+            prop_assert_eq!(read, outcome.bytes_read);
+            let chunks: u64 = ChunkOutcome::ALL.map(|o| signals.chunk_count(DATASET, o)).iter().sum();
+            let first = signals.sent_count(DATASET, AttemptKind::First)
+                + signals.withdrawn_count(DATASET, AttemptKind::First);
+            prop_assert_eq!(chunks, first);
         }
     }
 
@@ -2354,5 +2661,278 @@ mod tests {
             0,
             "all worker leases must be returned"
         );
+    }
+
+    /// Each kind of query, each outcome and each completion, from a script that
+    /// produces it.
+    #[test]
+    fn queries_are_counted_by_kind_outcome_and_completion() {
+        use AttemptCompletion::*;
+        use AttemptKind::*;
+        use AttemptOutcome::*;
+        let cases = [
+            // Too slow: a hedge answers at t=1100 and is read on the next timeout
+            // (the late read is a bug of its own); the first is cut off mid-body.
+            (
+                vec![QueryEvent::Slow(3000), QueryEvent::Slow(100)],
+                1,
+                vec![(First, Superseded, Incomplete), (Hedge, Delivered, Ok)],
+            ),
+            // A tie: both answers are in when the stream looks and it reads the first.
+            // The hedge's answer had arrived and goes unread: a download wasted.
+            (
+                vec![QueryEvent::Slow(1500), QueryEvent::Slow(500)],
+                1,
+                vec![(First, Delivered, Ok), (Hedge, Superseded, Ok)],
+            ),
+            // A hedge that had failed by the time the first answered is let go the same
+            // way, but no answer was thrown away: its cost is a failure's.
+            (
+                vec![QueryEvent::Slow(1500), QueryEvent::FailAfter(500)],
+                1,
+                vec![(First, Delivered, Ok), (Hedge, Superseded, Error)],
+            ),
+            // A hedge that fails while the first is still running is read at the next
+            // timeout and failed; the first goes on to deliver.
+            (
+                vec![QueryEvent::Slow(3000), QueryEvent::FailAfter(100)],
+                1,
+                vec![(First, Delivered, Ok), (Hedge, Failed, Error)],
+            ),
+            // A terminal error, read at the next timeout, ends the range with no winner:
+            // the first, still running, is cancelled, not beaten.
+            (
+                vec![QueryEvent::Slow(3000), QueryEvent::Fatal],
+                1,
+                vec![(First, Cancelled, Incomplete), (Hedge, Failed, Error)],
+            ),
+            (
+                vec![QueryEvent::Retriable, QueryEvent::Full],
+                1,
+                vec![(First, Failed, Error), (Retry, Delivered, Ok)],
+            ),
+            // An answer the controller rejects: the task returned one, the controller
+            // failed it.
+            (
+                vec![QueryEvent::Overshoot(5), QueryEvent::Full],
+                1,
+                vec![(First, Failed, Ok), (Retry, Delivered, Ok)],
+            ),
+            (
+                vec![QueryEvent::Partial(50), QueryEvent::Full],
+                0,
+                vec![(First, Delivered, Ok), (Continuation, Delivered, Ok)],
+            ),
+        ];
+        for (script, retries, want) in cases {
+            let scenario = Scenario {
+                n_chunks: 1,
+                streams: vec![StreamSpec { from: 100, to: 199 }],
+                find_worker_script: Vec::new(),
+                query_script: script.clone(),
+                buffer_size: 1,
+                retries,
+                max_stored_results_per_chunk: 1,
+                max_chunks: None,
+            };
+            let signals = run_scenario(&scenario).signals;
+            for kind in AttemptKind::ALL {
+                for outcome in AttemptOutcome::ALL {
+                    for stage in AttemptStage::ALL {
+                        for completion in AttemptCompletion::ALL {
+                            // None of these scripts abandons anything, so every
+                            // outcome here has exactly one stage it can be at.
+                            let expected = u64::from(
+                                want.contains(&(kind, outcome, completion))
+                                    && outcome.stages() == [stage],
+                            );
+                            let got =
+                                signals.settled_count(DATASET, kind, outcome, stage, completion);
+                            assert_eq!(
+                                got, expected,
+                                "{script:?}: {kind:?}/{outcome:?}/{stage:?}/{completion:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn read_ahead_scenario(script: Vec<QueryEvent>) -> Scenario {
+        Scenario {
+            n_chunks: 3,
+            streams: vec![StreamSpec { from: 100, to: 399 }],
+            find_worker_script: Vec::new(),
+            query_script: script,
+            buffer_size: 3,
+            retries: 0,
+            max_stored_results_per_chunk: 1,
+            max_chunks: None,
+        }
+    }
+
+    /// Takes the first of three read-ahead chunks and leaves, having let the others'
+    /// queries run or not.
+    async fn leave_after_first_chunk(
+        queries_run: bool,
+        script: Vec<QueryEvent>,
+    ) -> (Arc<AttemptSignals>, u64) {
+        let scenario = read_ahead_scenario(script);
+        let network = ScriptedNetwork::new(
+            scenario.build_chunks(),
+            Vec::new(),
+            scenario.query_script.clone(),
+        );
+        let signals = Arc::<AttemptSignals>::default();
+        let request = scenario.request(&scenario.streams[0], 0);
+        let mut controller = StreamController::new(request, network.clone(), 0, 1)
+            .unwrap()
+            .with_signals(signals.clone());
+        if queries_run {
+            controller.next().await.unwrap().unwrap();
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        } else {
+            futures::future::poll_fn(|ctx| {
+                let _ = Pin::new(&mut controller).poll_next(ctx);
+                Poll::Ready(())
+            })
+            .await;
+        }
+        drop(controller);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        (signals, network.bytes_read.load(Ordering::SeqCst))
+    }
+
+    /// Read-ahead fetched for a client that left: requested, downloaded, read into the
+    /// buffer, never sent. The reason is unknown, since all the controller saw was a
+    /// healthy stream let go of.
+    #[tokio::test(start_paused = true)]
+    async fn read_ahead_the_client_never_takes_is_abandoned() {
+        let (signals, _) = leave_after_first_chunk(true, Vec::new()).await;
+
+        let abandoned = AttemptOutcome::Abandoned(StreamEnd::Unknown);
+        let chunk = ChunkOutcome::Abandoned(StreamEnd::Unknown);
+        assert_eq!(signals.chunk_count(DATASET, chunk), 2);
+        let (read, ok) = (AttemptStage::Read, AttemptCompletion::Ok);
+        let count = signals.settled_count(DATASET, AttemptKind::First, abandoned, read, ok);
+        assert_eq!(count, 2);
+        let unsent = "200:299".len() + "300:399".len();
+        let bytes = signals.byte_count(DATASET, AttemptKind::First, abandoned, read, ok);
+        assert_eq!(bytes, unsent as u64);
+    }
+
+    /// Queries still in flight when the client left are abandoned incomplete, charged
+    /// only what they had read: outstanding work, not a buffered answer thrown away.
+    #[tokio::test(start_paused = true)]
+    async fn queries_outstanding_when_the_client_leaves_are_abandoned_incomplete() {
+        let script = vec![QueryEvent::Full, QueryEvent::Hang, QueryEvent::Hang];
+        let (signals, _) = leave_after_first_chunk(true, script).await;
+
+        let abandoned = AttemptOutcome::Abandoned(StreamEnd::Unknown);
+        let count = |stage, completion| {
+            signals.settled_count(DATASET, AttemptKind::First, abandoned, stage, completion)
+        };
+        let (in_flight, incomplete) = (AttemptStage::InFlight, AttemptCompletion::Incomplete);
+        assert_eq!(count(in_flight, incomplete), 2);
+        assert_eq!(count(AttemptStage::Read, AttemptCompletion::Ok), 0);
+        // Each hanging query had read one byte.
+        let bytes = signals.byte_count(
+            DATASET,
+            AttemptKind::First,
+            abandoned,
+            in_flight,
+            incomplete,
+        );
+        assert_eq!(bytes, 2);
+    }
+
+    /// An answer that lands after the controller last looked. The task had answered,
+    /// so its completion is `ok`, but the controller never took the answer: by its
+    /// stage the query was still in flight. Bandwidth spent, and not a buffered answer,
+    /// which the completion alone would have called it.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_landing_after_the_controller_last_looked_is_abandoned_in_flight() {
+        let script = vec![QueryEvent::Full, QueryEvent::Slow(100), QueryEvent::Hang];
+        let scenario = read_ahead_scenario(script);
+        let network = ScriptedNetwork::new(
+            scenario.build_chunks(),
+            Vec::new(),
+            scenario.query_script.clone(),
+        );
+        let signals = Arc::<AttemptSignals>::default();
+        let request = scenario.request(&scenario.streams[0], 0);
+        let mut controller = StreamController::new(request, network.clone(), 0, 1)
+            .unwrap()
+            .with_signals(signals.clone());
+        controller.next().await.unwrap().unwrap();
+        // The second chunk's answer lands while nobody polls the stream.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(controller);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let abandoned = AttemptOutcome::Abandoned(StreamEnd::Unknown);
+        let count = |stage, completion| {
+            signals.settled_count(DATASET, AttemptKind::First, abandoned, stage, completion)
+        };
+        let (in_flight, ok) = (AttemptStage::InFlight, AttemptCompletion::Ok);
+        assert_eq!(count(in_flight, ok), 1);
+        assert_eq!(count(AttemptStage::Read, ok), 0);
+        assert_eq!(count(in_flight, AttemptCompletion::Incomplete), 1);
+        let bytes = signals.byte_count(DATASET, AttemptKind::First, abandoned, in_flight, ok);
+        assert_eq!(bytes, "200:299".len() as u64);
+    }
+
+    /// A client gone before any query reached the transport, as when queued behind a
+    /// full congestion window: the chunks are abandoned, but no worker saw a query.
+    #[tokio::test(start_paused = true)]
+    async fn queries_cancelled_before_the_transport_are_withdrawn_not_sent() {
+        let (signals, bytes_read) = leave_after_first_chunk(false, Vec::new()).await;
+
+        assert_eq!(signals.withdrawn_count(DATASET, AttemptKind::First), 3);
+        assert_eq!(signals.sent_count(DATASET, AttemptKind::First), 0);
+        assert_eq!(bytes_read, 0);
+        let chunk = ChunkOutcome::Abandoned(StreamEnd::Unknown);
+        assert_eq!(signals.chunk_count(DATASET, chunk), 3);
+    }
+
+    /// A stream that ends on an error abandons its read-ahead for that reason, so this
+    /// waste can be told from a client that left.
+    #[tokio::test(start_paused = true)]
+    async fn read_ahead_behind_a_stream_error_is_abandoned_for_the_error() {
+        let scenario = read_ahead_scenario(vec![QueryEvent::Fatal]);
+        let network = ScriptedNetwork::new(
+            scenario.build_chunks(),
+            Vec::new(),
+            scenario.query_script.clone(),
+        );
+        let signals = Arc::<AttemptSignals>::default();
+        let request = scenario.request(&scenario.streams[0], 0);
+        let outcome = collect_stream_with(request, network.clone(), 0, signals.clone()).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(outcome.error.is_some());
+        assert!(outcome.emissions.is_empty());
+        use AttemptKind::First;
+        let (failed, read) = (AttemptOutcome::Failed, AttemptStage::Read);
+        let count = signals.settled_count(DATASET, First, failed, read, AttemptCompletion::Error);
+        assert_eq!(count, 1);
+        assert_eq!(signals.chunk_count(DATASET, ChunkOutcome::Failed), 1);
+        // The other two had answered and were buffered behind the failure.
+        let abandoned = AttemptOutcome::Abandoned(StreamEnd::Error);
+        let count = signals.settled_count(DATASET, First, abandoned, read, AttemptCompletion::Ok);
+        assert_eq!(count, 2);
+        let chunk = ChunkOutcome::Abandoned(StreamEnd::Error);
+        assert_eq!(signals.chunk_count(DATASET, chunk), 2);
+        let unknown = ChunkOutcome::Abandoned(StreamEnd::Unknown);
+        assert_eq!(signals.chunk_count(DATASET, unknown), 0);
     }
 }
