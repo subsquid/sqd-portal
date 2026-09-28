@@ -111,6 +111,7 @@ impl StreamStats {
             dataset = %request.dataset_id,
             first_block = request.query.first_block(),
             last_block = request.query.last_block(),
+            coverage_limit = request.coverage_limit,
             queries_sent = self.queries_sent,
             chunks_downloaded = self.chunks_downloaded,
             max_chunk_parts = self.max_chunk_parts,

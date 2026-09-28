@@ -175,7 +175,7 @@ chunk-boundary records FV-6 licenses.
 | INV-12 | CT-3/6 | P | mapping unit-tested; cap never driven (GAP-4) |
 | INV-13 | CT-5 | P | resolver units; source marker asserted on both sources by the CT-1 smoke |
 | INV-20 | CT-1 | P | exactly-once regression + ordering units; CT-1 smoke oracle-diffs toy-world streams; controller property test asserts gapless/monotonic/no-duplicate emission under randomized scheduling adversity |
-| INV-21 | CT-1/2 | P | bounds validator green on smoke responses; wrong-range worker responses are now rejected at the source seam and CT-2 proves they are never delivered; randomized worlds are controller-level only |
+| INV-21 | CT-1/2 | P | bounds validator green on smoke responses; wrong-range worker responses are now rejected at the source seam and CT-2 proves they are never delivered; randomized worlds are controller-level only; the bound at the reported head under a mid-response assignment is a controller unit test, since the toy world's assignment is static (GAP-39) |
 | INV-22 | CT-1/2 | P | smoke diffs delivered records against the stub ledger (signed responses); CT-2 now drives the rejection path — wrong-range (both directions) and bad-signature responses are discarded, rerouted, and byte-identical output is delivered from another worker |
 | INV-23 | CT-2 | P | verdict parsing tested; flow untested; minimum 409 payload meets the invariant; richer ancestors remain a REQ-3 SHOULD shortfall (GAP-7); EMPTY-precedence at the head unverified (GAP-19); verdict detection is exact-string parsing of worker messages (GAP-25) |
 | INV-24 | CT-5 | P | smoke asserts head markers against stub/artifact heads on success paths |
@@ -299,6 +299,19 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 | GAP-38 | OB-15 does not state its shadow-mode position. A usage record is cut only where `evaluate` returned a grant, so on a shadow portal the record and queue-depth signals move exactly when the control plane granted the presented credential — and a keyless caller bracketing two scrapes around its own request reads the verdict whose concealment is the point of the mode. OB-14 argues explicitly why the channel counts may move; OB-15 makes no such argument and inherits none. Present since the family was added, not introduced by the tap's move to the response, but sampling queue depth on scrape sharpens it | INV-39, IB-9, REQ-55, OB-15 (spec/12 shadow-mode rule) | P2 | decide whether OB-15 is a permitted shadow projection like OB-14 or must be suppressed there, and say so in 12; CT-10's bracketed-scrape case then covers it either way |
 
 ### Closed findings
+
+- **GAP-39** (closed 2026-09-28): an archival-path response wrote its head markers once,
+  with the archival head as the finalized head, but its stream read the assignment live.
+  A client far enough behind was therefore served chunks assigned after the headers went
+  out: records above the finalized head it had just been told, breaking INV-21 in
+  finalized mode and leaving the metadata stale for the rest of the response in real-time
+  mode. A squid indexer trusts that header. It processed everything above it as
+  unfinalized, one block per handler call, fell further behind, and so never reached the
+  end of the assignment that would have ended the stream. A `max_chunks_per_stream` cap
+  only masked it by ending streams early. Both
+  archival endpoints now bound coverage at the head they report, and a controller test
+  assigns a chunk mid-stream and asserts it is left to the next request. No CT class
+  drives it yet: the toy world's assignment is static.
 
 - **GAP-35** (closed 2026-08-07): the commercial band was specification only — the binary
   carried no authorization code, so REQ-50..56, DC-8, OP-11, INV-6/14/15/38/39 and

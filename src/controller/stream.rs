@@ -201,12 +201,9 @@ impl<N: StreamingNetwork> StreamController<N> {
             }
         };
 
-        // Gap resolution can return a chunk on either side of the requested range.
-        if request
-            .query
-            .intersect_with(&first_chunk.block_range())
-            .is_none()
-        {
+        // Gap resolution can return a chunk on either side of the requested range, and the
+        // coverage limit may sit below the first requested block.
+        if request.intersect_with(&first_chunk.block_range()).is_none() {
             return Err(RequestError::NoData);
         }
 
@@ -766,11 +763,12 @@ impl<N: StreamingNetwork> StreamController<N> {
         let next_chunk = self.network.next_chunk(&self.request.dataset_id, chunk);
 
         if let Some(next_chunk) = &next_chunk {
+            // The same rule `start_querying_chunk` sizes the query by, so a chunk picked here
+            // always has something to cover.
             if self
                 .request
-                .query
-                .last_block()
-                .is_some_and(|last_block| last_block < next_chunk.first_block)
+                .intersect_with(&next_chunk.block_range())
+                .is_none()
             {
                 tracing::debug!("The end of the requested range reached");
                 return None;
@@ -799,7 +797,6 @@ impl<N: StreamingNetwork> StreamController<N> {
     ) -> Result<Slot, Box<(Slot, SendQueryError)>> {
         let block_range = self
             .request
-            .query
             .intersect_with(&range.range)
             .expect("Chunk doesn't contain requested data");
         let data_range = range.with_range(block_range);
@@ -1381,6 +1378,7 @@ mod tests {
             retries: 1,
             compression: Compression::Gzip,
             skip_parent_hash_validation: false,
+            coverage_limit: None,
         }
     }
 
@@ -1439,6 +1437,149 @@ mod tests {
             1,
             "the chunk must be queried exactly once",
         );
+    }
+
+    /// A dataset whose assignment grows while a stream is open, as the assignment refresh
+    /// makes it. Every query succeeds at once with its range's data.
+    struct GrowingNetwork {
+        chunks: std::sync::Mutex<Vec<DataChunk>>,
+    }
+
+    impl GrowingNetwork {
+        fn new(chunks: &[(u64, u64)]) -> Self {
+            let network = Self {
+                chunks: std::sync::Mutex::default(),
+            };
+            for &(first, last) in chunks {
+                network.assign(first, last);
+            }
+            network
+        }
+
+        fn assign(&self, first: u64, last: u64) {
+            let chunk = DataChunk::new(0, first, last, "aaaaa").unwrap();
+            self.chunks.lock().unwrap().push(chunk);
+        }
+    }
+
+    impl StreamingNetwork for GrowingNetwork {
+        fn find_chunk(&self, _dataset: &DatasetId, block: u64) -> Result<DataChunk, ChunkNotFound> {
+            let chunks = self.chunks.lock().unwrap();
+            let chunk = chunks
+                .iter()
+                .find(|chunk| chunk.last_block >= block)
+                .copied();
+            drop(chunks);
+            chunk.ok_or(ChunkNotFound::AfterLast)
+        }
+
+        fn next_chunk(&self, _dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
+            let chunks = self.chunks.lock().unwrap();
+            chunks
+                .iter()
+                .find(|next| next.first_block == chunk.last_block + 1)
+                .copied()
+        }
+
+        fn find_worker(&self, _dataset: &DatasetId, _block: u64) -> Result<WorkerLease, NoWorker> {
+            Ok(WorkerLease::for_tests(PeerId::random()))
+        }
+
+        fn query_worker(
+            self: Arc<Self>,
+            _lease: WorkerLease,
+            _request_id: String,
+            _chunk_id: ChunkId,
+            block_range: BlockRange,
+            _query: String,
+            _compression: Compression,
+            _priority: Option<u32>,
+        ) -> BoxFuture<'static, QueryResult> {
+            Box::pin(async move {
+                Ok(QuerySuccess {
+                    ok: sqd_messages::QueryOk {
+                        data: format!("data-{}-{}", block_range.start(), block_range.end())
+                            .into_bytes()
+                            .into(),
+                        last_block: *block_range.end(),
+                    },
+                    ttfb: Duration::from_millis(1),
+                    transfer_time: Duration::from_millis(1),
+                    response_size: 10,
+                })
+            })
+        }
+
+        fn report_integrity_failure(&self, _worker: PeerId) {}
+    }
+
+    fn open_ended_request(coverage_limit: Option<u64>) -> StreamRequest {
+        let query_json = r#"{
+            "type": "evm",
+            "fromBlock": 0,
+            "fields": {"block": {"number": true}},
+            "includeAllBlocks": true
+        }"#;
+        StreamRequest {
+            query: ParsedQuery::try_from(query_json.to_owned()).unwrap(),
+            // One chunk in flight keeps the scheduler behind the archival head, as it is
+            // for a client catching up, so the next chunk is looked up after the refresh.
+            buffer_size: 1,
+            coverage_limit,
+            ..stream_request()
+        }
+    }
+
+    /// A client far behind the head gets its response headers, with the archival head as
+    /// the finalized head, and then the assignment refresh lands a newer chunk while the
+    /// stream is still draining older ones. Without a limit the stream follows it, and a
+    /// client that trusts the finalized head treats every block of it as unfinalized: squid
+    /// indexers drop to one block per batch and never catch up. With the limit at the
+    /// reported head the stream ends there, and the next request carries a fresh head.
+    #[tokio::test(start_paused = true)]
+    async fn chunk_assigned_mid_stream_is_not_served_past_the_coverage_limit() {
+        for (coverage_limit, expected) in [
+            (
+                None,
+                &["data-0-99", "data-100-199", "data-200-299", "data-300-399"][..],
+            ),
+            (
+                Some(299),
+                &["data-0-99", "data-100-199", "data-200-299"][..],
+            ),
+        ] {
+            let network = Arc::new(GrowingNetwork::new(&[(0, 99), (100, 199), (200, 299)]));
+            let request = open_ended_request(coverage_limit);
+            let mut controller = StreamController::new(request, network.clone(), 0, 1).unwrap();
+
+            let first = controller
+                .next()
+                .await
+                .unwrap()
+                .expect("stream should not fail");
+            network.assign(300, 399);
+            let mut responses = vec![first];
+            while let Some(item) = controller.next().await {
+                responses.push(item.expect("stream should not fail"));
+            }
+
+            let expected: Vec<Vec<u8>> = expected.iter().map(|s| s.as_bytes().to_vec()).collect();
+            assert_eq!(responses, expected, "coverage_limit {coverage_limit:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_coverage_limit_below_the_first_block_is_no_data() {
+        let network = Arc::new(GrowingNetwork::new(&[(0, 99), (100, 199)]));
+        let request = StreamRequest {
+            coverage_limit: Some(99),
+            ..stream_request() // fromBlock 100
+        };
+
+        let Err(err) = StreamController::new(request, network, 0, 1) else {
+            panic!("a request starting above the coverage limit is not a stream");
+        };
+        assert!(matches!(err, RequestError::NoData), "got {err:?}");
     }
 
     // ------------------------------------------------------------------
@@ -1724,6 +1865,7 @@ mod tests {
                 retries: self.retries,
                 compression: Compression::Gzip,
                 skip_parent_hash_validation: false,
+                coverage_limit: None,
             }
         }
     }

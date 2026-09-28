@@ -595,6 +595,7 @@ fn build_request(
         retries: config.default_retries,
         compression: Compression::Gzip,
         skip_parent_hash_validation: false,
+        coverage_limit: None,
     }
 }
 
