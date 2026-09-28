@@ -113,6 +113,7 @@ pub(crate) async fn run_archival_stream(
     let mut res = Response::builder();
     res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
     if let Some(head) = network.head(&dataset_id) {
+        request.query.cap_last_block(head.number);
         // Don't use hotblocks data source at all for this endpoint.
         res = res
             .header(FINALIZED_NUMBER_HEADER, head.number)
@@ -327,6 +328,9 @@ async fn stream_from_network(
     hotblocks_name: String,
 ) -> Response {
     let archival_head = network.head(&dataset_id);
+    if let Some(head) = &archival_head {
+        request.query.cap_last_block(head.number);
+    }
     let head_task = tokio::spawn({
         let archival_head = archival_head.clone();
         async move {

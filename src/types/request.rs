@@ -22,6 +22,7 @@ pub struct ParsedQuery {
     raw: String,
     without_parent_hash: Option<String>,
     parsed: Query,
+    last_block_cap: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +39,7 @@ impl ParsedQuery {
             raw: str,
             without_parent_hash: None,
             parsed: query,
+            last_block_cap: None,
         })
     }
 
@@ -46,7 +48,14 @@ impl ParsedQuery {
     }
 
     pub fn last_block(&self) -> Option<u64> {
-        self.parsed.last_block()
+        let last_block = self.parsed.last_block();
+        last_block.into_iter().chain(self.last_block_cap).min()
+    }
+
+    /// Stops the stream at `block` without changing the query sent to workers. Endpoints
+    /// cap at the head they report, so chunks assigned mid-stream can't exceed it (INV-21).
+    pub fn cap_last_block(&mut self, block: u64) {
+        self.last_block_cap = Some(block);
     }
 
     /// Returns `true` when the query does not need traces or statediffs,

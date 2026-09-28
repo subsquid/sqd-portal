@@ -1303,11 +1303,12 @@ mod tests {
     use crate::network::QuerySuccess;
     use crate::types::{Compression, DatasetId, ParsedQuery, StreamRequest};
 
-    /// A single-chunk dataset whose workers are all in a backoff until
-    /// `backoff_until`; afterwards every query succeeds and returns the
-    /// queried range's full data.
+    /// A dataset of `chunk`, then `next` if set, whose workers are all in a
+    /// backoff until `backoff_until`; afterwards every query succeeds and
+    /// returns the queried range's full data.
     struct MockNetwork {
         chunk: DataChunk,
+        next: Option<DataChunk>,
         backoff_until: Instant,
         queries_sent: AtomicUsize,
     }
@@ -1321,8 +1322,9 @@ mod tests {
             Ok(self.chunk)
         }
 
-        fn next_chunk(&self, _dataset: &DatasetId, _chunk: &DataChunk) -> Option<DataChunk> {
-            None
+        fn next_chunk(&self, _dataset: &DatasetId, chunk: &DataChunk) -> Option<DataChunk> {
+            self.next
+                .filter(|next| next.first_block == chunk.last_block + 1)
         }
 
         fn find_worker(&self, _dataset: &DatasetId, _block: u64) -> Result<WorkerLease, NoWorker> {
@@ -1392,6 +1394,7 @@ mod tests {
         ] {
             let network = Arc::new(MockNetwork {
                 chunk,
+                next: None,
                 backoff_until: Instant::now(),
                 queries_sent: AtomicUsize::new(0),
             });
@@ -1418,6 +1421,7 @@ mod tests {
     async fn chunk_hitting_short_backoff_is_served_exactly_once() {
         let network = Arc::new(MockNetwork {
             chunk: test_chunk(),
+            next: None,
             backoff_until: Instant::now() + Duration::from_millis(100),
             queries_sent: AtomicUsize::new(0),
         });
@@ -1439,6 +1443,27 @@ mod tests {
             1,
             "the chunk must be queried exactly once",
         );
+    }
+
+    /// A chunk assigned past the capped last block (the reported head) is left to the
+    /// client's next request.
+    #[tokio::test(start_paused = true)]
+    async fn a_capped_stream_ignores_later_chunks() {
+        let network = Arc::new(MockNetwork {
+            chunk: test_chunk(),
+            next: Some(DataChunk::new(0, 201, 300, "aaaaa").unwrap()),
+            backoff_until: Instant::now(),
+            queries_sent: AtomicUsize::new(0),
+        });
+        let mut request = stream_request();
+        request.query =
+            ParsedQuery::try_from(r#"{"type": "evm", "fromBlock": 100}"#.into()).unwrap();
+        request.query.cap_last_block(200);
+
+        let controller = StreamController::new(request, network, 0, 1).unwrap();
+        let responses: Vec<_> = controller.map(Result::unwrap).collect().await;
+
+        assert_eq!(responses, [b"data-100-200".to_vec()]);
     }
 
     // ------------------------------------------------------------------

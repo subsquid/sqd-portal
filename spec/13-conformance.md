@@ -300,6 +300,11 @@ with plausible trigger · P3 polish. "Next" = cheapest failing-test-first entry.
 
 ### Closed findings
 
+- **GAP-39** (closed 2026-09-28): archival responses reported the archival head as
+  finalized but kept streaming chunks assigned after the headers went out, so they
+  delivered blocks above it. The stream now stops at the reported head (controller test;
+  the toy world's assignment is static, so no CT class drives it).
+
 - **GAP-35** (closed 2026-08-07): the commercial band was specification only — the binary
   carried no authorization code, so REQ-50..56, DC-8, OP-11, INV-6/14/15/38/39 and
   LIV-13/14 were unmet by absence rather than by defect. The band landed with CT-10

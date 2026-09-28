@@ -150,7 +150,7 @@ model's output for the same coverage (modulo FV free variables).
 
 **INV-21 — Bounds respect.** [response]
 No record lies below the requested first block, above the requested last block, above
-the frontier, or (finalized mode) above the finalized head.
+the frontier, or (finalized mode) above the finalized head the response reported.
 *Why:* overshoot delivers unfinalized/duplicate data the client didn't ask for.
 *Check:* CT-1 structural validator on every response.
 
