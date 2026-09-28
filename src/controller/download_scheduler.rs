@@ -179,8 +179,9 @@ impl Drop for DownloadPermit {
 ///
 /// When `release()` wakes a waiter, it pre-increments `active_reads` and sends
 /// on the channel. If the task is aborted between the send and the permit
-/// creation, this future's `Drop` detects the buffered value via `try_recv`
-/// and releases the reserved slot.
+/// creation, this future's `Drop` closes the receiver before checking for a
+/// buffered value and releasing the reserved slot. Closing first ensures a
+/// concurrent send either fails or leaves a value that `try_recv` will observe.
 struct WaiterFuture {
     rx: Option<oneshot::Receiver<()>>,
     scheduler: Arc<DownloadScheduler>,
@@ -204,6 +205,9 @@ impl Future for WaiterFuture {
 impl Drop for WaiterFuture {
     fn drop(&mut self) {
         if let Some(mut rx) = self.rx.take() {
+            // Prevent release() from reserving a slot after try_recv() reports
+            // an empty channel but before the receiver is dropped.
+            rx.close();
             // Value was sent (slot reserved) but we never created the permit.
             if rx.try_recv().is_ok() {
                 self.scheduler.release(Outcome::Neutral);
@@ -236,6 +240,75 @@ mod tests {
         assert_eq!(sched.state.lock().active_reads, 1);
         drop(permit);
         assert_eq!(sched.state.lock().active_reads, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_leak_a_slot() {
+        for grant_before_cancel in [false, true] {
+            let sched = Arc::new(DownloadScheduler::new(CongestionConfig {
+                min_window: 1,
+                max_window: 1,
+                ..test_config()
+            }));
+            let blocker = sched.acquire(0).await;
+            let mut waiter = Box::pin(sched.acquire(0));
+            assert!(futures::poll!(&mut waiter).is_pending());
+            let mut next = Box::pin(sched.acquire(1));
+            assert!(futures::poll!(&mut next).is_pending());
+
+            if grant_before_cancel {
+                drop(blocker);
+                drop(waiter);
+            } else {
+                drop(waiter);
+                drop(blocker);
+            }
+
+            // Cancellation must return the slot and allow the next waiter to run.
+            let Poll::Ready(permit) = futures::poll!(&mut next) else {
+                panic!("cancelled waiter stranded the next waiter");
+            };
+            assert_eq!(sched.state.lock().active_reads, 1);
+            drop(permit);
+            assert_eq!(sched.state.lock().active_reads, 0);
+            assert!(sched.state.lock().waiters.is_empty());
+        }
+    }
+
+    #[test]
+    fn concurrent_cancellation_and_grant_do_not_leak_slots() {
+        let barrier = std::sync::Barrier::new(2);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DownloadPermit>(0);
+        let mut leaked = 0;
+        std::thread::scope(|scope| {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                while let Ok(blocker) = rx.recv() {
+                    barrier.wait();
+                    // Race a grant against cancellation on the other thread.
+                    drop(blocker);
+                    barrier.wait();
+                }
+            });
+            for _ in 0..100_000 {
+                let sched = Arc::new(DownloadScheduler::new(CongestionConfig {
+                    min_window: 1,
+                    max_window: 1,
+                    ..test_config()
+                }));
+                let blocker = futures::executor::block_on(sched.acquire(0));
+                let mut waiter = Box::pin(sched.acquire(0));
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                assert!(waiter.as_mut().poll(&mut cx).is_pending());
+                tx.send(blocker).unwrap();
+                barrier.wait();
+                drop(waiter);
+                barrier.wait();
+                leaked += sched.state.lock().active_reads;
+            }
+            drop(tx);
+        });
+        assert_eq!(leaked, 0, "slots leaked during concurrent cancellation");
     }
 
     #[tokio::test]
