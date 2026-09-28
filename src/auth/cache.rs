@@ -8,7 +8,7 @@
 use std::{
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -105,11 +105,20 @@ pub struct GrantCache {
     /// `expires_at` cliff (OB-9, OB-13).
     last_success: AtomicU64,
     /// Wall-clock second of the last exchange that could not answer at all —
-    /// not a denial and not a budget refusal, the call itself. Newer than
-    /// `last_success`, it is the only evidence a replica has that the
-    /// authority is down, and the only thing that lets a grant past
-    /// `expires_at` keep serving (REQ-54).
+    /// not a denial and not a budget refusal, the call itself. Says only that
+    /// silence postdates a grant's expiry; whether it is the authority's last
+    /// word is `last_word_failed`.
     last_failure: AtomicU64,
+    /// Whether the exchange that completed most recently failed to answer.
+    /// Kept apart from the two seconds above because those are stamped from
+    /// each caller's floored clock, so two overlapping exchanges can record
+    /// them out of completion order — and a recovery recorded "earlier" than
+    /// the failure it followed would leave expired grants serving unrevalidated.
+    /// This flag is set at completion and cannot misorder. Together with
+    /// `last_failure` it is the only evidence a replica has that the authority
+    /// is down, and the only thing that lets a grant past `expires_at` keep
+    /// serving (REQ-54).
+    last_word_failed: AtomicBool,
     /// Falls back for the gauge while `last_success` is still 0, so a replica
     /// that has never been served counts up from boot instead of reading as
     /// freshly successful.
@@ -132,6 +141,7 @@ impl GrantCache {
             limiter: Mutex::new(RateLimiter::new(limits.exchange_rate_per_sec)),
             last_success: AtomicU64::new(0),
             last_failure: AtomicU64::new(0),
+            last_word_failed: AtomicBool::new(false),
             started_at: now_secs(),
             limits,
         });
@@ -242,10 +252,23 @@ impl GrantCache {
     /// Whether the exchange has failed to answer at or after `since`, with no
     /// answer from the authority after that failure. A failure that predates
     /// `since` is not evidence about the present; an answer since it means the
-    /// authority is back, whatever it said.
+    /// authority is back, whatever it said. "After" is completion order, not
+    /// the stamped second: the seconds are compared only against `since`.
     fn authority_silent_since(&self, since: u64) -> bool {
-        let failure = self.last_failure.load(Ordering::Acquire);
-        failure >= since && failure > self.last_success.load(Ordering::Acquire)
+        self.last_word_failed.load(Ordering::Acquire)
+            && self.last_failure.load(Ordering::Acquire) >= since
+    }
+
+    /// The control plane spoke — a grant or a denial — at `settled`.
+    fn record_answer(&self, settled: u64) {
+        self.last_success.fetch_max(settled, Ordering::AcqRel);
+        self.last_word_failed.store(false, Ordering::Release);
+    }
+
+    /// The exchange could not answer at `settled`.
+    fn record_failure(&self, settled: u64) {
+        self.last_failure.fetch_max(settled, Ordering::AcqRel);
+        self.last_word_failed.store(true, Ordering::Release);
     }
 
     /// The renewal a request past `refresh_after` triggers without waiting for
@@ -322,7 +345,7 @@ impl GrantCache {
                 // published: counting it answered would refresh the OB-9
                 // freshness gauge.
                 if grant.expires_at <= expired_by {
-                    self.last_failure.store(settled, Ordering::Release);
+                    self.record_failure(settled);
                     self.report(|| {
                         metrics::report_exchange(ExchangeOutcome::Failed, Some(elapsed))
                     });
@@ -332,13 +355,13 @@ impl GrantCache {
                     );
                     return self.remember_failure(&credential.fingerprint, Resolved::Unavailable);
                 }
-                self.last_success.store(settled, Ordering::Release);
+                self.record_answer(settled);
                 self.report(|| metrics::report_exchange(ExchangeOutcome::Answered, Some(elapsed)));
                 let cached = self.store(&credential.fingerprint, grant, settled);
                 Resolved::Grant(cached)
             }
             Ok(Exchanged::Denied(reason)) => {
-                self.last_success.store(settled, Ordering::Release);
+                self.record_answer(settled);
                 self.report(|| metrics::report_exchange(ExchangeOutcome::Answered, Some(elapsed)));
                 // A denial outranks the grant's remaining lifetime: the
                 // authority has spoken since (INV-6).
@@ -348,7 +371,7 @@ impl GrantCache {
                 Resolved::Denied(reason)
             }
             Err(err) => {
-                self.last_failure.store(settled, Ordering::Release);
+                self.record_failure(settled);
                 self.report(|| metrics::report_exchange(ExchangeOutcome::Failed, Some(elapsed)));
                 tracing::warn!(
                     key_id = credential.key_id,
@@ -980,6 +1003,46 @@ mod tests {
         assert!(
             matches!(discarded, Resolved::Unavailable),
             "past the outage grace the outage is a dependency failure, got {discarded:?}"
+        );
+    }
+
+    /// The seconds an exchange is stamped with come from each caller's floored
+    /// clock, so a success that started before a failure can record an earlier
+    /// second than the failure it completed after. Completion order is what
+    /// says whether the authority is back; the stamps are not allowed to
+    /// outvote it, or a revoked key rides its stale grant past the recovery.
+    #[tokio::test]
+    async fn a_later_answer_clears_the_outage_whatever_second_it_is_stamped_with() {
+        let cp = MockControlPlane::spawn().await;
+        let cache = cache_for(&cp).await;
+        cache.insert_for_test(
+            &credential().fingerprint,
+            CachedGrant {
+                key_id: KEY_ID.to_owned(),
+                datasets: None,
+                organization_id: None,
+                refresh_after: NOW,
+                expires_at: NOW + 5,
+            },
+        );
+
+        // A failure completes first but carries the later second…
+        cp.status(KEY_ID, 503);
+        cache.exchange(&credential(), NOW + 11).await;
+        assert!(cache.authority_silent_since(NOW + 5));
+        // …and the answer completing after it carries the earlier one.
+        cp.clear_status(KEY_ID);
+        cp.deny(KEY_ID, "revoked");
+        cache.exchange(&credential(), NOW + 10).await;
+
+        assert!(
+            !cache.authority_silent_since(NOW + 5),
+            "the authority's last word was an answer"
+        );
+        let resolved = cache.resolve(&credential(), NOW + 12).await;
+        assert!(
+            matches!(resolved, Resolved::Denied(_)),
+            "the revoked key must not ride its stale grant past the recovery, got {resolved:?}"
         );
     }
 
