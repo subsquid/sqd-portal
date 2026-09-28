@@ -51,8 +51,10 @@ admitted stream decrements exactly once at its end.
 
 **INV-6 — Grant cache coherence.** [transition]
 Every entry of the grant cache (DEF-18) is reachable only by the fingerprint of the whole
-credential that earned it, and only until it passes `expires_at`; past that it admits
-nothing, whatever the state of the control plane. "Newer" means the result of a
+credential that earned it, and only until it passes `expires_at` while the control plane
+answers; past that it admits only under REQ-54's outage evidence, and past `expires_at` +
+P-GRANT-OUTAGE-GRACE it admits nothing, whatever the state of the control plane. "Newer"
+means the result of a
 later-started local exchange generation for that fingerprint, never a comparison of grant
 deadlines. Starting a successor retires the earlier generation, so a late completion from
 the retired attempt cannot write. An authoritative denial evicts on arrival and is never
@@ -66,8 +68,9 @@ of an answer that parsed.
 *Check:* CT-10 — time out one exchange without suppressing the stub's late completion,
 start its successor, and deliver the two answers in reverse generation order; also return a
 denial from the successor while the retired call can still complete. Assert the retired
-completion writes nothing, the denial survives, and an entry stops admitting at
-`expires_at` with the stub unreachable.
+completion writes nothing, the denial survives, an entry past `expires_at` is exchanged
+before it admits with the stub healthy, and an entry stops admitting at `expires_at` +
+P-GRANT-OUTAGE-GRACE with the stub unreachable.
 
 ## Operation legality (10–19)
 
@@ -130,7 +133,8 @@ which replica served, and the ladder's precedence (REQ-53) is total: a request f
 several rungs always reports the earliest. Two replicas holding the same grant and
 evaluating at the same time return the same verdict for the same request. They need not
 hold the same grant — each exchanges on its own traffic, so one replica may be a refresh
-ahead of another, and that divergence is bounded by `expires_at` rather than eliminated.
+ahead of another, and that divergence is bounded by `expires_at` — plus P-GRANT-OUTAGE-GRACE
+while the control plane is down — rather than eliminated.
 *Why:* a verdict that varies with load is an availability bug wearing an authorization
 costume, and a precedence that varies makes the refusal reason — the operator's only
 diagnostic — untrustworthy. Per-replica grant divergence is the honest cost of asking on

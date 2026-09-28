@@ -68,6 +68,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 | ADR-015 | 2026-07-21 | [One connection-class replay on the real-time path](decisions/ADR-015-real-time-connection-replay.md) | Accepted |
 | ADR-016 | 2026-08-12 | [Shadow usage measurement: encoded bytes at egress, deltas, and tolerated loss](decisions/ADR-016-shadow-usage-measurement.md) | Accepted |
 | ADR-013 | 2026-07-17 | [Assignment staleness must be bounded and observable](decisions/ADR-013-assignment-staleness-bound.md) | **Proposed** |
+| ADR-017 | 2026-09-28 | [A control-plane outage extends a grant past its hard expiry, for a stated time](decisions/ADR-017-outage-grace-past-hard-expiry.md) | **Proposed** |
 
 ## Conventions
 
@@ -96,7 +97,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 1. **Extend the harness past Phase 0** (13 §build order): the Phase-0 skeleton —
    dependency stubs per IB-7, the structural validators, the reference model — has
    landed (GAP-14 closed 2026-07-17); build the `CT-2..CT-9` classes on it next.
-2. **Ratify or reject proposed ADR-013** and the ⚠ targets in
+2. **Ratify or reject proposed ADR-013 and ADR-017** and the ⚠ targets in
    [15-parameters.md](15-parameters.md) and the SLO table (11); close the open questions
    in [02-requirements.md](02-requirements.md). The authorization band (REQ-50..REQ-56, DC-8)
    has landed, error contract and authorization path both, and CT-10 covers its request

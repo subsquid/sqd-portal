@@ -248,7 +248,9 @@ lazy_static::lazy_static! {
     static ref GRANT_CACHE_EVICTIONS: Counter = Default::default();
     static ref GRANT_LIFETIMES_CAPPED: Counter = Default::default();
     static ref GRACE_ADMISSIONS: Counter = Default::default();
+    static ref STALE_ADMISSIONS: Counter = Default::default();
     static ref GRANTS_IN_GRACE: Gauge = Default::default();
+    static ref GRANTS_STALE: Gauge = Default::default();
     static ref GRACE_MIN_REMAINING: Gauge = Default::default();
 
     // Usage measurement (OB-15). Registered for the process like every other
@@ -469,12 +471,27 @@ pub fn grace_admissions() -> u64 {
     GRACE_ADMISSIONS.get()
 }
 
-/// Point-in-time census of the `expires_at` cliff, republished on scrape: how
-/// many grants are serving on renewal grace, and the smallest remaining life
-/// among them — zero when none are. The admission rate says the condition
-/// exists; the minimum names the first hard refusal (OB-9, OB-13).
-pub fn report_grace_census(in_grace: usize, min_remaining_secs: u64) {
+/// A request served on a grant past its hard expiry because the control plane
+/// is not answering. Never moves while the control plane is healthy, so any
+/// rate at all is an outage in progress and the cliff is now the outage grace
+/// (OB-9).
+pub fn report_stale_admission() {
+    STALE_ADMISSIONS.inc();
+}
+
+#[cfg(test)]
+pub fn stale_admissions() -> u64 {
+    STALE_ADMISSIONS.get()
+}
+
+/// Point-in-time census of the cliff, republished on scrape: how many grants
+/// are serving on renewal grace, how many past their hard expiry on outage
+/// grace, and the smallest remaining life among all of them — zero when none
+/// are. The admission rates say the condition exists; the minimum names the
+/// first hard refusal if the outage persists (OB-9, OB-13).
+pub fn report_grace_census(in_grace: usize, stale: usize, min_remaining_secs: u64) {
     GRANTS_IN_GRACE.set(in_grace as i64);
+    GRANTS_STALE.set(stale as i64);
     GRACE_MIN_REMAINING.set(min_remaining_secs as i64);
 }
 
@@ -875,13 +892,23 @@ pub fn register_metrics(registry: &mut Registry) {
         GRACE_ADMISSIONS.clone(),
     );
     registry.register(
+        "auth_stale_admissions",
+        "Requests served on a grant past its hard expiry because the control plane was not answering",
+        STALE_ADMISSIONS.clone(),
+    );
+    registry.register(
         "auth_grants_in_grace",
         "Grants currently serving past refresh_after while their renewal has not landed",
         GRANTS_IN_GRACE.clone(),
     );
     registry.register(
+        "auth_grants_stale",
+        "Grants currently past expires_at and held for the outage grace",
+        GRANTS_STALE.clone(),
+    );
+    registry.register(
         "auth_grace_min_remaining_seconds",
-        "Smallest time to expires_at among grants in grace — the first hard refusal; zero when none are in grace",
+        "Smallest time until a grant in grace or stale is dropped — the first hard refusal if the control plane stays down; zero when none are",
         GRACE_MIN_REMAINING.clone(),
     );
     registry.register(

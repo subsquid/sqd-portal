@@ -76,6 +76,22 @@ pub async fn cache_with(
         enforcement,
         ..control_plane.config()
     };
+    cache_from(config)
+}
+
+/// The mock's defaults with the limits a test wants to pin.
+pub async fn cache_with_limits(
+    control_plane: &MockControlPlane,
+    limits: config::Limits,
+) -> Arc<GrantCache> {
+    let config = ResolvedAuth {
+        limits,
+        ..control_plane.config()
+    };
+    cache_from(config)
+}
+
+fn cache_from(config: ResolvedAuth) -> Arc<GrantCache> {
     let signer = config.signer(Keypair::generate_ed25519()).unwrap();
     GrantCache::new(
         ControlPlaneClient::new(&config, signer).expect("client should build"),

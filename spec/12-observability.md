@@ -72,15 +72,17 @@ ready, SIGTERM, drain start, exit — the LIV-5/LIV-11 witnesses.
 fetch/validation failures (⚠ GAP-1/2), background-loop deaths, usage-log drops,
 signature-verification failures, and — on an authorizing deployment — requests being served
 on renewal grace (a grant past `refresh_after` whose renewal is failing or locally
-suppressed), sustained exchange failure, and refused signing headers. The first is the one
-that has to page before the others matter: it is the leading edge of the `expires_at` cliff,
-and the minimum remaining lifetime among affected grants is the whole window an operator
-has to act in (REQ-54, DC-8). The last is a Portal-local misconfiguration — clock, identity,
-or request construction — that fails every exchange at once, and it must not be diagnosed
-as a client-key problem. Alarms are the LIV-12
-witness: persistent failure is never log-only. None of the three authorization ones is emitted
-or configured today (GAP-30). (Sampled error reporting to DC-7 complements, never replaces,
-these.)
+suppressed), requests being served past a grant's hard expiry on outage grace (the control
+plane has been failing for longer than a grant lifetime), sustained exchange failure, and
+refused signing headers. The first two are the ones that have to page before the others
+matter: renewal grace is the leading edge of the cliff and outage grace is the cliff moved
+out by P-GRANT-OUTAGE-GRACE, and the minimum remaining life among affected grants is the
+whole window an operator has to act in (REQ-54, DC-8). The last is a Portal-local
+misconfiguration — clock, identity, or request construction — that fails every exchange at
+once, and it must not be diagnosed as a client-key problem. Alarms are the LIV-12 witness:
+persistent failure is never log-only. The signals exist; the rules that page on them live
+in the monitoring stack (GAP-30). (Sampled error reporting to DC-7 complements, never
+replaces, these.)
 
 **OB-10 — Congestion window trace.** Window size, grow/shrink counters — the LIV-8
 witness.
@@ -118,12 +120,14 @@ mode, the public scrape carries cache occupancy against P-GRANT-CACHE-CAPACITY a
 eviction rate (the HZ-13 witness); exchange attempts and outcomes by operational class —
 answered, refused by budget, failed — with latency (the LIV-13/LIV-14 and DC-8 capacity
 witnesses); and a count of grants whose offered lifetime was capped. For the cliff it also
-carries a counter of admissions served on renewal grace, the number of grants currently in
-that state, and the minimum time remaining to `expires_at` among them (zero when none are in
-grace), the latter two recomputed on scrape by one walk of the cache under its lock — a walk
-P-GRANT-CACHE-CAPACITY bounds. The three answer different questions: the rate says the
-condition exists, the count says how wide it is, and the minimum names the first hard
-refusal — the operator's lead time on the cliff, which no rate can supply. None of these
+carries a counter of admissions served on renewal grace and one of admissions served past
+the hard expiry on outage grace, the number of grants currently in each state, and the
+minimum time remaining before the first of them is dropped (zero when none are in either),
+the counts and the minimum recomputed on scrape by one walk of the cache under its lock — a
+walk P-GRANT-CACHE-CAPACITY bounds. The three kinds answer different questions: the rates
+say the condition exists and which side of the hard expiry it is on, the counts say how wide
+it is, and the minimum names the first hard refusal if the outage persists — the operator's
+lead time on the cliff, which no rate can supply. None of these
 carries a key id, a fingerprint, a dataset, or a refusal reason finer than the enforcing
 caller's wire response.
 

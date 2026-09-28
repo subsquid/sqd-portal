@@ -131,7 +131,8 @@ a grant or a denial (DEF-17) out. It runs on the request path, and only when the
 no *fresh* grant for that credential's fingerprint — after a token outside the grammar has
 already been refused, that means an unseen credential or one whose grant has passed
 `refresh_after`. Freshness governs when an exchange happens; usability — not past
-`expires_at` — governs whether the grant in hand may still answer while it does.
+`expires_at`, or past it only under REQ-54's outage evidence and inside
+P-GRANT-OUTAGE-GRACE — governs whether the grant in hand may still answer while it does.
 
 - *Authenticated by signature.* Every request carries exactly one `X-Portal-Id`,
   `X-Signature-Timestamp`, and `X-Signature`; the last covers the canonical binding
@@ -152,8 +153,9 @@ already been refused, that means an unseen credential or one whose grant has pas
   denial is remembered for P-GRANT-NEGATIVE-TTL across at most P-GRANT-NEGATIVE-CAPACITY
   entries. If no usable grant exists, a rate or in-flight bound produces an immediate
   OVERLOADED response with a retry hint — never a queue or an admission (HZ-10). If a grant
-  remains inside `expires_at`, the same bound merely suppresses that renewal attempt: the
-  request is served on the grant and the skipped renewal is observed as grace-serving.
+  is still held — inside `expires_at`, or past it and inside P-GRANT-OUTAGE-GRACE — the same
+  bound merely suppresses that renewal attempt: the request is served on the grant and the
+  skipped renewal is observed as grace-serving.
 - *Renewal is off the latency path.* A request arriving past `refresh_after` is served on
   the grant in hand while the exchange runs; only a request with no usable grant waits for
   one. Renewals are spread by up to P-GRANT-REFRESH-JITTER, so a cohort of grants issued
@@ -164,21 +166,24 @@ already been refused, that means an unseen credential or one whose grant has pas
 | Fault | Own class / action |
 |---|---|
 | Exchange denies the credential | refuse on the rung it names (REQ-53), mapped to its DEF-10 row; evict any cached grant for that fingerprint at once; remember the denial for P-GRANT-NEGATIVE-TTL |
-| Exchange unreachable, times out, or returns a non-success status | serve on a cached grant that has not passed `expires_at`, if one exists; otherwise refuse as UPSTREAM-FAILURE. Never BAD-CREDENTIAL — the credential was never judged (REQ-54) |
+| Exchange unreachable, times out, or returns a non-success status | serve on a held grant if one exists — inside `expires_at`, or past it and inside P-GRANT-OUTAGE-GRACE, since this failure is the evidence REQ-54 asks for; otherwise refuse as UPSTREAM-FAILURE. Never BAD-CREDENTIAL — the credential was never judged (REQ-54) |
 | Answer missing a required field, or carrying a claims version this build does not understand | unusable, not permissive: handled as a failed exchange. Reading a newer vocabulary for the parts it recognizes is how an added restriction becomes an accidental permission (DEF-17) |
 | Answer about a credential other than the one asked about | discard and refuse as UPSTREAM-FAILURE |
 | Answer offering a lifetime beyond P-GRANT-MAX-LIFETIME | accept the grant, capped at the bound, and count it — a control plane drifting past the cap is a misconfiguration an operator should see before it becomes an incident |
 | Signing headers absent, repeated, malformed, unattributable, or outside P-SIGNATURE-MAX-SKEW in either direction | UPSTREAM-FAILURE like any other failed exchange, and alarm. The cause is the Portal's own clock, identity, or request construction, not the client's key, and it fails every exchange at once |
-| Rate or in-flight bound reached | with no usable grant, refuse immediately as OVERLOADED with `Retry-After` ≥ P-RETRY-AFTER-MIN; with a grant still inside `expires_at`, skip the renewal and serve on that grant. Never queue, and never claim the credential is bad |
+| Rate or in-flight bound reached | with no usable grant, refuse immediately as OVERLOADED with `Retry-After` ≥ P-RETRY-AFTER-MIN; with a grant still held, skip the renewal and serve on that grant. Never queue, and never claim the credential is bad |
 | Cache at P-GRANT-CACHE-CAPACITY | evict by least-recent use; the evicted credential's next request is an ordinary miss. Sustained eviction of live grants is the HZ-13 capacity signal, not a correctness event |
 
 *Degradation.* Fail-static, and bounded by construction: a cached grant rides an outage out
-to its `expires_at` and no further, so the worst-case stale-authorization window is one the
-control plane chose and the Portal capped. Past it, and for every credential this replica
-has not cached, an outage means refusals — retryable, attributed to the dependency, and
-never converted into a claim about anyone's key. That is the deliberate direction of failure
-a quiet control plane closes the gate rather than freezing it open, at the price
-of being a dependency the deployment must run like a production service. Readiness never
+to its `expires_at`, and past it for P-GRANT-OUTAGE-GRACE more while the exchange keeps
+failing to answer, and no further — so the worst-case stale-authorization window is one the
+control plane chose, the Portal capped, and the operator extended by a stated amount for
+the case where the authority is gone. Past it, and for every credential this replica has
+not cached, an outage means refusals — retryable, attributed to the dependency, and never
+converted into a claim about anyone's key. The direction of failure is deliberate: a quiet
+control plane freezes the gate where it stood for as long as the operator said, then closes
+it, at the price of being a dependency the deployment must run like a production service
+(ADR-017). Readiness never
 turns on it (INV-31): every replica shares the same authority, so withholding readiness
 fleet-wide would answer an outage with an outage. Nothing survives restart (NG5), and
 nothing needs to — a cold replica has no bootstrap to do, only a first exchange for each
@@ -233,7 +238,7 @@ scrape's shape.
 | Chain status | DC-5 poll | none (status only) | loading state before first fetch |
 | Worker health map (DEF-12) | per-query outcomes | rolling windows (P-WORKER-ERROR-COOLDOWN / P-WORKER-TIMEOUT-COOLDOWN) | operator debug view |
 | Heads | artifact (archival) / per-request (real-time) | one successful P-ASSIGNMENT-REFRESH cycle / live; archival outage unbounded | response metadata (INV-24) |
-| Grant cache (DEF-18) | DC-8 exchange, on the request that needs it | each grant's own `refresh_after` while healthy, `expires_at` absolutely — the only snapshot here with a hard bound during an outage | enforcing mode: grace count + minimum remaining expiry and exchange-outcome counters; shadow mode: protected events only (OB-13), alarmed on sustained grace (OB-9) |
+| Grant cache (DEF-18) | DC-8 exchange, on the request that needs it | each grant's own `refresh_after` while healthy, `expires_at` while the control plane answers, `expires_at` + P-GRANT-OUTAGE-GRACE while it does not — the only snapshot here with a hard bound during an outage | enforcing mode: grace and stale counts + minimum remaining life and exchange-outcome counters; shadow mode: protected events only (OB-13), alarmed on stale-serving and sustained grace (OB-9) |
 | Negative answers (denials) | DC-8 exchange | P-GRANT-NEGATIVE-TTL | protected exchange events (OB-13) |
 
 There is no response cache: no client-visible value is ever served from a cache other

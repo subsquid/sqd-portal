@@ -209,7 +209,10 @@ impl Rejection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::test_support::{cache_for, credential, MockControlPlane, KEY_ID};
+    use crate::auth::config::Limits;
+    use crate::auth::test_support::{
+        cache_for, cache_with_limits, credential, MockControlPlane, KEY_ID,
+    };
 
     const NOW: u64 = 1_800_000_000;
 
@@ -426,18 +429,28 @@ mod tests {
         assert_eq!(verdict.decision, Decision::Admit);
     }
 
-    /// A grant past its hard expiry admits nothing, and says so as a dependency
-    /// failure rather than as a claim about the key.
+    /// A grant past its hard expiry still admits while the control plane is
+    /// down, for the outage grace; past that it admits nothing, and says so as
+    /// a dependency failure rather than as a claim about the key (REQ-54).
     #[tokio::test]
-    async fn an_expired_grant_admits_nothing_even_with_the_control_plane_down() {
+    async fn an_expired_grant_admits_nothing_past_the_outage_grace() {
         let cp = MockControlPlane::spawn().await;
         cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
-        let cache = cache_for(&cp).await;
+        let cache = cache_with_limits(
+            &cp,
+            Limits {
+                outage_grace_secs: 600,
+                ..cp.config().limits
+            },
+        )
+        .await;
         verdict_for(&cache, Some(&credential()), None, NOW).await;
 
         cp.stop();
-        let verdict = verdict_for(&cache, Some(&credential()), None, NOW + 901).await;
+        let graced = verdict_for(&cache, Some(&credential()), None, NOW + 901).await;
+        assert_eq!(graced.decision, Decision::Admit);
 
+        let verdict = verdict_for(&cache, Some(&credential()), None, NOW + 1501).await;
         assert_eq!(reason(&verdict), "exchange_failed");
     }
 }

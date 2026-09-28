@@ -176,7 +176,9 @@ not cover it is denied rather than granted. A scope is either *absent*, meaning
 unrestricted, or a list matched exactly — an empty list therefore matches nothing, and the
 two are never conflated (REQ-53). The two lifetimes are the control plane's to choose and
 the Portal's only to cap (P-GRANT-MAX-LIFETIME): `refresh_after` is when the answer should
-be renewed, `expires_at` when it may no longer be acted on. A grant whose claims version
+be renewed, `expires_at` when it may no longer be acted on while the control plane answers
+— what it may still do past that while the control plane does not is REQ-54's, bounded by
+P-GRANT-OUTAGE-GRACE. A grant whose claims version
 this build does not fully understand is unusable rather than partly usable — reading a
 newer vocabulary for the parts it recognizes is how an added restriction becomes an
 accidental permission (REQ-54).

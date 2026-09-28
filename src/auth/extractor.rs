@@ -177,8 +177,8 @@ impl Gate {
         }
         metrics::report_exchange_success_age(self.cache.last_exchange_success_age());
         metrics::report_grant_cache_capacity(self.cache.capacity());
-        let (in_grace, min_remaining) = self.cache.grace_census(now_secs());
-        metrics::report_grace_census(in_grace, min_remaining);
+        let census = self.cache.grace_census(now_secs());
+        metrics::report_grace_census(census.in_grace, census.stale, census.min_remaining);
     }
 
     /// A route whose path does not name the dataset cannot be checked against

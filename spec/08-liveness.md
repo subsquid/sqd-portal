@@ -94,20 +94,26 @@ within P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT + slack, regardless of client behavio
 
 **LIV-13 — Revocation convergence.** Authorizing deployment ⇒ a key revoked at the control
 plane stops being served by a replica within its grant's `refresh_after` + one exchange +
-P-GRANT-REFRESH-JITTER, and unconditionally at that grant's `expires_at`. The same bound
-covers every narrowing of a live key — a withdrawn dataset, a reduced scope — since all of
-them reach the Portal only as the next grant. The first bound
-needs a healthy control plane and a request to arrive — an idle credential converges
-trivially, since nothing is being served on it. The second needs nothing at all: it holds
-through an outage, which is what makes the stale-authorization window a number rather than
-a hope, and it is capped for the fleet at P-GRANT-MAX-LIFETIME (REQ-54). Convergence is per
-replica and needs no coordination; two replicas may sit a refresh apart, bounded by the same
-expiry (INV-15). Nothing here converges faster than the control plane asked for; if a
-product requirement needs it to, that is an invalidation channel rather than a shorter
-interval (OQ-16). Witness: enforcing-mode OB-13 grace count, minimum remaining expiry, and
-exchange outcomes; shadow-mode and per-request details remain protected. Check: CT-10 —
-revoke a key while the stub is healthy and assert the first request past `refresh_after`
-converges; repeat with the stub unreachable and assert convergence exactly at `expires_at`.
+P-GRANT-REFRESH-JITTER, at that grant's `expires_at` while the control plane answers, and
+unconditionally at `expires_at` + P-GRANT-OUTAGE-GRACE. The same bound covers every
+narrowing of a live key — a withdrawn dataset, a reduced scope — since all of them reach
+the Portal only as the next grant. The first bound needs a healthy control plane and a
+request to arrive — an idle credential converges trivially, since nothing is being served
+on it. The second needs the control plane to answer at all: past `expires_at` a grant is
+exchanged before it is served unless the exchange is failing, so a key revoked during an
+outage converges on the first exchange the control plane answers after it. The third needs
+nothing at all: it holds through an outage, which is what makes the stale-authorization
+window a number rather than a hope, and it is capped for the fleet at P-GRANT-MAX-LIFETIME
++ P-GRANT-OUTAGE-GRACE (REQ-54, ADR-017). Convergence is per replica and needs no
+coordination; two replicas may sit a refresh apart, bounded by the same expiry (INV-15).
+Nothing here converges faster than the control plane asked for; if a product requirement
+needs it to, that is an invalidation channel rather than a shorter interval (OQ-16).
+Witness: enforcing-mode OB-13 grace and stale counts, minimum remaining life, and exchange
+outcomes; shadow-mode and per-request details remain protected. Check: CT-10 — revoke a key
+while the stub is healthy and assert the first request past `refresh_after` converges;
+repeat with the stub unreachable and assert convergence exactly at `expires_at` +
+P-GRANT-OUTAGE-GRACE; repeat with the stub restored past `expires_at` and assert
+convergence on its first answer.
 
 **LIV-14 — New-key admission.** Healthy control plane ⇒ a key minted a moment ago is served
 on its first request: there is no set to be absent from, only an exchange to make, so

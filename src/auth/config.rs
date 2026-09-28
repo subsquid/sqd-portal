@@ -70,9 +70,17 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Limits {
     /// Ceiling on the lifetime the portal honours, whatever is offered: the
-    /// fleet's worst-case stale-authorization window (REQ-54).
+    /// worst-case stale-authorization window while the control plane answers
+    /// (REQ-54).
     #[serde(default = "default_max_grant_lifetime_secs")]
     pub max_grant_lifetime_secs: u64,
+
+    /// How long past its hard expiry a grant keeps serving while the control
+    /// plane is not answering. Zero stops at `expires_at`, which turns a
+    /// control-plane outage into a lockout of every key once the grants it
+    /// issued run out (REQ-54, P-GRANT-OUTAGE-GRACE).
+    #[serde(default = "default_outage_grace_secs")]
+    pub outage_grace_secs: u64,
 
     /// Per-exchange deadline. Must stay below the deadline callers wait on, or
     /// a request outlives the exchange it is waiting for (ADR-010).
@@ -337,6 +345,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_grant_lifetime_secs: default_max_grant_lifetime_secs(),
+            outage_grace_secs: default_outage_grace_secs(),
             exchange_timeout_ms: default_exchange_timeout_ms(),
             exchange_rate_per_sec: default_exchange_rate_per_sec(),
             max_inflight_exchanges: default_max_inflight_exchanges(),
@@ -350,6 +359,10 @@ impl Default for Limits {
 
 fn default_max_grant_lifetime_secs() -> u64 {
     900
+}
+
+fn default_outage_grace_secs() -> u64 {
+    86_400
 }
 
 fn default_exchange_timeout_ms() -> u64 {
@@ -407,6 +420,8 @@ portal_id: portal-premium-eu
         assert_eq!(config.key_path, None);
         // P-GRANT-MAX-LIFETIME
         assert_eq!(config.limits.max_grant_lifetime_secs, 900);
+        // P-GRANT-OUTAGE-GRACE
+        assert_eq!(config.limits.outage_grace_secs, 86_400);
         // P-GRANT-CACHE-CAPACITY
         assert_eq!(config.limits.grant_cache_capacity, 65_536);
         // P-GRANT-EXCHANGE-TIMEOUT
@@ -430,6 +445,7 @@ portal_id: portal-premium-eu
              enforcement: log_only\n\
              limits:\n  \
              max_grant_lifetime_secs: 300\n  \
+             outage_grace_secs: 0\n  \
              exchange_timeout_ms: 500\n  \
              exchange_rate_per_sec: 5\n  \
              max_inflight_exchanges: 4\n  \
@@ -442,6 +458,7 @@ portal_id: portal-premium-eu
         assert_eq!(config.key_path, Some(PathBuf::from("/keys/exchange.key")));
         assert_eq!(config.enforcement, Enforcement::LogOnly);
         assert_eq!(config.limits.max_grant_lifetime_secs, 300);
+        assert_eq!(config.limits.outage_grace_secs, 0);
         assert_eq!(config.limits.exchange_rate_per_sec, 5);
         assert_eq!(config.limits.max_inflight_exchanges, 4);
         assert_eq!(config.limits.grant_cache_capacity, 128);

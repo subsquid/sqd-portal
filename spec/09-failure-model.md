@@ -72,19 +72,21 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 ## Control-plane faults (DC-8)
 
 Authorizing deployments only. The governing asymmetry: a fault in the *credential* fails
-closed, a fault in the *exchange* degrades — onto a cached grant while one is live, and
+closed, a fault in the *exchange* degrades — onto a cached grant while one is held, and
 into retryable refusals once it is not. The window between those two is the whole outage
-policy, and it is the control plane's `expires_at` under the Portal's cap (REQ-54).
+policy: the control plane's `expires_at` under the Portal's cap, and past it
+P-GRANT-OUTAGE-GRACE more while the authority is demonstrably silent (REQ-54, ADR-017).
 
 | Fault | Required response |
 |---|---|
 | Exchange unreachable / timeout / error status, cached grant inside `expires_at` | degrade: serve on the cached grant; count the grace-serving and alarm on it (OB-9/13). No request fails for this reason while the grant lives |
-| Exchange unreachable, no usable grant (never cached, or past `expires_at`) | fail-safe: refuse as UPSTREAM-FAILURE, retryable, attributed to the dependency. This is the accepted cost of asking on demand, not a defect |
+| Exchange unreachable / timeout / error status, cached grant past `expires_at` but inside P-GRANT-OUTAGE-GRACE | degrade: serve on the grant — this failure is the evidence REQ-54 asks for; count it apart from renewal grace and page on it (OB-9/13): the control plane has now been failing for longer than a grant lifetime, and the next cliff is the outage grace |
+| Exchange unreachable, no usable grant (never cached, or past `expires_at` + P-GRANT-OUTAGE-GRACE) | fail-safe: refuse as UPSTREAM-FAILURE, retryable, attributed to the dependency. This is the accepted cost of asking on demand, not a defect |
 | Answer malformed, missing a field, or carrying an unrecognized claims version | integrity: treat as a failed exchange, store nothing, alarm. Never read for the parts that parsed — an unread restriction is a granted permission |
 | Answer about a different credential than was asked about | integrity: discard and refuse as UPSTREAM-FAILURE |
 | Answer offers a lifetime beyond P-GRANT-MAX-LIFETIME | mask: accept, capped at the bound; count it as a control-plane misconfiguration |
 | Authoritative denial arriving against a live cached grant | fail-closed: evict and refuse from that moment; a denial is never outranked by remaining lifetime (INV-6) |
-| Exchange rate-limited or over the in-flight cap | with no usable grant, fail-safe immediately as OVERLOADED with a retry hint; with a grant inside `expires_at`, suppress this renewal and serve on the grant. Never queue or claim the credential is invalid (REQ-54, HZ-10) |
+| Exchange rate-limited or over the in-flight cap | with no usable grant, fail-safe immediately as OVERLOADED with a retry hint; with a grant still held, suppress this renewal and serve on the grant. Never queue or claim the credential is invalid (REQ-54, HZ-10) |
 | Signing headers malformed or unattributable, or timestamp skew past P-SIGNATURE-MAX-SKEW in either direction | fail-safe as UPSTREAM-FAILURE, and alarm: it fails every exchange at once and the cause is local clock, identity, or request construction, not any client's key |
 | Control plane never reached at all, either mode | mask for readiness — stay ready and refuse retryably (INV-31); leaving rotation would answer one outage with a larger one |
 | Signing identity missing or empty at startup | fail-safe at startup: refuse to run (REQ-33) |

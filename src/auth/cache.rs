@@ -36,9 +36,21 @@ pub struct CachedGrant {
     pub organization_id: Option<String>,
     /// A request arriving past this is still served.
     pub refresh_after: u64,
-    /// When to stop. Nothing serves on this grant afterwards, whatever the
-    /// control plane's state — the hard bound on stale authorization (REQ-54).
+    /// The hard expiry: past it the grant answers only while the control
+    /// plane is failing to answer, and only for the outage grace on top
+    /// (REQ-54). While the control plane answers, this is the bound on stale
+    /// authorization.
     pub expires_at: u64,
+}
+
+/// What the scrape publishes about the cliff: how many grants are serving past
+/// `refresh_after`, how many past `expires_at`, and the least life left before
+/// the first of them is dropped (zero when none are).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraceCensus {
+    pub in_grace: usize,
+    pub stale: usize,
+    pub min_remaining: u64,
 }
 
 /// What resolving a credential established. Only the first two are the control
@@ -92,6 +104,12 @@ pub struct GrantCache {
     /// climbs through an outage, which is the operator's distance to the
     /// `expires_at` cliff (OB-9, OB-13).
     last_success: AtomicU64,
+    /// Wall-clock second of the last exchange that could not answer at all —
+    /// not a denial and not a budget refusal, the call itself. Newer than
+    /// `last_success`, it is the only evidence a replica has that the
+    /// authority is down, and the only thing that lets a grant past
+    /// `expires_at` keep serving (REQ-54).
+    last_failure: AtomicU64,
     /// Falls back for the gauge while `last_success` is still 0, so a replica
     /// that has never been served counts up from boot instead of reading as
     /// freshly successful.
@@ -113,6 +131,7 @@ impl GrantCache {
             permits: Semaphore::new(limits.max_inflight_exchanges),
             limiter: Mutex::new(RateLimiter::new(limits.exchange_rate_per_sec)),
             last_success: AtomicU64::new(0),
+            last_failure: AtomicU64::new(0),
             started_at: now_secs(),
             limits,
         });
@@ -124,15 +143,27 @@ impl GrantCache {
     /// cannot. A grant past `refresh_after` still answers while its renewal
     /// runs; only a credential with nothing usable waits for an exchange.
     pub async fn resolve(self: &Arc<Self>, credential: &Credential, now: u64) -> Resolved {
-        if let Some(grant) = self.usable_grant(&credential.fingerprint, now) {
+        if let Some(grant) = self.held_grant(&credential.fingerprint, now) {
             if grant.refresh_after > now {
                 return Resolved::Grant(grant);
             }
-            // Serving on a grant whose renewal has not landed is the outage
-            // grace, and the only warning an operator gets before the cliff.
-            self.report(metrics::report_grace_admission);
-            self.spawn_refresh(credential, now);
-            return Resolved::Grant(grant);
+            if grant.expires_at > now {
+                // Serving on a grant whose renewal has not landed is the
+                // renewal grace, and the first warning an operator gets.
+                self.report(metrics::report_grace_admission);
+                self.spawn_refresh(credential, now);
+                return Resolved::Grant(grant);
+            }
+            // Past the hard expiry the grant answers only while the authority
+            // is silent, and silence has to have been witnessed since the
+            // grant expired: a failure older than that says nothing about
+            // now. Without it the request revalidates below, and is served
+            // on the grant only if that revalidation cannot run either.
+            if self.authority_silent_since(grant.expires_at) {
+                self.report(metrics::report_stale_admission);
+                self.spawn_refresh(credential, now);
+                return Resolved::Grant(grant);
+            }
         }
         if let Some(reason) = self.live_denial(&credential.fingerprint, now) {
             return Resolved::Denied(reason);
@@ -154,7 +185,7 @@ impl GrantCache {
         now: u64,
         arrived: Instant,
     ) -> Resolved {
-        let held = self.usable_grant(&credential.fingerprint, now);
+        let held = self.held_grant(&credential.fingerprint, now);
         if let Some(grant) = &held {
             if grant.refresh_after > now {
                 return Resolved::Grant(grant.clone());
@@ -181,20 +212,40 @@ impl GrantCache {
     }
 
     /// An exchange that established nothing must not discard a grant still
-    /// inside its expiry, or the grace would depend on which side of the lock
-    /// the request arrived (REQ-54). `now` is the admission second, not the
-    /// arrival: the wait plus a failed exchange can outlast what the fast path
-    /// saw.
+    /// held, or the grace would depend on which side of the lock the request
+    /// arrived (REQ-54). `now` is the admission second, not the arrival: the
+    /// wait plus a failed exchange can outlast what the fast path saw.
     fn or_grace(&self, resolved: Resolved, held: Option<Arc<CachedGrant>>, now: u64) -> Resolved {
         match (resolved, held) {
             (Resolved::Saturated | Resolved::Unavailable, Some(grant))
-                if grant.expires_at > now =>
+                if self.discard_at(&grant) > now =>
             {
-                self.report(metrics::report_grace_admission);
+                if grant.expires_at > now {
+                    self.report(metrics::report_grace_admission);
+                } else {
+                    self.report(metrics::report_stale_admission);
+                }
                 Resolved::Grant(grant)
             }
             (resolved, _) => resolved,
         }
+    }
+
+    /// When a grant is dropped rather than held for an outage: its hard expiry
+    /// plus the outage grace. Zero grace makes this the hard expiry itself.
+    fn discard_at(&self, grant: &CachedGrant) -> u64 {
+        grant
+            .expires_at
+            .saturating_add(self.limits.outage_grace_secs)
+    }
+
+    /// Whether the exchange has failed to answer at or after `since`, with no
+    /// answer from the authority after that failure. A failure that predates
+    /// `since` is not evidence about the present; an answer since it means the
+    /// authority is back, whatever it said.
+    fn authority_silent_since(&self, since: u64) -> bool {
+        let failure = self.last_failure.load(Ordering::Acquire);
+        failure >= since && failure > self.last_success.load(Ordering::Acquire)
     }
 
     /// The renewal a request past `refresh_after` triggers without waiting for
@@ -216,7 +267,7 @@ impl GrantCache {
             };
             // A refresh may have landed while this task waited for the lock.
             if cache
-                .usable_grant(&credential.fingerprint, now)
+                .held_grant(&credential.fingerprint, now)
                 .is_some_and(|grant| grant.refresh_after > now)
             {
                 return;
@@ -271,6 +322,7 @@ impl GrantCache {
                 // published: counting it answered would refresh the OB-9
                 // freshness gauge.
                 if grant.expires_at <= expired_by {
+                    self.last_failure.store(settled, Ordering::Release);
                     self.report(|| {
                         metrics::report_exchange(ExchangeOutcome::Failed, Some(elapsed))
                     });
@@ -296,6 +348,7 @@ impl GrantCache {
                 Resolved::Denied(reason)
             }
             Err(err) => {
+                self.last_failure.store(settled, Ordering::Release);
                 self.report(|| metrics::report_exchange(ExchangeOutcome::Failed, Some(elapsed)));
                 tracing::warn!(
                     key_id = credential.key_id,
@@ -404,12 +457,14 @@ impl GrantCache {
         false
     }
 
-    /// A grant inside its hard expiry, due for renewal or not. An expired one
-    /// is dropped: it can never be served on again.
-    fn usable_grant(&self, fingerprint: &str, now: u64) -> Option<Arc<CachedGrant>> {
+    /// A grant not yet discarded: inside its hard expiry, or past it and held
+    /// for the outage grace — whether it may answer past `expires_at` is the
+    /// caller's to decide. Past the discard point it is dropped: it can never
+    /// be served on again.
+    fn held_grant(&self, fingerprint: &str, now: u64) -> Option<Arc<CachedGrant>> {
         let mut grants = self.grants.lock().unwrap();
         let grant = grants.get(fingerprint)?;
-        if grant.expires_at > now {
+        if self.discard_at(grant) > now {
             return Some(grant.clone());
         }
         grants.pop(fingerprint);
@@ -421,26 +476,40 @@ impl GrantCache {
         None
     }
 
-    /// How many grants are past `refresh_after` but inside `expires_at`, and
-    /// the least life left among them (zero when none are). The admission rate
-    /// says the condition exists; the minimum says when the first hard refusal
-    /// lands (OB-9, OB-13). One walk per scrape, bounded by the capacity.
-    pub fn grace_census(&self, now: u64) -> (usize, u64) {
+    /// How many grants are past `refresh_after` but inside `expires_at`, how
+    /// many are past `expires_at` and held for the outage, and the least life
+    /// left among all of them before the first is dropped (zero when none
+    /// are). The admission rates say the condition exists; the minimum says
+    /// when the first hard refusal lands if the outage persists (OB-9, OB-13).
+    /// One walk per scrape, bounded by the capacity.
+    pub fn grace_census(&self, now: u64) -> GraceCensus {
         let grants = self.grants.lock().unwrap();
-        let mut in_grace = 0;
-        let mut min_remaining = 0;
+        let mut census = GraceCensus {
+            in_grace: 0,
+            stale: 0,
+            min_remaining: 0,
+        };
         for (_, grant) in grants.iter() {
-            if grant.refresh_after <= now && grant.expires_at > now {
-                in_grace += 1;
-                let remaining = grant.expires_at - now;
-                min_remaining = if in_grace == 1 {
-                    remaining
-                } else {
-                    min_remaining.min(remaining)
-                };
+            if grant.refresh_after > now {
+                continue;
             }
+            let discard_at = self.discard_at(grant);
+            if discard_at <= now {
+                continue;
+            }
+            if grant.expires_at > now {
+                census.in_grace += 1;
+            } else {
+                census.stale += 1;
+            }
+            let remaining = discard_at - now;
+            census.min_remaining = if census.in_grace + census.stale == 1 {
+                remaining
+            } else {
+                census.min_remaining.min(remaining)
+            };
         }
-        (in_grace, min_remaining)
+        census
     }
 
     fn live_denial(&self, fingerprint: &str, now: u64) -> Option<String> {
@@ -556,7 +625,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::auth::test_support::{cache_for, credential, MockControlPlane, KEY_ID};
+    use crate::auth::test_support::{
+        cache_for, cache_with_limits, credential, MockControlPlane, KEY_ID,
+    };
 
     const NOW: u64 = 1_800_000_000;
 
@@ -691,13 +762,29 @@ mod tests {
         }
     }
 
-    /// The census the scrape republishes: the grace rate says the cliff is
-    /// coming, the count says how wide it is, and the minimum names when the
-    /// first hard refusal lands (OB-9).
+    fn census(in_grace: usize, stale: usize, min_remaining: u64) -> GraceCensus {
+        GraceCensus {
+            in_grace,
+            stale,
+            min_remaining,
+        }
+    }
+
+    /// The census the scrape republishes: the admission rates say the cliff is
+    /// coming, the counts say how wide it is and which side of the hard expiry
+    /// it is on, and the minimum names when the first hard refusal lands if
+    /// the outage persists (OB-9).
     #[tokio::test]
     async fn the_grace_census_names_the_first_hard_refusal() {
         let cp = MockControlPlane::spawn().await;
-        let cache = cache_for(&cp).await;
+        let cache = cache_with_limits(
+            &cp,
+            Limits {
+                outage_grace_secs: 1000,
+                ..cp.config().limits
+            },
+        )
+        .await;
         for (fingerprint, refresh_after, expires_at) in [
             // Fresh: not in grace.
             ("fresh", NOW + 300, NOW + 900),
@@ -717,12 +804,15 @@ mod tests {
             );
         }
 
-        assert_eq!(cache.grace_census(NOW), (2, 500));
-        // Past its cliff a grant stops counting; the fresh one has aged into
-        // grace by then and names the next refusal.
-        assert_eq!(cache.grace_census(NOW + 600), (2, 100));
-        // Nothing in grace reads as zero, not as a stale minimum.
-        assert_eq!(cache.grace_census(NOW + 900), (0, 0));
+        // The first refusal is the nearest expiry plus the outage grace.
+        assert_eq!(cache.grace_census(NOW), census(2, 0, 1500));
+        // Past its hard expiry a grant is stale rather than gone, and still
+        // names the cliff; the fresh one has aged into grace by then.
+        assert_eq!(cache.grace_census(NOW + 600), census(2, 1, 900));
+        // Past its discard point a grant stops counting.
+        assert_eq!(cache.grace_census(NOW + 1500), census(0, 2, 200));
+        // Nothing held reads as zero, not as a stale minimum.
+        assert_eq!(cache.grace_census(NOW + 1900), census(0, 0, 0));
     }
 
     /// `refresh_after` cannot advance while the renewal keeps failing, so a
@@ -778,14 +868,24 @@ mod tests {
         let bare = cache.or_grace(Resolved::Unavailable, None, NOW + 1);
         assert!(matches!(bare, Resolved::Unavailable), "got {bare:?}");
 
-        // The expiry is judged as of the admission, not the arrival: a lock
-        // wait plus a failed exchange can outlast the grant, and past
-        // `expires_at` the refusal stands however live the grant looked when
-        // the request came in (REQ-54).
+        // The deadline is judged as of the admission, not the arrival: a lock
+        // wait plus a failed exchange can outlast the grant. A failed exchange
+        // is exactly the evidence the outage grace needs, so past `expires_at`
+        // the grant still answers — up to its discard point, where the refusal
+        // stands however live the grant looked when the request came in
+        // (REQ-54).
         let served = cache.or_grace(Resolved::Unavailable, Some(held.clone()), NOW + 899);
         assert_eq!(granted(&served).key_id, KEY_ID);
-        let expired = cache.or_grace(Resolved::Unavailable, Some(held), NOW + 900);
-        assert!(matches!(expired, Resolved::Unavailable), "got {expired:?}");
+        let stale = cache.or_grace(Resolved::Unavailable, Some(held.clone()), NOW + 900);
+        assert_eq!(granted(&stale).key_id, KEY_ID);
+        let discard_at = NOW + 900 + cache.limits.outage_grace_secs;
+        let last = cache.or_grace(Resolved::Unavailable, Some(held.clone()), discard_at - 1);
+        assert_eq!(granted(&last).key_id, KEY_ID);
+        let discarded = cache.or_grace(Resolved::Unavailable, Some(held), discard_at);
+        assert!(
+            matches!(discarded, Resolved::Unavailable),
+            "got {discarded:?}"
+        );
     }
 
     /// The keyed-lock map has no capacity bound, so an entry left behind leaks
@@ -822,29 +922,161 @@ mod tests {
     }
 
     /// REQ-54's grace, and its end. The control plane stops answering: a grant
-    /// past `refresh_after` keeps serving, and the same grant past `expires_at`
-    /// does not — retryably, and never as a claim about the credential.
+    /// past `refresh_after` keeps serving, the same grant past `expires_at`
+    /// keeps serving once this replica has seen the authority fail since the
+    /// expiry, and past the outage grace it does not — retryably, and never as
+    /// a claim about the credential.
     #[tokio::test]
-    async fn an_outage_is_survived_to_the_hard_expiry_and_no_further() {
+    async fn an_outage_is_survived_to_the_outage_grace_and_no_further() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_with_limits(
+            &cp,
+            Limits {
+                outage_grace_secs: 600,
+                ..cp.config().limits
+            },
+        )
+        .await;
+        cache.resolve(&credential(), NOW).await;
+
+        cp.stop();
+
+        let graced = cache.resolve(&credential(), NOW + 400).await;
+        assert_eq!(
+            granted(&graced).key_id,
+            KEY_ID,
+            "a grant past refresh_after still serves while renewal fails"
+        );
+        // Let the renewal that request spawned fail, so the exchanges counted
+        // below are the ones the expired grant costs.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = cp.exchanges();
+        let stale_before = metrics::stale_admissions();
+
+        // The last failure this replica saw predates the expiry, so the first
+        // request past it revalidates rather than trusting old news — and is
+        // served on the grant when that revalidation cannot run either.
+        let stale = cache.resolve(&credential(), NOW + 901).await;
+        assert_eq!(granted(&stale).key_id, KEY_ID);
+        assert_eq!(
+            cp.exchanges(),
+            before + 1,
+            "the expired grant is revalidated first"
+        );
+        assert!(metrics::stale_admissions() > stale_before);
+
+        // With the authority now known silent since the expiry, the next
+        // request is served without waiting on another attempt.
+        let again = cache.resolve(&credential(), NOW + 902).await;
+        assert_eq!(granted(&again).key_id, KEY_ID);
+        assert_eq!(
+            cp.exchanges(),
+            before + 1,
+            "served stale without a new exchange"
+        );
+
+        let discarded = cache.resolve(&credential(), NOW + 1501).await;
+        assert!(
+            matches!(discarded, Resolved::Unavailable),
+            "past the outage grace the outage is a dependency failure, got {discarded:?}"
+        );
+    }
+
+    /// The knob at zero is the behaviour before it existed: nothing serves past
+    /// `expires_at`, whatever the authority's state.
+    #[tokio::test]
+    async fn zero_outage_grace_stops_at_the_hard_expiry() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_with_limits(
+            &cp,
+            Limits {
+                outage_grace_secs: 0,
+                ..cp.config().limits
+            },
+        )
+        .await;
+        cache.resolve(&credential(), NOW).await;
+
+        cp.stop();
+
+        granted(&cache.resolve(&credential(), NOW + 899).await);
+        let expired = cache.resolve(&credential(), NOW + 900).await;
+        assert!(matches!(expired, Resolved::Unavailable), "got {expired:?}");
+    }
+
+    /// An expired grant is not a licence to skip the authority: a key idle
+    /// across its expiry while the control plane was healthy is exchanged
+    /// before it is served, and served on what the exchange returned.
+    #[tokio::test]
+    async fn an_expired_grant_is_revalidated_while_the_authority_answers() {
         let cp = MockControlPlane::spawn().await;
         cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
         let cache = cache_for(&cp).await;
         cache.resolve(&credential(), NOW).await;
 
-        cp.stop();
+        cp.grant(KEY_ID, None, NOW + 1300, NOW + 1900);
+        let renewed = cache.resolve(&credential(), NOW + 1000).await;
 
-        let stale = cache.resolve(&credential(), NOW + 400).await;
+        assert_eq!(cp.exchanges(), 2);
         assert_eq!(
-            granted(&stale).key_id,
-            KEY_ID,
-            "a grant past refresh_after still serves while renewal fails"
+            granted(&renewed).expires_at,
+            NOW + 1900,
+            "the request is answered on the fresh grant, not the expired one"
         );
+    }
 
-        let expired = cache.resolve(&credential(), NOW + 901).await;
-        assert!(
-            matches!(expired, Resolved::Unavailable),
-            "past the hard expiry the outage is a dependency failure, got {expired:?}"
-        );
+    /// INV-6 holds through the outage grace: the moment the authority answers
+    /// again, its answer outranks the stale grant — a denial evicts, a grant
+    /// replaces.
+    #[tokio::test]
+    async fn the_authority_returning_outranks_a_stale_grant_at_once() {
+        for revoked in [true, false] {
+            let cp = MockControlPlane::spawn().await;
+            cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+            let cache = cache_with_limits(
+                &cp,
+                Limits {
+                    // The cooldown is the exchange timeout; a short one lets
+                    // the refresh below run within the test.
+                    exchange_timeout_ms: 20,
+                    ..cp.config().limits
+                },
+            )
+            .await;
+            cache.resolve(&credential(), NOW).await;
+
+            cp.status(KEY_ID, 503);
+            granted(&cache.resolve(&credential(), NOW + 901).await);
+
+            cp.clear_status(KEY_ID);
+            if revoked {
+                cp.deny(KEY_ID, "revoked");
+            } else {
+                // Inside the lifetime cap as of the refresh, so the stored
+                // expiry is the offered one.
+                cp.grant(KEY_ID, None, NOW + 1300, NOW + 1700);
+            }
+
+            let settled = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match cache.resolve(&credential(), NOW + 902).await {
+                        Resolved::Denied(reason) => return Err(reason),
+                        Resolved::Grant(grant) if grant.expires_at == NOW + 1700 => return Ok(()),
+                        _ => tokio::time::sleep(Duration::from_millis(5)).await,
+                    }
+                }
+            })
+            .await
+            .expect("the refresh must land");
+
+            if revoked {
+                assert_eq!(settled, Err("revoked".to_owned()));
+            } else {
+                assert_eq!(settled, Ok(()));
+            }
+        }
     }
 
     /// INV-6: the authority has spoken since, so the remaining lifetime does not
@@ -1031,11 +1263,11 @@ mod tests {
 
         assert_eq!(cache.grants.lock().unwrap().len(), capacity);
         assert!(
-            cache.usable_grant("fingerprint-0", NOW).is_none(),
+            cache.held_grant("fingerprint-0", NOW).is_none(),
             "the least recently used entry goes first"
         );
         assert!(cache
-            .usable_grant(&format!("fingerprint-{}", capacity + 9), NOW)
+            .held_grant(&format!("fingerprint-{}", capacity + 9), NOW)
             .is_some());
     }
 

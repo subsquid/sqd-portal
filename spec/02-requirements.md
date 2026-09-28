@@ -486,11 +486,19 @@ and the requested dataset. Around that, four rules:
   and a request arriving while that runs is still served on the grant in hand.
 - **A denial lands at once.** An authoritative denial replaces the cached grant the moment
   it arrives, whatever the grant's remaining lifetime.
-- **A dependency failure buys time, and only to `expires_at`.** If the re-exchange cannot
-  run or cannot answer, the existing grant keeps serving until its hard expiry and no
-  further. That window is the entire outage grace; the control plane sizes it and the Portal
-  caps what it will accept at P-GRANT-MAX-LIFETIME. Two deadlines rather than one is what
-  buys the grace at all — OQ-14 records what collapsing them would cost.
+- **A dependency failure buys time: to `expires_at` on its own, and past it only while the
+  authority is demonstrably silent.** If the re-exchange cannot run or cannot answer, the
+  existing grant keeps serving to its hard expiry. Past the hard expiry it keeps serving
+  only while this replica has witnessed an exchange fail to answer since that expiry and
+  has heard nothing from the control plane since the failure — for at most
+  P-GRANT-OUTAGE-GRACE beyond `expires_at`, and no further. A request on an expired grant
+  with no such evidence exchanges first, and is served on the grant only if that exchange
+  cannot run or answer either; a request on one with the evidence is served at once while
+  the renewal runs beside it. The two windows together are the entire outage grace: the
+  control plane sizes the first and the Portal caps it at P-GRANT-MAX-LIFETIME; the operator
+  sizes the second, and zero restores the hard expiry as the end (ADR-017). Two deadlines
+  rather than one is what buys the grace at all — OQ-14 records what collapsing them would
+  cost.
 - **A missing answer is never a verdict.** With no usable grant, an exchange the local budget
   refuses is OVERLOADED and one that failed, timed out, or returned something unusable is
   UPSTREAM-FAILURE. Neither is BAD-CREDENTIAL: the same credential may succeed a second later.
@@ -499,9 +507,15 @@ Readiness is conditioned on none of this. A Portal that has never reached the co
 is ready and refuses retryably (INV-31): every replica shares one authority, so withholding
 readiness on its account empties the fleet in exactly the situation nobody can recover from.
 *Acceptance:* with the control plane stopped, a credential whose grant is inside its hard
-expiry keeps being served and one whose grant has passed it is refused as UPSTREAM-FAILURE,
-never as BAD-CREDENTIAL; a key revoked while the control plane is healthy stops being served
-no later than LIV-13's bound; with no usable grant, an exchange denied by the local budget
+expiry keeps being served; one whose grant has passed it is served once an exchange has
+failed since the expiry, and only until P-GRANT-OUTAGE-GRACE past it; one whose grant has
+passed that too is refused as UPSTREAM-FAILURE, never as BAD-CREDENTIAL; with the control
+plane healthy, a credential whose grant has passed `expires_at` is exchanged before it is
+served and is served on what the exchange returned; with P-GRANT-OUTAGE-GRACE at zero,
+nothing is served past `expires_at` whatever the control plane's state; a key revoked while
+the control plane is healthy stops being served no later than LIV-13's bound, and one
+revoked during an outage on the first exchange the control plane answers after it; with no
+usable grant, an exchange denied by the local budget
 receives OVERLOADED with `Retry-After`, while the same denial during renewal leaves a usable
 grant serving and increments the grace signal; a grant offering a lifetime beyond
 P-GRANT-MAX-LIFETIME is honored only to the cap; a grant carrying a claims version this
@@ -642,7 +656,8 @@ Deliberately left open — tests and clients must not pin these:
 | OQ-13 | Should a dataset-scoped key be able to use the SQL surface, which names its datasets in the body rather than the path? Today such a key is refused there outright (REQ-53), which is fail-closed but makes the surface unusable for exactly the customers most likely to be scoped. | REQ-53, OP-10 |
 | OQ-11 | REQ-40's fleet-cutover premise assumes workers also honor `effective_from`; workers currently apply assignments immediately (recorded in the worker suite's open questions, `worker-rs/spec/02`), so each publication opens a window of routing to reshuffling workers (transient `no_workers`/`retries_exhausted` churn). Size the window for worker convergence, or have workers delay too? | REQ-40, REQ-41 |
 | OQ-14 | Should a grant carry two deadlines or one? REQ-54 takes `refresh_after` + `expires_at` because one value cannot both keep refreshes off the latency path and bound how long a stale answer is acted on. Collapsing them is simpler and makes convergence exact, at the cost of a synchronous exchange every period and no outage grace at all. | REQ-54, DC-8, LIV-13 |
-| OQ-15 | Ratify P-GRANT-MAX-LIFETIME and the exchange budget (P-GRANT-EXCHANGE-RATE, P-GRANT-EXCHANGE-INFLIGHT, P-GRANT-CACHE-CAPACITY). The lifetime cap is the fleet's worst-case stale-authorization window and the budget decides whose new key gets turned away under a flood (HZ-10); neither has an observed value to reason from yet. | REQ-54, DC-8, HZ-10, HZ-13 |
+| OQ-15 | Ratify P-GRANT-MAX-LIFETIME, P-GRANT-OUTAGE-GRACE and the exchange budget (P-GRANT-EXCHANGE-RATE, P-GRANT-EXCHANGE-INFLIGHT, P-GRANT-CACHE-CAPACITY). The lifetime cap is the fleet's worst-case stale-authorization window while the control plane answers, the outage grace is what a control-plane outage adds to it, and the budget decides whose new key gets turned away under a flood (HZ-10); none has an observed value to reason from yet. | REQ-54, DC-8, HZ-10, HZ-13 |
+| OQ-17 | Should P-GRANT-OUTAGE-GRACE differ by deployment? A single-tenant Portal holds a handful of keys for one customer with an availability commitment, and a revoked key served through an outage costs it little; a shared Portal holds thousands, and its grace is how long a revoked free key keeps reading public data while the control plane is down. ADR-017 sets one default and leaves the split to the operator. | REQ-54, LIV-13, ADR-017 |
 | OQ-16 | Does anything need revocation faster than LIV-13's bound? If so it is a push invalidation channel, not a shorter refresh interval — shortening the interval multiplies exchange traffic across the whole working set to shorten one key's window. Adding the channel is a second distributed mechanism and should follow a stated freshness requirement, not precede it. | LIV-13, DC-8 |
 
 Closed: **OQ-6** (should the clamp-bypassing debug stream variant be exposed unconditionally,

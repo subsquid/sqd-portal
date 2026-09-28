@@ -159,9 +159,12 @@ that contract's rate, concurrency and single-flight bounds. With no usable grant
 exchange it is not allowed to make is an immediate OVERLOADED outcome, not a delay and not
 a BAD-CREDENTIAL claim, and a failed one is UPSTREAM-FAILURE. Past `refresh_after` but
 inside `expires_at`, the existing grant answers whether the renewal runs or its local
-budget is exhausted; past `expires_at` the request waits only for an exchange already
-admitted by the limiter, and is refused immediately rather than queued when no permit is
-available. It resolves the requested dataset to a canonical name **only** for a key that
+budget is exhausted. Past `expires_at` with the authority silent since the expiry (REQ-54),
+the held grant answers the same way and the renewal runs beside it; otherwise the request
+waits only for an exchange already admitted by the limiter, is served on the held grant if
+that exchange cannot run or answer and the grant is inside P-GRANT-OUTAGE-GRACE, and is
+refused immediately rather than queued when no permit is available. It resolves the
+requested dataset to a canonical name **only** for a key that
 is dataset-scoped and has already authenticated — the one rung that needs it — so an
 unauthenticated request cannot buy that work (INV-14). No serving dependency is consulted,
 and no shared state is mutated beyond the grant cache, its negative answers, and
