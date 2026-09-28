@@ -113,8 +113,7 @@ pub(crate) async fn run_archival_stream(
     let mut res = Response::builder();
     res = res.header(DATA_SOURCE_HEADER, DATA_SOURCE_NETWORK);
     if let Some(head) = network.head(&dataset_id) {
-        // The response reports this head, so it must not cover past it.
-        request.coverage_limit = Some(head.number);
+        request.query.cap_last_block(head.number);
         // Don't use hotblocks data source at all for this endpoint.
         res = res
             .header(FINALIZED_NUMBER_HEADER, head.number)
@@ -329,6 +328,9 @@ async fn stream_from_network(
     hotblocks_name: String,
 ) -> Response {
     let archival_head = network.head(&dataset_id);
+    if let Some(head) = &archival_head {
+        request.query.cap_last_block(head.number);
+    }
     let head_task = tokio::spawn({
         let archival_head = archival_head.clone();
         async move {
@@ -342,10 +344,6 @@ async fn stream_from_network(
         }
     });
 
-    // The response reports the archival head as its finalized head, so it must not cover
-    // past it: a chunk assigned mid-stream would deliver blocks the client was told are
-    // not final yet. The client picks them up on its next request.
-    request.coverage_limit = archival_head.as_ref().map(|head| head.number);
     request.dataset_id = dataset_id;
     let compression = request.compression;
 
