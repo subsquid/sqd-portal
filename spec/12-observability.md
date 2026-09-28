@@ -121,7 +121,9 @@ eviction rate (the HZ-13 witness); exchange attempts and outcomes by operational
 answered, refused by budget, failed — with latency (the LIV-13/LIV-14 and DC-8 capacity
 witnesses); and a count of grants whose offered lifetime was capped. For the cliff it also
 carries a counter of admissions served on renewal grace and one of admissions served past
-the hard expiry on outage grace, the number of grants currently in each state, and the
+the hard expiry on outage grace — the latter by cause, a failed exchange or a spent local
+budget, since only the first is the control plane's silence — the number of grants
+currently in each state, and the
 minimum time remaining before the first of them is dropped (zero when none are in either),
 the counts and the minimum recomputed on scrape by one walk of the cache under its lock — a
 walk P-GRANT-CACHE-CAPACITY bounds. The three kinds answer different questions: the rates

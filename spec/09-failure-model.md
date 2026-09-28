@@ -86,7 +86,7 @@ P-GRANT-OUTAGE-GRACE more while the authority is demonstrably silent (REQ-54, AD
 | Answer about a different credential than was asked about | integrity: discard and refuse as UPSTREAM-FAILURE |
 | Answer offers a lifetime beyond P-GRANT-MAX-LIFETIME | mask: accept, capped at the bound; count it as a control-plane misconfiguration |
 | Authoritative denial arriving against a live cached grant | fail-closed: evict and refuse from that moment; a denial is never outranked by remaining lifetime (INV-6) |
-| Exchange rate-limited or over the in-flight cap | with no usable grant, fail-safe immediately as OVERLOADED with a retry hint; with a grant still held, suppress this renewal and serve on the grant. Never queue or claim the credential is invalid (REQ-54, HZ-10) |
+| Exchange rate-limited or over the in-flight cap | with no usable grant, fail-safe immediately as OVERLOADED with a retry hint; with a grant still held, suppress this renewal and serve on the grant — past `expires_at`, counted as stale by budget, not by outage: the control plane was never asked. Never queue or claim the credential is invalid (REQ-54, HZ-10) |
 | Signing headers malformed or unattributable, or timestamp skew past P-SIGNATURE-MAX-SKEW in either direction | fail-safe as UPSTREAM-FAILURE, and alarm: it fails every exchange at once and the cause is local clock, identity, or request construction, not any client's key |
 | Control plane never reached at all, either mode | mask for readiness — stay ready and refuse retryably (INV-31); leaving rotation would answer one outage with a larger one |
 | Signing identity missing or empty at startup | fail-safe at startup: refuse to run (REQ-33) |

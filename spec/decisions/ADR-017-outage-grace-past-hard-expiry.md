@@ -68,11 +68,14 @@ answer**, for at most P-GRANT-OUTAGE-GRACE beyond the hard expiry, and no furthe
    end. It is long by default because it cannot be raised during the incident it exists
    for. Whether a shared Portal should run a shorter one than a single-tenant one is
    OQ-17.
-4. **Stale is its own signal.** Admissions past the hard expiry are counted apart from
-   renewal grace, as is the number of grants in that state; the minimum-remaining gauge
-   now names the outage-grace cliff. Renewal grace happens on every healthy refresh; stale
-   admission never happens while the control plane is healthy, so any rate at all is an
-   outage in progress and pages (OB-9, OB-13).
+4. **Stale is its own signal, by cause.** Admissions past the hard expiry are counted
+   apart from renewal grace and split by what refused the revalidation: the exchange
+   failed, or the local budget never made it. The number of grants in that state is
+   counted too, and the minimum-remaining gauge now names the outage-grace cliff. Renewal
+   grace happens on every healthy refresh; a stale admission on a failed exchange never
+   happens while the control plane is healthy, so any rate at all is an outage in progress
+   and pages. A stale admission on a spent budget is a flood or a cold fleet, with the
+   control plane unasked, and is not an outage page (OB-9, OB-13).
 
 Nothing here changes the direction of failure on the credential itself, readiness (INV-31),
 what survives a restart (NG5), or the lifetime cap on what the control plane may offer.

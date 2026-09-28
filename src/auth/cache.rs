@@ -24,7 +24,7 @@ use super::{
     now_secs,
     singleflight::KeyedLocks,
 };
-use crate::metrics::{self, ExchangeOutcome};
+use crate::metrics::{self, ExchangeOutcome, StaleCause};
 
 /// A grant as held, after the portal's own cap has been applied to what the
 /// control plane offered.
@@ -170,7 +170,7 @@ impl GrantCache {
             // now. Without it the request revalidates below, and is served
             // on the grant only if that revalidation cannot run either.
             if self.authority_silent_since(grant.expires_at) {
-                self.report(metrics::report_stale_admission);
+                self.report(|| metrics::report_stale_admission(StaleCause::Unavailable));
                 self.spawn_refresh(credential, now);
                 return Resolved::Grant(grant);
             }
@@ -227,13 +227,19 @@ impl GrantCache {
     /// wait plus a failed exchange can outlast what the fast path saw.
     fn or_grace(&self, resolved: Resolved, held: Option<Arc<CachedGrant>>, now: u64) -> Resolved {
         match (resolved, held) {
-            (Resolved::Saturated | Resolved::Unavailable, Some(grant))
+            (refusal @ (Resolved::Saturated | Resolved::Unavailable), Some(grant))
                 if self.discard_at(&grant) > now =>
             {
                 if grant.expires_at > now {
                     self.report(metrics::report_grace_admission);
                 } else {
-                    self.report(metrics::report_stale_admission);
+                    // Past the expiry the cause matters: a spent budget never
+                    // asked the authority, so it must not read as its silence.
+                    let cause = match refusal {
+                        Resolved::Saturated => StaleCause::Saturated,
+                        _ => StaleCause::Unavailable,
+                    };
+                    self.report(|| metrics::report_stale_admission(cause));
                 }
                 Resolved::Grant(grant)
             }
@@ -975,7 +981,7 @@ mod tests {
         // below are the ones the expired grant costs.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let before = cp.exchanges();
-        let stale_before = metrics::stale_admissions();
+        let stale_before = metrics::stale_admissions(StaleCause::Unavailable);
 
         // The last failure this replica saw predates the expiry, so the first
         // request past it revalidates rather than trusting old news — and is
@@ -987,7 +993,7 @@ mod tests {
             before + 1,
             "the expired grant is revalidated first"
         );
-        assert!(metrics::stale_admissions() > stale_before);
+        assert!(metrics::stale_admissions(StaleCause::Unavailable) > stale_before);
 
         // With the authority now known silent since the expiry, the next
         // request is served without waiting on another attempt.
@@ -1044,6 +1050,30 @@ mod tests {
             matches!(resolved, Resolved::Denied(_)),
             "the revoked key must not ride its stale grant past the recovery, got {resolved:?}"
         );
+    }
+
+    /// A spent budget past the expiry serves the grant too, but the authority
+    /// was never asked, so it must not read as the authority's silence: the
+    /// admission is counted under its own cause, and the fast path — which is
+    /// silence evidence only — is not opened by it.
+    #[tokio::test]
+    async fn a_spent_budget_past_the_expiry_is_stale_by_budget_not_by_outage() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+        cache.exhaust_budget_for_test();
+        let saturated_before = metrics::stale_admissions(StaleCause::Saturated);
+
+        let served = cache.resolve(&credential(), NOW + 901).await;
+
+        assert_eq!(granted(&served).key_id, KEY_ID);
+        assert!(metrics::stale_admissions(StaleCause::Saturated) > saturated_before);
+        assert!(
+            !cache.authority_silent_since(NOW + 900),
+            "a budget refusal is not evidence the authority is down"
+        );
+        assert_eq!(cp.exchanges(), 1, "the control plane was never asked");
     }
 
     /// The knob at zero is the behaviour before it existed: nothing serves past
