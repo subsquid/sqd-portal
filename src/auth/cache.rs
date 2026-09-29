@@ -24,7 +24,7 @@ use super::{
     now_secs,
     singleflight::KeyedLocks,
 };
-use crate::metrics::{self, ExchangeOutcome};
+use crate::metrics::{self, ExchangeBudget, ExchangeOutcome};
 
 /// A grant as held, after the portal's own cap has been applied to what the
 /// control plane offered.
@@ -116,8 +116,16 @@ impl GrantCache {
             denials: Mutex::new(LruCache::new(nonzero(limits.denial_cache_capacity))),
             failures: Mutex::new(LruCache::new(nonzero(limits.denial_cache_capacity))),
             inflight: KeyedLocks::default(),
-            admission: Budget::new(limits.max_inflight_exchanges, limits.exchange_rate_per_sec),
-            renewal: Budget::new(limits.max_inflight_renewals, limits.renewal_rate_per_sec),
+            admission: Budget::new(
+                ExchangeBudget::Admission,
+                limits.max_inflight_exchanges,
+                limits.exchange_rate_per_sec,
+            ),
+            renewal: Budget::new(
+                ExchangeBudget::Renewal,
+                limits.max_inflight_renewals,
+                limits.renewal_rate_per_sec,
+            ),
             last_success: AtomicU64::new(0),
             started_at: now_secs(),
             limits,
@@ -249,20 +257,23 @@ impl GrantCache {
         } else {
             &self.admission
         };
+        let spent = budget.kind;
         let Ok(_permit) = budget.permits.try_acquire() else {
-            self.report(|| metrics::report_exchange(ExchangeOutcome::Saturated, None));
+            self.report(|| metrics::report_exchange(ExchangeOutcome::Saturated, spent, None));
             tracing::warn!(
                 key_id = credential.key_id,
                 outcome = "over_inflight_cap",
+                budget = spent.as_str(),
                 "credential exchange skipped: too many in flight"
             );
             return self.remember_failure(&credential.fingerprint, Resolved::Saturated);
         };
         if !budget.limiter.lock().unwrap().take() {
-            self.report(|| metrics::report_exchange(ExchangeOutcome::Saturated, None));
+            self.report(|| metrics::report_exchange(ExchangeOutcome::Saturated, spent, None));
             tracing::warn!(
                 key_id = credential.key_id,
                 outcome = "rate_limited",
+                budget = spent.as_str(),
                 "credential exchange skipped: rate limit"
             );
             return self.remember_failure(&credential.fingerprint, Resolved::Saturated);
@@ -284,7 +295,7 @@ impl GrantCache {
                 // freshness gauge.
                 if grant.expires_at <= expired_by {
                     self.report(|| {
-                        metrics::report_exchange(ExchangeOutcome::Failed, Some(elapsed))
+                        metrics::report_exchange(ExchangeOutcome::Failed, spent, Some(elapsed))
                     });
                     tracing::warn!(
                         key_id = grant.key_id,
@@ -293,13 +304,17 @@ impl GrantCache {
                     return self.remember_failure(&credential.fingerprint, Resolved::Unavailable);
                 }
                 self.last_success.store(settled, Ordering::Release);
-                self.report(|| metrics::report_exchange(ExchangeOutcome::Answered, Some(elapsed)));
+                self.report(|| {
+                    metrics::report_exchange(ExchangeOutcome::Answered, spent, Some(elapsed))
+                });
                 let cached = self.store(&credential.fingerprint, grant, settled);
                 Resolved::Grant(cached)
             }
             Ok(Exchanged::Denied(reason)) => {
                 self.last_success.store(settled, Ordering::Release);
-                self.report(|| metrics::report_exchange(ExchangeOutcome::Answered, Some(elapsed)));
+                self.report(|| {
+                    metrics::report_exchange(ExchangeOutcome::Answered, spent, Some(elapsed))
+                });
                 // A denial outranks the grant's remaining lifetime: the
                 // authority has spoken since (INV-6).
                 self.grants.lock().unwrap().pop(&credential.fingerprint);
@@ -308,7 +323,9 @@ impl GrantCache {
                 Resolved::Denied(reason)
             }
             Err(err) => {
-                self.report(|| metrics::report_exchange(ExchangeOutcome::Failed, Some(elapsed)));
+                self.report(|| {
+                    metrics::report_exchange(ExchangeOutcome::Failed, spent, Some(elapsed))
+                });
                 tracing::warn!(
                     key_id = credential.key_id,
                     outcome = "failed",
@@ -533,13 +550,15 @@ fn latest_second_reached(now: u64, elapsed: Duration) -> u64 {
 /// An in-flight cap and a token bucket, spent together by one class of
 /// exchange.
 struct Budget {
+    kind: ExchangeBudget,
     permits: Semaphore,
     limiter: Mutex<RateLimiter>,
 }
 
 impl Budget {
-    fn new(max_inflight: usize, rate_per_sec: u64) -> Self {
+    fn new(kind: ExchangeBudget, max_inflight: usize, rate_per_sec: u64) -> Self {
         Self {
+            kind,
             permits: Semaphore::new(max_inflight),
             limiter: Mutex::new(RateLimiter::new(rate_per_sec)),
         }
@@ -1016,6 +1035,37 @@ mod tests {
         assert_eq!(refused, "revoked");
     }
 
+    /// OB-13: a spent renewal budget stops revocations landing while every
+    /// held key keeps serving, so it must be told apart from a spent admission
+    /// budget on the scrape.
+    #[tokio::test]
+    async fn a_refused_renewal_is_counted_against_the_renewal_budget() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+
+        let before = metrics::exchanges(ExchangeOutcome::Saturated, ExchangeBudget::Renewal);
+        cache.renewal.exhaust_for_test();
+        granted(&cache.resolve(&credential(), NOW + 400).await);
+
+        // The renewal runs off the request path; the counter is process-global,
+        // so only the monotone direction is race-tolerant.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics::exchanges(ExchangeOutcome::Saturated, ExchangeBudget::Renewal) <= before
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the refused renewal must be counted under budget=renewal");
+        assert_eq!(
+            cp.exchanges(),
+            1,
+            "the refused renewal must not reach the control plane"
+        );
+    }
+
     /// The control plane sets the lifetime; the portal owns the ceiling.
     #[tokio::test]
     async fn an_over_long_lifetime_is_capped() {
@@ -1157,9 +1207,9 @@ mod tests {
         assert!(!enforcing.silent());
 
         // The enforcing direction is race-tolerant: other tests only ever add.
-        let before = metrics::exchanges(ExchangeOutcome::Answered);
+        let before = metrics::exchanges(ExchangeOutcome::Answered, ExchangeBudget::Admission);
         enforcing.resolve(&credential(), NOW).await;
-        assert!(metrics::exchanges(ExchangeOutcome::Answered) > before);
+        assert!(metrics::exchanges(ExchangeOutcome::Answered, ExchangeBudget::Admission) > before);
     }
 
     /// A grant whose whole life fits inside the exchange that fetched it is not
@@ -1176,7 +1226,7 @@ mod tests {
 
         // The counters are process-global, so only the monotone direction is
         // race-tolerant; the claim about *this* exchange is read off the cache.
-        let failed_before = metrics::exchanges(ExchangeOutcome::Failed);
+        let failed_before = metrics::exchanges(ExchangeOutcome::Failed, ExchangeBudget::Admission);
 
         let resolved = cache.resolve(&credential(), NOW).await;
 
@@ -1184,7 +1234,9 @@ mod tests {
             matches!(resolved, Resolved::Unavailable),
             "an expired grant is a dependency failure, not a verdict: got {resolved:?}"
         );
-        assert!(metrics::exchanges(ExchangeOutcome::Failed) > failed_before);
+        assert!(
+            metrics::exchanges(ExchangeOutcome::Failed, ExchangeBudget::Admission) > failed_before
+        );
         assert_eq!(
             cache.last_success.load(Ordering::Acquire),
             0,
