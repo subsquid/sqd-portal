@@ -98,7 +98,8 @@ P-GRANT-REFRESH-JITTER, and unconditionally at that grant's `expires_at`. The sa
 covers every narrowing of a live key — a withdrawn dataset, a reduced scope — since all of
 them reach the Portal only as the next grant. The first bound
 needs a healthy control plane and a request to arrive — an idle credential converges
-trivially, since nothing is being served on it. The second needs nothing at all: it holds
+trivially, since nothing is being served on it — and holds through a flood of unknown
+tokens, since renewals spend their own budget (DC-8, HZ-10). The second needs nothing at all: it holds
 through an outage, which is what makes the stale-authorization window a number rather than
 a hope, and it is capped for the fleet at P-GRANT-MAX-LIFETIME (REQ-54). Convergence is per
 replica and needs no coordination; two replicas may sit a refresh apart, bounded by the same

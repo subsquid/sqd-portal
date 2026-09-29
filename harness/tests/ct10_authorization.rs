@@ -633,6 +633,10 @@ async fn enforcing(fx: &mut Fixture) -> anyhow::Result<()> {
                 || labels.contains("failed"),
             "OB-13: unexpected exchange outcome label: {labels}",
         );
+        ensure!(
+            labels.contains(r#"budget="admission""#) || labels.contains(r#"budget="renewal""#),
+            "OB-13: exchange outcome without the budget it spent: {labels}",
+        );
     }
 
     // The unattributable row of DC-8's error table, driven from the far side:

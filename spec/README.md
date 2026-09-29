@@ -67,6 +67,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 | ADR-014 | 2026-07-17 | [Contract reconciliation: overload hints, conflict precedence, artifact regression, archival finalized head, EMPTY metadata, timestamp frontier, gated debug surface](decisions/ADR-014-contract-reconciliation.md) | Accepted |
 | ADR-015 | 2026-07-21 | [One connection-class replay on the real-time path](decisions/ADR-015-real-time-connection-replay.md) | Accepted |
 | ADR-016 | 2026-08-12 | [Shadow usage measurement: encoded bytes at egress, deltas, and tolerated loss](decisions/ADR-016-shadow-usage-measurement.md) | Accepted |
+| ADR-017 | 2026-09-29 | [The outage runway is the grant lifetime; renewals get their own budget](decisions/ADR-017-lifetime-is-the-outage-runway.md) | Accepted |
 | ADR-013 | 2026-07-17 | [Assignment staleness must be bounded and observable](decisions/ADR-013-assignment-staleness-bound.md) | **Proposed** |
 
 ## Conventions

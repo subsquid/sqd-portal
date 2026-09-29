@@ -104,6 +104,27 @@ impl ExchangeOutcome {
     }
 }
 
+/// Which budget an exchange spent (OB-13). Saturation of the two means opposite
+/// things: admission refuses keys the replica has not seen, retryably, while
+/// renewal keeps every held key serving on grace and stops revocations landing
+/// until `expires_at` (HZ-10). Only a credential with a held grant can spend
+/// renewal, and holding one takes the whole secret, so the label names no key
+/// (GAP-32).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExchangeBudget {
+    Admission,
+    Renewal,
+}
+
+impl ExchangeBudget {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::Renewal => "renewal",
+        }
+    }
+}
+
 /// Why one usage record never reached the control plane (OB-15, HZ-14).
 /// Closed set, and each value is bound to its own counter at construction — the
 /// hot path increments a pointer it already holds rather than looking a label
@@ -412,9 +433,13 @@ pub fn credential_channels(channel: &str) -> u64 {
 }
 
 /// Count one credential exchange and how long it took (OB-13).
-pub fn report_exchange(outcome: ExchangeOutcome, elapsed: Option<Duration>) {
+pub fn report_exchange(
+    outcome: ExchangeOutcome,
+    budget: ExchangeBudget,
+    elapsed: Option<Duration>,
+) {
     EXCHANGES
-        .get_or_create(&vec![("outcome".to_owned(), outcome.as_str().to_owned())])
+        .get_or_create(&exchange_labels(outcome, budget))
         .inc();
     if let Some(elapsed) = elapsed {
         EXCHANGE_DURATION.observe(elapsed.as_secs_f64());
@@ -422,10 +447,17 @@ pub fn report_exchange(outcome: ExchangeOutcome, elapsed: Option<Duration>) {
 }
 
 #[cfg(test)]
-pub fn exchanges(outcome: ExchangeOutcome) -> u64 {
+pub fn exchanges(outcome: ExchangeOutcome, budget: ExchangeBudget) -> u64 {
     EXCHANGES
-        .get_or_create(&vec![("outcome".to_owned(), outcome.as_str().to_owned())])
+        .get_or_create(&exchange_labels(outcome, budget))
         .get()
+}
+
+fn exchange_labels(outcome: ExchangeOutcome, budget: ExchangeBudget) -> Labels {
+    vec![
+        ("outcome".to_owned(), outcome.as_str().to_owned()),
+        ("budget".to_owned(), budget.as_str().to_owned()),
+    ]
 }
 
 /// Seconds since the control plane last answered anything. Republished on
@@ -836,7 +868,7 @@ pub fn register_metrics(registry: &mut Registry) {
     );
     registry.register(
         "auth_exchanges",
-        "Credential exchanges by coarse outcome; carries no key id and no denial reason",
+        "Credential exchanges by coarse outcome and the budget spent; carries no key id and no denial reason",
         EXCHANGES.clone(),
     );
     registry.register(

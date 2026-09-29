@@ -116,8 +116,12 @@ metric (INV-30).
 **OB-13 — Grant cache and exchange health.** Authorizing deployments only. In enforcing
 mode, the public scrape carries cache occupancy against P-GRANT-CACHE-CAPACITY and the
 eviction rate (the HZ-13 witness); exchange attempts and outcomes by operational class —
-answered, refused by budget, failed — with latency (the LIV-13/LIV-14 and DC-8 capacity
-witnesses); and a count of grants whose offered lifetime was capped. For the cliff it also
+answered, refused by budget, failed — per budget spent, with latency (the LIV-13/LIV-14 and
+DC-8 capacity witnesses); and a count of grants whose offered lifetime was capped. The
+budget split is what tells the two refusals apart: a spent admission budget turns new keys
+away, while a spent renewal budget refuses no one and instead stops revocations landing
+until `expires_at` (HZ-10). It names no key: only a held grant spends renewal, and holding
+one takes the whole secret (GAP-32). For the cliff it also
 carries a counter of admissions served on renewal grace, the number of grants currently in
 that state, and the minimum time remaining to `expires_at` among them (zero when none are in
 grace), the latter two recomputed on scrape by one walk of the cache under its lock — a walk
