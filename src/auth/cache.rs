@@ -1041,7 +1041,16 @@ mod tests {
     async fn a_spent_budget_past_the_expiry_refuses() {
         let cp = MockControlPlane::spawn().await;
         cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
-        let cache = cache_for(&cp).await;
+        // One token a second, so the bucket cannot refill between the
+        // exhaustion and the request on a slow runner.
+        let cache = cache_with_limits(
+            &cp,
+            Limits {
+                exchange_rate_per_sec: 1,
+                ..cp.config().limits
+            },
+        )
+        .await;
         cache.resolve(&credential(), NOW).await;
         cache.exhaust_budget_for_test();
 
@@ -1161,8 +1170,9 @@ mod tests {
                 &cp,
                 Limits {
                     // The cooldown is the exchange timeout; a short one lets
-                    // the refresh below run within the test.
-                    exchange_timeout_ms: 20,
+                    // the refresh below run within the test, but it is also
+                    // the HTTP deadline, so not so short a slow runner misses it.
+                    exchange_timeout_ms: 250,
                     ..cp.config().limits
                 },
             )
