@@ -65,7 +65,9 @@ impl ControlPlaneClient {
 
         let response = request.body(body).send().await?;
         let status = response.status();
-        anyhow::ensure!(status.is_success(), "exchange returned status {status}");
+        if !status.is_success() {
+            return Err(StatusError(status).into());
+        }
 
         match response.json::<ExchangeAnswer>().await? {
             ExchangeAnswer::Denied { reason } => Ok(Exchanged::Denied(reason)),
@@ -89,6 +91,33 @@ impl ControlPlaneClient {
             }
         }
     }
+}
+
+/// A non-success status from the exchange, kept typed so [`is_outage`] can
+/// read it back.
+#[derive(Debug)]
+struct StatusError(reqwest::StatusCode);
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exchange returned status {}", self.0)
+    }
+}
+
+impl std::error::Error for StatusError {}
+
+/// Whether a failed exchange means the control plane did not answer —
+/// unreachable, timed out, or a 5xx — rather than answered with something this
+/// build cannot use. Only the first may carry a grant past its hard expiry: an
+/// unreadable answer, an unknown claims version or a 4xx is the control plane
+/// speaking, and reading it as silence would serve what it just declined to
+/// grant (REQ-54).
+pub fn is_outage(err: &anyhow::Error) -> bool {
+    if let Some(status) = err.downcast_ref::<StatusError>() {
+        return status.0.is_server_error();
+    }
+    err.downcast_ref::<reqwest::Error>()
+        .is_some_and(|err| !err.is_decode())
 }
 
 /// Appends the endpoint to a base that carries the control plane's own mount

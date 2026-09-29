@@ -8,7 +8,7 @@
 use std::{
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -18,13 +18,13 @@ use lru::LruCache;
 use tokio::sync::Semaphore;
 
 use super::{
-    client::{ControlPlaneClient, Exchanged},
+    client::{self, ControlPlaneClient, Exchanged},
     config::{Enforcement, Limits},
     extractor::Credential,
     now_secs,
     singleflight::KeyedLocks,
 };
-use crate::metrics::{self, ExchangeOutcome, StaleCause};
+use crate::metrics::{self, ExchangeOutcome};
 
 /// A grant as held, after the portal's own cap has been applied to what the
 /// control plane offered.
@@ -80,6 +80,12 @@ struct Failure {
     /// not come back fresher.
     completed_at: Instant,
     retry_after: Instant,
+    /// Wall-clock second the exchange failed to answer at all (DC-8 outage,
+    /// not an unusable answer or a spent budget). The only evidence that lets
+    /// this credential's grant answer past `expires_at` (REQ-54); it is per
+    /// credential because attempts on one fingerprint are serialized, so the
+    /// record is always its latest word.
+    outage_at: Option<u64>,
 }
 
 pub struct GrantCache {
@@ -104,21 +110,6 @@ pub struct GrantCache {
     /// climbs through an outage, which is the operator's distance to the
     /// `expires_at` cliff (OB-9, OB-13).
     last_success: AtomicU64,
-    /// Wall-clock second of the last exchange that could not answer at all —
-    /// not a denial and not a budget refusal, the call itself. Says only that
-    /// silence postdates a grant's expiry; whether it is the authority's last
-    /// word is `last_word_failed`.
-    last_failure: AtomicU64,
-    /// Whether the exchange that completed most recently failed to answer.
-    /// Kept apart from the two seconds above because those are stamped from
-    /// each caller's floored clock, so two overlapping exchanges can record
-    /// them out of completion order — and a recovery recorded "earlier" than
-    /// the failure it followed would leave expired grants serving unrevalidated.
-    /// This flag is set at completion and cannot misorder. Together with
-    /// `last_failure` it is the only evidence a replica has that the authority
-    /// is down, and the only thing that lets a grant past `expires_at` keep
-    /// serving (REQ-54).
-    last_word_failed: AtomicBool,
     /// Falls back for the gauge while `last_success` is still 0, so a replica
     /// that has never been served counts up from boot instead of reading as
     /// freshly successful.
@@ -140,8 +131,6 @@ impl GrantCache {
             permits: Semaphore::new(limits.max_inflight_exchanges),
             limiter: Mutex::new(RateLimiter::new(limits.exchange_rate_per_sec)),
             last_success: AtomicU64::new(0),
-            last_failure: AtomicU64::new(0),
-            last_word_failed: AtomicBool::new(false),
             started_at: now_secs(),
             limits,
         });
@@ -165,12 +154,10 @@ impl GrantCache {
                 return Resolved::Grant(grant);
             }
             // Past the hard expiry the grant answers only while the authority
-            // is silent, and silence has to have been witnessed since the
-            // grant expired: a failure older than that says nothing about
-            // now. Without it the request revalidates below, and is served
-            // on the grant only if that revalidation cannot run either.
-            if self.authority_silent_since(grant.expires_at) {
-                self.report(|| metrics::report_stale_admission(StaleCause::Unavailable));
+            // is failing to answer this credential, witnessed since the grant
+            // expired. Without that the request revalidates below.
+            if self.outage_since(&credential.fingerprint, grant.expires_at) {
+                self.report(metrics::report_stale_admission);
                 self.spawn_refresh(credential, now);
                 return Resolved::Grant(grant);
             }
@@ -208,6 +195,7 @@ impl GrantCache {
         // control plane costs one full timeout per request, serially.
         if let Some(resolved) = self.failure_since(&credential.fingerprint, arrived) {
             return self.or_grace(
+                &credential.fingerprint,
                 resolved,
                 held,
                 latest_second_reached(now, arrived.elapsed()),
@@ -215,6 +203,7 @@ impl GrantCache {
         }
         let resolved = self.exchange(credential, now).await;
         self.or_grace(
+            &credential.fingerprint,
             resolved,
             held,
             latest_second_reached(now, arrived.elapsed()),
@@ -225,22 +214,28 @@ impl GrantCache {
     /// held, or the grace would depend on which side of the lock the request
     /// arrived (REQ-54). `now` is the admission second, not the arrival: the
     /// wait plus a failed exchange can outlast what the fast path saw.
-    fn or_grace(&self, resolved: Resolved, held: Option<Arc<CachedGrant>>, now: u64) -> Resolved {
+    fn or_grace(
+        &self,
+        fingerprint: &str,
+        resolved: Resolved,
+        held: Option<Arc<CachedGrant>>,
+        now: u64,
+    ) -> Resolved {
         match (resolved, held) {
-            (refusal @ (Resolved::Saturated | Resolved::Unavailable), Some(grant))
-                if self.discard_at(&grant) > now =>
+            (Resolved::Saturated | Resolved::Unavailable, Some(grant))
+                if grant.expires_at > now =>
             {
-                if grant.expires_at > now {
-                    self.report(metrics::report_grace_admission);
-                } else {
-                    // Past the expiry the cause matters: a spent budget never
-                    // asked the authority, so it must not read as its silence.
-                    let cause = match refusal {
-                        Resolved::Saturated => StaleCause::Saturated,
-                        _ => StaleCause::Unavailable,
-                    };
-                    self.report(|| metrics::report_stale_admission(cause));
-                }
+                self.report(metrics::report_grace_admission);
+                Resolved::Grant(grant)
+            }
+            // Past the expiry only an outage of this credential's exchange
+            // serves: a spent budget never asked, and an unusable answer is
+            // the authority speaking.
+            (Resolved::Unavailable, Some(grant))
+                if self.discard_at(&grant) > now
+                    && self.outage_since(fingerprint, grant.expires_at) =>
+            {
+                self.report(metrics::report_stale_admission);
                 Resolved::Grant(grant)
             }
             (resolved, _) => resolved,
@@ -255,26 +250,15 @@ impl GrantCache {
             .saturating_add(self.limits.outage_grace_secs)
     }
 
-    /// Whether the exchange has failed to answer at or after `since`, with no
-    /// answer from the authority after that failure. A failure that predates
-    /// `since` is not evidence about the present; an answer since it means the
-    /// authority is back, whatever it said. "After" is completion order, not
-    /// the stamped second: the seconds are compared only against `since`.
-    fn authority_silent_since(&self, since: u64) -> bool {
-        self.last_word_failed.load(Ordering::Acquire)
-            && self.last_failure.load(Ordering::Acquire) >= since
-    }
-
-    /// The control plane spoke — a grant or a denial — at `settled`.
-    fn record_answer(&self, settled: u64) {
-        self.last_success.fetch_max(settled, Ordering::AcqRel);
-        self.last_word_failed.store(false, Ordering::Release);
-    }
-
-    /// The exchange could not answer at `settled`.
-    fn record_failure(&self, settled: u64) {
-        self.last_failure.fetch_max(settled, Ordering::AcqRel);
-        self.last_word_failed.store(true, Ordering::Release);
+    /// Whether this credential's latest exchange failed to answer at or after
+    /// `since`. A failure older than `since` says nothing about the present.
+    fn outage_since(&self, fingerprint: &str, since: u64) -> bool {
+        self.failures
+            .lock()
+            .unwrap()
+            .peek(fingerprint)
+            .and_then(|failure| failure.outage_at)
+            .is_some_and(|at| at >= since)
     }
 
     /// The renewal a request past `refresh_after` triggers without waiting for
@@ -351,7 +335,6 @@ impl GrantCache {
                 // published: counting it answered would refresh the OB-9
                 // freshness gauge.
                 if grant.expires_at <= expired_by {
-                    self.record_failure(settled);
                     self.report(|| {
                         metrics::report_exchange(ExchangeOutcome::Failed, Some(elapsed))
                     });
@@ -361,13 +344,13 @@ impl GrantCache {
                     );
                     return self.remember_failure(&credential.fingerprint, Resolved::Unavailable);
                 }
-                self.record_answer(settled);
+                self.last_success.store(settled, Ordering::Release);
                 self.report(|| metrics::report_exchange(ExchangeOutcome::Answered, Some(elapsed)));
                 let cached = self.store(&credential.fingerprint, grant, settled);
                 Resolved::Grant(cached)
             }
             Ok(Exchanged::Denied(reason)) => {
-                self.record_answer(settled);
+                self.last_success.store(settled, Ordering::Release);
                 self.report(|| metrics::report_exchange(ExchangeOutcome::Answered, Some(elapsed)));
                 // A denial outranks the grant's remaining lifetime: the
                 // authority has spoken since (INV-6).
@@ -377,7 +360,6 @@ impl GrantCache {
                 Resolved::Denied(reason)
             }
             Err(err) => {
-                self.record_failure(settled);
                 self.report(|| metrics::report_exchange(ExchangeOutcome::Failed, Some(elapsed)));
                 tracing::warn!(
                     key_id = credential.key_id,
@@ -385,7 +367,8 @@ impl GrantCache {
                     error = %err,
                     "credential exchange failed"
                 );
-                self.remember_failure(&credential.fingerprint, Resolved::Unavailable)
+                let outage_at = client::is_outage(&err).then_some(settled);
+                self.remember(&credential.fingerprint, Resolved::Unavailable, outage_at)
             }
         }
     }
@@ -453,6 +436,10 @@ impl GrantCache {
     }
 
     fn remember_failure(&self, fingerprint: &str, resolved: Resolved) -> Resolved {
+        self.remember(fingerprint, resolved, None)
+    }
+
+    fn remember(&self, fingerprint: &str, resolved: Resolved, outage_at: Option<u64>) -> Resolved {
         let completed_at = Instant::now();
         self.failures.lock().unwrap().put(
             fingerprint.to_owned(),
@@ -461,6 +448,7 @@ impl GrantCache {
                 completed_at,
                 // Retrying faster than one call takes cannot learn anything.
                 retry_after: completed_at + self.limits.exchange_timeout(),
+                outage_at,
             },
         );
         resolved
@@ -474,16 +462,16 @@ impl GrantCache {
         (failure.completed_at >= arrived).then(|| failure.resolved.clone())
     }
 
+    /// Reads without removing: the record is also the credential's outage
+    /// evidence, and dropping it with the cooldown would send every request
+    /// past the expiry back to a synchronous exchange. A later attempt
+    /// overwrites it and a grant clears it.
     fn cooling_down(&self, fingerprint: &str) -> bool {
-        let mut failures = self.failures.lock().unwrap();
-        let Some(failure) = failures.get(fingerprint) else {
-            return false;
-        };
-        if failure.retry_after > Instant::now() {
-            return true;
-        }
-        failures.pop(fingerprint);
-        false
+        self.failures
+            .lock()
+            .unwrap()
+            .peek(fingerprint)
+            .is_some_and(|failure| failure.retry_after > Instant::now())
     }
 
     /// A grant not yet discarded: inside its hard expiry, or past it and held
@@ -513,12 +501,13 @@ impl GrantCache {
     /// One walk per scrape, bounded by the capacity.
     pub fn grace_census(&self, now: u64) -> GraceCensus {
         let grants = self.grants.lock().unwrap();
+        let failures = self.failures.lock().unwrap();
         let mut census = GraceCensus {
             in_grace: 0,
             stale: 0,
             min_remaining: 0,
         };
-        for (_, grant) in grants.iter() {
+        for (fingerprint, grant) in grants.iter() {
             if grant.refresh_after > now {
                 continue;
             }
@@ -528,8 +517,16 @@ impl GrantCache {
             }
             if grant.expires_at > now {
                 census.in_grace += 1;
-            } else {
+            } else if failures
+                .peek(fingerprint)
+                .and_then(|failure| failure.outage_at)
+                .is_some_and(|at| at >= grant.expires_at)
+            {
                 census.stale += 1;
+            } else {
+                // Expired and idle, or expired on a healthy control plane:
+                // nothing is being served on it, so it names no cliff.
+                continue;
             }
             let remaining = discard_at - now;
             census.min_remaining = if census.in_grace + census.stale == 1 {
@@ -832,14 +829,18 @@ mod tests {
                 },
             );
         }
+        // Outages witnessed after each expiry; "fresh" never sees one.
+        cache.remember("closest", Resolved::Unavailable, Some(NOW + 550));
+        cache.remember("further", Resolved::Unavailable, Some(NOW + 750));
 
         // The first refusal is the nearest expiry plus the outage grace.
         assert_eq!(cache.grace_census(NOW), census(2, 0, 1500));
-        // Past its hard expiry a grant is stale rather than gone, and still
-        // names the cliff; the fresh one has aged into grace by then.
+        // Past its hard expiry a grant riding an outage is stale rather than
+        // gone, and still names the cliff; the fresh one has aged into grace.
         assert_eq!(cache.grace_census(NOW + 600), census(2, 1, 900));
-        // Past its discard point a grant stops counting.
-        assert_eq!(cache.grace_census(NOW + 1500), census(0, 2, 200));
+        // Past its discard point a grant stops counting, and an expired grant
+        // with no outage behind it is idle and names nothing.
+        assert_eq!(cache.grace_census(NOW + 1500), census(0, 1, 200));
         // Nothing held reads as zero, not as a stale minimum.
         assert_eq!(cache.grace_census(NOW + 1900), census(0, 0, 0));
     }
@@ -887,30 +888,46 @@ mod tests {
             expires_at: NOW + 900,
         });
 
+        let fp = &credential().fingerprint;
         for refusal in [Resolved::Unavailable, Resolved::Saturated] {
-            let graced = cache.or_grace(refusal, Some(held.clone()), NOW + 1);
+            let graced = cache.or_grace(fp, refusal, Some(held.clone()), NOW + 1);
             assert_eq!(granted(&graced).key_id, KEY_ID);
         }
 
         // With nothing to fall back on the refusal stands, and stays retryable
         // rather than becoming a verdict about the credential.
-        let bare = cache.or_grace(Resolved::Unavailable, None, NOW + 1);
+        let bare = cache.or_grace(fp, Resolved::Unavailable, None, NOW + 1);
         assert!(matches!(bare, Resolved::Unavailable), "got {bare:?}");
 
         // The deadline is judged as of the admission, not the arrival: a lock
-        // wait plus a failed exchange can outlast the grant. A failed exchange
-        // is exactly the evidence the outage grace needs, so past `expires_at`
-        // the grant still answers — up to its discard point, where the refusal
-        // stands however live the grant looked when the request came in
-        // (REQ-54).
-        let served = cache.or_grace(Resolved::Unavailable, Some(held.clone()), NOW + 899);
+        // wait plus a failed exchange can outlast the grant (REQ-54).
+        let served = cache.or_grace(fp, Resolved::Unavailable, Some(held.clone()), NOW + 899);
         assert_eq!(granted(&served).key_id, KEY_ID);
-        let stale = cache.or_grace(Resolved::Unavailable, Some(held.clone()), NOW + 900);
+
+        // Past `expires_at` only an outage of this credential's exchange,
+        // witnessed since the expiry, serves — up to the discard point.
+        let unwitnessed = cache.or_grace(fp, Resolved::Unavailable, Some(held.clone()), NOW + 900);
+        assert!(
+            matches!(unwitnessed, Resolved::Unavailable),
+            "got {unwitnessed:?}"
+        );
+        cache.remember(fp, Resolved::Unavailable, Some(NOW + 900));
+        let stale = cache.or_grace(fp, Resolved::Unavailable, Some(held.clone()), NOW + 900);
         assert_eq!(granted(&stale).key_id, KEY_ID);
+        let saturated = cache.or_grace(fp, Resolved::Saturated, Some(held.clone()), NOW + 900);
+        assert!(
+            matches!(saturated, Resolved::Saturated),
+            "got {saturated:?}"
+        );
         let discard_at = NOW + 900 + cache.limits.outage_grace_secs;
-        let last = cache.or_grace(Resolved::Unavailable, Some(held.clone()), discard_at - 1);
+        let last = cache.or_grace(
+            fp,
+            Resolved::Unavailable,
+            Some(held.clone()),
+            discard_at - 1,
+        );
         assert_eq!(granted(&last).key_id, KEY_ID);
-        let discarded = cache.or_grace(Resolved::Unavailable, Some(held), discard_at);
+        let discarded = cache.or_grace(fp, Resolved::Unavailable, Some(held), discard_at);
         assert!(
             matches!(discarded, Resolved::Unavailable),
             "got {discarded:?}"
@@ -981,7 +998,7 @@ mod tests {
         // below are the ones the expired grant costs.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let before = cp.exchanges();
-        let stale_before = metrics::stale_admissions(StaleCause::Unavailable);
+        let stale_before = metrics::stale_admissions();
 
         // The last failure this replica saw predates the expiry, so the first
         // request past it revalidates rather than trusting old news — and is
@@ -993,7 +1010,7 @@ mod tests {
             before + 1,
             "the expired grant is revalidated first"
         );
-        assert!(metrics::stale_admissions(StaleCause::Unavailable) > stale_before);
+        assert!(metrics::stale_admissions() > stale_before);
 
         // With the authority now known silent since the expiry, the next
         // request is served without waiting on another attempt.
@@ -1012,68 +1029,80 @@ mod tests {
         );
     }
 
-    /// The seconds an exchange is stamped with come from each caller's floored
-    /// clock, so a success that started before a failure can record an earlier
-    /// second than the failure it completed after. Completion order is what
-    /// says whether the authority is back; the stamps are not allowed to
-    /// outvote it, or a revoked key rides its stale grant past the recovery.
-    #[tokio::test]
-    async fn a_later_answer_clears_the_outage_whatever_second_it_is_stamped_with() {
-        let cp = MockControlPlane::spawn().await;
-        let cache = cache_for(&cp).await;
-        cache.insert_for_test(
-            &credential().fingerprint,
-            CachedGrant {
-                key_id: KEY_ID.to_owned(),
-                datasets: None,
-                organization_id: None,
-                refresh_after: NOW,
-                expires_at: NOW + 5,
-            },
-        );
-
-        // A failure completes first but carries the later second…
-        cp.status(KEY_ID, 503);
-        cache.exchange(&credential(), NOW + 11).await;
-        assert!(cache.authority_silent_since(NOW + 5));
-        // …and the answer completing after it carries the earlier one.
-        cp.clear_status(KEY_ID);
-        cp.deny(KEY_ID, "revoked");
-        cache.exchange(&credential(), NOW + 10).await;
-
-        assert!(
-            !cache.authority_silent_since(NOW + 5),
-            "the authority's last word was an answer"
-        );
-        let resolved = cache.resolve(&credential(), NOW + 12).await;
-        assert!(
-            matches!(resolved, Resolved::Denied(_)),
-            "the revoked key must not ride its stale grant past the recovery, got {resolved:?}"
-        );
+    fn other_credential() -> Credential {
+        crate::auth::extractor::parse_token_for_test("sqd_portal_k2_anothersecretvalue")
+            .expect("the second test token parses")
     }
 
-    /// A spent budget past the expiry serves the grant too, but the authority
-    /// was never asked, so it must not read as the authority's silence: the
-    /// admission is counted under its own cause, and the fast path — which is
-    /// silence evidence only — is not opened by it.
+    /// Past the expiry the grant needs the authority to have failed; a spent
+    /// local budget never asked it. Serving here is what let a flood of junk
+    /// keys keep a revoked key working (HZ-10).
     #[tokio::test]
-    async fn a_spent_budget_past_the_expiry_is_stale_by_budget_not_by_outage() {
+    async fn a_spent_budget_past_the_expiry_refuses() {
         let cp = MockControlPlane::spawn().await;
         cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
         let cache = cache_for(&cp).await;
         cache.resolve(&credential(), NOW).await;
         cache.exhaust_budget_for_test();
-        let saturated_before = metrics::stale_admissions(StaleCause::Saturated);
 
-        let served = cache.resolve(&credential(), NOW + 901).await;
+        let refused = cache.resolve(&credential(), NOW + 901).await;
 
-        assert_eq!(granted(&served).key_id, KEY_ID);
-        assert!(metrics::stale_admissions(StaleCause::Saturated) > saturated_before);
-        assert!(
-            !cache.authority_silent_since(NOW + 900),
-            "a budget refusal is not evidence the authority is down"
-        );
+        assert!(matches!(refused, Resolved::Saturated), "got {refused:?}");
         assert_eq!(cp.exchanges(), 1, "the control plane was never asked");
+    }
+
+    /// An answer this build cannot use is the control plane speaking: a newer
+    /// claims version may carry a restriction the old grant lacks.
+    #[tokio::test]
+    async fn an_unusable_answer_past_the_expiry_refuses() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+
+        cp.raw(
+            KEY_ID,
+            serde_json::json!({
+                "result": "granted",
+                "grant": {
+                    "claims_version": crate::auth::types::CLAIMS_VERSION + 1,
+                    "key_id": KEY_ID,
+                    "refresh_after": NOW + 1300,
+                    "expires_at": NOW + 1900,
+                },
+            }),
+        );
+        let refused = cache.resolve(&credential(), NOW + 901).await;
+
+        assert!(matches!(refused, Resolved::Unavailable), "got {refused:?}");
+    }
+
+    /// Outage evidence is per credential. One key's failing exchange does not
+    /// let another key's expired grant skip revalidation, and another key's
+    /// answer does not send the failing key back to a synchronous exchange.
+    #[tokio::test]
+    async fn one_keys_outage_neither_opens_nor_closes_another_keys_grace() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        cp.grant("k2", None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+        cache.resolve(&other_credential(), NOW).await;
+
+        cp.status(KEY_ID, 503);
+        granted(&cache.resolve(&credential(), NOW + 901).await);
+
+        cp.deny("k2", "revoked");
+        let other = cache.resolve(&other_credential(), NOW + 901).await;
+        assert!(matches!(other, Resolved::Denied(_)), "got {other:?}");
+
+        let before = cp.exchanges();
+        granted(&cache.resolve(&credential(), NOW + 902).await);
+        assert_eq!(
+            cp.exchanges(),
+            before,
+            "served stale without a new exchange"
+        );
     }
 
     /// The knob at zero is the behaviour before it existed: nothing serves past

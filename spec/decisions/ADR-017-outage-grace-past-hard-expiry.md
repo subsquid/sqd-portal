@@ -50,13 +50,15 @@ should be exchanged, not served on old news.
 Past `expires_at`, a held grant keeps serving **only while the control plane is failing to
 answer**, for at most P-GRANT-OUTAGE-GRACE beyond the hard expiry, and no further.
 
-1. **Silence is the condition, and it has to be witnessed.** A grant past `expires_at`
-   answers a request without waiting only if this replica has seen an exchange fail to
-   answer — unreachable, timed out, an error status, an unreadable answer — at or after
-   the grant's expiry, with no answer from the control plane since that failure. A denial
-   is not silence; a budget refusal is not silence. Without that evidence the request
-   exchanges first, and is served on the held grant only if that exchange cannot run or
-   answer either. The first request past an expiry therefore pays one exchange's worth of
+1. **Silence is the condition, per credential, and it has to be witnessed.** A grant past
+   `expires_at` answers only if that credential's latest exchange, made at or after the
+   grant's expiry, got no answer at all: unreachable, timed out, or a 5xx. A denial, a
+   4xx, an answer this build cannot use, and a spent local budget are not silence and end
+   the grant at `expires_at` — the budget because outsiders can drain it, an unusable
+   answer because it may carry a restriction the old grant lacks. The evidence is the
+   credential's own because one key's failure says nothing about another's, and attempts
+   on one credential are serialized, so its record is always its latest word. Without that
+   evidence the request exchanges first. The first request past an expiry therefore pays one exchange's worth of
    latency once per outage per credential; every request after it is served at once while
    the renewal runs beside it.
 2. **The authority's next word outranks the grant.** The refresh keeps running through the
@@ -68,14 +70,12 @@ answer**, for at most P-GRANT-OUTAGE-GRACE beyond the hard expiry, and no furthe
    end. It is long by default because it cannot be raised during the incident it exists
    for. Whether a shared Portal should run a shorter one than a single-tenant one is
    OQ-17.
-4. **Stale is its own signal, by cause.** Admissions past the hard expiry are counted
-   apart from renewal grace and split by what refused the revalidation: the exchange
-   failed, or the local budget never made it. The number of grants in that state is
-   counted too, and the minimum-remaining gauge now names the outage-grace cliff. Renewal
-   grace happens on every healthy refresh; a stale admission on a failed exchange never
-   happens while the control plane is healthy, so any rate at all is an outage in progress
-   and pages. A stale admission on a spent budget is a flood or a cold fleet, with the
-   control plane unasked, and is not an outage page (OB-9, OB-13).
+4. **Stale is its own signal.** Admissions past the hard expiry are counted apart from
+   renewal grace, as is the number of grants riding an outage; an expired grant nobody is
+   using is neither, so the minimum-remaining gauge names the outage-grace cliff of grants
+   actually served. Renewal grace happens on every healthy refresh; stale admission never
+   happens while the control plane answers, so any rate at all is an outage in progress
+   and pages (OB-9, OB-13).
 
 Nothing here changes the direction of failure on the credential itself, readiness (INV-31),
 what survives a restart (NG5), or the lifetime cap on what the control plane may offer.
@@ -92,10 +92,10 @@ the grace protects warm replicas only. Persisting grants across restarts, or pin
 single-tenant Portal's credentials in its configuration, are the two follow-ups that would
 close that, and neither is decided here.
 
-The evidence rule is per replica. Two replicas can disagree about whether the authority is
-silent for one exchange's worth of time; INV-15's divergence bound absorbs that.
+The evidence rule is per credential and per replica. Two replicas can disagree about a
+credential for one exchange's worth of time; INV-15's divergence bound absorbs that.
 
-A Portal-local fault that fails every exchange — a rotated signing key, a clock skewed past
-P-SIGNATURE-MAX-SKEW — reads as silence and is served through on the same grace. That is
-the intended direction: the alternative is a lockout caused by the Portal's own
-configuration, and the alarm on sustained exchange failure is what distinguishes the two.
+A Portal-local fault the control plane answers with a 4xx — a rotated signing key, a clock
+skewed past P-SIGNATURE-MAX-SKEW — is not silence and does not ride the outage grace: keys
+stop at `expires_at`, as before this decision, and the alarm on sustained exchange failure
+names the cause.

@@ -487,14 +487,14 @@ and the requested dataset. Around that, four rules:
 - **A denial lands at once.** An authoritative denial replaces the cached grant the moment
   it arrives, whatever the grant's remaining lifetime.
 - **A dependency failure buys time: to `expires_at` on its own, and past it only while the
-  authority is demonstrably silent.** If the re-exchange cannot run or cannot answer, the
-  existing grant keeps serving to its hard expiry. Past the hard expiry it keeps serving
-  only while this replica has witnessed an exchange fail to answer since that expiry and
-  has heard nothing from the control plane since the failure — for at most
-  P-GRANT-OUTAGE-GRACE beyond `expires_at`, and no further. A request on an expired grant
-  with no such evidence exchanges first, and is served on the grant only if that exchange
-  cannot run or answer either; a request on one with the evidence is served at once while
-  the renewal runs beside it. The two windows together are the entire outage grace: the
+  control plane fails to answer that credential.** If the re-exchange cannot run or cannot
+  answer, the existing grant keeps serving to its hard expiry. Past the hard expiry it keeps
+  serving only while that credential's latest exchange, made since the expiry, got no
+  answer at all — unreachable, timed out, or a 5xx — for at most P-GRANT-OUTAGE-GRACE beyond
+  `expires_at`, and no further. A spent local budget, a 4xx, and an answer this build cannot
+  use are not that: they end the grant at `expires_at`. A request on an expired grant with
+  no such evidence exchanges first; one with it is served at once while the renewal runs
+  beside it. The two windows together are the entire outage grace: the
   control plane sizes the first and the Portal caps it at P-GRANT-MAX-LIFETIME; the operator
   sizes the second, and zero restores the hard expiry as the end (ADR-017). Two deadlines
   rather than one is what buys the grace at all — OQ-14 records what collapsing them would
@@ -507,12 +507,13 @@ Readiness is conditioned on none of this. A Portal that has never reached the co
 is ready and refuses retryably (INV-31): every replica shares one authority, so withholding
 readiness on its account empties the fleet in exactly the situation nobody can recover from.
 *Acceptance:* with the control plane stopped, a credential whose grant is inside its hard
-expiry keeps being served; one whose grant has passed it is served once an exchange has
-failed since the expiry, and only until P-GRANT-OUTAGE-GRACE past it; one whose grant has
+expiry keeps being served; one whose grant has passed it is served once its own exchange
+has failed to answer since the expiry, and only until P-GRANT-OUTAGE-GRACE past it; one whose grant has
 passed that too is refused as UPSTREAM-FAILURE, never as BAD-CREDENTIAL; with the control
 plane healthy, a credential whose grant has passed `expires_at` is exchanged before it is
 served and is served on what the exchange returned; with P-GRANT-OUTAGE-GRACE at zero,
-nothing is served past `expires_at` whatever the control plane's state; a key revoked while
+nothing is served past `expires_at` whatever the control plane's state; with the local
+budget spent, or the answer unusable, nothing is served past `expires_at`; a key revoked while
 the control plane is healthy stops being served no later than LIV-13's bound, and one
 revoked during an outage on the first exchange the control plane answers after it; with no
 usable grant, an exchange denied by the local budget

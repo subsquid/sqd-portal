@@ -248,7 +248,7 @@ lazy_static::lazy_static! {
     static ref GRANT_CACHE_EVICTIONS: Counter = Default::default();
     static ref GRANT_LIFETIMES_CAPPED: Counter = Default::default();
     static ref GRACE_ADMISSIONS: Counter = Default::default();
-    static ref STALE_ADMISSIONS: Family<Labels, Counter> = Default::default();
+    static ref STALE_ADMISSIONS: Counter = Default::default();
     static ref GRANTS_IN_GRACE: Gauge = Default::default();
     static ref GRANTS_STALE: Gauge = Default::default();
     static ref GRACE_MIN_REMAINING: Gauge = Default::default();
@@ -471,45 +471,17 @@ pub fn grace_admissions() -> u64 {
     GRACE_ADMISSIONS.get()
 }
 
-/// Why a request was served on a grant past its hard expiry (OB-9). Only the
-/// first is the control plane's silence; the second never asked it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StaleCause {
-    /// The exchange failed, timed out, or could not be read.
-    Unavailable,
-    /// The local exchange budget refused to make the call.
-    Saturated,
-}
-
-impl StaleCause {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unavailable => "unavailable",
-            Self::Saturated => "saturated",
-        }
-    }
-}
-
-/// A request served on a grant past its hard expiry. `unavailable` never
-/// moves while the control plane is healthy, so any rate at all is an outage
-/// in progress and the cliff is now the outage grace; `saturated` is a flood
-/// or a cold fleet spending the exchange budget, with the control plane
-/// unasked (OB-9).
-pub fn report_stale_admission(cause: StaleCause) {
-    STALE_ADMISSIONS
-        .get_or_create(&stale_cause_labels(cause))
-        .inc();
-}
-
-fn stale_cause_labels(cause: StaleCause) -> Labels {
-    vec![("cause".to_owned(), cause.as_str().to_owned())]
+/// A request served on a grant past its hard expiry because the control plane
+/// failed to answer that key's exchange. Never moves while the control plane
+/// is healthy, so any rate at all is an outage in progress and the cliff is
+/// now the outage grace (OB-9).
+pub fn report_stale_admission() {
+    STALE_ADMISSIONS.inc();
 }
 
 #[cfg(test)]
-pub fn stale_admissions(cause: StaleCause) -> u64 {
-    STALE_ADMISSIONS
-        .get_or_create(&stale_cause_labels(cause))
-        .get()
+pub fn stale_admissions() -> u64 {
+    STALE_ADMISSIONS.get()
 }
 
 /// Point-in-time census of the cliff, republished on scrape: how many grants
@@ -921,7 +893,7 @@ pub fn register_metrics(registry: &mut Registry) {
     );
     registry.register(
         "auth_stale_admissions",
-        "Requests served on a grant past its hard expiry, by cause: the exchange failed (unavailable) or the local budget refused it (saturated)",
+        "Requests served on a grant past its hard expiry because the control plane failed to answer",
         STALE_ADMISSIONS.clone(),
     );
     registry.register(
