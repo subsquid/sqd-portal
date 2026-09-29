@@ -85,6 +85,15 @@ pub struct Limits {
     #[serde(default = "default_max_inflight_exchanges")]
     pub max_inflight_exchanges: usize,
 
+    /// The renewal budget, spent only on credentials this replica holds a
+    /// grant for, and apart from the two above so a flood of unknown tokens
+    /// cannot starve renewals (HZ-10).
+    #[serde(default = "default_renewal_rate_per_sec")]
+    pub renewal_rate_per_sec: u64,
+
+    #[serde(default = "default_max_inflight_renewals")]
+    pub max_inflight_renewals: usize,
+
     /// Sized by the credential working set, not by the key set — the whole
     /// point of asking on demand (HZ-13).
     #[serde(default = "default_grant_cache_capacity")]
@@ -307,6 +316,16 @@ impl Limits {
             self.max_inflight_exchanges >= 1,
             "auth.max_inflight_exchanges must be at least 1"
         );
+        // Zero stops every renewal, which serves each grant to its expiry and
+        // then refuses it as an outage would.
+        anyhow::ensure!(
+            self.renewal_rate_per_sec >= 1,
+            "auth.renewal_rate_per_sec must be at least 1"
+        );
+        anyhow::ensure!(
+            self.max_inflight_renewals >= 1,
+            "auth.max_inflight_renewals must be at least 1"
+        );
         anyhow::ensure!(
             self.grant_cache_capacity >= 1,
             "auth.grant_cache_capacity must be at least 1"
@@ -340,6 +359,8 @@ impl Default for Limits {
             exchange_timeout_ms: default_exchange_timeout_ms(),
             exchange_rate_per_sec: default_exchange_rate_per_sec(),
             max_inflight_exchanges: default_max_inflight_exchanges(),
+            renewal_rate_per_sec: default_renewal_rate_per_sec(),
+            max_inflight_renewals: default_max_inflight_renewals(),
             grant_cache_capacity: default_grant_cache_capacity(),
             denial_cache_capacity: default_denial_cache_capacity(),
             denial_ttl_secs: default_denial_ttl_secs(),
@@ -361,6 +382,14 @@ fn default_exchange_rate_per_sec() -> u64 {
 }
 
 fn default_max_inflight_exchanges() -> usize {
+    32
+}
+
+fn default_renewal_rate_per_sec() -> u64 {
+    20
+}
+
+fn default_max_inflight_renewals() -> usize {
     32
 }
 
@@ -417,6 +446,9 @@ portal_id: portal-premium-eu
         // P-GRANT-EXCHANGE-RATE / -INFLIGHT
         assert_eq!(config.limits.exchange_rate_per_sec, 20);
         assert_eq!(config.limits.max_inflight_exchanges, 32);
+        // P-GRANT-RENEWAL-RATE / -INFLIGHT
+        assert_eq!(config.limits.renewal_rate_per_sec, 20);
+        assert_eq!(config.limits.max_inflight_renewals, 32);
         // P-GRANT-NEGATIVE-TTL / -CAPACITY
         assert_eq!(config.limits.denial_ttl_secs, 15);
         assert_eq!(config.limits.denial_cache_capacity, 4096);
@@ -586,6 +618,8 @@ portal_id: portal-premium-eu
             |l| l.exchange_timeout_ms = 0,
             |l| l.exchange_rate_per_sec = 0,
             |l| l.max_inflight_exchanges = 0,
+            |l| l.renewal_rate_per_sec = 0,
+            |l| l.max_inflight_renewals = 0,
             |l| l.grant_cache_capacity = 0,
             |l| l.denial_cache_capacity = 0,
             |l| l.denial_ttl_secs = 0,

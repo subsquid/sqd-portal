@@ -98,10 +98,12 @@ set, which is the only thing that can size them honestly.
 
 | Parameter | Role (where used) | Observed | Target |
 |---|---|---|---|
-| P-GRANT-MAX-LIFETIME | Cap on the `expires_at` the Portal will honour, however long a one the control plane offers. The fleet's worst-case stale-authorization window, and the only lifetime term the Portal owns (REQ-54, DC-8, LIV-13) | 900 s | ⚠ 15 min (draft; ratify via OQ-15) |
+| P-GRANT-MAX-LIFETIME | Cap on the `expires_at` the Portal will honour, however long a one the control plane offers. The fleet's worst-case stale-authorization window, the whole outage runway, and the only lifetime term the Portal owns (REQ-54, DC-8, LIV-13, ADR-017) | 900 s | ⚠ per deployment, at or above what the control plane issues it: 24 h single-tenant, 1 h shared (draft; ratify via OQ-15) |
 | P-GRANT-EXCHANGE-TIMEOUT | Per-exchange deadline; must stay < P-CLIENT-TIMEOUT (DC-8, ADR-010, PF-7) | 2 s | ⚠ 2 s (draft; ratify via OQ-15) |
 | P-GRANT-EXCHANGE-RATE | Token-bucket rate for exchanges (DC-8, LIV-14, HZ-10) | 20 /s | ⚠ one budget serves two opposed purposes — bounding attacker cost and admitting legitimate uncached keys (HZ-10); ratify via OQ-15 once CT-10 can measure the interference |
 | P-GRANT-EXCHANGE-INFLIGHT | Cap on concurrent exchanges (DC-8, HZ-10) | 32 | ⚠ 32 (draft; ratify via OQ-15) |
+| P-GRANT-RENEWAL-RATE | Token-bucket rate for renewing held grants, apart from P-GRANT-EXCHANGE-RATE; sized by the replica's active credentials over the refresh interval (DC-8, LIV-13, HZ-10) | 20 /s | ⚠ 20 /s (draft; ratify via OQ-15) |
+| P-GRANT-RENEWAL-INFLIGHT | Cap on concurrent renewals, apart from P-GRANT-EXCHANGE-INFLIGHT (DC-8, HZ-10) | 32 | ⚠ 32 (draft; ratify via OQ-15) |
 | P-GRANT-CACHE-CAPACITY | Cap on cached grants; sized by the replica's credential working set, not by the key set (DEF-18, DC-8, HZ-13) | 65536 | ⚠ 65536 (draft; ratify via OQ-15) |
 | P-GRANT-NEGATIVE-TTL | How long an authoritative denial suppresses repeat exchanges for the same fingerprint (DC-8) | 15 s | ⚠ 15 s (draft; ratify via OQ-15) |
 | P-GRANT-NEGATIVE-CAPACITY | Cap on remembered denials; fingerprints are attacker-chosen, so the map is bounded rather than grown (DC-8, HZ-10) | 4096 | ⚠ 4096 (draft; ratify via OQ-15) |

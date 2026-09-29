@@ -142,8 +142,12 @@ already been refused, that means an unseen credential or one whose grant has pas
   operator did not configure, and its answer is not the control plane's.
 - *Deadline.* P-GRANT-EXCHANGE-TIMEOUT per call, strictly below P-CLIENT-TIMEOUT (ADR-010)
   — a caller must never still be waiting on an exchange the Portal has stopped waiting for.
-- *Bounded, without shortening a live grant.* At most P-GRANT-EXCHANGE-RATE exchanges per
-  second and P-GRANT-EXCHANGE-INFLIGHT concurrent, with one *logically active* call per
+- *Bounded, without shortening a live grant.* Two budgets, never shared: an exchange for a
+  credential with no held grant spends at most P-GRANT-EXCHANGE-RATE per second and
+  P-GRANT-EXCHANGE-INFLIGHT concurrent; the renewal of a held grant spends
+  P-GRANT-RENEWAL-RATE and P-GRANT-RENEWAL-INFLIGHT. Only a credential the control plane
+  once granted can reach the second, so a flood of unknown tokens cannot stop a held grant
+  from being re-checked (HZ-10). Either way there is one *logically active* call per
   fingerprint, so a burst on the same credential costs one exchange rather than one per
   request. Each attempt owns a locally monotone generation in that fingerprint's
   coordination state. Timing out or replacing an attempt retires its generation before a

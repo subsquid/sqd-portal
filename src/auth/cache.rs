@@ -85,8 +85,14 @@ pub struct GrantCache {
     /// One exchange in flight per fingerprint. Without it a burst on one
     /// uncached credential is one control-plane call per request.
     inflight: KeyedLocks,
-    permits: Semaphore,
-    limiter: Mutex<RateLimiter>,
+    /// For credentials this replica holds no grant for. Attacker-fillable:
+    /// any well-formed token spends it (HZ-10).
+    admission: Budget,
+    /// For renewing a grant this replica holds. Kept apart so a flood of
+    /// unknown tokens cannot stop a held grant from being re-checked — and
+    /// with it a revocation from landing — for the rest of its lifetime.
+    /// Only a credential that was once granted can reach it (HZ-10).
+    renewal: Budget,
     /// Wall-clock second of the last exchange the control plane answered, or 0
     /// for a replica it has never answered at all. The gauge derived from it
     /// climbs through an outage, which is the operator's distance to the
@@ -110,8 +116,8 @@ impl GrantCache {
             denials: Mutex::new(LruCache::new(nonzero(limits.denial_cache_capacity))),
             failures: Mutex::new(LruCache::new(nonzero(limits.denial_cache_capacity))),
             inflight: KeyedLocks::default(),
-            permits: Semaphore::new(limits.max_inflight_exchanges),
-            limiter: Mutex::new(RateLimiter::new(limits.exchange_rate_per_sec)),
+            admission: Budget::new(limits.max_inflight_exchanges, limits.exchange_rate_per_sec),
+            renewal: Budget::new(limits.max_inflight_renewals, limits.renewal_rate_per_sec),
             last_success: AtomicU64::new(0),
             started_at: now_secs(),
             limits,
@@ -172,7 +178,7 @@ impl GrantCache {
                 latest_second_reached(now, arrived.elapsed()),
             );
         }
-        let resolved = self.exchange(credential, now).await;
+        let resolved = self.exchange(credential, now, held.is_some()).await;
         self.or_grace(
             resolved,
             held,
@@ -230,14 +236,20 @@ impl GrantCache {
             {
                 return;
             }
-            cache.exchange(&credential, now).await;
+            cache.exchange(&credential, now, true).await;
         });
     }
 
     /// One call to the authority, under the budgets that keep an unauthenticated
-    /// flood from becoming a cost amplifier pointed at it (HZ-10).
-    async fn exchange(&self, credential: &Credential, now: u64) -> Resolved {
-        let Ok(_permit) = self.permits.try_acquire() else {
+    /// flood from becoming a cost amplifier pointed at it (HZ-10). `renewal`
+    /// says a grant for this credential is held, which picks the budget.
+    async fn exchange(&self, credential: &Credential, now: u64, renewal: bool) -> Resolved {
+        let budget = if renewal {
+            &self.renewal
+        } else {
+            &self.admission
+        };
+        let Ok(_permit) = budget.permits.try_acquire() else {
             self.report(|| metrics::report_exchange(ExchangeOutcome::Saturated, None));
             tracing::warn!(
                 key_id = credential.key_id,
@@ -246,7 +258,7 @@ impl GrantCache {
             );
             return self.remember_failure(&credential.fingerprint, Resolved::Saturated);
         };
-        if !self.limiter.lock().unwrap().take() {
+        if !budget.limiter.lock().unwrap().take() {
             self.report(|| metrics::report_exchange(ExchangeOutcome::Saturated, None));
             tracing::warn!(
                 key_id = credential.key_id,
@@ -497,9 +509,7 @@ impl GrantCache {
     /// What a burst of misses does to the token bucket, without the burst.
     #[cfg(test)]
     pub(crate) fn exhaust_budget_for_test(&self) {
-        let mut limiter = self.limiter.lock().unwrap();
-        limiter.tokens = 0.0;
-        limiter.last = Instant::now();
+        self.admission.exhaust_for_test();
     }
 }
 
@@ -518,6 +528,29 @@ fn second_reached(now: u64, elapsed: Duration) -> u64 {
 /// is the only direction REQ-54 allows erring in.
 fn latest_second_reached(now: u64, elapsed: Duration) -> u64 {
     second_reached(now, elapsed).saturating_add(1)
+}
+
+/// An in-flight cap and a token bucket, spent together by one class of
+/// exchange.
+struct Budget {
+    permits: Semaphore,
+    limiter: Mutex<RateLimiter>,
+}
+
+impl Budget {
+    fn new(max_inflight: usize, rate_per_sec: u64) -> Self {
+        Self {
+            permits: Semaphore::new(max_inflight),
+            limiter: Mutex::new(RateLimiter::new(rate_per_sec)),
+        }
+    }
+
+    #[cfg(test)]
+    fn exhaust_for_test(&self) {
+        let mut limiter = self.limiter.lock().unwrap();
+        limiter.tokens = 0.0;
+        limiter.last = Instant::now();
+    }
 }
 
 struct RateLimiter {
@@ -949,6 +982,38 @@ mod tests {
 
         assert!(matches!(resolved, Resolved::Saturated), "got {resolved:?}");
         assert_eq!(cp.exchanges(), 0);
+    }
+
+    /// HZ-10: a flood of unknown tokens spends the admission budget, not the
+    /// renewal one, so a held grant is still re-checked and a revocation still
+    /// lands. Sharing one budget let the flood keep a revoked key serving for
+    /// the rest of its grant.
+    #[tokio::test]
+    async fn a_spent_admission_budget_does_not_stop_a_renewal() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+
+        cache.exhaust_budget_for_test();
+        cp.deny(KEY_ID, "revoked");
+        granted(&cache.resolve(&credential(), NOW + 400).await);
+
+        // A sustained flood: the admission bucket is drained again before
+        // every request, so only a separate budget lets the renewal through.
+        let refused = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                cache.exhaust_budget_for_test();
+                match cache.resolve(&credential(), NOW + 401).await {
+                    Resolved::Denied(reason) => return reason,
+                    _ => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+        })
+        .await
+        .expect("the renewal must run on its own budget");
+
+        assert_eq!(refused, "revoked");
     }
 
     /// The control plane sets the lifetime; the portal owns the ceiling.
