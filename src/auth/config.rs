@@ -70,7 +70,9 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Limits {
     /// Ceiling on the lifetime the portal honours, whatever is offered: the
-    /// fleet's worst-case stale-authorization window (REQ-54).
+    /// fleet's worst-case stale-authorization window (REQ-54). A day, the
+    /// single-tenant runway; the control plane issues shorter per portal
+    /// (ADR-017).
     #[serde(default = "default_max_grant_lifetime_secs")]
     pub max_grant_lifetime_secs: u64,
 
@@ -370,7 +372,7 @@ impl Default for Limits {
 }
 
 fn default_max_grant_lifetime_secs() -> u64 {
-    900
+    86_400
 }
 
 fn default_exchange_timeout_ms() -> u64 {
@@ -435,7 +437,7 @@ portal_id: portal-premium-eu
         // Signs with the network identity until told otherwise.
         assert_eq!(config.key_path, None);
         // P-GRANT-MAX-LIFETIME
-        assert_eq!(config.limits.max_grant_lifetime_secs, 900);
+        assert_eq!(config.limits.max_grant_lifetime_secs, 86_400);
         // P-GRANT-CACHE-CAPACITY
         assert_eq!(config.limits.grant_cache_capacity, 65_536);
         // P-GRANT-EXCHANGE-TIMEOUT
@@ -677,6 +679,6 @@ portal_id: portal-premium-eu
         .expect("the block still parses");
 
         assert_eq!(ignored, vec!["limits.max_grant_lifetime_seconds"]);
-        assert_eq!(config.limits.max_grant_lifetime_secs, 900);
+        assert_eq!(config.limits.max_grant_lifetime_secs, 86_400);
     }
 }

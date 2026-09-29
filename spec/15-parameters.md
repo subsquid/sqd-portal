@@ -98,7 +98,7 @@ set, which is the only thing that can size them honestly.
 
 | Parameter | Role (where used) | Observed | Target |
 |---|---|---|---|
-| P-GRANT-MAX-LIFETIME | Cap on the `expires_at` the Portal will honour, however long a one the control plane offers. The fleet's worst-case stale-authorization window, the whole outage runway, and the only lifetime term the Portal owns (REQ-54, DC-8, LIV-13, ADR-017) | 900 s | ⚠ per deployment, at or above what the control plane issues it: 24 h single-tenant, 1 h shared (draft; ratify via OQ-15) |
+| P-GRANT-MAX-LIFETIME | Cap on the `expires_at` the Portal will honour, however long a one the control plane offers. The fleet's worst-case stale-authorization window, the whole outage runway, and the only lifetime term the Portal owns (REQ-54, DC-8, LIV-13, ADR-017) | 24 h | ⚠ 24 h, the single-tenant runway; the control plane issues shorter per Portal (1 h shared), so a deployment lowers it only to hold a shorter bound locally (draft; ratify via OQ-15) |
 | P-GRANT-EXCHANGE-TIMEOUT | Per-exchange deadline; must stay < P-CLIENT-TIMEOUT (DC-8, ADR-010, PF-7) | 2 s | ⚠ 2 s (draft; ratify via OQ-15) |
 | P-GRANT-EXCHANGE-RATE | Token-bucket rate for exchanges (DC-8, LIV-14, HZ-10) | 20 /s | ⚠ one budget serves two opposed purposes — bounding attacker cost and admitting legitimate uncached keys (HZ-10); ratify via OQ-15 once CT-10 can measure the interference |
 | P-GRANT-EXCHANGE-INFLIGHT | Cap on concurrent exchanges (DC-8, HZ-10) | 32 | ⚠ 32 (draft; ratify via OQ-15) |
