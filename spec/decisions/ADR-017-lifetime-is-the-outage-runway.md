@@ -27,10 +27,11 @@ decides how long a Portal keeps serving when it cannot ask. Only the second was 
 
 1. **The runway is the lifetime, and the control plane sets it per deployment.**
    `refresh_after` stays short. `expires_at` is issued per Portal, long enough to ride the
-   outages the deployment must survive — 24 h for single-tenant, 1 h for shared as a
-   starting point. The Portal keeps its cap (P-GRANT-MAX-LIFETIME), raised per deployment
-   to what that deployment is issued. Nothing in the Portal decides whether the control
-   plane is down.
+   outages the deployment must survive. Most Portals are single-tenant, so 24 h is the
+   default on both sides: the control plane issues it to any Portal it does not name, and
+   the Portal's cap (P-GRANT-MAX-LIFETIME) defaults to it. A shared Portal is named with a
+   shorter lifetime — 1 h as a starting point — in the one place that issues it. Nothing
+   in the Portal decides whether the control plane is down.
 2. **Renewals spend their own budget.** Renewing a held grant uses P-GRANT-RENEWAL-RATE and
    P-GRANT-RENEWAL-INFLIGHT, never the admission budget unknown tokens drain (HZ-10). Only a
    credential the control plane once granted can reach it. Without this, a flood of junk
@@ -43,7 +44,9 @@ While the control plane answers nothing changes: a key in use converges on revoc
 within `refresh_after` + one exchange (LIV-13), and a denial evicts at once (INV-6).
 
 The worst case is explicit: a revoked key whose renewals keep failing serves until its
-`expires_at`, at most P-GRANT-MAX-LIFETIME for that deployment. An idle key that returns
+`expires_at`, at most P-GRANT-MAX-LIFETIME for that deployment. A shared Portal the control
+plane is not told about gets the single-tenant day; naming it is part of turning its
+enforcement on. An idle key that returns
 gets one request served on its held grant before the renewal's denial lands, as before.
 
 An answer the Portal cannot read — notably a claims version it does not understand —
