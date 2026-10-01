@@ -119,6 +119,10 @@ pub struct GrantCache {
     /// Shadow mode publishes none of the OB-13 signals: both answers serve
     /// there, so a counter moving is the verdict the response withheld (OB-12).
     enforcement: Enforcement,
+    /// This cache's own grace admissions. The published counter is global, so
+    /// tests running alongside each other cannot assert it exactly.
+    #[cfg(test)]
+    grace_admitted: AtomicU64,
 }
 
 impl GrantCache {
@@ -143,6 +147,8 @@ impl GrantCache {
             last_success: AtomicU64::new(0),
             started_at: now_secs(),
             limits,
+            #[cfg(test)]
+            grace_admitted: AtomicU64::new(0),
         });
         cache.publish_gauges();
         cache
@@ -161,7 +167,7 @@ impl GrantCache {
             // skipped is serving on this grant the outage grace, and the only
             // warning an operator gets before the cliff (OB-9).
             if held.renewal_failing {
-                self.report(metrics::report_grace_admission);
+                self.admit_on_grace();
             }
             self.spawn_refresh(credential, now);
             return Resolved::Grant(held.grant);
@@ -222,11 +228,19 @@ impl GrantCache {
             (Resolved::Saturated | Resolved::Unavailable, Some(grant))
                 if grant.expires_at > now =>
             {
-                self.report(metrics::report_grace_admission);
+                self.admit_on_grace();
                 Resolved::Grant(grant)
             }
             (resolved, _) => resolved,
         }
+    }
+
+    /// A request served on a grant whose renewal has failed or been skipped
+    /// (OB-9).
+    fn admit_on_grace(&self) {
+        self.report(metrics::report_grace_admission);
+        #[cfg(test)]
+        self.grace_admitted.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The renewal a request past `refresh_after` triggers without waiting for
@@ -502,12 +516,12 @@ impl GrantCache {
 
     /// How many grants are past `refresh_after` and inside `expires_at` with
     /// their renewal failing, and the least life left among them (zero when
-    /// none are). The admission rate says the condition exists; the minimum
-    /// says when the first hard refusal lands (OB-9, OB-13). A grant merely
-    /// due is left out: no renewal has been tried since nobody has called its
-    /// credential. One whose renewal failed stays in until its own renewal,
-    /// denial, expiry or eviction, used or not. One walk per scrape, bounded
-    /// by the capacity.
+    /// none are) (OB-9, OB-13). A grant merely due is left out: no renewal has
+    /// been tried since nobody has called its credential. One whose renewal
+    /// failed stays in until its own renewal, denial, expiry or eviction, used
+    /// or not — so the minimum bounds the first hard refusal rather than naming
+    /// it, and may belong to a key nobody is calling. One walk per scrape,
+    /// bounded by the capacity.
     pub fn grace_census(&self, now: u64) -> (usize, u64) {
         let grants = self.grants.lock().unwrap();
         let mut in_grace = 0;
@@ -813,7 +827,7 @@ mod tests {
     }
 
     /// The census the scrape republishes: the grace rate says the cliff is
-    /// coming, the count says how wide it is, and the minimum names when the
+    /// coming, the count says how wide it is, and the minimum bounds when the
     /// first hard refusal lands (OB-9).
     #[tokio::test]
     async fn the_grace_census_names_the_first_hard_refusal() {
@@ -899,6 +913,78 @@ mod tests {
         granted(&cache.resolve(&credential(), after_cooldown).await);
         until(|| cache.grace_census(after_cooldown) == (0, 0)).await;
         assert_eq!(cache.grace_census(after_cooldown), (0, 0));
+    }
+
+    fn admitted(cache: &GrantCache) -> u64 {
+        cache.grace_admitted.load(Ordering::Relaxed)
+    }
+
+    /// The admissions counter: nothing for a healthy lazy renewal, one per
+    /// request served while the grant's renewal is failing, and nothing again
+    /// once its own renewal lands. The request that triggers the failing
+    /// renewal is served before it fails, so a credential not called again
+    /// shows in the census and never here.
+    #[tokio::test]
+    async fn grace_admissions_count_requests_served_on_a_failing_renewal() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        let fingerprint = credential().fingerprint;
+        let renewed_by = |at: u64| {
+            cache
+                .usable_grant(&fingerprint, at)
+                .is_some_and(|grant| grant.refresh_after > at)
+        };
+        cache.resolve(&credential(), NOW).await;
+
+        // Healthy: the due request triggers a renewal and is not grace.
+        granted(&cache.resolve(&credential(), NOW + 400).await);
+        until(|| renewed_by(NOW + 400)).await;
+        granted(&cache.resolve(&credential(), NOW + 400).await);
+        assert_eq!(admitted(&cache), 0);
+
+        // Failing: the triggering request is not grace, the next one is.
+        cp.status(KEY_ID, 503);
+        granted(&cache.resolve(&credential(), NOW + 500).await);
+        until(|| cache.grace_census(NOW + 500) != (0, 0)).await;
+        assert_eq!(cache.grace_census(NOW + 500), (1, 400));
+        assert_eq!(admitted(&cache), 0);
+        granted(&cache.resolve(&credential(), NOW + 501).await);
+        assert_eq!(admitted(&cache), 1);
+
+        // Recovered: the request that triggers the successful renewal is still
+        // served on the failing grant; once it lands, nothing more counts.
+        cp.clear_status(KEY_ID);
+        tokio::time::sleep(cache.limits.exchange_timeout()).await;
+        granted(&cache.resolve(&credential(), NOW + 600).await);
+        assert_eq!(admitted(&cache), 2);
+        until(|| renewed_by(NOW + 600)).await;
+        granted(&cache.resolve(&credential(), NOW + 600).await);
+        assert_eq!(admitted(&cache), 2);
+        assert_eq!(cache.grace_census(NOW + 600), (0, 0));
+    }
+
+    /// A renewal skipped on its own budget is the "locally suppressed" half of
+    /// OB-9's grace, and counts like a failed one.
+    #[tokio::test]
+    async fn a_renewal_skipped_on_its_budget_counts_as_grace() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+        let _busy = cache
+            .renewal
+            .permits
+            .acquire_many(cache.limits.max_inflight_renewals as u32)
+            .await
+            .unwrap();
+
+        granted(&cache.resolve(&credential(), NOW + 400).await);
+        until(|| cache.grace_census(NOW + 400) != (0, 0)).await;
+        assert_eq!(cache.grace_census(NOW + 400), (1, 500));
+        assert_eq!(admitted(&cache), 0);
+        granted(&cache.resolve(&credential(), NOW + 401).await);
+        assert_eq!(admitted(&cache), 1);
     }
 
     /// An answer for another key says nothing about this one. A renewal

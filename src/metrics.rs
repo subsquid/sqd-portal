@@ -490,9 +490,10 @@ pub fn report_lifetime_capped() {
     GRANT_LIFETIMES_CAPPED.inc();
 }
 
-/// A request served past `refresh_after` on a grant whose renewal has failed
-/// or been skipped. The leading edge of the `expires_at` cliff, and the only
-/// warning before it (OB-9). Zero while renewals succeed.
+/// A request served past `refresh_after` on a grant whose renewal has already
+/// failed or been skipped (OB-9). Zero while renewals succeed. It counts
+/// requests, so a credential that is not called again after its renewal fails
+/// never moves it; the census below still holds that grant.
 pub fn report_grace_admission() {
     GRACE_ADMISSIONS.inc();
 }
@@ -503,10 +504,11 @@ pub fn grace_admissions() -> u64 {
 }
 
 /// Point-in-time census of the `expires_at` cliff, republished on scrape: how
-/// many grants are past `refresh_after` with their renewal failing, and the
-/// smallest remaining life among them — zero when none are. The admission
-/// rate says the condition exists; the minimum names the first hard refusal
-/// (OB-9, OB-13).
+/// many grants are past `refresh_after` with an unresolved failed or skipped
+/// renewal, and the smallest remaining life among them — zero when none are
+/// (OB-9, OB-13). The minimum is a conservative bound, not the next refusal:
+/// it covers grants whose key has gone idle since their renewal failed, and
+/// nobody is refused on those.
 pub fn report_grace_census(in_grace: usize, min_remaining_secs: u64) {
     GRANTS_IN_GRACE.set(in_grace as i64);
     GRACE_MIN_REMAINING.set(min_remaining_secs as i64);
@@ -905,17 +907,17 @@ pub fn register_metrics(registry: &mut Registry) {
     );
     registry.register(
         "auth_grace_admissions",
-        "Requests served past refresh_after on a grant whose renewal has failed or been skipped; zero while renewals succeed",
+        "Requests served past refresh_after on a grant whose renewal already failed or was skipped; zero while renewals succeed, and unmoved by a credential not called again",
         GRACE_ADMISSIONS.clone(),
     );
     registry.register(
         "auth_grants_in_grace",
-        "Grants past refresh_after whose last renewal failed or was skipped",
+        "Grants past refresh_after with a failed or skipped renewal not resolved since, including grants whose key has since gone idle",
         GRANTS_IN_GRACE.clone(),
     );
     registry.register(
         "auth_grace_min_remaining_seconds",
-        "Smallest time to expires_at among grants in grace — the first hard refusal; zero when none are in grace",
+        "Smallest time to expires_at among grants in grace; a conservative bound that may name an idle grant; zero when none are in grace",
         GRACE_MIN_REMAINING.clone(),
     );
     registry.register(
