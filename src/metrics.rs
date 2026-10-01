@@ -490,8 +490,9 @@ pub fn report_lifetime_capped() {
     GRANT_LIFETIMES_CAPPED.inc();
 }
 
-/// A request served on a grant whose renewal has not landed. The leading edge
-/// of the `expires_at` cliff, and the only warning before it (OB-9).
+/// A request served past `refresh_after` on a grant whose renewal has failed
+/// or been skipped. The leading edge of the `expires_at` cliff, and the only
+/// warning before it (OB-9). Zero while renewals succeed.
 pub fn report_grace_admission() {
     GRACE_ADMISSIONS.inc();
 }
@@ -502,9 +503,10 @@ pub fn grace_admissions() -> u64 {
 }
 
 /// Point-in-time census of the `expires_at` cliff, republished on scrape: how
-/// many grants are serving on renewal grace, and the smallest remaining life
-/// among them — zero when none are. The admission rate says the condition
-/// exists; the minimum names the first hard refusal (OB-9, OB-13).
+/// many grants are past `refresh_after` with their renewal failing, and the
+/// smallest remaining life among them — zero when none are. The admission
+/// rate says the condition exists; the minimum names the first hard refusal
+/// (OB-9, OB-13).
 pub fn report_grace_census(in_grace: usize, min_remaining_secs: u64) {
     GRANTS_IN_GRACE.set(in_grace as i64);
     GRACE_MIN_REMAINING.set(min_remaining_secs as i64);
@@ -903,12 +905,12 @@ pub fn register_metrics(registry: &mut Registry) {
     );
     registry.register(
         "auth_grace_admissions",
-        "Requests served on a grant whose renewal has not landed",
+        "Requests served past refresh_after on a grant whose renewal has failed or been skipped; zero while renewals succeed",
         GRACE_ADMISSIONS.clone(),
     );
     registry.register(
         "auth_grants_in_grace",
-        "Grants currently serving past refresh_after while their renewal has not landed",
+        "Grants past refresh_after whose last renewal failed or was skipped",
         GRANTS_IN_GRACE.clone(),
     );
     registry.register(
