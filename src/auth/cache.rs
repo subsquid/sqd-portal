@@ -41,6 +41,20 @@ pub struct CachedGrant {
     pub expires_at: u64,
 }
 
+/// A grant as the cache holds it, with what the replica learned since it was
+/// stored. Kept beside the grant rather than in it: the grant is what the
+/// control plane said, this is how asking again has gone.
+#[derive(Debug, Clone)]
+struct Held {
+    grant: Arc<CachedGrant>,
+    /// A renewal of this grant failed or was skipped by its budget. Only this
+    /// credential's own outcome clears it — a stored grant replaces the entry,
+    /// a denial, expiry or eviction removes it — so an answer for another key
+    /// cannot read as recovery, and a flood of unknown keys cannot push it
+    /// out: it is bounded by the grant capacity, not the failure cache (HZ-10).
+    renewal_failing: bool,
+}
+
 /// What resolving a credential established. Only the first two are the control
 /// plane speaking; the last two are the portal failing to ask, and reporting
 /// them as a verdict would tell the holder of a valid key to stop retrying
@@ -73,7 +87,7 @@ struct Failure {
 pub struct GrantCache {
     client: ControlPlaneClient,
     limits: Limits,
-    grants: Mutex<LruCache<String, Arc<CachedGrant>>>,
+    grants: Mutex<LruCache<String, Held>>,
     /// Capped apart from the grants: the fingerprint is attacker-chosen, so a
     /// flood must not evict what a paying key is served on (HZ-10).
     denials: Mutex<LruCache<String, Denial>>,
@@ -105,6 +119,10 @@ pub struct GrantCache {
     /// Shadow mode publishes none of the OB-13 signals: both answers serve
     /// there, so a counter moving is the verdict the response withheld (OB-12).
     enforcement: Enforcement,
+    /// This cache's own grace admissions. The published counter is global, so
+    /// tests running alongside each other cannot assert it exactly.
+    #[cfg(test)]
+    grace_admitted: AtomicU64,
 }
 
 impl GrantCache {
@@ -129,6 +147,8 @@ impl GrantCache {
             last_success: AtomicU64::new(0),
             started_at: now_secs(),
             limits,
+            #[cfg(test)]
+            grace_admitted: AtomicU64::new(0),
         });
         cache.publish_gauges();
         cache
@@ -138,15 +158,19 @@ impl GrantCache {
     /// cannot. A grant past `refresh_after` still answers while its renewal
     /// runs; only a credential with nothing usable waits for an exchange.
     pub async fn resolve(self: &Arc<Self>, credential: &Credential, now: u64) -> Resolved {
-        if let Some(grant) = self.usable_grant(&credential.fingerprint, now) {
-            if grant.refresh_after > now {
-                return Resolved::Grant(grant);
+        if let Some(held) = self.usable_held(&credential.fingerprint, now) {
+            if held.grant.refresh_after > now {
+                return Resolved::Grant(held.grant);
             }
-            // Serving on a grant whose renewal has not landed is the outage
-            // grace, and the only warning an operator gets before the cliff.
-            self.report(metrics::report_grace_admission);
+            // Renewal is lazy, so the first request past `refresh_after` is an
+            // ordinary renewal trigger. Only once a renewal has failed or been
+            // skipped is serving on this grant the outage grace, and the only
+            // warning an operator gets before the cliff (OB-9).
+            if held.renewal_failing {
+                self.admit_on_grace();
+            }
             self.spawn_refresh(credential, now);
-            return Resolved::Grant(grant);
+            return Resolved::Grant(held.grant);
         }
         if let Some(reason) = self.live_denial(&credential.fingerprint, now) {
             return Resolved::Denied(reason);
@@ -204,11 +228,19 @@ impl GrantCache {
             (Resolved::Saturated | Resolved::Unavailable, Some(grant))
                 if grant.expires_at > now =>
             {
-                self.report(metrics::report_grace_admission);
+                self.admit_on_grace();
                 Resolved::Grant(grant)
             }
             (resolved, _) => resolved,
         }
+    }
+
+    /// A request served on a grant whose renewal has failed or been skipped
+    /// (OB-9).
+    fn admit_on_grace(&self) {
+        self.report(metrics::report_grace_admission);
+        #[cfg(test)]
+        self.grace_admitted.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The renewal a request past `refresh_after` triggers without waiting for
@@ -266,7 +298,7 @@ impl GrantCache {
                 budget = spent.as_str(),
                 "credential exchange skipped: too many in flight"
             );
-            return self.remember_failure(&credential.fingerprint, Resolved::Saturated);
+            return self.renewal_failed(&credential.fingerprint, renewal, now, Resolved::Saturated);
         };
         if !budget.limiter.lock().unwrap().take() {
             self.report(|| metrics::report_exchange(ExchangeOutcome::Saturated, spent, None));
@@ -276,7 +308,7 @@ impl GrantCache {
                 budget = spent.as_str(),
                 "credential exchange skipped: rate limit"
             );
-            return self.remember_failure(&credential.fingerprint, Resolved::Saturated);
+            return self.renewal_failed(&credential.fingerprint, renewal, now, Resolved::Saturated);
         }
 
         let started = Instant::now();
@@ -301,7 +333,12 @@ impl GrantCache {
                         key_id = grant.key_id,
                         "credential exchange returned an already-expired grant"
                     );
-                    return self.remember_failure(&credential.fingerprint, Resolved::Unavailable);
+                    return self.renewal_failed(
+                        &credential.fingerprint,
+                        renewal,
+                        now,
+                        Resolved::Unavailable,
+                    );
                 }
                 self.last_success.store(settled, Ordering::Release);
                 self.report(|| {
@@ -332,7 +369,7 @@ impl GrantCache {
                     error = %err,
                     "credential exchange failed"
                 );
-                self.remember_failure(&credential.fingerprint, Resolved::Unavailable)
+                self.renewal_failed(&credential.fingerprint, renewal, now, Resolved::Unavailable)
             }
         }
     }
@@ -366,11 +403,13 @@ impl GrantCache {
             refresh_after,
             expires_at,
         });
-        let evicted = self
-            .grants
-            .lock()
-            .unwrap()
-            .push(fingerprint.to_owned(), cached.clone());
+        let evicted = self.grants.lock().unwrap().push(
+            fingerprint.to_owned(),
+            Held {
+                grant: cached.clone(),
+                renewal_failing: false,
+            },
+        );
         if evicted.is_some_and(|(key, _)| key != fingerprint) {
             self.report(metrics::report_grant_eviction);
         }
@@ -397,6 +436,27 @@ impl GrantCache {
                 until: now.saturating_add(self.limits.denial_ttl_secs),
             },
         );
+    }
+
+    /// An exchange that established nothing. When it was a renewal, the held
+    /// grant is marked: its renewal is failing or locally suppressed, and
+    /// serving on it past `refresh_after` is now grace (OB-9). A grant that is
+    /// not yet due is left alone — another path renewed it meanwhile.
+    fn renewal_failed(
+        &self,
+        fingerprint: &str,
+        renewal: bool,
+        now: u64,
+        resolved: Resolved,
+    ) -> Resolved {
+        if renewal {
+            if let Some(held) = self.grants.lock().unwrap().peek_mut(fingerprint) {
+                if held.grant.refresh_after <= now {
+                    held.renewal_failing = true;
+                }
+            }
+        }
+        self.remember_failure(fingerprint, resolved)
     }
 
     fn remember_failure(&self, fingerprint: &str, resolved: Resolved) -> Resolved {
@@ -433,13 +493,17 @@ impl GrantCache {
         false
     }
 
+    fn usable_grant(&self, fingerprint: &str, now: u64) -> Option<Arc<CachedGrant>> {
+        self.usable_held(fingerprint, now).map(|held| held.grant)
+    }
+
     /// A grant inside its hard expiry, due for renewal or not. An expired one
     /// is dropped: it can never be served on again.
-    fn usable_grant(&self, fingerprint: &str, now: u64) -> Option<Arc<CachedGrant>> {
+    fn usable_held(&self, fingerprint: &str, now: u64) -> Option<Held> {
         let mut grants = self.grants.lock().unwrap();
-        let grant = grants.get(fingerprint)?;
-        if grant.expires_at > now {
-            return Some(grant.clone());
+        let held = grants.get(fingerprint)?;
+        if held.grant.expires_at > now {
+            return Some(held.clone());
         }
         grants.pop(fingerprint);
         // Also republished here: in an outage nothing is stored, and occupancy
@@ -450,16 +514,21 @@ impl GrantCache {
         None
     }
 
-    /// How many grants are past `refresh_after` but inside `expires_at`, and
-    /// the least life left among them (zero when none are). The admission rate
-    /// says the condition exists; the minimum says when the first hard refusal
-    /// lands (OB-9, OB-13). One walk per scrape, bounded by the capacity.
+    /// How many grants are past `refresh_after` and inside `expires_at` with
+    /// their renewal failing, and the least life left among them (zero when
+    /// none are) (OB-9, OB-13). A grant merely due is left out: no renewal has
+    /// been tried since nobody has called its credential. One whose renewal
+    /// failed stays in until its own renewal, denial, expiry or eviction, used
+    /// or not — so the minimum bounds the first hard refusal rather than naming
+    /// it, and may belong to a key nobody is calling. One walk per scrape,
+    /// bounded by the capacity.
     pub fn grace_census(&self, now: u64) -> (usize, u64) {
         let grants = self.grants.lock().unwrap();
         let mut in_grace = 0;
         let mut min_remaining = 0;
-        for (_, grant) in grants.iter() {
-            if grant.refresh_after <= now && grant.expires_at > now {
+        for (_, held) in grants.iter() {
+            let grant = &held.grant;
+            if held.renewal_failing && grant.refresh_after <= now && grant.expires_at > now {
                 in_grace += 1;
                 let remaining = grant.expires_at - now;
                 min_remaining = if in_grace == 1 {
@@ -517,10 +586,24 @@ impl GrantCache {
 
     #[cfg(test)]
     pub(crate) fn insert_for_test(&self, fingerprint: &str, grant: CachedGrant) {
+        self.grants.lock().unwrap().put(
+            fingerprint.to_owned(),
+            Held {
+                grant: Arc::new(grant),
+                renewal_failing: false,
+            },
+        );
+    }
+
+    /// What a failed renewal leaves on the held grant, without the exchange.
+    #[cfg(test)]
+    fn mark_renewal_failing_for_test(&self, fingerprint: &str) {
         self.grants
             .lock()
             .unwrap()
-            .put(fingerprint.to_owned(), Arc::new(grant));
+            .peek_mut(fingerprint)
+            .expect("a held grant")
+            .renewal_failing = true;
     }
 
     /// What a burst of misses does to the token bucket, without the burst.
@@ -744,18 +827,20 @@ mod tests {
     }
 
     /// The census the scrape republishes: the grace rate says the cliff is
-    /// coming, the count says how wide it is, and the minimum names when the
+    /// coming, the count says how wide it is, and the minimum bounds when the
     /// first hard refusal lands (OB-9).
     #[tokio::test]
     async fn the_grace_census_names_the_first_hard_refusal() {
         let cp = MockControlPlane::spawn().await;
         let cache = cache_for(&cp).await;
-        for (fingerprint, refresh_after, expires_at) in [
+        for (fingerprint, refresh_after, expires_at, failing) in [
             // Fresh: not in grace.
-            ("fresh", NOW + 300, NOW + 900),
+            ("fresh", NOW + 300, NOW + 900, false),
+            // Due, but nobody has called it since: no renewal tried, not grace.
+            ("idle", NOW, NOW + 400, false),
             // In grace, the nearest cliff.
-            ("closest", NOW, NOW + 500),
-            ("further", NOW, NOW + 700),
+            ("closest", NOW, NOW + 500, true),
+            ("further", NOW, NOW + 700, true),
         ] {
             cache.insert_for_test(
                 fingerprint,
@@ -767,14 +852,207 @@ mod tests {
                     expires_at,
                 },
             );
+            if failing {
+                cache.mark_renewal_failing_for_test(fingerprint);
+            }
         }
 
         assert_eq!(cache.grace_census(NOW), (2, 500));
-        // Past its cliff a grant stops counting; the fresh one has aged into
-        // grace by then and names the next refusal.
-        assert_eq!(cache.grace_census(NOW + 600), (2, 100));
+        // Past its cliff a grant stops counting; the fresh one has aged past
+        // `refresh_after` by then, but with no failed renewal it is not grace.
+        assert_eq!(cache.grace_census(NOW + 600), (1, 100));
         // Nothing in grace reads as zero, not as a stale minimum.
         assert_eq!(cache.grace_census(NOW + 900), (0, 0));
+    }
+
+    async fn until(mut done: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Grace is a renewal failing, not a renewal due. A healthy lazy renewal
+    /// never enters the census; the same grant does once its renewal fails,
+    /// and leaves it when its own renewal lands again.
+    #[tokio::test]
+    async fn only_a_failing_renewal_enters_the_grace_census() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+
+        // Due and served while the control plane answers: the request triggers
+        // an ordinary renewal, which is not grace before or after it lands.
+        granted(&cache.resolve(&credential(), NOW + 400).await);
+        assert_eq!(cache.grace_census(NOW + 400), (0, 0));
+        until(|| cp.exchanges() >= 2).await;
+        assert_eq!(cp.exchanges(), 2, "the due request triggered no renewal");
+        until(|| {
+            cache
+                .usable_grant(&credential().fingerprint, NOW + 400)
+                .unwrap()
+                .refresh_after
+                > NOW + 400
+        })
+        .await;
+        assert_eq!(cache.grace_census(NOW + 400), (0, 0));
+
+        // The next renewal fails: the grant it was meant to replace is grace.
+        cp.status(KEY_ID, 503);
+        granted(&cache.resolve(&credential(), NOW + 500).await);
+        until(|| cache.grace_census(NOW + 500) != (0, 0)).await;
+        assert_eq!(cache.grace_census(NOW + 500), (1, 400));
+
+        // Its own renewal landing is what ends it.
+        cp.clear_status(KEY_ID);
+        let after_cooldown = NOW + 500 + cache.limits.exchange_timeout().as_secs() + 1;
+        tokio::time::sleep(cache.limits.exchange_timeout()).await;
+        granted(&cache.resolve(&credential(), after_cooldown).await);
+        until(|| cache.grace_census(after_cooldown) == (0, 0)).await;
+        assert_eq!(cache.grace_census(after_cooldown), (0, 0));
+    }
+
+    fn admitted(cache: &GrantCache) -> u64 {
+        cache.grace_admitted.load(Ordering::Relaxed)
+    }
+
+    /// The admissions counter: nothing for a healthy lazy renewal, one per
+    /// request served while the grant's renewal is failing, and nothing again
+    /// once its own renewal lands. The request that triggers the failing
+    /// renewal is served before it fails, so a credential not called again
+    /// shows in the census and never here.
+    #[tokio::test]
+    async fn grace_admissions_count_requests_served_on_a_failing_renewal() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        let fingerprint = credential().fingerprint;
+        let renewed_by = |at: u64| {
+            cache
+                .usable_grant(&fingerprint, at)
+                .is_some_and(|grant| grant.refresh_after > at)
+        };
+        cache.resolve(&credential(), NOW).await;
+
+        // Healthy: the due request triggers a renewal and is not grace.
+        granted(&cache.resolve(&credential(), NOW + 400).await);
+        until(|| renewed_by(NOW + 400)).await;
+        granted(&cache.resolve(&credential(), NOW + 400).await);
+        assert_eq!(admitted(&cache), 0);
+
+        // Failing: the triggering request is not grace, the next one is.
+        cp.status(KEY_ID, 503);
+        granted(&cache.resolve(&credential(), NOW + 500).await);
+        until(|| cache.grace_census(NOW + 500) != (0, 0)).await;
+        assert_eq!(cache.grace_census(NOW + 500), (1, 400));
+        assert_eq!(admitted(&cache), 0);
+        granted(&cache.resolve(&credential(), NOW + 501).await);
+        assert_eq!(admitted(&cache), 1);
+
+        // Recovered: the request that triggers the successful renewal is still
+        // served on the failing grant; once it lands, nothing more counts.
+        cp.clear_status(KEY_ID);
+        tokio::time::sleep(cache.limits.exchange_timeout()).await;
+        granted(&cache.resolve(&credential(), NOW + 600).await);
+        assert_eq!(admitted(&cache), 2);
+        until(|| renewed_by(NOW + 600)).await;
+        granted(&cache.resolve(&credential(), NOW + 600).await);
+        assert_eq!(admitted(&cache), 2);
+        assert_eq!(cache.grace_census(NOW + 600), (0, 0));
+    }
+
+    /// A renewal skipped on its own budget is the "locally suppressed" half of
+    /// OB-9's grace, and counts like a failed one.
+    #[tokio::test]
+    async fn a_renewal_skipped_on_its_budget_counts_as_grace() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+        let _busy = cache
+            .renewal
+            .permits
+            .acquire_many(cache.limits.max_inflight_renewals as u32)
+            .await
+            .unwrap();
+
+        granted(&cache.resolve(&credential(), NOW + 400).await);
+        until(|| cache.grace_census(NOW + 400) != (0, 0)).await;
+        assert_eq!(cache.grace_census(NOW + 400), (1, 500));
+        assert_eq!(admitted(&cache), 0);
+        granted(&cache.resolve(&credential(), NOW + 401).await);
+        assert_eq!(admitted(&cache), 1);
+    }
+
+    /// An answer for another key says nothing about this one. A renewal
+    /// skipped on its own budget stays grace while unrelated keys are answered
+    /// through the admission budget.
+    #[tokio::test]
+    async fn an_answer_for_another_key_does_not_end_grace() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        cp.deny("k2", "unknown_key");
+        let cache = cache_for(&cp).await;
+        granted(&cache.resolve(&credential(), NOW).await);
+
+        let _busy = cache
+            .renewal
+            .permits
+            .acquire_many(cache.limits.max_inflight_renewals as u32)
+            .await
+            .unwrap();
+        assert!(matches!(
+            cache.exchange(&credential(), NOW + 400, true).await,
+            Resolved::Saturated
+        ));
+        assert_eq!(cache.grace_census(NOW + 400), (1, 500));
+
+        let other =
+            crate::auth::extractor::parse_token_for_test("sqd_portal_k2_anothersecret").unwrap();
+        assert!(matches!(
+            cache.resolve(&other, NOW + 401).await,
+            Resolved::Denied(_)
+        ));
+        assert_eq!(cache.grace_census(NOW + 401), (1, 499));
+    }
+
+    /// The failure cache is filled at whatever rate well-formed tokens arrive,
+    /// so grace kept there could be pushed out by exactly the overload it is
+    /// meant to warn through (HZ-10).
+    #[tokio::test]
+    async fn an_admission_flood_does_not_erase_grace() {
+        let cp = MockControlPlane::spawn().await;
+        cp.grant(KEY_ID, None, NOW + 300, NOW + 900);
+        let cache = cache_for(&cp).await;
+        granted(&cache.resolve(&credential(), NOW).await);
+
+        cp.stop();
+        assert!(matches!(
+            cache.exchange(&credential(), NOW + 400, true).await,
+            Resolved::Unavailable
+        ));
+        assert_eq!(cache.grace_census(NOW + 400), (1, 500));
+
+        let _busy = cache
+            .admission
+            .permits
+            .acquire_many(cache.limits.max_inflight_exchanges as u32)
+            .await
+            .unwrap();
+        for index in 0..=cache.limits.denial_cache_capacity {
+            let other = crate::auth::extractor::parse_token_for_test(&format!(
+                "sqd_portal_flood{index}_anothersecret"
+            ))
+            .unwrap();
+            assert!(matches!(
+                cache.resolve(&other, NOW + 401).await,
+                Resolved::Saturated
+            ));
+        }
+        assert_eq!(cache.grace_census(NOW + 401), (1, 499));
     }
 
     /// `refresh_after` cannot advance while the renewal keeps failing, so a
