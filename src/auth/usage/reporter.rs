@@ -17,6 +17,7 @@ use serde::Serialize;
 use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use uuid::Uuid;
 
 use super::{config::UsageConfig, event::UsageEvent, Queued};
 use crate::{
@@ -65,7 +66,41 @@ pub(super) struct Reporter {
 /// ingest can grow a field without a new endpoint.
 #[derive(Serialize)]
 struct Batch<'a> {
+    batch_id: String,
     events: Vec<&'a UsageEvent>,
+}
+
+/// The batch in hand, and the id every attempt at delivering it carries.
+///
+/// The control plane inserts each delivery under that id as a deduplication
+/// token, so an attempt that already landed is skipped rather than counted
+/// again — which the daily rollup there depends on, since it sums each insert
+/// before any merge could collapse a repeat. Every attempt therefore sends the
+/// same id and the same events: [`Reporter::expire`] never trims an offered
+/// batch, and the id is replaced only once the batch is done with.
+struct Pending {
+    id: Uuid,
+    events: Vec<Queued>,
+    /// Whether any attempt has gone out. An offered batch is never topped up:
+    /// a shard that took the earlier attempt skips every later one under the
+    /// same id, and would silently discard whatever had been added to it.
+    offered: bool,
+}
+
+impl Pending {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            events: Vec::with_capacity(capacity),
+            offered: false,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.events.clear();
+        self.id = Uuid::new_v4();
+        self.offered = false;
+    }
 }
 
 /// Whether another attempt could ever succeed. The split matters: retrying a
@@ -117,7 +152,7 @@ impl Reporter {
     /// runs after the drain returns (ADR-005's second phase), which is the first
     /// moment there is nothing left to measure.
     pub(super) async fn run(self, mut events: mpsc::Receiver<Queued>, stop: CancellationToken) {
-        let mut batch: Vec<Queued> = Vec::with_capacity(self.batch_max.min(EAGER_BATCH_CAPACITY));
+        let mut batch = Pending::with_capacity(self.batch_max.min(EAGER_BATCH_CAPACITY));
         loop {
             let deadline = Instant::now() + self.flush_interval;
             loop {
@@ -129,8 +164,8 @@ impl Reporter {
                     }
                     received = events.recv() => match received {
                         Some(queued) => {
-                            batch.push(queued);
-                            if batch.len() >= self.batch_max {
+                            batch.events.push(queued);
+                            if batch.events.len() >= self.batch_max {
                                 break;
                             }
                         }
@@ -144,7 +179,7 @@ impl Reporter {
                     () = tokio::time::sleep_until(deadline) => break,
                 }
             }
-            if !batch.is_empty() {
+            if !batch.events.is_empty() {
                 // A stop during this returns with the batch still in hand; the
                 // loop above takes its biased stop branch on the next turn and
                 // finalizes it.
@@ -158,14 +193,16 @@ impl Reporter {
     /// keeps a dead sink from turning into an unbounded retry loop — and it is
     /// checked before every attempt, so a batch that spent its life in backoff
     /// dies there rather than on the next one.
-    async fn deliver(&self, batch: &mut Vec<Queued>, stop: &CancellationToken) {
+    async fn deliver(&self, batch: &mut Pending, stop: &CancellationToken) {
         let mut backoff = INITIAL_BACKOFF;
         loop {
             self.expire(batch);
-            if batch.is_empty() {
+            if batch.events.is_empty() {
+                batch.clear();
                 return;
             }
             let started = Instant::now();
+            batch.offered = true;
             // Raced, not merely awaited. A post to a sink that accepts the
             // connection and then says nothing holds a whole DELIVERY_TIMEOUT,
             // and FINALIZE_BUDGET is the budget for the *whole* stop — not for
@@ -179,7 +216,7 @@ impl Reporter {
             };
             match posted {
                 Ok(()) => {
-                    self.signals.delivered.inc_by(batch.len() as u64);
+                    self.signals.delivered.inc_by(batch.events.len() as u64);
                     self.signals
                         .delivery_seconds
                         .observe(started.elapsed().as_secs_f64());
@@ -188,9 +225,9 @@ impl Reporter {
                 }
                 Err(Delivery::Rejected(why)) => {
                     self.signals
-                        .dropped_by(UsageDrop::Rejected, batch.len() as u64);
+                        .dropped_by(UsageDrop::Rejected, batch.events.len() as u64);
                     tracing::error!(
-                        events = batch.len(),
+                        events = batch.events.len(),
                         reason = why,
                         "usage batch refused on its content; dropping it"
                     );
@@ -203,7 +240,7 @@ impl Reporter {
                     // sink outage, and a log line per record would just move the
                     // flood somewhere else.
                     tracing::warn!(
-                        events = batch.len(),
+                        events = batch.events.len(),
                         reason = why,
                         backoff = ?backoff,
                         "usage batch delivery failed; retrying"
@@ -221,7 +258,7 @@ impl Reporter {
     /// One bounded pass at whatever is left, off the serving path and after the
     /// listener has stopped taking new work. A response still draining past this
     /// loses its residual record — loss is acceptable and counted (D5).
-    async fn finalize(&self, events: &mut mpsc::Receiver<Queued>, batch: &mut Vec<Queued>) {
+    async fn finalize(&self, events: &mut mpsc::Receiver<Queued>, batch: &mut Pending) {
         // Closed first, so what is left is a fixed set this can account for in
         // full rather than a moving one. A response still draining finds the
         // sink shut from here on and is counted at the hand-off instead.
@@ -229,14 +266,16 @@ impl Reporter {
 
         let flush = async {
             loop {
-                while batch.len() < self.batch_max {
+                // Not into a batch an earlier attempt took out: see `Pending`.
+                while !batch.offered && batch.events.len() < self.batch_max {
                     match events.try_recv() {
-                        Ok(queued) => batch.push(queued),
+                        Ok(queued) => batch.events.push(queued),
                         Err(_) => break,
                     }
                 }
                 self.expire(batch);
-                if batch.is_empty() {
+                if batch.events.is_empty() {
+                    batch.clear();
                     if events.is_empty() {
                         return None;
                     }
@@ -247,9 +286,10 @@ impl Reporter {
                 }
                 // One attempt each: a shutdown that waits out a retry schedule
                 // is a shutdown that misses its deadline.
+                batch.offered = true;
                 match self.post(batch).await {
                     Ok(()) => {
-                        self.signals.delivered.inc_by(batch.len() as u64);
+                        self.signals.delivered.inc_by(batch.events.len() as u64);
                         batch.clear();
                     }
                     Err(why) => return Some(why),
@@ -287,10 +327,10 @@ impl Reporter {
     fn abandon(
         &self,
         events: &mut mpsc::Receiver<Queued>,
-        batch: &mut Vec<Queued>,
+        batch: &mut Pending,
         refused: Option<Delivery>,
     ) {
-        let in_hand = batch.len() as u64;
+        let in_hand = batch.events.len() as u64;
         batch.clear();
         let mut unread = 0u64;
         while events.try_recv().is_ok() {
@@ -318,10 +358,23 @@ impl Reporter {
 
     /// Drops what has waited longer than `P-USAGE-MAX-RETRY-AGE`, counted by
     /// reason so the loss is a number rather than a suspicion (HZ-14).
-    fn expire(&self, batch: &mut Vec<Queued>) {
-        let before = batch.len();
-        batch.retain(|queued| queued.queued_at.elapsed() <= self.max_retry_age);
-        let dropped = before - batch.len();
+    ///
+    /// An offered batch goes whole, once any of it is too old, rather than
+    /// trimmed. A shard where the earlier attempt stored the events but the
+    /// control plane's rollup view failed is repaired only by a retry that
+    /// repeats the batch exactly: a trimmed retry is skipped at the source and
+    /// reaches the view without what was trimmed.
+    fn expire(&self, batch: &mut Pending) {
+        let before = batch.events.len();
+        let aged = |queued: &Queued| queued.queued_at.elapsed() > self.max_retry_age;
+        if batch.offered {
+            if batch.events.iter().any(aged) {
+                batch.events.clear();
+            }
+        } else {
+            batch.events.retain(|queued| !aged(queued));
+        }
+        let dropped = before - batch.events.len();
         if dropped > 0 {
             self.signals.dropped_by(UsageDrop::Expired, dropped as u64);
             tracing::warn!(
@@ -332,9 +385,10 @@ impl Reporter {
         }
     }
 
-    async fn post(&self, batch: &[Queued]) -> Result<(), Delivery> {
+    async fn post(&self, batch: &Pending) -> Result<(), Delivery> {
         let events = Batch {
-            events: batch.iter().map(|queued| &queued.event).collect(),
+            batch_id: batch.id.to_string(),
+            events: batch.events.iter().map(|queued| &queued.event).collect(),
         };
         // Serialized once: the signature covers the bytes actually sent.
         let body = serde_json::to_vec(&events)
@@ -415,6 +469,8 @@ mod tests {
     #[derive(Default)]
     struct Sink {
         batches: Mutex<Vec<Vec<Value>>>,
+        /// Every attempt's body, refused or not, in arrival order.
+        bodies: Mutex<Vec<Value>>,
         signatures: Mutex<Vec<(String, String, String)>>,
         statuses: Mutex<Vec<u16>>,
         attempts: AtomicUsize,
@@ -462,6 +518,27 @@ mod tests {
         fn attempts(&self) -> usize {
             self.attempts.load(Ordering::SeqCst)
         }
+
+        /// Per attempt: the batch id it carried and the event ids it held.
+        fn deliveries(&self) -> Vec<(String, Vec<String>)> {
+            self.bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|body| {
+                    let ids = body["events"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|event| event["event_id"].as_str().unwrap_or_default().to_owned())
+                        .collect();
+                    (
+                        body["batch_id"].as_str().unwrap_or_default().to_owned(),
+                        ids,
+                    )
+                })
+                .collect()
+        }
     }
 
     async fn usage(
@@ -470,6 +547,7 @@ mod tests {
         Json(body): Json<Value>,
     ) -> StatusCode {
         let attempt = sink.attempts.fetch_add(1, Ordering::SeqCst);
+        sink.bodies.lock().unwrap().push(body.clone());
         let header = |name: &str| {
             headers
                 .get(name)
@@ -569,19 +647,25 @@ mod tests {
         }
     }
 
+    fn pending(events: Vec<Queued>) -> Pending {
+        let mut batch = Pending::with_capacity(events.len());
+        batch.events = events;
+        batch
+    }
+
     /// The control plane authenticates a portal by signature and stamps the
     /// portal identity from it, which is why no event carries one.
     #[tokio::test]
     async fn a_batch_arrives_whole_and_signed() {
         let (sink, config) = Sink::spawn(Vec::new()).await;
         let reporter = reporter(&config, UsageConfig::default());
-        let mut batch = vec![queued("one"), queued("two")];
+        let mut batch = pending(vec![queued("one"), queued("two")]);
 
         reporter
             .deliver(&mut batch, &CancellationToken::new())
             .await;
 
-        assert!(batch.is_empty(), "a delivered batch is not held");
+        assert!(batch.events.is_empty(), "a delivered batch is not held");
         assert_eq!(sink.ids(), ["one", "two"]);
         assert_eq!(sink.batches().len(), 1, "one call, not one per event");
         let (portal_id, _, signature) = sink.signatures.lock().unwrap()[0].clone();
@@ -634,7 +718,7 @@ mod tests {
     async fn a_transient_failure_is_retried_until_it_lands() {
         let (sink, config) = Sink::spawn(vec![503]).await;
         let reporter = reporter(&config, UsageConfig::default());
-        let mut batch = vec![queued("survivor")];
+        let mut batch = pending(vec![queued("survivor")]);
 
         reporter
             .deliver(&mut batch, &CancellationToken::new())
@@ -642,7 +726,160 @@ mod tests {
 
         assert_eq!(sink.attempts(), 2);
         assert_eq!(sink.ids(), ["survivor"]);
-        assert!(batch.is_empty());
+        assert!(batch.events.is_empty());
+    }
+
+    /// The control plane inserts each delivery under its batch id and skips an
+    /// id a shard has already taken, so every attempt at one batch must carry
+    /// the same id — and no two batches may share one.
+    #[tokio::test]
+    async fn a_retry_carries_the_batch_id_of_the_attempt_it_repeats() {
+        let (sink, config) = Sink::spawn(vec![503]).await;
+        let reporter = reporter(&config, UsageConfig::default());
+
+        reporter
+            .deliver(
+                &mut pending(vec![queued("first")]),
+                &CancellationToken::new(),
+            )
+            .await;
+        reporter
+            .deliver(
+                &mut pending(vec![queued("second")]),
+                &CancellationToken::new(),
+            )
+            .await;
+
+        let deliveries = sink.deliveries();
+        assert_eq!(deliveries.len(), 3, "{deliveries:?}");
+        let (retried, repeated, next) = (&deliveries[0].0, &deliveries[1].0, &deliveries[2].0);
+        assert!(Uuid::parse_str(retried).is_ok(), "not a uuid: {retried:?}");
+        assert_eq!(retried, repeated, "a retry must repeat its batch id");
+        assert_ne!(retried, next, "a new batch must not reuse an id");
+    }
+
+    /// Expiry never trims a batch an attempt has taken out: every retry must
+    /// repeat it exactly, so once any of it ages out the whole batch goes,
+    /// counted.
+    ///
+    /// Real time, for the reason the test above gives.
+    #[tokio::test]
+    async fn an_offered_batch_ages_out_whole_rather_than_trimmed() {
+        let (sink, config) = Sink::spawn(vec![503]).await;
+        let signals = UsageSignals::bind();
+        let reporter = reporter_with(
+            &config,
+            UsageConfig {
+                max_retry_age_secs: 2,
+                ..UsageConfig::default()
+            },
+            signals.clone(),
+        );
+        // Ages out during the first backoff (0.75–1.25 s); the other does not.
+        let ageing = Queued {
+            queued_at: Instant::now() - Duration::from_millis(1_900),
+            ..queued("ageing")
+        };
+        let mut batch = pending(vec![ageing, queued("fresh")]);
+        let expired = signals.drops(UsageDrop::Expired);
+
+        reporter
+            .deliver(&mut batch, &CancellationToken::new())
+            .await;
+
+        let deliveries = sink.deliveries();
+        assert_eq!(
+            deliveries.len(),
+            1,
+            "a trimmed retry went out: {deliveries:?}"
+        );
+        assert!(batch.events.is_empty());
+        assert!(
+            signals.drops(UsageDrop::Expired) >= expired + 2,
+            "both records of the dropped batch must be counted"
+        );
+    }
+
+    /// The stop can arrive while a batch is between attempts, and the final
+    /// flush then posts it once more under its id. A shard that took the
+    /// earlier attempt skips that post whole, so records topped up into it
+    /// would be lost while counted as delivered: they must leave in a batch of
+    /// their own.
+    ///
+    /// Driven through `deliver`, so the batch is marked offered by the attempt
+    /// itself; the stop lands in the backoff after a 503 (0.75–1.25 s).
+    #[tokio::test]
+    async fn the_final_flush_does_not_top_up_a_batch_already_offered() {
+        let (sink, config) = Sink::spawn(vec![503]).await;
+        let reporter = reporter(&config, UsageConfig::default());
+        let (tx, mut events) = mpsc::channel(8);
+        tx.send(queued("queued")).await.unwrap();
+        let mut batch = pending(vec![queued("offered")]);
+        let stop = CancellationToken::new();
+        let stopping = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stopping.cancel();
+        });
+
+        reporter.deliver(&mut batch, &stop).await;
+        assert!(
+            batch.offered,
+            "an attempt went out, so the batch is offered"
+        );
+        reporter.finalize(&mut events, &mut batch).await;
+
+        let deliveries = sink.deliveries();
+        assert_eq!(deliveries.len(), 3, "{deliveries:?}");
+        let offered_id = deliveries[0].0.clone();
+        assert_eq!(
+            deliveries[1],
+            (offered_id.clone(), vec!["offered".to_owned()]),
+            "the final flush repeats the offered batch as it was"
+        );
+        assert_eq!(deliveries[2].1, ["queued"]);
+        assert_ne!(deliveries[2].0, offered_id);
+    }
+
+    /// A batch that ends without being acknowledged — refused, or aged out
+    /// entirely — must not pass its id to the next batch built in the same
+    /// `Pending`: if an earlier attempt landed unacknowledged, the next batch
+    /// would be skipped as its repeat.
+    #[tokio::test]
+    async fn a_batch_ended_by_refusal_or_expiry_frees_its_id() {
+        let (sink, config) = Sink::spawn(vec![422]).await;
+        let reporter = reporter(
+            &config,
+            UsageConfig {
+                max_retry_age_secs: 5,
+                ..UsageConfig::default()
+            },
+        );
+        let mut batch = pending(vec![queued("refused")]);
+        let refused_id = batch.id;
+
+        reporter
+            .deliver(&mut batch, &CancellationToken::new())
+            .await;
+
+        assert_eq!(sink.attempts(), 1);
+        assert_ne!(batch.id, refused_id, "a refused batch keeps its id");
+        assert!(!batch.offered);
+
+        batch.events.push(Queued {
+            queued_at: Instant::now() - Duration::from_secs(600),
+            ..queued("aged-out")
+        });
+        // As if an earlier attempt had gone out unacknowledged.
+        batch.offered = true;
+        let expired_id = batch.id;
+        reporter
+            .deliver(&mut batch, &CancellationToken::new())
+            .await;
+
+        assert_eq!(sink.attempts(), 1, "an aged-out batch is not sent");
+        assert_ne!(batch.id, expired_id, "an aged-out batch keeps its id");
+        assert!(!batch.offered);
     }
 
     /// A batch the control plane refuses on its content will be refused
@@ -655,14 +892,14 @@ mod tests {
         for status in [400, 413, 422] {
             let (sink, config) = Sink::spawn(vec![status]).await;
             let reporter = reporter(&config, UsageConfig::default());
-            let mut batch = vec![queued("malformed")];
+            let mut batch = pending(vec![queued("malformed")]);
 
             reporter
                 .deliver(&mut batch, &CancellationToken::new())
                 .await;
 
             assert_eq!(sink.attempts(), 1, "{status} must not be retried");
-            assert!(batch.is_empty());
+            assert!(batch.events.is_empty());
         }
     }
 
@@ -681,7 +918,7 @@ mod tests {
         };
         let signals = UsageSignals::bind();
         let reporter = reporter_with(&config, usage, signals.clone());
-        let mut batch = vec![queued("too-old")];
+        let mut batch = pending(vec![queued("too-old")]);
         // The families are process-global, so only the direction is assertable.
         let dropped = signals.drops(UsageDrop::Expired);
 
@@ -692,7 +929,10 @@ mod tests {
         .await
         .expect("the retry loop must be bounded by the age of what it holds");
 
-        assert!(batch.is_empty(), "an aged-out batch is not held forever");
+        assert!(
+            batch.events.is_empty(),
+            "an aged-out batch is not held forever"
+        );
         assert!(
             signals.drops(UsageDrop::Expired) > dropped,
             "a dropped record must be counted"
@@ -742,13 +982,13 @@ mod tests {
         let (tx, mut events) = mpsc::channel(8);
         tx.send(expired("expired-in-queue")).await.unwrap();
         tx.send(queued("fresh")).await.unwrap();
-        let mut batch = vec![expired("expired-in-hand")];
+        let mut batch = pending(vec![expired("expired-in-hand")]);
 
         reporter.finalize(&mut events, &mut batch).await;
 
         assert_eq!(sink.ids(), ["fresh"]);
         assert_eq!(sink.attempts(), 1);
-        assert!(batch.is_empty());
+        assert!(batch.events.is_empty());
         assert!(events.is_empty());
     }
 
@@ -824,14 +1064,14 @@ mod tests {
         for id in ["queued-1", "queued-2"] {
             tx.send(queued(id)).await.unwrap();
         }
-        let mut batch = vec![queued("in-hand")];
+        let mut batch = pending(vec![queued("in-hand")]);
         // The families are process-global, so only a lower bound is assertable —
         // but three is more than every other test in this file can contribute.
         let stopped = signals.drops(UsageDrop::Stopped);
 
         reporter.finalize(&mut events, &mut batch).await;
 
-        assert!(batch.is_empty(), "nothing is held past the finalize");
+        assert!(batch.events.is_empty(), "nothing is held past the finalize");
         assert!(
             events.try_recv().is_err(),
             "the queue was drained, not left holding records nobody will read"
@@ -855,12 +1095,12 @@ mod tests {
         let signals = UsageSignals::bind();
         let reporter = reporter_with(&config, UsageConfig::default(), signals.clone());
         let (_tx, mut events) = mpsc::channel(16);
-        let mut batch = vec![queued("malformed")];
+        let mut batch = pending(vec![queued("malformed")]);
         let rejected = signals.drops(UsageDrop::Rejected);
 
         reporter.finalize(&mut events, &mut batch).await;
 
-        assert!(batch.is_empty());
+        assert!(batch.events.is_empty());
         assert!(
             signals.drops(UsageDrop::Rejected) > rejected,
             "a content refusal at shutdown is still a content refusal"
