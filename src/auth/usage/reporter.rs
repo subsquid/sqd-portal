@@ -75,9 +75,9 @@ struct Batch<'a> {
 /// The control plane inserts each delivery under that id as a deduplication
 /// token, so an attempt that already landed is skipped rather than counted
 /// again — which the daily rollup there depends on, since it sums each insert
-/// before any merge could collapse a repeat. The id therefore names the
-/// delivery, not the events: it survives [`Reporter::expire`] trimming the
-/// batch between attempts, and it is replaced only once the batch is done with.
+/// before any merge could collapse a repeat. Every attempt therefore sends the
+/// same id and the same events: [`Reporter::expire`] never trims an offered
+/// batch, and the id is replaced only once the batch is done with.
 struct Pending {
     id: Uuid,
     events: Vec<Queued>,
@@ -196,7 +196,7 @@ impl Reporter {
     async fn deliver(&self, batch: &mut Pending, stop: &CancellationToken) {
         let mut backoff = INITIAL_BACKOFF;
         loop {
-            self.expire(&mut batch.events);
+            self.expire(batch);
             if batch.events.is_empty() {
                 batch.clear();
                 return;
@@ -273,7 +273,7 @@ impl Reporter {
                         Err(_) => break,
                     }
                 }
-                self.expire(&mut batch.events);
+                self.expire(batch);
                 if batch.events.is_empty() {
                     batch.clear();
                     if events.is_empty() {
@@ -358,10 +358,23 @@ impl Reporter {
 
     /// Drops what has waited longer than `P-USAGE-MAX-RETRY-AGE`, counted by
     /// reason so the loss is a number rather than a suspicion (HZ-14).
-    fn expire(&self, batch: &mut Vec<Queued>) {
-        let before = batch.len();
-        batch.retain(|queued| queued.queued_at.elapsed() <= self.max_retry_age);
-        let dropped = before - batch.len();
+    ///
+    /// An offered batch goes whole, once any of it is too old, rather than
+    /// trimmed. A shard where the earlier attempt stored the events but the
+    /// control plane's rollup view failed is repaired only by a retry that
+    /// repeats the batch exactly: a trimmed retry is skipped at the source and
+    /// reaches the view without what was trimmed.
+    fn expire(&self, batch: &mut Pending) {
+        let before = batch.events.len();
+        let aged = |queued: &Queued| queued.queued_at.elapsed() > self.max_retry_age;
+        if batch.offered {
+            if batch.events.iter().any(aged) {
+                batch.events.clear();
+            }
+        } else {
+            batch.events.retain(|queued| !aged(queued));
+        }
+        let dropped = before - batch.events.len();
         if dropped > 0 {
             self.signals.dropped_by(UsageDrop::Expired, dropped as u64);
             tracing::warn!(
@@ -745,39 +758,46 @@ mod tests {
         assert_ne!(retried, next, "a new batch must not reuse an id");
     }
 
-    /// Expiry trims a batch between attempts. The id stays: a shard that took
-    /// the first attempt must skip the trimmed one, whose events it already
-    /// holds, and only an unchanged id lets it recognise the trimmed batch.
+    /// Expiry never trims a batch an attempt has taken out: every retry must
+    /// repeat it exactly, so once any of it ages out the whole batch goes,
+    /// counted.
     ///
     /// Real time, for the reason the test above gives.
     #[tokio::test]
-    async fn a_batch_trimmed_between_attempts_keeps_its_id() {
+    async fn an_offered_batch_ages_out_whole_rather_than_trimmed() {
         let (sink, config) = Sink::spawn(vec![503]).await;
-        let reporter = reporter(
+        let signals = UsageSignals::bind();
+        let reporter = reporter_with(
             &config,
             UsageConfig {
                 max_retry_age_secs: 2,
                 ..UsageConfig::default()
             },
+            signals.clone(),
         );
         // Ages out during the first backoff (0.75–1.25 s); the other does not.
         let ageing = Queued {
             queued_at: Instant::now() - Duration::from_millis(1_900),
             ..queued("ageing")
         };
+        let mut batch = pending(vec![ageing, queued("fresh")]);
+        let expired = signals.drops(UsageDrop::Expired);
 
         reporter
-            .deliver(
-                &mut pending(vec![ageing, queued("fresh")]),
-                &CancellationToken::new(),
-            )
+            .deliver(&mut batch, &CancellationToken::new())
             .await;
 
         let deliveries = sink.deliveries();
-        assert_eq!(deliveries.len(), 2, "{deliveries:?}");
-        assert_eq!(deliveries[0].1, ["ageing", "fresh"]);
-        assert_eq!(deliveries[1].1, ["fresh"]);
-        assert_eq!(deliveries[0].0, deliveries[1].0);
+        assert_eq!(
+            deliveries.len(),
+            1,
+            "a trimmed retry went out: {deliveries:?}"
+        );
+        assert!(batch.events.is_empty());
+        assert!(
+            signals.drops(UsageDrop::Expired) >= expired + 2,
+            "both records of the dropped batch must be counted"
+        );
     }
 
     /// The stop can arrive while a batch is between attempts, and the final
