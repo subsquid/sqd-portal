@@ -23,7 +23,7 @@ The server (axum) exposes per-dataset endpoints, including:
 - `GET /datasets/:dataset/head`, `/finalized-head`, `/state`, `/metadata`: dataset status and metadata.
 - `GET /datasets/:dataset/timestamps/:timestamp/block`: resolve a timestamp to a block number.
 - `GET /status`, `GET /datasets`: Portal and dataset listing.
-- `GET /metrics` (Prometheus), `GET /ready` (readiness probe).
+- `GET /metrics` (Prometheus), `GET /ready` (readiness probe). Recipes for the stream fan-out families (wasted worker queries and bytes, hedging, read-ahead) are in [docs/observability/fan-out-efficiency.md](docs/observability/fan-out-efficiency.md).
 - `/docs` (Scalar), with the OpenAPI spec at `/api-docs/openapi.json`.
 
 A SQL query endpoint (`POST /sql/query`, `GET /sql/metadata`) is available when the crate is built with the `sql` feature.
