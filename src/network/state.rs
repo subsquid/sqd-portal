@@ -11,7 +11,7 @@ use crate::types::DatasetId;
 use crate::utils::RwLock;
 use crate::{datasets::Datasets, types::api_types::DatasetState};
 
-use super::priorities::{NoWorker, WorkersPool};
+use super::priorities::{HolderSummary, NoWorker, WorkersPool};
 
 pub struct WorkerLease {
     pool: Arc<RwLock<WorkersPool>>,
@@ -153,9 +153,13 @@ impl NetworkState {
 
         self.pool
             .read()
-            .get_priorities(workers.iter().copied())
+            .describe(workers.iter().copied())
             .into_iter()
-            .map(|(peer_id, priority)| WorkerDebugInfo { peer_id, priority })
+            .map(|(peer_id, priority, health)| WorkerDebugInfo {
+                peer_id,
+                priority,
+                health,
+            })
             .collect()
     }
 
@@ -163,22 +167,39 @@ impl NetworkState {
         let workers = self.dataset_storage.get_all_workers();
         self.pool
             .read()
-            .get_priorities(workers)
+            .describe(workers)
             .into_iter()
-            .map(|(peer_id, priority)| WorkerDebugInfo { peer_id, priority })
+            .map(|(peer_id, priority, health)| WorkerDebugInfo {
+                peer_id,
+                priority,
+                health,
+            })
             .collect()
     }
 
-    pub fn report_query_success(&self, worker: PeerId, throughput: Option<f64>) {
-        self.pool.write().success(worker, throughput);
+    /// How the holders of the chunk containing `start_block` look to `pick` right now.
+    pub fn summarize_holders(&self, dataset_id: &DatasetId, start_block: u64) -> HolderSummary {
+        let Ok(workers) = self.dataset_storage.find_workers(dataset_id, start_block) else {
+            return HolderSummary::default();
+        };
+        self.pool.read().summarize(workers)
     }
 
-    pub fn report_query_error(&self, worker: PeerId) {
-        self.pool.write().error(worker);
+    pub fn report_query_success(
+        &self,
+        worker: PeerId,
+        verdict: &'static str,
+        throughput: Option<f64>,
+    ) {
+        self.pool.write().success(worker, verdict, throughput);
     }
 
-    pub fn report_query_failure(&self, worker: PeerId) {
-        self.pool.write().failure(worker);
+    pub fn report_query_error(&self, worker: PeerId, verdict: &'static str) {
+        self.pool.write().error(worker, verdict);
+    }
+
+    pub fn report_query_failure(&self, worker: PeerId, verdict: &'static str) {
+        self.pool.write().failure(worker, verdict);
     }
 
     pub fn hint_backoff(&self, worker: PeerId, duration: Duration) {
