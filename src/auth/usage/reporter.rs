@@ -785,26 +785,81 @@ mod tests {
     /// earlier attempt skips that post whole, so records topped up into it
     /// would be lost while counted as delivered: they must leave in a batch of
     /// their own.
+    ///
+    /// Driven through `deliver`, so the batch is marked offered by the attempt
+    /// itself; the stop lands in the backoff after a 503 (0.75–1.25 s).
     #[tokio::test]
     async fn the_final_flush_does_not_top_up_a_batch_already_offered() {
-        let (sink, config) = Sink::spawn(Vec::new()).await;
+        let (sink, config) = Sink::spawn(vec![503]).await;
         let reporter = reporter(&config, UsageConfig::default());
         let (tx, mut events) = mpsc::channel(8);
         tx.send(queued("queued")).await.unwrap();
         let mut batch = pending(vec![queued("offered")]);
-        batch.offered = true;
-        let offered_id = batch.id.to_string();
+        let stop = CancellationToken::new();
+        let stopping = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stopping.cancel();
+        });
 
+        reporter.deliver(&mut batch, &stop).await;
+        assert!(
+            batch.offered,
+            "an attempt went out, so the batch is offered"
+        );
         reporter.finalize(&mut events, &mut batch).await;
 
         let deliveries = sink.deliveries();
-        assert_eq!(deliveries.len(), 2, "{deliveries:?}");
+        assert_eq!(deliveries.len(), 3, "{deliveries:?}");
+        let offered_id = deliveries[0].0.clone();
         assert_eq!(
-            deliveries[0],
-            (offered_id.clone(), vec!["offered".to_owned()])
+            deliveries[1],
+            (offered_id.clone(), vec!["offered".to_owned()]),
+            "the final flush repeats the offered batch as it was"
         );
-        assert_eq!(deliveries[1].1, ["queued"]);
-        assert_ne!(deliveries[1].0, offered_id);
+        assert_eq!(deliveries[2].1, ["queued"]);
+        assert_ne!(deliveries[2].0, offered_id);
+    }
+
+    /// A batch that ends without being acknowledged — refused, or aged out
+    /// entirely — must not pass its id to the next batch built in the same
+    /// `Pending`: if an earlier attempt landed unacknowledged, the next batch
+    /// would be skipped as its repeat.
+    #[tokio::test]
+    async fn a_batch_ended_by_refusal_or_expiry_frees_its_id() {
+        let (sink, config) = Sink::spawn(vec![422]).await;
+        let reporter = reporter(
+            &config,
+            UsageConfig {
+                max_retry_age_secs: 5,
+                ..UsageConfig::default()
+            },
+        );
+        let mut batch = pending(vec![queued("refused")]);
+        let refused_id = batch.id;
+
+        reporter
+            .deliver(&mut batch, &CancellationToken::new())
+            .await;
+
+        assert_eq!(sink.attempts(), 1);
+        assert_ne!(batch.id, refused_id, "a refused batch keeps its id");
+        assert!(!batch.offered);
+
+        batch.events.push(Queued {
+            queued_at: Instant::now() - Duration::from_secs(600),
+            ..queued("aged-out")
+        });
+        // As if an earlier attempt had gone out unacknowledged.
+        batch.offered = true;
+        let expired_id = batch.id;
+        reporter
+            .deliver(&mut batch, &CancellationToken::new())
+            .await;
+
+        assert_eq!(sink.attempts(), 1, "an aged-out batch is not sent");
+        assert_ne!(batch.id, expired_id, "an aged-out batch keeps its id");
+        assert!(!batch.offered);
     }
 
     /// A batch the control plane refuses on its content will be refused
