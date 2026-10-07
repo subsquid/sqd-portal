@@ -186,24 +186,46 @@ impl Meter {
         }
     }
 
-    /// One yielded frame. Cuts an interim record when the open window has run
-    /// longer than `P-USAGE-INTERIM` — on the frame boundary, so a record is
-    /// never made while a frame is half-counted. That boundary is also the
-    /// caveat REQ-60 states: an idle stream's counted-but-unreported bytes wait
-    /// for its next frame or its end.
+    /// One yielded frame. When the open window has already run longer than
+    /// `P-USAGE-INTERIM`, it is cut *before* this frame is counted, and the
+    /// frame opens the next window. Counting first and cutting after would date
+    /// the frame to the old window's start — after an idle hour, an hour before
+    /// it was sent, which the control plane's hourly rollup of `started_at`
+    /// then shows as usage in the wrong hour. Cut first, every byte is dated
+    /// less than one interim before it was yielded.
+    ///
+    /// The cut is on a frame boundary, so a record is never made while a frame
+    /// is half-counted. That boundary is also the caveat REQ-60 states: bytes
+    /// counted before a stream went idle stay unreported until its next frame
+    /// or its end. They are delayed, not misdated — the record that finally
+    /// carries them still starts where their window did, and its duration runs
+    /// to the cut, idle time included.
+    ///
+    /// An expired window with nothing in it is cut like any other, as an empty
+    /// `open` record, rather than silently moved forward. Records tile the
+    /// response — each starts at the previous one's cut, so their durations
+    /// account for the response's whole life as a run of rate observations —
+    /// and a moved window would leave a hole exactly where the response sat
+    /// silent, and drop the response's own start from the record whenever its
+    /// first byte came late. The price is an extra event, and it is bounded at one per
+    /// response: every window after a cut opens with the frame that caused it,
+    /// so only the first window can expire empty. Empty frames are what would
+    /// break that bound, which is why they are not frames here: they carry
+    /// nothing to date, so they neither count nor cut.
     fn observed(&mut self, bytes: usize) {
         // The terminal record is the last word on a response. Armor, not a live
         // case: a frame arriving after it would open a window the completion
-        // already closed, and cut a delta nothing would ever terminate.
-        if self.finished {
+        // already closed, and cut a delta nothing would ever terminate. An
+        // empty frame is turned away for the reason above.
+        if self.finished || bytes == 0 {
             return;
         }
-        self.pending = self.pending.saturating_add(bytes as u64);
-        self.yielded = self.yielded.saturating_add(bytes as u64);
         let now = Instant::now();
         if now.duration_since(self.window) >= self.interim {
             self.cut(now, Status::Open);
         }
+        self.pending = self.pending.saturating_add(bytes as u64);
+        self.yielded = self.yielded.saturating_add(bytes as u64);
     }
 
     /// The end, however it came: exactly one terminal record per measured
@@ -785,6 +807,148 @@ mod tests {
                 .all(|pair| pair[0].started_at < pair[1].started_at),
             "records must partition the response in order: {events:?}"
         );
+    }
+
+    /// A meter driven by hand, so a test can place each frame on the clock
+    /// exactly — including frames no real body would bother to send.
+    fn meter(interim: Duration) -> (Meter, mpsc::Receiver<Queued>) {
+        let (sink, events) = UsageSink::for_test(64, interim);
+        let meter = Meter::new(sink, attribution(), Encoding::Identity, Framing::Chunked);
+        (meter, events)
+    }
+
+    /// Seconds between two records' starts. Both are one wall read plus a
+    /// monotone offset, so under paused time the difference is the offset.
+    fn apart(earlier: &UsageEvent, later: &UsageEvent) -> f64 {
+        later.started_at - earlier.started_at
+    }
+
+    /// The defect this ordering exists to remove: a frame that ends a long idle
+    /// was counted into the window the idle began in, so bytes sent now were
+    /// dated hours ago — into the wrong hour of the control plane's rollup.
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_after_a_long_idle_is_dated_to_its_arrival() {
+        let (mut meter, mut events) = meter(INTERIM);
+
+        meter.observed(100);
+        tokio::time::advance(Duration::from_secs(2 * 3600)).await;
+        meter.observed(50);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        meter.finish(Stopped::Eof);
+
+        let events = drain(&mut events);
+        assert_eq!(events.len(), 2, "{events:?}");
+        let (before, after) = (&events[0], &events[1]);
+        assert_eq!(before.status, Status::Open);
+        assert_eq!(
+            before.wire_bytes, 100,
+            "the old window carries only what it held before the idle"
+        );
+        assert_eq!(before.duration_ms, 2 * 3600 * 1000, "and runs to the cut");
+        assert_eq!(after.status, Status::Completed);
+        assert_eq!(after.wire_bytes, 50);
+        assert!(
+            (apart(before, after) - 7200.0).abs() < 1e-3,
+            "the late frame opens a window at its own arrival: {events:?}"
+        );
+        assert_eq!(after.duration_ms, 5_000);
+    }
+
+    /// The other side of the same reordering: a steady stream still reports
+    /// once per interim, the windows still tile the response, and moving the
+    /// cut ahead of the count neither loses a byte nor counts one twice.
+    #[tokio::test(start_paused = true)]
+    async fn a_steady_stream_cuts_one_record_per_interim_and_loses_nothing() {
+        let chunks = futures::stream::unfold(0usize, |sent| async move {
+            if sent == 10 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Some((
+                Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b'x'; 1000])),
+                sent + 1,
+            ))
+        });
+        let (response, mut events) =
+            measured(Body::from_stream(chunks), None, Duration::from_secs(30));
+
+        assert_eq!(read(response.into_body()).await, 10_000);
+
+        let events = drain(&mut events);
+        assert_eq!(
+            total(&events),
+            10_000,
+            "every byte exactly once: {events:?}"
+        );
+        let (last, interims) = events.split_last().expect("at least one record");
+        assert_eq!(last.status, Status::Completed);
+        // Frames at 10 s .. 100 s: the ones at 30, 60 and 90 find the window
+        // expired, cut it, and open the next one.
+        assert_eq!(interims.len(), 3, "one record per interim: {events:?}");
+        assert!(interims
+            .iter()
+            .all(|event| event.status == Status::Open && event.duration_ms == 30_000));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.wire_bytes)
+                .collect::<Vec<_>>(),
+            vec![2000, 3000, 3000, 2000],
+            "each cut frame lands in the window it opens: {events:?}"
+        );
+        assert!(
+            events.windows(2).all(|pair| {
+                let gap = apart(&pair[0], &pair[1]) - pair[0].duration_ms as f64 / 1000.0;
+                gap.abs() < 1e-3
+            }),
+            "each record starts where the previous one was cut: {events:?}"
+        );
+    }
+
+    /// A window that expires before anything was counted in it is still cut,
+    /// as an empty `open` record, so the response's start stays on record and
+    /// the windows keep tiling it. Only the first window can expire empty.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_first_frame_cuts_one_empty_window_ahead_of_it() {
+        let (mut meter, mut events) = meter(INTERIM);
+
+        tokio::time::advance(Duration::from_secs(90)).await;
+        meter.observed(100);
+        tokio::time::advance(Duration::from_secs(40)).await;
+        meter.observed(10);
+        meter.finish(Stopped::Eof);
+
+        let events = drain(&mut events);
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events[0].status, Status::Open);
+        assert_eq!(events[0].wire_bytes, 0);
+        assert_eq!(events[0].duration_ms, 90_000, "from the response's start");
+        assert_eq!(events[1].status, Status::Open);
+        assert_eq!(events[1].wire_bytes, 100, "the late frame's own window");
+        assert!((apart(&events[0], &events[1]) - 90.0).abs() < 1e-3);
+        assert_eq!(events[2].status, Status::Completed);
+        assert_eq!(events[2].wire_bytes, 10);
+        assert_eq!(total(&events), 110);
+    }
+
+    /// Empty frames carry nothing to date, so they neither count nor cut. Were
+    /// they frames here, a body yielding them on an idle stream would mint an
+    /// empty record every interim.
+    #[tokio::test(start_paused = true)]
+    async fn empty_frames_never_cut_a_window() {
+        let (mut meter, mut events) = meter(INTERIM);
+
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(40)).await;
+            meter.observed(0);
+        }
+        meter.finish(Stopped::Eof);
+
+        let events = drain(&mut events);
+        assert_eq!(events.len(), 1, "only the terminal record: {events:?}");
+        assert_eq!(events[0].status, Status::Completed);
+        assert_eq!(events[0].wire_bytes, 0);
+        assert_eq!(events[0].duration_ms, 160_000);
     }
 
     /// The end that matters most on a streaming product: nobody sends EOF, the
