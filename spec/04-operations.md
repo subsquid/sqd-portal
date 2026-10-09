@@ -72,8 +72,8 @@ source failure → UPSTREAM-FAILURE; parent-hash mismatch → CONFLICT (real-tim
 only; takes precedence over EMPTY). Failures
 **after the first record** truncate per INV-25 (ADR-001); the client recovers via
 continuation (DEF-9). The stream ends when the requested range or the frontier is
-reached, a chunk-count limit fires, a paced stream's grant has gone stale (REQ-72), or
-truncation occurs — coverage extent is a free variable (FV-4).
+reached, a chunk-count limit fires, or truncation occurs — coverage extent is a free
+variable (FV-4).
 
 *Timeouts.* Each worker attempt is bounded by P-TRANSPORT-TIMEOUT; body reads by
 congestion permits (DC-1). Client disconnect aborts every in-flight attempt and

@@ -27,9 +27,9 @@ precondition on the surface those documents already describe, not a second syste
 Commercial usage measurement (REQ-60/61, DC-9) is conditional on that in turn, and on its
 own configuration under it: it records what an authorized request was served and can never
 change it, so it is spread the same way rather than given a document. Usage pacing
-(REQ-70..REQ-75) is conditional on authorization, on its own mode, and on a grant that
-carries a rate: it slows a response to the rate the control plane chose and never refuses
-one, and is spread the same way.
+(REQ-70..REQ-74) is conditional on enforced authorization, on its own mode, and on a grant
+that carries a rate: it slows a response to the rate the control plane chose and never
+refuses one, and is spread the same way.
 
 ## Document map
 

@@ -189,11 +189,11 @@ catches framework rejections, which would erase the distinction this rule exists
 Emitting through the envelope is what prevents that, and CT-5 pins it behind the real
 middleware stack rather than at the gate alone.
 
-**IB-10 — Usage headers.** Pacing enforcing deployments only (REQ-74; added with
+**IB-10 — Usage headers.** Pacing enforcing deployments only (REQ-73; added with
 ADR-018). Every gated response admitted on a version-2 grant carries them, whatever its
 status, with values from the grant it was admitted on; they do not change while it streams.
-None appears with pacing off or in log_only, on a version-1 grant, or on a response with no
-grant.
+None appears with pacing off or in log_only, on a portal whose authorization runs in shadow,
+on a version-1 grant, or on a response with no grant.
 
 | Header | Value |
 |---|---|
@@ -204,9 +204,7 @@ grant.
 | `x-sqd-usage-floor-bytes-per-sec` | the floor rate an over-limit stream is slowed to; omitted when there is none |
 | `x-sqd-usage-as-of` | when the control plane last computed the usage, RFC 3339; omitted when it has not yet |
 
-The rate a response is paced at is not a header: it is the grant's, and it can change while
-the response streams (REQ-72). No status code is added; a slowed response is a 200 like any
-other (INV-17).
+No status code is added; a slowed response is a 200 like any other (INV-17).
 
 **IB-8 — Versioning rule.** Any change to this binding (route, code, header, schema,
 taxonomy) updates this file and the interface-conformance class CT-5 in the same

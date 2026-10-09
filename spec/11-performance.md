@@ -35,7 +35,7 @@ Reference scenarios:
 | SLI-3 | Refusal correctness: fraction of refusals carrying the correct DEF-10 class and (for OVERLOADED) a retry hint |
 | SLI-4 | Availability: fraction of time ready (OP-8) excluding deploys |
 | SLI-5 | Memory headroom: peak RSS / P-MEMORY-BUDGET |
-| SLI-6 | Completion integrity: fraction of streams ending for a contract reason — requested bound reached, frontier reached, a client-requested chunk/coverage limit, or a stale paced stream ended cleanly (REQ-72) — vs truncated by failure |
+| SLI-6 | Completion integrity: fraction of streams ending for a contract reason — requested bound reached, frontier reached, or a client-requested chunk/coverage limit — vs truncated by failure |
 
 ## SLO table
 

@@ -88,7 +88,7 @@ P-MAX-CHUNKS-PER-STREAM chunks, or P-STORED-RESULTS-PER-CHUNK buffered results p
 chunk. The clamp-bypassing debug variant exists only behind an explicit operator flag,
 disabled by default (ADR-014; GAP-21 until gated). While pacing enforces, a stream admitted
 over its allowance and paced obtains at most P-FLOOR-READ-AHEAD read-ahead, on the debug
-variant too (REQ-73).
+variant too (REQ-72).
 *Why:* client-controlled resource amplification; at the floor, read-ahead is data pulled from
 the network long before the client can be sent it.
 *Check:* CT-1 — boundary values; observe via coverage/behavior and metrics. CT-12 — the floor
@@ -144,30 +144,25 @@ under saturation and on a second replica; assert identical verdicts, and that tw
 given the same denial converge within their grants' `expires_at`.
 
 **INV-16 — Pacing bound.** [response]
-Over any interval in which a successful response is paced at one rate (REQ-71), the encoded
-body bytes it yields are at most P-PACING-BURST plus that rate times the interval's length, through its
-last byte. When the rate changes (REQ-72) the credit it had is kept, clipped to the new
-P-PACING-BURST, and the bound holds again at the new rate from the next piece; a newer grant
-carrying the same rate changes nothing, so a renewal never refills the burst. No frame is
-exempt: one larger than P-PACING-SLICE is released in pieces, each only once the bound covers
-it, and the response does not end while a piece is still held. Error responses carry no chain
-data and are outside the bound.
+Over any interval of a successful response paced at its admission rate (REQ-71), the encoded
+body bytes it yields are at most P-PACING-BURST plus that rate times the interval's length,
+through its last byte. No frame is exempt: one larger than P-PACING-SLICE is released in
+pieces, each only once the bound covers it, and the response does not end while a piece is
+still held. Error responses carry no chain data and are outside the bound.
 *Why:* a bound that lapses on the last frame, or on a response that is one frame, is no bound
 for the workload that matters: archival zstd responses whose frames are whole worker results.
-*Check:* CT-12 — pace responses of many small frames, of one huge frame, and with a rate
-changing mid-response; assert the cumulative byte curve against the bound at every frame.
+*Check:* CT-12 — pace responses of many small frames and of one huge frame; assert the
+cumulative byte curve against the bound at every frame, and the whole body delivered.
 
-**INV-17 — Pacing changes timing and extent only.** [response]
+**INV-17 — Pacing changes timing only.** [response]
 A response pacing touched is semantically equal to the same request served with pacing off,
-except in its timing, in its coverage extent when it was ended as stale (FV-4, REQ-72), and in
-the usage headers of REQ-74: same status, same records, a complete encoding. Pacing produces
-no refusal and no error, in any mode, and its read-ahead clamp (REQ-73) changes nothing but
-timing.
+except in its timing and in the usage headers of REQ-73: same status, same records, the same
+ending. Pacing produces no refusal, no error and no early end, in any mode, and its read-ahead
+clamp (REQ-72) changes nothing but timing.
 *Why:* an over-limit organization is slowed, never refused; a pacer that could fail a request
 or corrupt a body is a refusal with extra steps.
 *Check:* CT-12 — serve the same requests with pacing off, log_only and enforce, and compare
-status, headers and decoded records; in enforce with the stale end on, compare the shorter
-body's records against a prefix of the unpaced one.
+status, headers and decoded records.
 
 ## Response semantics (20–29)
 
@@ -212,14 +207,9 @@ reported heads never lie).
 **INV-25 — Truncation well-formedness.** [response]
 A stream body always ends on a record boundary with valid encoding — whether complete
 or truncated; a truncated body is indistinguishable from a short complete one at the
-encoding level. An early end the Portal decides for itself — the operator's chunk cap
-(REQ-8), a stale paced response (REQ-72) — is not a truncation: it ends the record sequence
-before encoding, so the body is a complete encoding, and never before the first chunk.
-*Why:* torn records corrupt client decoders (ADR-001's price must stay this low). An end the
-Portal chooses has no reason to pay even that price: a body that is one compressed member
-fails to decode if it is cut before its trailer.
-*Check:* CT-2 — kill the serving stub mid-stream at every phase; decode-validate. CT-12 —
-end a stale paced response under gzip and zstd; decode-validate the whole body.
+encoding level.
+*Why:* torn records corrupt client decoders (ADR-001's price must stay this low).
+*Check:* CT-2 — kill the serving stub mid-stream at every phase; decode-validate.
 
 **INV-26 — Error soundness.** [response]
 Every failure maps to exactly one DEF-10 `type`/`code` pair; body-bearing errors use the
@@ -401,5 +391,5 @@ Structural validators (13 §validators) enforce INV-20/21/25 on every response f
 free. The dependency-fault matrix (CT-2) owns INV-2/23/25/31/37/40. Concurrency swarms
 (CT-3) own INV-1/3/4/5/12/28/30/35. The fuzz corpus (CT-4/9) owns INV-10/36. Interface
 conformance (CT-5) owns INV-13/24/26. Authorization (CT-10) shares INV-10 and owns
-INV-6/14/15/38/39. Pacing (CT-12) owns INV-16/17 and shares INV-11/25. Every response in
+INV-6/14/15/38/39. Pacing (CT-12) owns INV-16/17 and shares INV-11. Every response in
 every class re-checks the `[response]` band via the validators.

@@ -182,7 +182,7 @@ newer vocabulary for the parts it recognizes is how an added restriction becomes
 accidental permission (REQ-54). Claims version 2 adds a required **usage claim**: the
 organization's usage state, the per-response rate the Portal paces to (absent: unpaced), and
 figures the Portal only copies into headers — allowance, used bytes, floor rate, period end,
-and when the usage was last computed (REQ-70, REQ-74). The Portal acts on the rate alone and
+and when the usage was last computed (REQ-70, REQ-73). The Portal acts on the rate alone and
 derives nothing from the rest.
 
 A **denial** is the exchange's other authoritative answer: the earliest ladder rung that
@@ -302,4 +302,4 @@ Semantics in [04-operations.md](04-operations.md).
 | `log_only` / `enforce` | Shadow and enforcing modes (REQ-55) |
 | exchange | The one control-plane call: credential in, grant or denial out (DC-8) |
 | fingerprint | The digest of a whole credential that keys the grant cache (DEF-16, DEF-18) |
-| `auth.limits.pacing`, pacer, stop flag | Usage pacing and the stale end (REQ-70..REQ-75) |
+| `auth.limits.pacing`, pacer | Usage pacing (REQ-70..REQ-74) |

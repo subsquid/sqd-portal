@@ -79,7 +79,7 @@ policy, and it is the control plane's `expires_at` under the Portal's cap (REQ-5
 | Fault | Required response |
 |---|---|
 | Exchange unreachable / timeout / error status, cached grant inside `expires_at` | degrade: serve on the cached grant; count the grace-serving and alarm on it (OB-9/13). No request fails for this reason while the grant lives |
-| Exchange unreachable while responses are paced on a version-2 grant | degrade, failing open on the rate: the held grant keeps its rate and its headers until `expires_at`, so an organization that crosses its allowance stays at full speed and one whose period resets stays at the floor. A stale paced response is ended, and a resumption admitted on a grant already due is not ended again on that grant (REQ-72); one that reaches another replica, on a grant still fresh there, can be |
+| Exchange unreachable while responses are paced on a version-2 grant | degrade, failing open on the rate: the held grant keeps its rate and its headers until `expires_at`, so an organization that crosses its allowance stays at full speed and one whose period resets stays at the floor (REQ-71) |
 | Exchange unreachable, no usable grant (never cached, or past `expires_at`) | fail-safe: refuse as UPSTREAM-FAILURE, retryable, attributed to the dependency. This is the accepted cost of asking on demand, not a defect |
 | Answer malformed, missing a field, or carrying an unrecognized claims version | integrity: treat as a failed exchange, store nothing, alarm. Never read for the parts that parsed — an unread restriction is a granted permission |
 | Answer about a different credential than was asked about | integrity: discard and refuse as UPSTREAM-FAILURE |
