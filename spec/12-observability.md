@@ -192,6 +192,20 @@ configuration. A family that appeared only where measurement was on would make a
 counter ambiguous between "not configured" and "nothing reported", which is the harder
 question to answer during an incident.
 
+**OB-16 — Pacing.** Pacing deployments only (P-PACING-MODE not off). In enforce: responses
+that waited on their rate at least once, the time they spent waiting, and responses ended as
+stale (REQ-72). In log_only: responses that would have waited, and the time they would have
+waited (REQ-75). Each is counted by the usage state of the grant the response was paced at —
+a closed set — and by nothing finer: no key id, no organization, no dataset, no request path,
+for OB-15's reasons. The first wait, or would-be wait, of each response goes to protected
+logs with the key id, the organization, the rate and the state, which is where a single
+customer's pacing is looked up. The families are registered for the process
+unconditionally and read zero where pacing is off. They move only for a response admitted on
+a version-2 grant, so on a portal whose authorization runs in shadow they track the verdict
+that mode conceals, exactly as OB-15's do, and GAP-38 decides both. The log_only counters are
+what a cutover is judged on: the would-wait volume by state, against the organizations the
+control plane holds over their allowance.
+
 ## Property → observable mapping
 
 | Property | Decided by |
@@ -209,6 +223,7 @@ question to answer during an incident.
 | INV-6, INV-15, INV-39 | protected OB-12 reason logs + public non-disclosure; neutral shadow projection and enforcing-only OB-13 classes |
 | INV-30/31 | OB-1, OB-5 (they are the invariant's subject) |
 | INV-32, REQ-60/61 | OB-15 drop reasons and queue depth against the sink stub's ledger |
+| INV-16, INV-17, REQ-70..REQ-75 | OB-16 waits and stale ends by state against the harness's byte-curve and header ledger; protected first-wait log lines |
 | SLI-1..6 | OB-2, OB-3, OB-1 + process RSS |
 
 ## Logging

@@ -72,8 +72,8 @@ source failure → UPSTREAM-FAILURE; parent-hash mismatch → CONFLICT (real-tim
 only; takes precedence over EMPTY). Failures
 **after the first record** truncate per INV-25 (ADR-001); the client recovers via
 continuation (DEF-9). The stream ends when the requested range or the frontier is
-reached, a chunk-count limit fires, or truncation occurs — coverage extent is a free
-variable (FV-4).
+reached, a chunk-count limit fires, a paced stream's grant has gone stale (REQ-72), or
+truncation occurs — coverage extent is a free variable (FV-4).
 
 *Timeouts.* Each worker attempt is bounded by P-TRANSPORT-TIMEOUT; body reads by
 congestion permits (DC-1). Client disconnect aborts every in-flight attempt and
@@ -167,7 +167,8 @@ unauthenticated request cannot buy that work (INV-14). No serving dependency is 
 and no shared state is mutated beyond the grant cache, its negative answers, and
 authorization observability.
 
-*Post.* Admit, and the request proceeds to its operation unchanged; reject with the first
+*Post.* Admit, and the request proceeds to its operation unchanged — on a version-2 grant
+its response is then paced to the grant's rate (REQ-71); reject with the first
 failed rung of REQ-53's ladder, mapped to its DEF-10 row; or fail before a verdict with
 OVERLOADED/UPSTREAM-FAILURE when a required exchange could not run or answer. Any such
 outcome is terminal while enforcing: no handler runs, no stream slot is taken, and no
