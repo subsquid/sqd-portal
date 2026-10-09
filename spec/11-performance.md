@@ -35,7 +35,7 @@ Reference scenarios:
 | SLI-3 | Refusal correctness: fraction of refusals carrying the correct DEF-10 class and (for OVERLOADED) a retry hint |
 | SLI-4 | Availability: fraction of time ready (OP-8) excluding deploys |
 | SLI-5 | Memory headroom: peak RSS / P-MEMORY-BUDGET |
-| SLI-6 | Completion integrity: fraction of streams ending for a contract reason — requested bound reached, frontier reached, or a client-requested chunk/coverage limit — vs truncated by failure |
+| SLI-6 | Completion integrity: fraction of streams ending for a contract reason — requested bound reached, frontier reached, a client-requested chunk/coverage limit, or a stale paced stream ended cleanly (REQ-72) — vs truncated by failure |
 
 ## SLO table
 
@@ -49,7 +49,7 @@ register ([13-conformance.md](13-conformance.md)), and seed the regression gates
 |---|---|---|
 | SLI-1 (stream) | S1 | p99 ≤ P-SLO-STREAM-TTFB-P99 ⚠ |
 | SLI-1 (heads/metadata) | S1 | p99 ≤ P-SLO-METADATA-TTFB-P99 ⚠ |
-| SLI-2 | S1 | ≥ SDK consumption rate (client-bound, not portal-bound) ⚠ OQ-10 |
+| SLI-2 | S1 | ≥ SDK consumption rate (client-bound, not portal-bound), or the paced rate for a paced stream (REQ-71) ⚠ OQ-10 |
 | SLI-3 | S3 | ≥ P-SLO-REFUSAL-CORRECTNESS (hard invariant INV-26) |
 | SLI-4 | any | ≥ P-SLO-AVAILABILITY monthly ⚠ |
 | SLI-5 | S1/S4 | ≤ P-SLO-MEMORY-HEADROOM ⚠ |

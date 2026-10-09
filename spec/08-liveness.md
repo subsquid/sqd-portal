@@ -99,12 +99,16 @@ plane stops being served by a replica within its grant's `refresh_after` + one e
 P-GRANT-REFRESH-JITTER, and unconditionally at that grant's `expires_at`. The same bound
 covers every narrowing of a live key — a withdrawn dataset, a reduced scope — since all of
 them reach the Portal only as the next grant. A lowered rate (REQ-72) is such a narrowing,
-and the bound is about admissions: a response already open sees a newer grant only when
-another request for the same credential renews it on that replica. With
-P-END-STALE-STREAMS set while pacing enforces, a paced open response whose grant goes unrenewed ends
-P-STALE-STREAM-GRACE past that grant's `refresh_after`, so its resumption is admitted on the
-current grant — a revoked key's paced responses included. Without it, a response that is its
-credential's only traffic on the replica keeps its admission rate to its end. The first bound
+and the bound is about admissions: a response already open sees a newer grant only when a
+request for the same credential renews it on that replica. With P-END-STALE-STREAMS set while
+pacing enforces, a paced open response that took its grant up before that grant's
+`refresh_after`, and finds nothing newer P-STALE-STREAM-GRACE past it, is ended at its next
+chunk boundary, so its resumption is admitted on the current grant — or refused, for a key
+revoked meanwhile. That is eligibility, not a deadline: the current chunk still drains at the
+paced rate. A response admitted on a grant already due is exempt (REQ-72), so one whose
+renewal is denied keeps streaming to its end, as does every unpaced response. Without the
+switch, a response that is its credential's only traffic on the replica keeps its admission
+rate to its end. The first bound
 needs a healthy control plane and a request to arrive — an idle credential converges
 trivially, since nothing is being served on it — and holds through a flood of unknown
 tokens, since renewals spend their own budget (DC-8, HZ-10). The second needs nothing at all: it holds

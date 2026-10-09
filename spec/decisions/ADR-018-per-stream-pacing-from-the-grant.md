@@ -19,10 +19,11 @@ with a per-pod tally rebased on every snapshot. The control plane has the totals
 aggregates the usage records into one state per organization, so it can say how fast a key
 may go, and say it again when that changes.
 
-**The pacer cannot renew a grant.** Renewal needs the credential, and the credential is
-destroyed once admission is done (DEF-16, INV-38). A long stream holds only the fingerprint.
-It can read what other requests put in the grant cache, and nothing more: a stream that is
-its key's only traffic on a replica never sees a newer grant.
+**The pacer cannot renew a grant.** Renewal needs the credential, and only a request holds
+it: the request itself, and the one exchange it starts when it finds its grant due (DEF-16,
+INV-38). A long stream holds only the fingerprint. It can read what requests put in the grant
+cache, and nothing more. Once its own admission's renewal, if any, has landed, a stream that
+is its key's only traffic on a replica sees no newer grant.
 
 **A response cannot be cut short at an arbitrary byte.** A gzip response is one member for the
 whole body, from the recompressor and from gzjoin alike, so a body cut before the trailer
@@ -73,14 +74,21 @@ between responses or replicas.
    is paced whenever its grant has a rate. The stream routes stamp `x-sqd-data-source` inside
    the gate, and the routes with no stamp are the direct worker query and the SQL plan, both
    served by the network, so no route has to declare its source to the gate. A response
-   naming no source is an error or an empty body, and pacing it costs nothing.
+   naming no source is an error or an empty body, and pacing it costs nothing. The wrapper
+   forwards the inner body's size hint and end of stream, so the response normalizer and the
+   tap read the same framing as before. Two outer rewrites replace a body after the gate: a
+   framework rejection of at most 8 KiB, and a typed 5xx envelope stamped with its request
+   id. Both bodies are far below the burst, so leaving them unwrapped breaks no bound, and
+   both keep the headers and extensions the gate set.
 
 4. **Token bucket on encoded bytes, sliced.** The bucket fills at `stream_bytes_per_sec` and
    holds one second of the rate, but never less than 64 KiB, so one slice always fits. Frames
    are split with `Bytes::split_to` (zero-copy) into slices of at most 64 KiB, and a slice is
    released only once the bucket covers it. The bound (burst plus rate times elapsed time)
    therefore holds through the end of the stream, including a single large final frame, and
-   the longest pause pacing adds is one slice at the current rate. `poll_frame` stays
+   the longest pause pacing adds is one slice at the current rate. When the rate changes,
+   the bucket keeps its credit, clipped to the new burst; a renewed grant with the same rate
+   changes nothing, so a renewal never refills the burst. `poll_frame` stays
    synchronous: a response that must wait polls a stored `tokio::time::Sleep`, and a response
    that does not wait has no timer.
 
@@ -104,23 +112,27 @@ between responses or replicas.
 
    A response that took up a grant already due is never ended for staleness. Admission
    serves a due grant while it renews in the background, so in a control-plane outage that is
-   exactly the resumed request, and ending it would loop. A stale paced stream is therefore
-   ended at most once per outage.
+   exactly the resumed request, and ending it would loop. A resumption admitted on a due grant
+   is therefore not ended again on that grant. Replicas hold their caches independently, so a
+   resumption that lands on another replica, holding a grant still fresh there, can be ended
+   once more when that grant goes stale; nothing coordinates replicas to prevent it.
 
    **How it ends.** Never by cutting the encoded body. The middleware inserts a stop flag as
    a request extension before the handler runs; the wrapper sets it, and the network chunk
    stream reads it between chunks, the same place the operator's chunk cap ends a stream
-   (REQ-8). The chunk stream ends, gzip writes its trailer, and zstd stops after a whole
-   frame. The flag is read only after a chunk has been sent, so a stale end never produces an
+   (REQ-8). The chunk stream ends at its next chunk boundary, gzip writes its trailer, and
+   zstd stops after a whole frame, so the response finishes some time after the conditions
+   first hold: whatever of the current chunk is still to be sent, at the current rate. The flag is read only after a chunk has been sent, so a stale end never produces an
    empty 200: squid-sdk (`if (!res.data) break`) and pipes-sdk (`if (res.stream == null)
    break`) stop the whole stream on one. After a non-empty body ends, both clients request
-   again from the last block + 1, as they do after any short response (both `main` branches,
-   2026-10-09). A response with no chunk boundaries never reads the flag: the real-time proxy,
+   again from the last block + 1, as they do after any short response (squid-sdk `master` @
+   `4c86209`, pipes-sdk `main` @ `b1d46a6`, both read 2026-10-09). A response with no chunk boundaries never reads the flag: the real-time proxy,
    the direct worker query, the SQL plan and the timestamp lookup are never ended this way.
 
 7. **Read-ahead capped at the floor.** The middleware also inserts the usage snapshot as a
    request extension. In `enforce`, a stream admitted on a grant whose `state` is `over` and
-   whose rate is set gets its `buffer_size` capped at 1. The cap is read in
+   whose rate is set gets its `buffer_size` capped at 1: the scheduler downloads one chunk
+   ahead. What the encoder and the pacer hold past that is not counted against it. The cap is read in
    `run_stream_internal` and `run_archival_stream`, not in `restrict_request`, which the
    `/debug` variant skips. It applies at admission only: a stream that crosses mid-way keeps
    its window until it ends.
@@ -136,6 +148,12 @@ between responses or replicas.
    `state`. A response counts as paced once it has waited. No new status code exists: a
    paced response is a 200, and nothing is refused for usage.
 
+   In either mode, the pacing counters stay at zero while authorization runs in shadow. They
+   move only for a response admitted on a v2 grant, so on a shadow portal they would publish
+   the verdict that mode withholds from the keyless scrape (REQ-55), the same leak GAP-38
+   records for usage measurement. The protected log lines are kept. Shadow pacing is judged
+   on a portal that already enforces keys.
+
 10. **Headers (D106), in `enforce` only,** on every gated response admitted on a v2 grant:
     `x-sqd-usage-state`, `x-sqd-usage-limit-bytes` (omitted when uncapped),
     `x-sqd-usage-used-bytes`, `x-sqd-usage-reset` (`period_end`, RFC 3339),
@@ -147,7 +165,7 @@ between responses or replicas.
 
 | Failure | Behaviour |
 |---|---|
-| Control plane down | Held grants keep their rate until `expires_at`. An organization that crosses its allowance stays at full speed, and one whose period resets stays at the floor. This fails open on the rate, which is accepted and documented. A stale paced stream is ended once, and its resumption, admitted on a grant already due, is not ended again. |
+| Control plane down | Held grants keep their rate until `expires_at`. An organization that crosses its allowance stays at full speed, and one whose period resets stays at the floor. This fails open on the rate, which is accepted and documented. A stale paced stream is ended, and a resumption admitted on a grant already due is not ended again on that grant. |
 | A v2 grant on a portal with pacing `off` | Not paced, like v1. |
 | A portal on an older release switched to v2 by mistake | The release reads v2 as an unknown claims version. New keys get 502 `upstream_unavailable`; cached keys serve until `expires_at`, up to the grant lifetime (ADR-017), and then every key on that portal is refused. Upgrade first, then switch. |
 
@@ -164,9 +182,11 @@ with nothing else on that replica it runs at its admission rate until it ends. M
 seven days on the keyed stacks, 520 of about 60,000 network streams that would be paced ran
 past 5.5 minutes, one renewal interval plus the grace. The switch exists for them.
 
-**The stale end also lands revocations on open paced streams.** With the switch on, a denial
-evicts the grant (INV-6), so `peek` finds nothing newer and the stream ends 30 s after its
-`refresh_after`; the resumed request is refused. Unpaced streams are never ended, as before.
+**The stale end also lands most revocations on open paced streams.** With the switch on, a
+denial evicts the grant (INV-6), so `peek` finds nothing newer, and a paced stream that took
+its grant up fresh ends at the first chunk boundary 30 s past its `refresh_after`; the resumed
+request is refused. A stream admitted on a grant already due is exempt, and one whose renewal
+is denied keeps streaming to its end. So are unpaced streams, as before.
 
 **How quickly a crossing reaches the stream is a timeline, not a bound.** Reporting (interim
 records every 30 s), the control plane's aggregation (up to 2 minutes), grant renewal (60 s
@@ -198,7 +218,7 @@ each by how it is built, not by an added mitigation.
 - *Prefetch pulling data a client never receives.* #131 cut streams mid-flight when a key's
   quota ran out, so everything read ahead past the cut had been downloaded for nothing, at a
   depth the client chose through `buffer_size`. Nothing here is cut for usage (D51). A stream
-  admitted at the floor reads ahead one chunk. The one end the Portal initiates sits behind a
+  admitted at the floor downloads one chunk ahead. The one end the Portal initiates sits behind a
   switch, happens at most once per renewal interval per stream, and discards at most that
   stream's read-ahead, which is what a client disconnecting at the same moment discards.
 - *Why not a proxy in front.* A proxy can slow the bytes a client receives, which is the easy
@@ -218,7 +238,7 @@ each by how it is built, not by an added mitigation.
 - INV-25: an early end the Portal decides stops the record sequence before encoding, so the
   body is a complete encoding; REQ-8's chunk cap is the precedent. LIV-13: a lowered rate is a
   narrowing, and reaches open responses through `peek` or the stale end. INV-11, LIV-2, IB-1,
-  OP-1, OP-11 and the DC-8 fault table in 09 gain one clause each.
+  OP-1, OP-11, SLI-2, SLI-6 and the DC-8 fault table in 09 gain one clause each.
 - The usage state the Portal reads from the grant is the control plane's alone. The tap
   (INV-32, REQ-61) stays measurement-only; pacing is a separate band so that "measurement is
   not metering" stays true.

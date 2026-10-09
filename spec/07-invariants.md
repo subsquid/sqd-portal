@@ -144,11 +144,13 @@ under saturation and on a second replica; assert identical verdicts, and that tw
 given the same denial converge within their grants' `expires_at`.
 
 **INV-16 — Pacing bound.** [response]
-A response paced at a rate (REQ-71) never has yielded more encoded body bytes than
-P-PACING-BURST plus that rate times its age, measured from any point of its life to any
-later one and holding through its last byte. When its rate changes (REQ-72) the bound applies
-at the new rate from the next piece. No frame is exempt: one larger than P-PACING-SLICE is
-released in pieces, each only once the bound covers it.
+Over any interval in which a response is paced at one rate (REQ-71), the encoded body bytes
+it yields are at most P-PACING-BURST plus that rate times the interval's length, through its
+last byte. When the rate changes (REQ-72) the credit it had is kept, clipped to the new
+P-PACING-BURST, and the bound holds again at the new rate from the next piece; a newer grant
+carrying the same rate changes nothing, so a renewal never refills the burst. No frame is
+exempt: one larger than P-PACING-SLICE is released in pieces, each only once the bound covers
+it.
 *Why:* a bound that lapses on the last frame, or on a response that is one frame, is no bound
 for the workload that matters: archival zstd responses whose frames are whole worker results.
 *Check:* CT-12 — pace responses of many small frames, of one huge frame, and with a rate

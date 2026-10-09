@@ -200,9 +200,10 @@ a closed set — and by nothing finer: no key id, no organization, no dataset, n
 for OB-15's reasons. The first wait, or would-be wait, of each response goes to protected
 logs with the key id, the organization, the rate and the state, which is where a single
 customer's pacing is looked up. The families are registered for the process
-unconditionally and read zero where pacing is off. They move only for a response admitted on
-a version-2 grant, so on a portal whose authorization runs in shadow they track the verdict
-that mode conceals, exactly as OB-15's do, and GAP-38 decides both. The log_only counters are
+unconditionally and read zero where pacing is off. They also stay at zero while authorization
+runs in shadow: they move only for a response admitted on a version-2 grant, so there they
+would publish the verdict that mode withholds from the keyless scrape (REQ-55, OB-12) — the
+leak GAP-38 records for OB-15. The protected log lines are kept. The log_only counters are
 what a cutover is judged on: the would-wait volume by state, against the organizations the
 control plane holds over their allowance.
 

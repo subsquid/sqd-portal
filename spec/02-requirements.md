@@ -623,8 +623,9 @@ against an allowance, and shares no pacing state between responses or replicas (
 it owns is applying that rate to each response without breaking the response: through to its
 last byte, without corrupting its encoding, and without a request path that can refuse. The
 rate a response runs at can be stale. Only requests renew grants and the pacer never holds
-the secret (INV-38), so a long response sees a newer rate only when another request for the
-same credential renewed it on this replica; ending a response whose grant has gone stale is
+the secret (INV-38), so a long response sees a newer rate only when a request for the same
+credential renewed it on this replica — its own admission, if that found the grant due, or a
+later one; ending a response whose grant has gone stale is
 the operator's switch (P-END-STALE-STREAMS), not the default (ADR-018).
 
 **REQ-70 — The usage claim.** [MUST]
@@ -668,13 +669,14 @@ a response admitted unpaced picks up a rate the same way. With P-END-STALE-STREA
 only in enforce, the Portal ends a response when all of these hold: the grant it is paced by
 has a rate; it took that grant up, at admission or on a later look, before the grant's
 `refresh_after`; it is now P-STALE-STREAM-GRACE past that `refresh_after`; and the cache holds
-nothing newer. It ends between network chunks, after at least one, by ending the record
-sequence before encoding, so the body is a complete encoding (INV-25) and never empty. A
-response with no chunk boundaries — the real-time proxy, the timestamp lookup, the direct
-worker query, the SQL plan — is never ended this way. A response that took up a grant already
+nothing newer. It ends at its next boundary between network chunks, after at least one, by
+ending the record sequence before encoding, so the body is a complete encoding (INV-25) and
+never empty. A response with no chunk boundaries — the real-time proxy, the timestamp
+lookup, the direct worker query, the SQL plan — is never ended this way. A response that took up a grant already
 past `refresh_after` is never ended for staleness: that is the resumption of one already
 ended, admitted on the grant in hand while the control plane is unreachable, and ending it
-again would loop.
+again would loop. Replicas do not coordinate this: a resumption that reaches another
+replica, on a grant still fresh there, can be ended again when that grant goes stale.
 *Acceptance:* a response picks up a renewed grant's rate, looking no more often than
 P-RATE-PEEK-INTERVAL, and an unpaced response picks up a rate; with P-END-STALE-STREAMS set, a
 paced response whose grant was not renewed ends after at least one chunk with a complete gzip
@@ -685,13 +687,14 @@ in log_only, no response ends.
 
 **REQ-73 — Read-ahead at the floor.** [MUST]
 With P-PACING-MODE enforce, a stream admitted on a grant whose state is over and whose rate is
-set has its read-ahead clamped to P-FLOOR-READ-AHEAD, on every network stream route, the
-clamp-bypassing debug variant included (INV-11). It is decided at admission: a stream whose
-grant crosses while it runs keeps its window until it ends. A stream slowed to the floor
-therefore pulls from the network at most that many chunks ahead of what it has sent.
-*Acceptance:* a stream admitted over and paced reads at most P-FLOOR-READ-AHEAD chunks ahead
-on the stream, finalized-stream, archival-stream and its debug variant, whatever read-ahead it
-asked for; one admitted within, or unpaced, keeps its requested read-ahead; log_only applies
+set has its read-ahead window (DEF-11) clamped to P-FLOOR-READ-AHEAD chunk slots, on every
+network stream route, the clamp-bypassing debug variant included (INV-11). It is decided at
+admission: a stream whose grant crosses while it runs keeps its window until it ends. The
+clamp bounds what the stream downloads ahead, not what the encoder and the pacer hold once a
+chunk has left the window.
+*Acceptance:* a stream admitted over and paced has at most P-FLOOR-READ-AHEAD chunk slots in
+flight on the stream, finalized-stream, archival-stream and its debug variant, whatever
+read-ahead it asked for; one admitted within, or unpaced, keeps its requested read-ahead; log_only applies
 no clamp.
 *Trace:* ADR-018.
 
@@ -708,8 +711,9 @@ log_only, and on a version-1 grant, none appears.
 With P-PACING-MODE log_only, the Portal computes the waits enforce would take and takes none:
 it ends nothing, clamps nothing and adds no header, so every response equals the one pacing
 off serves. It counts the responses that would have waited and the time they would have
-waited (OB-16), and logs the first would-be wait of each response with its key id,
-organization, rate and state, to protected logs only.
+waited (OB-16, which stays at zero while authorization runs in shadow), and logs the first
+would-be wait of each response with its key id, organization, rate and state, to protected
+logs only.
 *Acceptance:* in log_only, a response that enforce would pace is served with the same status,
 headers and body as with pacing off and is never held back, and the would-wait signals move; its first
 would-be wait is in the protected log; no metric carries a key id or an organization.
