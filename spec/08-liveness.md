@@ -107,8 +107,8 @@ chunk boundary, so its resumption is admitted on the current grant — or refuse
 revoked meanwhile. That is eligibility, not a deadline: the current chunk still drains at the
 paced rate. A response admitted on a grant already due is exempt (REQ-72), so one whose
 renewal is denied keeps streaming to its end, as does every unpaced response. Without the
-switch, a response that is its credential's only traffic on the replica keeps its admission
-rate to its end. The first bound
+switch, a response that is its credential's only traffic on the replica keeps the last rate
+it obtained — its admission's, or that of the renewal its admission started — to its end. The first bound
 needs a healthy control plane and a request to arrive — an idle credential converges
 trivially, since nothing is being served on it — and holds through a flood of unknown
 tokens, since renewals spend their own budget (DC-8, HZ-10). The second needs nothing at all: it holds

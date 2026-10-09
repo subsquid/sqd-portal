@@ -643,19 +643,21 @@ version-1 grant.
 *Trace:* ADR-018, ADR-017.
 
 **REQ-71 — Per-response pacing.** [MUST]
-With P-PACING-MODE enforce, a gated response admitted on a version-2 grant whose rate is set
-is paced to that rate: over any interval of its life, the encoded body bytes it yields are at
-most P-PACING-BURST plus the rate times the interval, from its first byte to its last.
-Frames larger than P-PACING-SLICE are cut into pieces no larger, and a piece is released only
-once the bound covers it, so a single large frame, a response's last included, is paced like
-the rest instead of escaping the bound or arriving after a long silence. A response whose
+With P-PACING-MODE enforce, the body of a successful gated response admitted on a version-2
+grant whose rate is set is paced to that rate, from its first byte to its last, within the
+bound INV-16 states: over any interval at one rate, P-PACING-BURST plus the rate times the
+interval's length. Frames larger than P-PACING-SLICE are cut into pieces no larger, and a
+piece is released only once the bound covers it, so a single large frame, a response's last
+included, is paced like the rest instead of escaping the bound or arriving after a long
+silence. An error response is not paced: it carries no chain data. A response whose
 serving source is the real-time source (DEF-6) is not paced unless P-PACE-REAL-TIME is set.
 Pacing refuses nothing and changes no status, no record and no header but REQ-74's (INV-17).
 It runs inside measurement (REQ-60), which therefore counts what was sent and when, and is no
 part of it: measurement stays non-interfering (INV-32) whatever pacing does.
-*Acceptance:* against a version-2 grant with a rate, a response's cumulative encoded bytes
-stay within P-PACING-BURST plus the rate times the elapsed time at every point, including a
-response whose body is one frame many times P-PACING-SLICE; its status and decoded records
+*Acceptance:* against a version-2 grant with a rate, a successful response's encoded bytes
+stay within INV-16's bound over every interval at one rate, including a response whose body is
+one frame many times P-PACING-SLICE and one whose rate changes while it streams, and the whole
+body arrives, held pieces included; its status and decoded records
 equal an unpaced run of the same request; a real-time response is unpaced unless
 P-PACE-REAL-TIME is set; a version-1 grant, a version-2 grant with no rate, and pacing off
 are unpaced.

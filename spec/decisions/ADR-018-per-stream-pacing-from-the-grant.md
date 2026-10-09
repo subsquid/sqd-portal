@@ -67,19 +67,24 @@ between responses or replicas.
 
 3. **One wrapper, inside the tap.** The auth middleware wraps the response body after the
    handler returns. That is inside the usage tap, which still counts what was sent and when;
-   the tap stays measurement-only (INV-32, REQ-61). Every response admitted on a v2 grant is
-   wrapped, paced or not, so a stream admitted unpaced can still pick up a rate. A response
+   the tap stays measurement-only (INV-32, REQ-61). Every successful response admitted on a
+   v2 grant is wrapped, paced or not, so a stream admitted unpaced can still pick up a rate. A response
    naming `real_time` as its source is left unpaced unless `pace_real_time` is set: by
    default real-time data counts toward the allowance but is not slowed. Every other response
    is paced whenever its grant has a rate. The stream routes stamp `x-sqd-data-source` inside
    the gate, and the routes with no stamp are the direct worker query and the SQL plan, both
-   served by the network, so no route has to declare its source to the gate. A response
-   naming no source is an error or an empty body, and pacing it costs nothing. The wrapper
-   forwards the inner body's size hint and end of stream, so the response normalizer and the
-   tap read the same framing as before. Two outer rewrites replace a body after the gate: a
-   framework rejection of at most 8 KiB, and a typed 5xx envelope stamped with its request
-   id. Both bodies are far below the burst, so leaving them unwrapped breaks no bound, and
-   both keep the headers and extensions the gate set.
+   served by the network, so no route has to declare its source to the gate.
+
+   Error responses are not wrapped. They carry no chain data, and two outer layers re-render
+   them after the gate: framework rejections, and 5xx envelopes stamped with the request id,
+   whose size the client's own `x-request-id` sets. Both keep the headers and extensions the
+   gate set; no successful body is rewritten after the gate.
+
+   The wrapper reports its own framing, not the inner body's: end of stream only once the
+   inner body has ended and no slice is held, and a size hint that counts the bytes it holds.
+   A body of known size, such as the direct worker query's single buffer, keeps an exact hint,
+   so the transport and the tap read the same framing as without pacing. Forwarding the inner
+   body's end of stream would let the transport drop the slices still held.
 
 4. **Token bucket on encoded bytes, sliced.** The bucket fills at `stream_bytes_per_sec` and
    holds one second of the rate, but never less than 64 KiB, so one slice always fits. Frames
@@ -175,10 +180,11 @@ between responses or replicas.
 key. A key with N open streams receives N times the rate. Capping concurrent streams (D130)
 is not part of v2.
 
-**A single long stream keeps its admission rate while `end_stale_streams` is off.** Only
-requests renew grants, the chunk count is unlimited by default (P-MAX-CHUNKS-PER-STREAM), and
-the pacer has no secret. A key's other requests on the same replica move it through `peek`;
-with nothing else on that replica it runs at its admission rate until it ends. Measured over
+**A single long stream keeps its last rate while `end_stale_streams` is off.** Only requests
+renew grants, the chunk count is unlimited by default (P-MAX-CHUNKS-PER-STREAM), and the pacer
+has no secret. A key's other requests on the same replica move it through `peek`. With nothing
+else on that replica it runs at the last rate it obtained until it ends: its admission's, or
+the one brought by the renewal its own admission started on a due grant. Measured over
 seven days on the keyed stacks, 520 of about 60,000 network streams that would be paced ran
 past 5.5 minutes, one renewal interval plus the grace. The switch exists for them.
 
