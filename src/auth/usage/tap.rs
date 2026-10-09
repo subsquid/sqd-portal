@@ -44,6 +44,7 @@ use super::{
     event::{unix_seconds, Encoding, Status, UsageEvent, Window},
     Attribution, UsageSink,
 };
+use crate::endpoints::stream::DataSource;
 
 /// Runs outside the router and response-rewriting middleware, so the tap sees
 /// the final body, including stamped errors and HEAD's empty response. Only
@@ -135,7 +136,13 @@ fn measure(
     // body with an exact size and no `Content-Length` gets one from hyper, and
     // is then length-delimited on the wire.
     let framing = Framing::of(method, parts.status, &parts.headers, &body.size_hint());
-    let meter = Meter::new(sink, attribution, Encoding::of(&parts.headers), framing);
+    let meter = Meter::new(
+        sink,
+        attribution,
+        Encoding::of(&parts.headers),
+        DataSource::of(&parts.extensions, &parts.headers),
+        framing,
+    );
     Response::from_parts(parts, Body::new(MeasuredBody { inner: body, meter }))
 }
 
@@ -144,6 +151,9 @@ struct Meter {
     sink: Arc<UsageSink>,
     attribution: Attribution,
     encoding: Encoding,
+    /// Read once, like the encoding: a response is served by one source (INV-13),
+    /// chosen before its first byte.
+    data_source: Option<DataSource>,
     interim: Duration,
     /// One wall read per response; every record's `started_at` is this plus a
     /// monotone offset, so a clock step cannot make two records of the same
@@ -167,6 +177,7 @@ impl Meter {
         sink: Arc<UsageSink>,
         attribution: Attribution,
         encoding: Encoding,
+        data_source: Option<DataSource>,
         framing: Framing,
     ) -> Self {
         let interim = sink.interim();
@@ -175,6 +186,7 @@ impl Meter {
             sink,
             attribution,
             encoding,
+            data_source,
             interim,
             started_at: unix_seconds(SystemTime::now()),
             started,
@@ -279,6 +291,7 @@ impl Meter {
         let event = UsageEvent::new(
             &self.attribution,
             self.encoding,
+            self.data_source,
             self.pending,
             window,
             status,
@@ -813,7 +826,13 @@ mod tests {
     /// exactly — including frames no real body would bother to send.
     fn meter(interim: Duration) -> (Meter, mpsc::Receiver<Queued>) {
         let (sink, events) = UsageSink::for_test(64, interim);
-        let meter = Meter::new(sink, attribution(), Encoding::Identity, Framing::Chunked);
+        let meter = Meter::new(
+            sink,
+            attribution(),
+            Encoding::Identity,
+            None,
+            Framing::Chunked,
+        );
         (meter, events)
     }
 
@@ -1061,6 +1080,75 @@ mod tests {
     /// Shadow mode admits requests that presented no credential at all. There is
     /// nobody to attribute those bytes to, and inventing an owner would put
     /// unattributable volume in the table the pricing work reads.
+    /// The record names the layer the response does (DEF-6), read the way the HTTP
+    /// metrics read it: a handler's extension, a route's `served_by`, or the
+    /// `x-sqd-data-source` header that `/stream` sets.
+    #[tokio::test]
+    async fn the_record_names_the_source_the_response_was_served_by() {
+        use crate::{
+            endpoints::stream::DATA_SOURCE_HEADER, utils::logging::EndpointAnnotationLayer,
+        };
+
+        let cases: [(MethodRouter, Option<DataSource>); 4] = [
+            (
+                get(|| async { (DataSource::RealTime, "served") }),
+                Some(DataSource::RealTime),
+            ),
+            (
+                get(|| async { ([(DATA_SOURCE_HEADER, "network")], "served") }),
+                Some(DataSource::Network),
+            ),
+            (
+                get(|| async { "served" })
+                    .layer(EndpointAnnotationLayer::new("/fixed").served_by(DataSource::Network)),
+                Some(DataSource::Network),
+            ),
+            (get(|| async { "served" }), None),
+        ];
+        for (route, expected) in cases {
+            let (sink, mut events) = UsageSink::for_test(8, INTERIM);
+            let response = serve(route, Some(sink), "GET", "/probe").await;
+            assert_eq!(read(response.into_body()).await, 6);
+            let events = drain(&mut events);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].data_source, expected);
+        }
+    }
+
+    /// Read once per response, so an interim record carries it as the last one does.
+    #[tokio::test(start_paused = true)]
+    async fn every_record_of_a_response_carries_its_source() {
+        let chunks = futures::stream::unfold(0usize, |sent| async move {
+            if sent == 3 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            Some((
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"block")),
+                sent + 1,
+            ))
+        });
+        let (sink, mut events) = UsageSink::for_test(64, INTERIM);
+        let response = Response::builder()
+            .header(crate::endpoints::stream::DATA_SOURCE_HEADER, "real_time")
+            .body(Body::from_stream(chunks))
+            .unwrap();
+        let response = measure(sink, attribution(), &Method::GET, response);
+
+        assert_eq!(read(response.into_body()).await, 15);
+        let events = drain(&mut events);
+        assert!(
+            events.len() >= 2,
+            "the premise: interim records: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.data_source == Some(DataSource::RealTime)),
+            "{events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_request_the_gate_did_not_attribute_is_not_measured() {
         let (sink, mut events) = UsageSink::for_test(8, INTERIM);

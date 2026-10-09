@@ -558,8 +558,10 @@ switch off; this is the switch, and there is nothing behind it (NG2, REQ-61).
 Where configured, the Portal records what each authorized request was served, attributed
 to the credential that caused it, and reports it to the control plane. A record carries the
 key id, the organization the grant named where it named one, the dataset and route, the
-content encoding, the encoded response-body bytes counted at egress, the window they were
-served in, and how that window ended. Records are **deltas**, never running totals: a
+content encoding, the serving source (DEF-6) where routing selected one, the encoded
+response-body bytes counted at egress, the window they were served in, and how that window
+ended. A response has one source (INV-13), so every record of it names the same one.
+Records are **deltas**, never running totals: a
 response still open after P-USAGE-INTERIM is recorded then, and once more when it ends —
 including when it ends because the client went away — so the sum of a group's records is
 that group's total with nothing counted twice. Attribution comes from the grant the
@@ -580,10 +582,11 @@ price of a per-response timer on every measured response, on a service whose ste
 is tens of thousands of them, and was rejected for that; nothing is lost by the delay, only
 delayed, and the bound is the interval between a response's own frames.
 *Acceptance:* against a usage-sink stub, a gated request produces one record naming the
-key id, the organization, the canonical dataset, the route label and the encoding, whose
-byte count is the encoded body the client received; a response outliving P-USAGE-INTERIM
-produces more than one record, all but the last marked as continuing, whose counts sum to
-exactly that response's encoded bytes; several requests reach the sink in fewer deliveries
+key id, the organization, the canonical dataset, the route label, the encoding and the
+serving source, whose byte count is the encoded body the client received; a response
+outliving P-USAGE-INTERIM produces more than one record, all but the last marked as
+continuing, each naming the response's source, whose counts sum to exactly that response's
+encoded bytes; several requests reach the sink in fewer deliveries
 than there were records; a request that presented no credential produces none; and a
 Portal with no usage configuration makes no call to the sink at all and leaves every
 OB-15 signal at zero.

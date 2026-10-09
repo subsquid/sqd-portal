@@ -246,6 +246,10 @@ async fn measuring(fx: &mut Fixture) -> anyhow::Result<()> {
         "encoded bytes are keyed on the encoding that produced them: {record}",
     );
     ensure!(
+        record["data_source"] == "network",
+        "the record names the source that served it (DEF-6): {record}",
+    );
+    ensure!(
         record["wire_bytes"].as_u64().unwrap_or_default() > 0
             && record["event_id"].as_str().is_some_and(|id| !id.is_empty()),
         "a record needs its bytes and its idempotency key: {record}",
@@ -334,6 +338,12 @@ async fn measuring(fx: &mut Fixture) -> anyhow::Result<()> {
         "deltas summed to {} of the {} encoded bytes the client received",
         wire_bytes(&deltas),
         paced.encoded_len(),
+    );
+    ensure!(
+        deltas
+            .iter()
+            .all(|delta| delta["data_source"] == "real_time"),
+        "every delta of a real-time response names it (INV-13): {deltas:?}",
     );
 
     // ---- 4. An empty body is a delivery, not a hang-up ---------------------

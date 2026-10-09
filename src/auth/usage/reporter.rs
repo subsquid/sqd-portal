@@ -633,6 +633,7 @@ mod tests {
             dataset: Some("ethereum-mainnet".to_owned()),
             endpoint: "/stream".to_owned(),
             encoding: Encoding::Gzip,
+            data_source: Some(crate::endpoints::stream::DataSource::Network),
             wire_bytes: 1024,
             started_at: 1_800_000_000.0,
             duration_ms: 30_000,
