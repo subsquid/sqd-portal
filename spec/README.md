@@ -26,7 +26,10 @@ spread through the existing documents rather than given one of its own, because 
 precondition on the surface those documents already describe, not a second system.
 Commercial usage measurement (REQ-60/61, DC-9) is conditional on that in turn, and on its
 own configuration under it: it records what an authorized request was served and can never
-change it, so it is spread the same way rather than given a document.
+change it, so it is spread the same way rather than given a document. Usage pacing
+(REQ-70..REQ-75) is conditional on enforced authorization, on its own mode, and on a grant
+that carries a rate: it slows a response to the rate the control plane chose and never
+refuses one, and is spread the same way.
 
 ## Document map
 
@@ -69,6 +72,7 @@ not been ratified are explicitly `Proposed` and appear after the accepted log.
 | ADR-016 | 2026-08-12 | [Shadow usage measurement: encoded bytes at egress, deltas, and tolerated loss](decisions/ADR-016-shadow-usage-measurement.md) | Accepted |
 | ADR-017 | 2026-09-29 | [The outage runway is the grant lifetime; renewals get their own budget](decisions/ADR-017-lifetime-is-the-outage-runway.md) | Accepted |
 | ADR-013 | 2026-07-17 | [Assignment staleness must be bounded and observable](decisions/ADR-013-assignment-staleness-bound.md) | **Proposed** |
+| ADR-018 | 2026-10-09 | [Per-stream pacing from the grant](decisions/ADR-018-per-stream-pacing-from-the-grant.md) | **Proposed** |
 
 ## Conventions
 

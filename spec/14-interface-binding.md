@@ -5,8 +5,8 @@ encodings — as *observable contract*, still no internals. **Anything not speci
 here is unspecified: clients and tests must not pin it** (IB-8).
 
 **IB-1 — Transport generalities.** HTTP/1.1+; permissive CORS (any origin/method/
-header), exposing `Retry-After`, `x-request-id` and the `x-sqd-*`
-stream metadata —
+header), exposing `Retry-After`, `x-request-id`, the `x-sqd-*`
+stream metadata and the `x-sqd-usage-*` headers (IB-10) —
 allowing an origin does not make a response header readable, and the CORS-safelisted set
 contains none of ours, so a browser client would otherwise see the status and nothing
 else. Request bodies may be gzip-compressed. Every response carries `x-request-id`
@@ -188,6 +188,23 @@ carrying no code is normalized onto `malformed_request` at 400 by the same rule 
 catches framework rejections, which would erase the distinction this rule exists to make.
 Emitting through the envelope is what prevents that, and CT-5 pins it behind the real
 middleware stack rather than at the gate alone.
+
+**IB-10 — Usage headers.** Pacing enforcing deployments only (REQ-73; added with
+ADR-018). Every gated response admitted on a version-2 grant carries them, whatever its
+status, with values from the grant it was admitted on; they do not change while it streams.
+None appears with pacing off or in log_only, on a portal whose authorization runs in shadow,
+on a version-1 grant, or on a response with no grant.
+
+| Header | Value |
+|---|---|
+| `x-sqd-usage-state` | `within`, `over` or `unmetered`. "Slowed" means `over` |
+| `x-sqd-usage-limit-bytes` | the allowance, in wire bytes; omitted when uncapped |
+| `x-sqd-usage-used-bytes` | wire bytes used in the period, as of `x-sqd-usage-as-of`. It may exceed the limit while the state is `within` |
+| `x-sqd-usage-reset` | the end of the period, RFC 3339 |
+| `x-sqd-usage-floor-bytes-per-sec` | the floor rate an over-limit stream is slowed to; omitted when there is none |
+| `x-sqd-usage-as-of` | when the control plane last computed the usage, RFC 3339; omitted when it has not yet |
+
+No status code is added; a slowed response is a 200 like any other (INV-17).
 
 **IB-8 — Versioning rule.** Any change to this binding (route, code, header, schema,
 taxonomy) updates this file and the interface-conformance class CT-5 in the same

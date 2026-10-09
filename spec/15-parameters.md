@@ -112,6 +112,21 @@ set, which is the only thing that can size them honestly.
 | P-KEY-ID-MAX-LEN | Max accepted key-id length; mirrors what the control plane can mint (IB-9, REQ-52) | 64 *(fixed)* | 64 |
 | P-KEY-SECRET-MAX-LEN | Max accepted secret length (IB-9, REQ-52) | 128 *(fixed)* | 128 |
 
+## Usage pacing
+
+Bound only on an authorizing deployment, under `auth.limits.pacing` (REQ-70..REQ-75,
+ADR-018). The two switches are operator-bindable per portal; the rest are fixed. Nothing
+here is implemented yet, so the observed column is empty and every target waits on ADR-018.
+
+| Parameter | Role (where used) | Observed | Target |
+|---|---|---|---|
+| P-PACING-MODE | `auth.limits.pacing.mode`: `off` validates the grant's usage claim and does not act on it, `log_only` computes and counts waits without taking them, `enforce` paces, ends long paced streams, clamps and adds the usage headers (REQ-70..REQ-75). Separate from the authorization enforcement mode, and inert on a portal whose authorization runs in shadow | — | ⚠ `off` (ratify via ADR-018) |
+| P-PACE-REAL-TIME | `auth.limits.pacing.pace_real_time`: whether responses served by the real-time source are paced. They count toward the allowance either way (REQ-71) | — | ⚠ false (ratify via ADR-018) |
+| P-PACING-SLICE | Largest piece a response frame is released in while paced (REQ-71, INV-16, LIV-2) | — | ⚠ 64 KiB *(fixed)* (ratify via ADR-018) |
+| P-PACING-BURST | What a paced response may send ahead of its rate: one second of the rate, never less than P-PACING-SLICE, so every piece fits (REQ-71, INV-16) | — | ⚠ max(1 s × rate, P-PACING-SLICE) *(fixed)* (ratify via ADR-018) |
+| P-FLOOR-READ-AHEAD | Read-ahead a stream admitted over its allowance and paced is clamped to (REQ-72, INV-11) | — | ⚠ 1 chunk *(fixed)* (ratify via ADR-018) |
+| P-PACED-STREAM-MAX-AGE | Age past which a paced network stream starts no chunk after its first and ends once those in flight are sent, so its client resumes on a current grant. No shorter than the control plane's refresh interval, which it matches (REQ-75, LIV-13) | — | ⚠ 5 min *(fixed)* (ratify via ADR-018) |
+
 ## SLO targets
 
 | Parameter | Role (where used) | Observed | Target |

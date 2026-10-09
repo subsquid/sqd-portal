@@ -38,7 +38,9 @@ timeout plus a rerouted attempt (the same worst case as LIV-2). Witness: OB-2
 **LIV-2 — Stream progress (stall budget).** Healthy environment, draining client ⇒ a
 stream's coverage advances; zero-progress intervals never exceed P-STALL-BUDGET ⚠
 (worst honest case: a worker timeout plus rerouted attempt). A stream that cannot
-progress within the budget terminates (truncation or error) rather than hanging.
+progress within the budget terminates (truncation or error) rather than hanging. A paced
+response (REQ-71) is held to its rate instead, and any pause pacing adds lasts at most one
+piece, P-PACING-SLICE at that rate (INV-16).
 Witness: OB-2 heartbeat vs coverage. Check: CT-2 — stub-induced stalls.
 
 **LIV-3 — Non-stream termination.** Every non-stream operation (OP-2..OP-10) answers
@@ -96,7 +98,12 @@ within P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT + slack, regardless of client behavio
 plane stops being served by a replica within its grant's `refresh_after` + one exchange +
 P-GRANT-REFRESH-JITTER, and unconditionally at that grant's `expires_at`. The same bound
 covers every narrowing of a live key — a withdrawn dataset, a reduced scope — since all of
-them reach the Portal only as the next grant. The first bound
+them reach the Portal only as the next grant. A lowered rate is such a narrowing, and reaches
+the responses admitted on that grant: a response keeps the rate it was admitted with to its
+end (REQ-71). A paced network stream starts no chunk after P-PACED-STREAM-MAX-AGE
+(REQ-75), so a narrowing, a revocation included, reaches a long paced stream at the first
+resumption its replica admits after renewing, once the chunks in flight have drained; an
+unpaced stream is not ended. The first bound
 needs a healthy control plane and a request to arrive — an idle credential converges
 trivially, since nothing is being served on it — and holds through a flood of unknown
 tokens, since renewals spend their own budget (DC-8, HZ-10). The second needs nothing at all: it holds
@@ -109,6 +116,8 @@ interval (OQ-16). Witness: enforcing-mode OB-13 grace count, minimum remaining e
 exchange outcomes; shadow-mode and per-request details remain protected. Check: CT-10 —
 revoke a key while the stub is healthy and assert the first request past `refresh_after`
 converges; repeat with the stub unreachable and assert convergence exactly at `expires_at`.
+CT-12 — lower the rate a long paced stream's grant carries and assert that a resumption after
+the age limit, once admitted on the renewed grant, is paced at the new rate.
 
 **LIV-14 — New-key admission.** Healthy control plane ⇒ a key minted a moment ago is served
 on its first request: there is no set to be absent from, only an exchange to make, so
