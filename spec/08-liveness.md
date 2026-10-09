@@ -100,9 +100,10 @@ P-GRANT-REFRESH-JITTER, and unconditionally at that grant's `expires_at`. The sa
 covers every narrowing of a live key — a withdrawn dataset, a reduced scope — since all of
 them reach the Portal only as the next grant. A lowered rate is such a narrowing, and reaches
 the responses admitted on that grant: a response keeps the rate it was admitted with to its
-end (REQ-71). A paced network stream ends at P-PACED-STREAM-MAX-AGE (REQ-75), so a narrowing,
-a revocation included, reaches a long paced stream through its resumption, within about
-twice that age; an unpaced stream is not ended. The first bound
+end (REQ-71). A paced network stream starts no chunk after P-PACED-STREAM-MAX-AGE
+(REQ-75), so a narrowing, a revocation included, reaches a long paced stream through a later
+resumption — the second on the same replica — once the chunks in flight have drained; an
+unpaced stream is not ended. The first bound
 needs a healthy control plane and a request to arrive — an idle credential converges
 trivially, since nothing is being served on it — and holds through a flood of unknown
 tokens, since renewals spend their own budget (DC-8, HZ-10). The second needs nothing at all: it holds

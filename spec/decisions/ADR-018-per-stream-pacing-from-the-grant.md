@@ -107,27 +107,33 @@ after a fixed age, so its client comes back on a current grant.
    are unchanged). A changed rate reaches the requests admitted once the replica holds the
    renewed grant.
 
-6. **Paced streams end after P-PACED-STREAM-MAX-AGE, 5 minutes.** In `enforce`, the middleware
-   inserts a deadline, admission time plus 5 minutes, as a request extension on a request
-   admitted on a grant with a rate. The network chunk stream reads it the way it reads the
-   operator's chunk cap (REQ-8): past the deadline it starts no new chunk, sends the ones
-   already started, and ends. gzip writes its trailer and zstd stops after a whole frame, and
-   nothing downloaded is discarded. A stream always starts its first chunk before the deadline,
-   so it never ends empty, which both clients would read as "no data for this range". Both
+6. **Paced streams start no chunk after P-PACED-STREAM-MAX-AGE, 5 minutes.** In `enforce`, the
+   middleware inserts a deadline, admission time plus 5 minutes, as a request extension on a
+   request admitted on a grant with a rate. The network chunk stream reads it the way it reads
+   the operator's chunk cap (REQ-8), on every poll: past the deadline it starts no chunk after
+   its first, sends the ones already started, and ends. gzip writes its trailer and zstd stops
+   after a whole frame, and nothing downloaded is discarded. The first chunk is exempt, so a
+   stream whose request body arrived late still serves something; it never ends empty, which
+   both clients would read as "no data for this range", and the deadline never turns a
+   stream into a 204. The deadline bounds when the last chunk starts, not when the response
+   ends: the chunks in flight still drain at the paced rate, which at the floor can take
+   minutes for one large worker result. Both
    squid-sdk (`master` @ `4c86209`) and pipes-sdk (`main` @ `b1d46a6`) request again from the
    last block + 1 after a non-empty response ends, as after any short response. Routes with no
    chunk stream are never ended: the real-time proxy, the direct worker query, the SQL plan
    and the timestamp lookup. Neither are unpaced responses, Enterprise among them.
 
-   Nothing re-reads the grant. The resumed request is admitted on whatever grant the cache
+   Nothing re-reads the grant. The resumed request is admitted on whatever grant its replica
    holds by then, and if that grant is due its admission starts the renewal. The grant
-   refresh interval is 5 minutes, so the grant a stream was admitted on is due by its
-   deadline, and a changed rate reaches a long stream within about two age limits. The limit
+   refresh interval is 5 minutes, so on the same replica the grant a stream was admitted on is
+   due by its deadline, and a changed rate reaches a long stream on its second resumption.
+   A resumption that lands on another replica renews that replica's grant instead, so it can
+   take one more. The limit
    is a plain age, not a check for a stale grant. Without `peek`, a resumption is admitted on
    the held due grant while the renewal runs, so a staleness rule would either never end it
    again, leaving it at the old rate for life, or end it in a loop. An age has neither
-   problem. While the control plane is down it costs one reconnect per long paced stream every
-   5 minutes, the cost agreed with EF on 2026-10-09.
+   problem. While the control plane is down it costs at most one reconnect per long paced
+   stream every 5 minutes, the cost agreed with EF on 2026-10-09.
 
 7. **Read-ahead capped at the floor.** The middleware inserts the usage snapshot as a request
    extension before the handler runs. In `enforce`, a stream admitted on a grant whose
@@ -158,7 +164,7 @@ after a fixed age, so its client comes back on a current grant.
 
 | Failure | Behaviour |
 |---|---|
-| Control plane down | Held grants keep admitting requests at their rate until `expires_at`. An organization that crosses its allowance stays at full speed, and one whose period resets stays at the floor. This fails open on the rate, which is accepted and documented. Long paced streams still end every 5 minutes and resume on the held grant: one reconnect each, no loop. |
+| Control plane down | Held grants keep admitting requests at their rate until `expires_at`. An organization that crosses its allowance stays at full speed, and one whose period resets stays at the floor. This fails open on the rate, which is accepted and documented. Long paced streams still reach their age limit and resume, at most once per 5 minutes, with no loop. A resumption is admitted only where its replica holds a usable grant; one that lands on a replica that does not is refused as `upstream_unavailable` and retried by the client. |
 | A v2 grant on a portal with pacing `off`, or with authorization in shadow | Not paced, like v1. |
 | A portal on an older release switched to v2 by mistake | The release reads v2 as an unknown claims version. New keys get 502 `upstream_unavailable`; cached keys serve until `expires_at`, up to the grant lifetime (ADR-017), and then every key on that portal is refused. Upgrade first, then switch. |
 
@@ -169,22 +175,24 @@ key. A key with N open streams receives N times the rate. Capping concurrent str
 is not part of v2.
 
 **A new rate reaches an open stream only through its end.** A stream keeps its admission
-rate until it ends. A paced network stream ends within 5 minutes; its resumption is admitted
-on the grant then held and, if that grant is due, starts its renewal while still served on it
-(REQ-54). So a changed rate reaches a long stream within about 10 minutes. An unpaced stream
+rate until it ends. A paced network stream starts no chunk after 5 minutes and ends once the
+chunks in flight are sent; its resumption is admitted on the grant its replica holds and, if
+that grant is due, starts its renewal while still served on it (REQ-54). So a changed rate
+reaches a long stream on its second resumption on the same replica, or a third when the
+resumptions move between replicas. An unpaced stream
 is never ended, so a stream admitted without a rate keeps running unpaced, even after its
 organization crosses into a paced state, until the client's next request.
 
-**The age limit also lands revocations on paced streams.** A revoked key's paced stream ends
-within 5 minutes, and its resumption is refused once the replica has learned the denial,
-which the resumption's own renewal can bring. Unpaced streams are never ended, as before.
+**The age limit also lands revocations on paced streams.** A revoked key's paced stream
+starts no chunk after 5 minutes, and its resumption is refused once the replica has learned
+the denial, which the resumption's own renewal can bring. Unpaced streams are never ended, as before.
 
 **How quickly a crossing reaches the client is a timeline, not a bound.** Reporting (interim
 records every 30 s), the control plane's aggregation (up to 2 minutes), grant renewal (60 s
 once the grant was issued at 90 % of the allowance or more, 5 minutes below that), then the
 client's next request admitted on the renewed grant. That is about 3 minutes typically, and
-about 8 minutes from below 90 % straight to over, plus up to the age limit's 10 minutes for a
-long stream. D51 tolerates it. Full speed after a purchase or an upgrade comes back
+about 8 minutes from below 90 % straight to over, plus one or two age limits and their drain
+for a long stream. D51 tolerates it. Full speed after a purchase or an upgrade comes back
 on the same path.
 
 **Pacing makes streams longer.** At the floor more streams are in flight at a given moment,

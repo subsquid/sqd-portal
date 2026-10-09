@@ -658,7 +658,8 @@ it: measurement stays non-interfering (INV-32) whatever pacing does.
 stay within INV-16's bound over every interval, including a response whose body is one frame
 many times P-PACING-SLICE, and the whole body arrives, held pieces included; a renewal of the
 grant while the response streams changes nothing about it; its status and decoded records
-equal an unpaced run of the same request; a real-time response is unpaced unless
+equal an unpaced run of the same request, or a prefix of it when the response reached its age
+limit (REQ-75); a real-time response is unpaced unless
 P-PACE-REAL-TIME is set; a version-1 grant, a version-2 grant with no rate, pacing off and a
 shadow portal are unpaced.
 *Trace:* ADR-018.
@@ -698,24 +699,28 @@ its first would-be wait is in the protected log; no metric carries a key id or a
 organization.
 *Trace:* ADR-018.
 
-**REQ-75 — Paced streams end at an age.** [MUST]
+**REQ-75 — Paced streams stop at an age.** [MUST]
 With P-PACING-MODE enforce, a network stream admitted on a version-2 grant whose rate is set
-starts no new chunk once it is older than P-PACED-STREAM-MAX-AGE, sends the chunks already
-started, and ends: the record sequence ends before encoding, so the body is a complete
-encoding (INV-25). Its first chunk always starts before that, so the body is never empty.
-Nothing re-reads the grant: the client resumes, and its next request is admitted on whatever
-grant the replica holds, starting that grant's renewal if it is due. With
-P-PACED-STREAM-MAX-AGE no shorter than the control plane's refresh interval, a changed rate
-therefore reaches a long paced stream within about twice that age. A response with no chunk
-stream — the real-time proxy, the timestamp lookup, the direct worker query, the SQL plan — and
-an unpaced response are never ended this way. While the control plane is unreachable, each
-long paced stream reconnects once per P-PACED-STREAM-MAX-AGE and is admitted on its held
-grant until `expires_at`.
+starts no chunk after its first once it is older than P-PACED-STREAM-MAX-AGE, sends the
+chunks already started, and ends: the record sequence ends before encoding, so the body is a
+complete encoding (INV-25). The first chunk is exempt, so the body is never empty and the
+age never produces EMPTY. The age bounds when the last chunk starts, not when the response
+ends: chunks already started drain at the paced rate. Nothing re-reads the grant: the client
+resumes, and its next request is admitted on whatever grant its replica holds, starting that
+grant's renewal if it is due. With P-PACED-STREAM-MAX-AGE no shorter than the control plane's
+refresh interval, a changed rate reaches a long paced stream on its second resumption when
+both land on the same replica; replicas renew independently (DEF-18), so one more may be
+needed when they do not. A response with no chunk stream — the real-time proxy, the
+timestamp lookup, the direct worker query, the SQL plan — and an unpaced response are never
+ended this way. While the control plane is unreachable, a long paced stream reconnects at
+most once per P-PACED-STREAM-MAX-AGE; a resumption is admitted where its replica holds a
+usable grant and refused retryably where it does not (DC-8).
 *Acceptance:* in enforce, a paced network stream on the stream, finalized-stream,
-archival-stream and debug routes ends once older than P-PACED-STREAM-MAX-AGE, after every
-chunk it started, with a complete gzip body and a complete zstd body, from which the client
-resumes; an unpaced stream, a real-time response and a direct worker query never end this
-way; in log_only and off no stream ends.
+archival-stream and debug routes starts no chunk past P-PACED-STREAM-MAX-AGE and ends after
+every chunk it started, with a complete gzip body and a complete zstd body, from which the
+client resumes; a stream whose deadline passed before its first chunk still serves that
+chunk; an unpaced stream, a real-time response and a direct worker query never end this way;
+in log_only and off no stream ends.
 *Trace:* ADR-018, ADR-001.
 
 ## Explicitly unspecified
