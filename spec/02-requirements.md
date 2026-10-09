@@ -625,7 +625,7 @@ against an allowance, and shares no pacing state between responses or replicas (
 it owns is applying that rate to each response without breaking the response: through to its
 last byte, without corrupting its encoding, and without a request path that can refuse. A
 response keeps what its admission decided until it ends; a rate that changes reaches the
-client's next request (ADR-018).
+requests admitted once the replica holds the renewed grant (ADR-018).
 
 **REQ-70 — The usage claim.** [MUST]
 The Portal reads claims versions 1 and 2. A version-2 grant carries a usage claim (DEF-17); a

@@ -99,8 +99,8 @@ plane stops being served by a replica within its grant's `refresh_after` + one e
 P-GRANT-REFRESH-JITTER, and unconditionally at that grant's `expires_at`. The same bound
 covers every narrowing of a live key — a withdrawn dataset, a reduced scope — since all of
 them reach the Portal only as the next grant. A lowered rate is such a narrowing, and reaches
-responses admitted after it: a response keeps the rate it was admitted with to its end
-(REQ-71). The first bound
+the responses admitted on that grant: a response keeps the rate it was admitted with to its
+end (REQ-71). The first bound
 needs a healthy control plane and a request to arrive — an idle credential converges
 trivially, since nothing is being served on it — and holds through a flood of unknown
 tokens, since renewals spend their own budget (DC-8, HZ-10). The second needs nothing at all: it holds

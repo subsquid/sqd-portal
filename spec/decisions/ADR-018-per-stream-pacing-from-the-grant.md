@@ -24,7 +24,7 @@ allowance, buys more, or has its terms changed by staff, and a stream sees the c
 it is still open then. Most streams are not: over seven days on the keyed stacks, 520 of
 about 60,000 network streams that would be paced ran past 5.5 minutes. When it does happen,
 the damage is small: a stream that crosses finishes at the old speed, and a stream admitted
-at the floor stays slow until the client's next request.
+at the floor stays slow until the client restarts it on a renewed grant.
 
 **zstd network frames are whole worker results,** often many megabytes in one frame. A pacer
 that waits per frame either stalls for a minute at the floor or lets a large frame through
@@ -98,8 +98,8 @@ whole life, with no state shared between responses or replicas.
 5. **Admission fixes everything.** The rate, the read-ahead cap and the headers come from the
    grant the response was admitted on and do not change while it streams. The pacer reads
    nothing after admission: no grant cache lookup, no exchange, no secret (DEF-16 and INV-38
-   are unchanged). A changed rate reaches the client's next request. The Portal never ends a
-   response because of usage.
+   are unchanged). A changed rate reaches the requests admitted once the replica holds the
+   renewed grant. The Portal never ends a response because of usage.
 
 6. **Read-ahead capped at the floor.** The middleware inserts the usage snapshot as a request
    extension before the handler runs. In `enforce`, a stream admitted on a grant whose
@@ -129,7 +129,7 @@ whole life, with no state shared between responses or replicas.
 
 | Failure | Behaviour |
 |---|---|
-| Control plane down | Held grants keep their rate until `expires_at`. An organization that crosses its allowance stays at full speed, and one whose period resets stays at the floor. This fails open on the rate, which is accepted and documented. |
+| Control plane down | Held grants keep admitting requests at their rate until `expires_at`, and a response already open keeps its admission rate until it ends, past `expires_at` if it runs that long. An organization that crosses its allowance stays at full speed, and one whose period resets stays at the floor. This fails open on the rate, which is accepted and documented. |
 | A v2 grant on a portal with pacing `off`, or with authorization in shadow | Not paced, like v1. |
 | A portal on an older release switched to v2 by mistake | The release reads v2 as an unknown claims version. New keys get 502 `upstream_unavailable`; cached keys serve until `expires_at`, up to the grant lifetime (ADR-017), and then every key on that portal is refused. Upgrade first, then switch. |
 
@@ -139,17 +139,18 @@ whole life, with no state shared between responses or replicas.
 key. A key with N open streams receives N times the rate. Capping concurrent streams (D130)
 is not part of v2.
 
-**A new rate reaches the next request, not the open stream.** A stream that crosses its
+**A new rate reaches later requests, not the open stream.** A stream that crosses its
 organization's allowance keeps its admission rate until it ends, and so does a stream
-admitted at the floor after its organization buys more. The client can restart the stream
-to get the new rate; squid-sdk and pipes-sdk resume from the last block + 1 after any short
-response. Only requests renew grants, so a long stream that is its key's only traffic on a
-replica sees no change until it ends.
+admitted at the floor after its organization buys more. Only requests renew grants, and the
+request that finds its grant due is still served on that grant while the renewal runs
+(REQ-54). So a client whose long stream is its key's only traffic on a replica gets the new
+rate on the request after the one that triggered the renewal. A restarted stream resumes
+from the last block + 1, as squid-sdk and pipes-sdk do after any short response.
 
 **How quickly a crossing reaches the client is a timeline, not a bound.** Reporting (interim
 records every 30 s), the control plane's aggregation (up to 2 minutes), grant renewal (60 s
 once the grant was issued at 90 % of the allowance or more, 5 minutes below that), then the
-client's next request. That is about 3 minutes typically, and about 8 minutes from below
+client's next request admitted on the renewed grant. That is about 3 minutes typically, and about 8 minutes from below
 90 % straight to over. D51 tolerates it. Full speed after a purchase or an upgrade comes back
 on the same path.
 
