@@ -10,6 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::http::{header, HeaderMap};
 use serde::Serialize;
 
+use crate::endpoints::stream::DataSource;
+
 /// How the bytes on the wire were encoded. Kept as a label rather than
 /// normalized away because logical size is estimated at read time from
 /// (dataset family, encoding), and a gzip ratio applied to zstd traffic is off
@@ -89,6 +91,10 @@ pub struct UsageEvent {
     /// mint a dimension per spelling (HZ-15).
     pub endpoint: String,
     pub encoding: Encoding,
+    /// The layer that served the response (DEF-6). One per response, since none
+    /// mixes sources (INV-13), so every record of it carries the same one. Absent
+    /// on a response refused before routing chose a layer.
+    pub data_source: Option<DataSource>,
     /// Encoded body bytes, as yielded to the transport. Excludes headers and
     /// HTTP framing (see [`super::tap`] for what that means for accuracy).
     pub wire_bytes: u64,
@@ -122,6 +128,7 @@ impl UsageEvent {
     pub fn new(
         attribution: &super::Attribution,
         encoding: Encoding,
+        data_source: Option<DataSource>,
         wire_bytes: u64,
         window: Window,
         status: Status,
@@ -133,6 +140,7 @@ impl UsageEvent {
             dataset: attribution.dataset().map(capped),
             endpoint: attribution.endpoint().to_owned(),
             encoding,
+            data_source,
             wire_bytes,
             started_at: window.started_at,
             duration_ms: window.duration.as_millis() as u64,
@@ -217,6 +225,7 @@ mod tests {
             dataset: Some("ethereum-mainnet".to_owned()),
             endpoint: "/stream".to_owned(),
             encoding: Encoding::Zstd,
+            data_source: Some(DataSource::RealTime),
             wire_bytes: 4096,
             started_at: 1_800_000_000.5,
             duration_ms: 30_000,
@@ -232,6 +241,7 @@ mod tests {
                 "dataset": "ethereum-mainnet",
                 "endpoint": "/stream",
                 "encoding": "zstd",
+                "data_source": "real_time",
                 "wire_bytes": 4096,
                 "started_at": 1_800_000_000.5,
                 "duration_ms": 30_000,
@@ -240,7 +250,7 @@ mod tests {
         );
     }
 
-    /// The two optional claims are absent, not empty strings: the ingest
+    /// The optional fields are absent, not empty strings: the ingest
     /// distinguishes "no organization was claimed" from one named "".
     #[test]
     fn unclaimed_attribution_serializes_as_null_rather_than_empty() {
@@ -251,6 +261,7 @@ mod tests {
             dataset: None,
             endpoint: "/sql/query".to_owned(),
             encoding: Encoding::Identity,
+            data_source: None,
             wire_bytes: 0,
             started_at: 0.0,
             duration_ms: 0,
@@ -260,6 +271,7 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap();
         assert!(json["organization_id"].is_null());
         assert!(json["dataset"].is_null());
+        assert!(json["data_source"].is_null());
     }
 
     /// Armor rather than a live bound: neither claim is client-supplied, so this
@@ -292,6 +304,7 @@ mod tests {
         let event = UsageEvent::new(
             &attribution,
             Encoding::Identity,
+            None,
             0,
             Window {
                 started_at: 0.0,

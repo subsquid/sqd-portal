@@ -2,11 +2,12 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
-    http::{header, HeaderValue, StatusCode},
+    http::{header, Extensions, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, IntoResponseParts, Response, ResponseParts},
     Extension,
 };
 use futures::{Stream, StreamExt};
+use serde::Serialize;
 
 use crate::{
     config::Config,
@@ -522,8 +523,10 @@ const DATA_SOURCE_REALTIME: HeaderValue = HeaderValue::from_static(DATA_SOURCE_R
 ///
 /// A response extension read by the HTTP metrics, never written to the wire: DEF-6 puts
 /// `x-sqd-data-source` on stream and timestamp responses only, while the metric names the
-/// layer on every response that has one, errors included.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// layer on every response that has one, errors included. Serialized in the header's
+/// spelling, which is what usage records carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum DataSource {
     Network,
     RealTime,
@@ -535,6 +538,20 @@ impl DataSource {
         match self {
             Self::Network => DATA_SOURCE_NETWORK_METRIC,
             Self::RealTime => DATA_SOURCE_REALTIME_METRIC,
+        }
+    }
+
+    /// The source a finished response names: the extension, else the header, the order
+    /// the HTTP metrics read them in. `None` where no layer was chosen (DEF-6), and for a
+    /// header value this build does not name.
+    pub(crate) fn of(extensions: &Extensions, headers: &HeaderMap) -> Option<Self> {
+        if let Some(source) = extensions.get::<Self>() {
+            return Some(*source);
+        }
+        match headers.get(DATA_SOURCE_HEADER)?.to_str().ok()? {
+            DATA_SOURCE_NETWORK_METRIC => Some(Self::Network),
+            DATA_SOURCE_REALTIME_METRIC => Some(Self::RealTime),
+            _ => None,
         }
     }
 }
@@ -550,7 +567,45 @@ impl IntoResponseParts for DataSource {
 
 #[cfg(test)]
 mod tests {
-    use super::is_hotblocks_gap;
+    use super::{is_hotblocks_gap, DataSource, DATA_SOURCE_HEADER};
+    use axum::http::{Extensions, HeaderMap, HeaderValue};
+
+    fn named(extension: Option<DataSource>, header: Option<&'static str>) -> Option<DataSource> {
+        let mut extensions = Extensions::new();
+        if let Some(source) = extension {
+            extensions.insert(source);
+        }
+        let mut headers = HeaderMap::new();
+        if let Some(value) = header {
+            headers.insert(DATA_SOURCE_HEADER, HeaderValue::from_static(value));
+        }
+        DataSource::of(&extensions, &headers)
+    }
+
+    #[test]
+    fn a_response_names_its_source_by_extension_or_header() {
+        assert_eq!(
+            named(Some(DataSource::RealTime), None),
+            Some(DataSource::RealTime)
+        );
+        assert_eq!(named(None, Some("network")), Some(DataSource::Network));
+        assert_eq!(named(None, Some("real_time")), Some(DataSource::RealTime));
+        assert_eq!(
+            named(Some(DataSource::Network), Some("real_time")),
+            Some(DataSource::Network),
+            "the extension wins, as in the HTTP metrics"
+        );
+        assert_eq!(named(None, None), None);
+        assert_eq!(named(None, Some("hotblocks")), None);
+    }
+
+    /// Usage records carry the source in the header's spelling (DEF-6).
+    #[test]
+    fn the_source_serializes_as_the_header_spells_it() {
+        for source in [DataSource::Network, DataSource::RealTime] {
+            assert_eq!(serde_json::to_value(source).unwrap(), source.as_str());
+        }
+    }
 
     #[test]
     fn hotblocks_gap_detects_missing_blocks_after_archival_height() {
