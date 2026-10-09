@@ -674,16 +674,18 @@ has a rate; it took that grant up, at admission or on a later look, before the g
 nothing newer. It ends at its next boundary between network chunks, after at least one, by
 ending the record sequence before encoding, so the body is a complete encoding (INV-25) and
 never empty. A response with no chunk boundaries — the real-time proxy, the timestamp
-lookup, the direct worker query, the SQL plan — is never ended this way. A response that took up a grant already
-past `refresh_after` is never ended for staleness: that is the resumption of one already
-ended, admitted on the grant in hand while the control plane is unreachable, and ending it
-again would loop. Replicas do not coordinate this: a resumption that reaches another
+lookup, the direct worker query, the SQL plan — is never ended this way. A response is never
+ended for staleness on a grant it took up already past `refresh_after`: that is the
+resumption of one already ended, admitted on the grant in hand while the control plane is
+unreachable, and ending it again would loop. Once a renewal hands it a fresh grant, the rule
+applies to that grant as to any other. Replicas do not coordinate this: a resumption that reaches another
 replica, on a grant still fresh there, can be ended again when that grant goes stale.
 *Acceptance:* a response picks up a renewed grant's rate, looking no more often than
 P-RATE-PEEK-INTERVAL, and an unpaced response picks up a rate; with P-END-STALE-STREAMS set, a
 paced response whose grant was not renewed ends after at least one chunk with a complete gzip
 body and a complete zstd body, from which the client resumes; a response admitted on a grant
-already due never ends for staleness; an unpaced response never ends; with the switch off, or
+already due never ends for staleness on that grant, but does once a renewal has handed it a
+fresh grant that then goes stale; an unpaced response never ends; with the switch off, or
 in log_only, no response ends.
 *Trace:* ADR-018, ADR-001.
 

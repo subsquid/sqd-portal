@@ -115,7 +115,7 @@ between responses or replicas.
    - it is now 30 s past that `refresh_after`;
    - `peek` finds nothing newer.
 
-   A response that took up a grant already due is never ended for staleness. Admission
+   A response is never ended for staleness on a grant it took up already due. Admission
    serves a due grant while it renews in the background, so in a control-plane outage that is
    exactly the resumed request, and ending it would loop. A resumption admitted on a due grant
    is therefore not ended again on that grant. Replicas hold their caches independently, so a
@@ -191,8 +191,8 @@ past 5.5 minutes, one renewal interval plus the grace. The switch exists for the
 **The stale end also lands most revocations on open paced streams.** With the switch on, a
 denial evicts the grant (INV-6), so `peek` finds nothing newer, and a paced stream that took
 its grant up fresh ends at the first chunk boundary 30 s past its `refresh_after`; the resumed
-request is refused. A stream admitted on a grant already due is exempt, and one whose renewal
-is denied keeps streaming to its end. So are unpaced streams, as before.
+request is refused. A stream admitted on a grant already due is exempt while it holds that
+grant, so one whose renewal is denied keeps streaming to its end. So are unpaced streams, as before.
 
 **How quickly a crossing reaches the stream is a timeline, not a bound.** Reporting (interim
 records every 30 s), the control plane's aggregation (up to 2 minutes), grant renewal (60 s
