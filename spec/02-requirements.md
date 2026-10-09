@@ -707,10 +707,10 @@ complete encoding (INV-25). The first chunk is exempt, so the body is never empt
 age never produces EMPTY. The age bounds when the last chunk starts, not when the response
 ends: chunks already started drain at the paced rate. Nothing re-reads the grant: the client
 resumes, and its next request is admitted on whatever grant its replica holds, starting that
-grant's renewal if it is due. With P-PACED-STREAM-MAX-AGE no shorter than the control plane's
-refresh interval, a changed rate reaches a long paced stream on its second resumption when
-both land on the same replica; replicas renew independently (DEF-18), so one more may be
-needed when they do not. A response with no chunk stream — the real-time proxy, the
+grant's renewal if it is due. A changed rate reaches a long paced stream at the first
+resumption admitted by a replica that has renewed its grant since the change. Replicas renew
+independently and only when a request finds its grant due (DEF-18, DC-8), so no resumption
+count is promised; on one replica it is typically the second. A response with no chunk stream — the real-time proxy, the
 timestamp lookup, the direct worker query, the SQL plan — and an unpaced response are never
 ended this way. While the control plane is unreachable, a long paced stream reconnects at
 most once per P-PACED-STREAM-MAX-AGE; a resumption is admitted where its replica holds a

@@ -124,11 +124,11 @@ after a fixed age, so its client comes back on a current grant.
    and the timestamp lookup. Neither are unpaced responses, Enterprise among them.
 
    Nothing re-reads the grant. The resumed request is admitted on whatever grant its replica
-   holds by then, and if that grant is due its admission starts the renewal. The grant
-   refresh interval is 5 minutes, so on the same replica the grant a stream was admitted on is
-   due by its deadline, and a changed rate reaches a long stream on its second resumption.
-   A resumption that lands on another replica renews that replica's grant instead, so it can
-   take one more. The limit
+   holds by then, and if that grant is due its admission starts the renewal. A changed rate
+   reaches the stream at the first resumption admitted by a replica that has renewed since
+   the change. With the 5-minute refresh interval that is typically the second resumption on
+   the same replica; replicas renew independently and only when a request finds the grant
+   due, so no count is promised. The limit
    is a plain age, not a check for a stale grant. Without `peek`, a resumption is admitted on
    the held due grant while the renewal runs, so a staleness rule would either never end it
    again, leaving it at the old rate for life, or end it in a loop. An age has neither
@@ -178,8 +178,8 @@ is not part of v2.
 rate until it ends. A paced network stream starts no chunk after 5 minutes and ends once the
 chunks in flight are sent; its resumption is admitted on the grant its replica holds and, if
 that grant is due, starts its renewal while still served on it (REQ-54). So a changed rate
-reaches a long stream on its second resumption on the same replica, or a third when the
-resumptions move between replicas. An unpaced stream
+reaches a long stream at the first resumption admitted by a replica that has renewed since,
+typically the second on one replica. An unpaced stream
 is never ended, so a stream admitted without a rate keeps running unpaced, even after its
 organization crosses into a paced state, until the client's next request.
 
