@@ -65,8 +65,8 @@ after a fixed age, so its client comes back on a current grant.
    ```
 
    Unknown keys under `auth.limits` only warn, so a rollback to a release that predates the
-   block still boots (ADR-008; directly under `auth:` an unknown key is fatal). `off` ignores
-   `usage` entirely. Pacing acts only where authorization enforces. On a portal whose
+   block still boots (ADR-008; directly under `auth:` an unknown key is fatal). `off` validates
+   `usage` and does not act on it. Pacing acts only where authorization enforces. On a portal whose
    authorization runs in shadow, pacing is inert in every mode: its counters would move only
    for requests that were granted, and so publish the verdict shadow mode withholds from the
    keyless scrape (REQ-55). `pace_real_time` exists because whether real-time data is slowed

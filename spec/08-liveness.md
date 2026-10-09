@@ -116,8 +116,8 @@ interval (OQ-16). Witness: enforcing-mode OB-13 grace count, minimum remaining e
 exchange outcomes; shadow-mode and per-request details remain protected. Check: CT-10 —
 revoke a key while the stub is healthy and assert the first request past `refresh_after`
 converges; repeat with the stub unreachable and assert convergence exactly at `expires_at`.
-CT-12 — lower the rate a long paced stream's grant carries and assert its resumption after
-the age limit is paced at the new rate.
+CT-12 — lower the rate a long paced stream's grant carries and assert that a resumption after
+the age limit, once admitted on the renewed grant, is paced at the new rate.
 
 **LIV-14 — New-key admission.** Healthy control plane ⇒ a key minted a moment ago is served
 on its first request: there is no set to be absent from, only an exchange to make, so
