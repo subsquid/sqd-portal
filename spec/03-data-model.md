@@ -302,4 +302,4 @@ Semantics in [04-operations.md](04-operations.md).
 | `log_only` / `enforce` | Shadow and enforcing modes (REQ-55) |
 | exchange | The one control-plane call: credential in, grant or denial out (DC-8) |
 | fingerprint | The digest of a whole credential that keys the grant cache (DEF-16, DEF-18) |
-| `auth.limits.pacing`, pacer | Usage pacing (REQ-70..REQ-74) |
+| `auth.limits.pacing`, pacer | Usage pacing (REQ-70..REQ-75) |

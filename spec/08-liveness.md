@@ -100,7 +100,9 @@ P-GRANT-REFRESH-JITTER, and unconditionally at that grant's `expires_at`. The sa
 covers every narrowing of a live key — a withdrawn dataset, a reduced scope — since all of
 them reach the Portal only as the next grant. A lowered rate is such a narrowing, and reaches
 the responses admitted on that grant: a response keeps the rate it was admitted with to its
-end (REQ-71). The first bound
+end (REQ-71). A paced network stream ends at P-PACED-STREAM-MAX-AGE (REQ-75), so a narrowing,
+a revocation included, reaches a long paced stream through its resumption, within about
+twice that age; an unpaced stream is not ended. The first bound
 needs a healthy control plane and a request to arrive — an idle credential converges
 trivially, since nothing is being served on it — and holds through a flood of unknown
 tokens, since renewals spend their own budget (DC-8, HZ-10). The second needs nothing at all: it holds
@@ -113,6 +115,8 @@ interval (OQ-16). Witness: enforcing-mode OB-13 grace count, minimum remaining e
 exchange outcomes; shadow-mode and per-request details remain protected. Check: CT-10 —
 revoke a key while the stub is healthy and assert the first request past `refresh_after`
 converges; repeat with the stub unreachable and assert convergence exactly at `expires_at`.
+CT-12 — lower the rate a long paced stream's grant carries and assert its resumption after
+the age limit is paced at the new rate.
 
 **LIV-14 — New-key admission.** Healthy control plane ⇒ a key minted a moment ago is served
 on its first request: there is no set to be absent from, only an exchange to make, so

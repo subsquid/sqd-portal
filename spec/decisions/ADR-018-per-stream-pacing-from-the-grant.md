@@ -19,12 +19,17 @@ with a per-pod tally rebased on every snapshot. The control plane has the totals
 aggregates the usage records into one state per organization, so it can say how fast a key
 may go, and say it again on the next exchange.
 
-**A rate rarely changes while a stream is open.** It changes when an organization crosses its
-allowance, buys more, or has its terms changed by staff, and a stream sees the change only if
-it is still open then. Most streams are not: over seven days on the keyed stacks, 520 of
-about 60,000 network streams that would be paced ran past 5.5 minutes. When it does happen,
-the damage is small: a stream that crosses finishes at the old speed, and a stream admitted
-at the floor stays slow until the client restarts it on a renewed grant.
+**Most streams are short; a few are not.** A rate changes when an organization crosses its
+allowance, buys more, or has its terms changed by staff. A short stream picks up the change
+on its own: the client's next request is admitted on the current grant. Over seven days on
+the keyed stacks, 520 of about 60,000 network streams that would be paced ran past 5.5
+minutes. Those few would keep their admission rate for hours, at full speed past the
+allowance or at the floor after a purchase. Only requests renew grants, and the pacer cannot
+start one: renewal needs the credential, which the stream no longer holds (DEF-16, INV-38).
+
+**A response cannot be cut short at an arbitrary byte.** A gzip response is one member for the
+whole body, from the recompressor and from gzjoin alike, so a body cut before the trailer
+fails to decode, and squid-sdk throws on it instead of resuming.
 
 **zstd network frames are whole worker results,** often many megabytes in one frame. A pacer
 that waits per frame either stalls for a minute at the floor or lets a large frame through
@@ -34,7 +39,8 @@ unpaced.
 
 The control plane decides one effective rate per stream and carries it in the grant. Each
 replica paces each response to the rate of the grant it was admitted on, for the response's
-whole life, with no state shared between responses or replicas.
+whole life, with no state shared between responses or replicas. A paced network stream ends
+after a fixed age, so its client comes back on a current grant.
 
 1. **Grant v2.** The Portal accepts `claims_version` 1 and 2. Version 2 requires a `usage`
    claim: `state` (`within`, `over`, `unmetered`), `stream_bytes_per_sec`,
@@ -99,37 +105,60 @@ whole life, with no state shared between responses or replicas.
    grant the response was admitted on and do not change while it streams. The pacer reads
    nothing after admission: no grant cache lookup, no exchange, no secret (DEF-16 and INV-38
    are unchanged). A changed rate reaches the requests admitted once the replica holds the
-   renewed grant. The Portal never ends a response because of usage.
+   renewed grant.
 
-6. **Read-ahead capped at the floor.** The middleware inserts the usage snapshot as a request
+6. **Paced streams end after P-PACED-STREAM-MAX-AGE, 5 minutes.** In `enforce`, the middleware
+   inserts a deadline, admission time plus 5 minutes, as a request extension on a request
+   admitted on a grant with a rate. The network chunk stream reads it the way it reads the
+   operator's chunk cap (REQ-8): past the deadline it starts no new chunk, sends the ones
+   already started, and ends. gzip writes its trailer and zstd stops after a whole frame, and
+   nothing downloaded is discarded. A stream always starts its first chunk before the deadline,
+   so it never ends empty, which both clients would read as "no data for this range". Both
+   squid-sdk (`master` @ `4c86209`) and pipes-sdk (`main` @ `b1d46a6`) request again from the
+   last block + 1 after a non-empty response ends, as after any short response. Routes with no
+   chunk stream are never ended: the real-time proxy, the direct worker query, the SQL plan
+   and the timestamp lookup. Neither are unpaced responses, Enterprise among them.
+
+   Nothing re-reads the grant. The resumed request is admitted on whatever grant the cache
+   holds by then, and if that grant is due its admission starts the renewal. The grant
+   refresh interval is 5 minutes, so the grant a stream was admitted on is due by its
+   deadline, and a changed rate reaches a long stream within about two age limits. The limit
+   is a plain age, not a check for a stale grant. Without `peek`, a resumption is admitted on
+   the held due grant while the renewal runs, so a staleness rule would either never end it
+   again, leaving it at the old rate for life, or end it in a loop. An age has neither
+   problem. While the control plane is down it costs one reconnect per long paced stream every
+   5 minutes, the cost agreed with EF on 2026-10-09.
+
+7. **Read-ahead capped at the floor.** The middleware inserts the usage snapshot as a request
    extension before the handler runs. In `enforce`, a stream admitted on a grant whose
    `state` is `over` and whose rate is set gets its `buffer_size` capped at 1: the scheduler
    downloads one chunk ahead. What the encoder and the pacer hold past that is not counted
    against it. The cap is read in `run_stream_internal` and `run_archival_stream`, not in
    `restrict_request`, which the `/debug` variant skips.
 
-7. **`log_only`.** Waits are computed and not taken. Nothing is capped and no header is added,
-   so the client sees exactly what `off` serves. The replica counts
+8. **`log_only`.** Waits are computed and not taken. Nothing is ended, nothing is capped and
+   no header is added, so the client sees exactly what `off` serves. The replica counts
    `portal_limit_would_wait_seconds_total` and `portal_limit_would_pace_responses_total`, both
    labelled by `state`. The first would-be wait of a response is logged with `key_id`,
    `organization_id`, the rate and the state. Metrics carry no key or organization.
 
-8. **`enforce`.** Waits are taken and counted in `portal_limit_paced_seconds_total` and
-   `portal_limit_paced_responses_total`, labelled by `state`. A response counts as paced once
+9. **`enforce`.** Waits are taken and counted in `portal_limit_paced_seconds_total` and
+   `portal_limit_paced_responses_total`, and streams ended by the age limit in
+   `portal_limit_age_ends_total`, all labelled by `state`. A response counts as paced once
    it has waited. No new status code exists: a paced response is a 200, and nothing is
    refused for usage.
 
-9. **Headers (D106), in `enforce` only,** on every gated response admitted on a v2 grant:
-   `x-sqd-usage-state`, `x-sqd-usage-limit-bytes` (omitted when uncapped),
-   `x-sqd-usage-used-bytes`, `x-sqd-usage-reset` (`period_end`, RFC 3339),
-   `x-sqd-usage-floor-bytes-per-sec` (omitted when null) and `x-sqd-usage-as-of` (RFC 3339,
-   omitted when null). All six join the CORS expose list, or browsers cannot read them.
+10. **Headers (D106), in `enforce` only,** on every gated response admitted on a v2 grant:
+    `x-sqd-usage-state`, `x-sqd-usage-limit-bytes` (omitted when uncapped),
+    `x-sqd-usage-used-bytes`, `x-sqd-usage-reset` (`period_end`, RFC 3339),
+    `x-sqd-usage-floor-bytes-per-sec` (omitted when null) and `x-sqd-usage-as-of` (RFC 3339,
+    omitted when null). All six join the CORS expose list, or browsers cannot read them.
 
 ## Failures
 
 | Failure | Behaviour |
 |---|---|
-| Control plane down | Held grants keep admitting requests at their rate until `expires_at`, and a response already open keeps its admission rate until it ends, past `expires_at` if it runs that long. An organization that crosses its allowance stays at full speed, and one whose period resets stays at the floor. This fails open on the rate, which is accepted and documented. |
+| Control plane down | Held grants keep admitting requests at their rate until `expires_at`. An organization that crosses its allowance stays at full speed, and one whose period resets stays at the floor. This fails open on the rate, which is accepted and documented. Long paced streams still end every 5 minutes and resume on the held grant: one reconnect each, no loop. |
 | A v2 grant on a portal with pacing `off`, or with authorization in shadow | Not paced, like v1. |
 | A portal on an older release switched to v2 by mistake | The release reads v2 as an unknown claims version. New keys get 502 `upstream_unavailable`; cached keys serve until `expires_at`, up to the grant lifetime (ADR-017), and then every key on that portal is refused. Upgrade first, then switch. |
 
@@ -139,19 +168,23 @@ whole life, with no state shared between responses or replicas.
 key. A key with N open streams receives N times the rate. Capping concurrent streams (D130)
 is not part of v2.
 
-**A new rate reaches later requests, not the open stream.** A stream that crosses its
-organization's allowance keeps its admission rate until it ends, and so does a stream
-admitted at the floor after its organization buys more. Only requests renew grants, and the
-request that finds its grant due is still served on that grant while the renewal runs
-(REQ-54). So a client whose long stream is its key's only traffic on a replica gets the new
-rate on the request after the one that triggered the renewal. A restarted stream resumes
-from the last block + 1, as squid-sdk and pipes-sdk do after any short response.
+**A new rate reaches an open stream only through its end.** A stream keeps its admission
+rate until it ends. A paced network stream ends within 5 minutes; its resumption is admitted
+on the grant then held and, if that grant is due, starts its renewal while still served on it
+(REQ-54). So a changed rate reaches a long stream within about 10 minutes. An unpaced stream
+is never ended, so a stream admitted without a rate keeps running unpaced, even after its
+organization crosses into a paced state, until the client's next request.
+
+**The age limit also lands revocations on paced streams.** A revoked key's paced stream ends
+within 5 minutes, and its resumption is refused once the replica has learned the denial,
+which the resumption's own renewal can bring. Unpaced streams are never ended, as before.
 
 **How quickly a crossing reaches the client is a timeline, not a bound.** Reporting (interim
 records every 30 s), the control plane's aggregation (up to 2 minutes), grant renewal (60 s
 once the grant was issued at 90 % of the allowance or more, 5 minutes below that), then the
-client's next request admitted on the renewed grant. That is about 3 minutes typically, and about 8 minutes from below
-90 % straight to over. D51 tolerates it. Full speed after a purchase or an upgrade comes back
+client's next request admitted on the renewed grant. That is about 3 minutes typically, and
+about 8 minutes from below 90 % straight to over, plus up to the age limit's 10 minutes for a
+long stream. D51 tolerates it. Full speed after a purchase or an upgrade comes back
 on the same path.
 
 **Pacing makes streams longer.** At the floor more streams are in flight at a given moment,
@@ -176,11 +209,15 @@ each by how it is built, not by an added mitigation.
   claimed to be zero.
 - *Prefetch pulling data a client never receives.* #131 cut streams mid-flight when a key's
   quota ran out, so everything read ahead past the cut had been downloaded for nothing, at a
-  depth the client chose through `buffer_size`. Here the Portal ends no stream because of
-  usage (D51), and a stream admitted at the floor downloads one chunk ahead.
+  depth the client chose through `buffer_size`. Nothing here is cut for usage (D51). The one
+  end the Portal initiates, the age limit, starts no new chunk and sends the ones already
+  started, so nothing downloaded is discarded. A stream admitted at the floor downloads one
+  chunk ahead.
 - *Why not a proxy in front.* A proxy can slow the bytes a client receives, which is the easy
-  half. It cannot cap the read-ahead, which lives in the stream scheduler. And it holds no
-  grant, so it would need its own exchange and the secret on a second hop. Enforcement lives
+  half. It cannot cap the read-ahead, which lives in the stream scheduler. It cannot end a
+  stream where the gzip member can still be closed: the encoder runs in the pod, and a proxy
+  sees only the encoded body. And it holds no grant, so it would need its own exchange and
+  the secret on a second hop. Enforcement lives
   in the pod for these reasons.
 
 ## Spec changes
@@ -189,10 +226,12 @@ each by how it is built, not by an added mitigation.
   the grant, and that each response is paced alone with no state shared between replicas.
 - DEF-17 gains the v2 usage claim. DEF-16 and INV-38 are unchanged: the pacer reads nothing
   after admission.
-- REQ-70..REQ-74 (usage pacing), INV-16 (pacing bound), INV-17 (pacing changes timing only),
-  OB-16, IB-10 (usage headers), HZ-16 and CT-12 are new.
-- LIV-13 states that a lowered rate reaches new admissions only. INV-11, LIV-2, IB-1, OP-11,
-  SLI-2 and the DC-8 fault table in 09 gain one clause each.
+- REQ-70..REQ-75 (usage pacing), INV-16 (pacing bound), INV-17 (pacing changes timing and,
+  through the age limit, extent only), OB-16, IB-10 (usage headers), HZ-16 and CT-12 are new.
+- INV-25: an end the Portal decides — the operator's chunk cap, the age limit — stops the
+  record sequence before encoding, so the body is a complete encoding. LIV-13: a lowered rate
+  reaches a paced stream through its age limit. INV-11, LIV-2, IB-1, OP-1, OP-11, SLI-2,
+  SLI-6 and the DC-8 fault table in 09 gain one clause each.
 - The tap (INV-32, REQ-61) stays measurement-only; pacing is a separate band so that
   "measurement is not metering" stays true.
 
@@ -204,14 +243,22 @@ to be rebased after restarts, rollbacks and replica-count changes, and a request
 within budget could still overspend by one response. The control plane already computes the
 state centrally; the Portal only needs the rate it implies.
 
-**Moving open streams to a new rate.** Three ways were worked out: reading a renewed grant
-from the cache once a second; ending a paced stream once its grant went stale, at a chunk
-boundary through a stop flag so gzip still writes its trailer; and ending every stream after
-a fixed time. Each brought its own edge cases: rate changes inside the bucket, a loop while
-the control plane is down, streams whose renewal was denied, replicas that disagree. All of
-that served about 1 % of streams, for a damage measured in minutes of the old speed.
-Renewing from the pacer was never an option: it needs the credential for the life of the
-stream, which INV-38 forbids.
+**Moving an open stream to a new rate.** Reading a renewed grant from the cache once a second
+and applying its rate from the next slice. It brought rate changes inside the bucket, a
+lookup per response, and wrapping unpaced responses so they could pick a rate up, all for
+about 1 % of streams. Ending the stream lets the client's next admission do the same work.
+
+**Ending a paced stream only once its grant has gone stale.** That rule worked alongside the
+cache lookup above, which moved a stream whose grant had been renewed onto the new rate.
+Without it, a renewed grant leaves the stream at the old rate, so "not renewed" stops being
+the reason to end it. It also needed an exemption for streams admitted on a due grant, or
+the resumption would be ended in a loop while the control plane is down.
+
+**Ending at an arbitrary byte.** A gzip response is one member, so the client receives an
+undecodable body and squid-sdk throws instead of resuming.
+
+**Renewing from the pacer.** It needs the credential for the life of the stream, which INV-38
+forbids.
 
 **Pacing per frame, without slicing.** At the floor a multi-megabyte zstd frame is a silence
 of a minute or more, followed by a burst; a response that is one frame escapes the bound.

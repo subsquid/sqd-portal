@@ -154,15 +154,17 @@ for the workload that matters: archival zstd responses whose frames are whole wo
 *Check:* CT-12 — pace responses of many small frames and of one huge frame; assert the
 cumulative byte curve against the bound at every frame, and the whole body delivered.
 
-**INV-17 — Pacing changes timing only.** [response]
+**INV-17 — Pacing changes timing and extent only.** [response]
 A response pacing touched is semantically equal to the same request served with pacing off,
-except in its timing and in the usage headers of REQ-73: same status, same records, the same
-ending. Pacing produces no refusal, no error and no early end, in any mode, and its read-ahead
-clamp (REQ-72) changes nothing but timing.
+except in its timing, in its coverage extent when it reached its age limit (FV-4, REQ-75), and
+in the usage headers of REQ-73: same status, same records, a complete encoding. Pacing
+produces no refusal and no error, in any mode, and its read-ahead clamp (REQ-72) changes
+nothing but timing.
 *Why:* an over-limit organization is slowed, never refused; a pacer that could fail a request
 or corrupt a body is a refusal with extra steps.
 *Check:* CT-12 — serve the same requests with pacing off, log_only and enforce, and compare
-status, headers and decoded records.
+status, headers and decoded records; a stream ended by its age limit is compared against a
+prefix of the unpaced one.
 
 ## Response semantics (20–29)
 
@@ -207,9 +209,15 @@ reported heads never lie).
 **INV-25 — Truncation well-formedness.** [response]
 A stream body always ends on a record boundary with valid encoding — whether complete
 or truncated; a truncated body is indistinguishable from a short complete one at the
-encoding level.
-*Why:* torn records corrupt client decoders (ADR-001's price must stay this low).
-*Check:* CT-2 — kill the serving stub mid-stream at every phase; decode-validate.
+encoding level. An early end the Portal decides for itself — the operator's chunk cap
+(REQ-8), a paced stream's age limit (REQ-75) — is not a truncation: it ends the record
+sequence before encoding, so the body is a complete encoding, and never before the first
+chunk.
+*Why:* torn records corrupt client decoders (ADR-001's price must stay this low). An end the
+Portal chooses has no reason to pay even that price: a body that is one compressed member
+fails to decode if it is cut before its trailer.
+*Check:* CT-2 — kill the serving stub mid-stream at every phase; decode-validate. CT-12 —
+end a paced stream at its age limit under gzip and zstd; decode-validate the whole body.
 
 **INV-26 — Error soundness.** [response]
 Every failure maps to exactly one DEF-10 `type`/`code` pair; body-bearing errors use the
@@ -391,5 +399,5 @@ Structural validators (13 §validators) enforce INV-20/21/25 on every response f
 free. The dependency-fault matrix (CT-2) owns INV-2/23/25/31/37/40. Concurrency swarms
 (CT-3) own INV-1/3/4/5/12/28/30/35. The fuzz corpus (CT-4/9) owns INV-10/36. Interface
 conformance (CT-5) owns INV-13/24/26. Authorization (CT-10) shares INV-10 and owns
-INV-6/14/15/38/39. Pacing (CT-12) owns INV-16/17 and shares INV-11. Every response in
+INV-6/14/15/38/39. Pacing (CT-12) owns INV-16/17 and shares INV-11/25. Every response in
 every class re-checks the `[response]` band via the validators.

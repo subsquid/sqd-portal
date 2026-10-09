@@ -2,7 +2,7 @@
 
 Bands: 1–9 core data delivery · 10–16 discovery & metadata · 20–29 robustness &
 overload · 30–34 operability · 40–44 network integration · 50–56 authorization
-control · 60–61 commercial usage measurement · 70–74 usage pacing. Gaps in numbering are reserved; additions
+control · 60–61 commercial usage measurement · 70–75 usage pacing. Gaps in numbering are reserved; additions
 never renumber. Acceptance status lives in [13-conformance.md](13-conformance.md), not here.
 
 ## Core data delivery (1–9)
@@ -553,7 +553,7 @@ bounded, drops-not-delays — and neither may ever delay or fail data serving.
 **Measurement is not metering.** Nothing in this band decides whether a request is served,
 how fast, or how much of it. A path that could refuse or stall is enforcement with the
 switch off; this is the switch, and there is nothing behind it (NG2, REQ-61). How fast is
-decided by pacing (REQ-70..REQ-74), from the grant rather than from these records, in a band
+decided by pacing (REQ-70..REQ-75), from the grant rather than from these records, in a band
 of its own so that this one stays true.
 
 **REQ-60 — Commercial usage measurement.** [MAY]
@@ -608,7 +608,7 @@ completes; with the queue saturated, responses are served in full and the drops 
 counted (OB-15); no test observes a response outcome that differs by the sink's state.
 *Trace:* ADR-016.
 
-## Usage pacing (70–74)
+## Usage pacing (70–75)
 
 This band applies only to a Portal configured for authorization (REQ-56) that enforces it
 (REQ-55) and whose pacing mode (P-PACING-MODE) is not off, and only to responses admitted on a
@@ -625,7 +625,8 @@ against an allowance, and shares no pacing state between responses or replicas (
 it owns is applying that rate to each response without breaking the response: through to its
 last byte, without corrupting its encoding, and without a request path that can refuse. A
 response keeps what its admission decided until it ends; a rate that changes reaches the
-requests admitted once the replica holds the renewed grant (ADR-018).
+requests admitted once the replica holds the renewed grant. A paced network stream ends after
+a fixed age, so a long one comes back on a current grant too (REQ-75, ADR-018).
 
 **REQ-70 — The usage claim.** [MUST]
 The Portal reads claims versions 1 and 2. A version-2 grant carries a usage claim (DEF-17); a
@@ -645,8 +646,7 @@ version-1 grant.
 With P-PACING-MODE enforce, the body of a successful gated response admitted on a version-2
 grant whose rate is set is paced to that rate, from its first byte to its last, within the
 bound INV-16 states. The rate is the one the response was admitted with, and it holds until
-the response ends: the Portal looks up no newer grant for an open response, and ends none
-because of usage. Frames larger than P-PACING-SLICE are cut into pieces no larger, and a piece
+the response ends: the Portal looks up no newer grant for an open response. Frames larger than P-PACING-SLICE are cut into pieces no larger, and a piece
 is released only once the bound covers it, so a single large frame, a response's last
 included, is paced like the rest instead of escaping the bound or arriving after a long
 silence. A response whose serving source is the real-time source (DEF-6) is not paced unless
@@ -687,7 +687,8 @@ log_only, on a shadow portal, and on a version-1 grant, none appears.
 
 **REQ-74 — Pacing in shadow.** [MUST]
 With P-PACING-MODE log_only, the Portal computes the waits enforce would take and takes none:
-it clamps nothing and adds no header, so every response equals the one pacing off serves. It
+it ends nothing, clamps nothing and adds no header, so every response equals the one pacing
+off serves. It
 counts the responses that would have waited and the time they would have waited (OB-16), and
 logs the first would-be wait of each response with its key id, organization, rate and state,
 to protected logs only.
@@ -696,6 +697,26 @@ headers and body as with pacing off and is never held back, and the would-wait s
 its first would-be wait is in the protected log; no metric carries a key id or an
 organization.
 *Trace:* ADR-018.
+
+**REQ-75 — Paced streams end at an age.** [MUST]
+With P-PACING-MODE enforce, a network stream admitted on a version-2 grant whose rate is set
+starts no new chunk once it is older than P-PACED-STREAM-MAX-AGE, sends the chunks already
+started, and ends: the record sequence ends before encoding, so the body is a complete
+encoding (INV-25). Its first chunk always starts before that, so the body is never empty.
+Nothing re-reads the grant: the client resumes, and its next request is admitted on whatever
+grant the replica holds, starting that grant's renewal if it is due. With
+P-PACED-STREAM-MAX-AGE no shorter than the control plane's refresh interval, a changed rate
+therefore reaches a long paced stream within about twice that age. A response with no chunk
+stream — the real-time proxy, the timestamp lookup, the direct worker query, the SQL plan — and
+an unpaced response are never ended this way. While the control plane is unreachable, each
+long paced stream reconnects once per P-PACED-STREAM-MAX-AGE and is admitted on its held
+grant until `expires_at`.
+*Acceptance:* in enforce, a paced network stream on the stream, finalized-stream,
+archival-stream and debug routes ends once older than P-PACED-STREAM-MAX-AGE, after every
+chunk it started, with a complete gzip body and a complete zstd body, from which the client
+resumes; an unpaced stream, a real-time response and a direct worker query never end this
+way; in log_only and off no stream ends.
+*Trace:* ADR-018, ADR-001.
 
 ## Explicitly unspecified
 

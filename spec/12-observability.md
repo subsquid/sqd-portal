@@ -193,8 +193,8 @@ counter ambiguous between "not configured" and "nothing reported", which is the 
 question to answer during an incident.
 
 **OB-16 — Pacing.** Pacing deployments only (P-PACING-MODE not off, authorization
-enforcing). In enforce: responses that waited on their rate at least once, and the time they
-spent waiting (REQ-71). In log_only: responses that would have waited, and the time they would
+enforcing). In enforce: responses that waited on their rate at least once, the time they
+spent waiting (REQ-71), and streams ended by their age limit (REQ-75). In log_only: responses that would have waited, and the time they would
 have waited (REQ-74). Each is counted by the usage state of the grant the response was paced at —
 a closed set — and by nothing finer: no key id, no organization, no dataset, no request path,
 for OB-15's reasons. The first wait, or would-be wait, of each response goes to protected
@@ -222,7 +222,7 @@ control plane holds over their allowance.
 | INV-6, INV-15, INV-39 | protected OB-12 reason logs + public non-disclosure; neutral shadow projection and enforcing-only OB-13 classes |
 | INV-30/31 | OB-1, OB-5 (they are the invariant's subject) |
 | INV-32, REQ-60/61 | OB-15 drop reasons and queue depth against the sink stub's ledger |
-| INV-16, INV-17, REQ-70..REQ-74 | OB-16 waits by state against the harness's byte-curve and header ledger; protected first-wait log lines |
+| INV-16, INV-17, REQ-70..REQ-75 | OB-16 waits and age-limit ends by state against the harness's byte-curve and header ledger; protected first-wait log lines |
 | SLI-1..6 | OB-2, OB-3, OB-1 + process RSS |
 
 ## Logging
