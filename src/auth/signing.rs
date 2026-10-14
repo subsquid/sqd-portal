@@ -93,10 +93,7 @@ pub(super) fn sign_for_test(
     credential: &super::extractor::Credential,
     now_secs: u64,
 ) -> String {
-    let body = serde_json::to_vec(&serde_json::json!({
-        "credential": credential.token.expose(),
-    }))
-    .expect("a credential serializes");
+    let body = super::client::exchange_body(credential).expect("a credential serializes");
     let signer = RequestSigner::new(test_keypair(), config.portal_id.clone());
     signer
         .headers("POST", "/authority/v1/auth/exchange", &body, now_secs)

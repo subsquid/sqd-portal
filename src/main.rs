@@ -145,6 +145,8 @@ fn log_authorization_mode(auth: Option<&sqd_portal::auth::ResolvedAuth>) {
     tracing::info!(
         portal_id = auth.portal_id,
         enforcement = ?auth.enforcement,
+        pacing = auth.limits.pacing.mode.as_str(),
+        pace_real_time = auth.limits.pacing.pace_real_time,
         "authorization enabled"
     );
 }

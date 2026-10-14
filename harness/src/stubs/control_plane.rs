@@ -48,7 +48,8 @@ pub const USAGE_PATH: &str = "/authority/v1/auth/usage";
 /// A drift here is what the scheme tag exists to make loud.
 const SCHEME: &str = "sqd-portal-v1";
 
-/// The claim vocabulary the portal understands (`auth::types::CLAIMS_VERSION`).
+/// The version the typed grants are issued in; [`Answer::GrantV2`] carries the
+/// usage claim a portal that offers version 2 is paced by (ADR-018).
 pub const CLAIMS_VERSION: u32 = 1;
 
 /// P-SIGNATURE-MAX-SKEW.
@@ -74,6 +75,11 @@ pub enum Answer {
     /// An unrestricted grant that also names the key's owner.
     GrantOwned {
         organization: String,
+    },
+    /// An unrestricted version-2 grant carrying `usage` verbatim, so a test can
+    /// send a malformed claim as easily as a good one.
+    GrantV2 {
+        usage: Value,
     },
     Deny(String),
     Status(u16),
@@ -136,6 +142,17 @@ impl Answer {
                 },
             }))
             .into_response(),
+            Answer::GrantV2 { usage } => Json(json!({
+                "result": "granted",
+                "grant": {
+                    "claims_version": 2,
+                    "key_id": key_id,
+                    "refresh_after": now + 300,
+                    "expires_at": now + 900,
+                    "usage": usage,
+                },
+            }))
+            .into_response(),
             Answer::Deny(reason) => {
                 Json(json!({ "result": "denied", "reason": reason })).into_response()
             }
@@ -155,6 +172,8 @@ pub struct Seen {
     pub token: String,
     pub portal_id: String,
     pub timestamp: u64,
+    /// The body's `claims_versions`, `Null` when absent (REQ-57).
+    pub claims_versions: Value,
 }
 
 struct Inner {
@@ -297,8 +316,11 @@ async fn exchange(State(s): State<Arc<Inner>>, headers: HeaderMap, body: Bytes) 
         }
     };
 
-    let token = match serde_json::from_slice::<Value>(&body) {
-        Ok(value) => value["credential"].as_str().unwrap_or_default().to_owned(),
+    let (token, claims_versions) = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => (
+            value["credential"].as_str().unwrap_or_default().to_owned(),
+            value["claims_versions"].clone(),
+        ),
         Err(_) => {
             s.ledger.push("reject unparseable-body");
             return StatusCode::BAD_REQUEST.into_response();
@@ -317,6 +339,7 @@ async fn exchange(State(s): State<Arc<Inner>>, headers: HeaderMap, body: Bytes) 
         token,
         portal_id: s.portal_id.lock().unwrap().clone(),
         timestamp,
+        claims_versions,
     });
 
     let delay = *s.delay.lock().unwrap();

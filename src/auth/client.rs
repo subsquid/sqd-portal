@@ -3,7 +3,7 @@ use url::Url;
 use super::{
     config::ResolvedAuth,
     signing::RequestSigner,
-    types::{ExchangeAnswer, Grant, CLAIMS_VERSION},
+    types::{ExchangeAnswer, Grant, CLAIMS_VERSIONS},
 };
 use crate::auth::extractor::Credential;
 
@@ -49,9 +49,7 @@ impl ControlPlaneClient {
         now_secs: u64,
     ) -> anyhow::Result<Exchanged> {
         // Once: the signature binds the bytes actually sent.
-        let body = serde_json::to_vec(&serde_json::json!({
-            "credential": credential.token.expose(),
-        }))?;
+        let body = exchange_body(credential)?;
         let path = self.exchange_url.path().to_owned();
         let headers = self.signer.headers("POST", &path, &body, now_secs)?;
 
@@ -70,9 +68,11 @@ impl ControlPlaneClient {
         match response.json::<ExchangeAnswer>().await? {
             ExchangeAnswer::Denied { reason } => Ok(Exchanged::Denied(reason)),
             ExchangeAnswer::Granted { grant } => {
+                // Listing a version is how the portal asks, not a reason to
+                // read one it did not list (REQ-57).
                 anyhow::ensure!(
-                    grant.claims_version == CLAIMS_VERSION,
-                    "grant claims version {} is not {CLAIMS_VERSION}",
+                    CLAIMS_VERSIONS.contains(&grant.claims_version),
+                    "grant claims version {} is not one of {CLAIMS_VERSIONS:?}",
                     grant.claims_version
                 );
                 // Acting on it would admit one caller on another's
@@ -89,6 +89,16 @@ impl ControlPlaneClient {
             }
         }
     }
+}
+
+/// The signed exchange body: the credential and every claims version this
+/// build reads, so a new version reaches a portal with the release that reads
+/// it, and a rollback is answered in what it reads (REQ-57, DC-8).
+pub(super) fn exchange_body(credential: &Credential) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(&serde_json::json!({
+        "credential": credential.token.expose(),
+        "claims_versions": CLAIMS_VERSIONS,
+    }))
 }
 
 /// Appends the endpoint to a base that carries the control plane's own mount
@@ -176,7 +186,7 @@ mod tests {
         cp.raw(
             KEY_ID,
             serde_json::json!({"result": "granted", "grant": {
-                "claims_version": CLAIMS_VERSION + 1,
+                "claims_version": 3,
                 "key_id": KEY_ID,
                 "refresh_after": NOW + 300,
                 "expires_at": NOW + 900,
@@ -188,7 +198,7 @@ mod tests {
         cp.raw(
             KEY_ID,
             serde_json::json!({"result": "granted", "grant": {
-                "claims_version": CLAIMS_VERSION,
+                "claims_version": 1,
                 "key_id": "someone-else",
                 "refresh_after": NOW + 300,
                 "expires_at": NOW + 900,
@@ -210,6 +220,15 @@ mod tests {
         let client = client_for(&cp.config()).await;
         client.exchange(&credential(), NOW).await.unwrap();
 
+        // The versions ride under the signature, first exchange and renewal
+        // alike: there is one body builder (REQ-57).
+        assert_eq!(
+            cp.bodies(),
+            [serde_json::json!({
+                "credential": credential().token.expose(),
+                "claims_versions": [1, 2],
+            })]
+        );
         let seen = cp.signatures();
         assert_eq!(seen.len(), 1);
         let (portal_id, timestamp, signature) = &seen[0];

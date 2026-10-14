@@ -78,6 +78,14 @@ impl Auth {
         self.limits.push(format!("    {key}: {value}\n"));
         self
     }
+
+    /// `auth.limits.pacing` (ADR-018).
+    pub fn pacing(mut self, mode: &str, pace_real_time: bool) -> Self {
+        self.limits.push(format!(
+            "    pacing:\n      mode: {mode}\n      pace_real_time: {pace_real_time}\n"
+        ));
+        self
+    }
 }
 
 pub fn write_config(

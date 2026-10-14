@@ -405,9 +405,11 @@ async fn enforcing(fx: &mut Fixture) -> anyhow::Result<()> {
     // to the dependency; none may answer 403, which would tell a customer whose
     // key is perfectly good to stop retrying.
     let unreadable = json!({"result": "granted", "grant": {}});
+    // A version the exchange did not offer (REQ-57): offering is how the portal
+    // asks, not a reason to read what it cannot.
     let newer_claims = |key: &str| {
         json!({"result": "granted", "grant": {
-            "claims_version": 2,
+            "claims_version": 3,
             "key_id": key,
             "refresh_after": 4_102_444_800u64,
             "expires_at": 4_102_444_800u64,
@@ -552,6 +554,18 @@ async fn enforcing(fx: &mut Fixture) -> anyhow::Result<()> {
         fx.cp().rejections().is_empty(),
         "DC-8: the control plane refused an exchange the portal sent: {:?}",
         fx.cp().rejections(),
+    );
+    // REQ-57 — every exchange, inside the body the signature just verified,
+    // offers each claims version the build reads.
+    let offers: Vec<_> = fx
+        .cp()
+        .seen()
+        .into_iter()
+        .map(|s| s.claims_versions)
+        .collect();
+    ensure!(
+        !offers.is_empty() && offers.iter().all(|offer| *offer == json!([1, 2])),
+        "REQ-57: every exchange must offer claims versions [1, 2], got {offers:?}",
     );
 
     // INV-38 — the secret's single egress. The stub holds every token it was

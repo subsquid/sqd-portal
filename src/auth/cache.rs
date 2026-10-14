@@ -23,6 +23,7 @@ use super::{
     extractor::Credential,
     now_secs,
     singleflight::KeyedLocks,
+    types::UsageClaim,
 };
 use crate::metrics::{self, ExchangeBudget, ExchangeOutcome};
 
@@ -39,6 +40,9 @@ pub struct CachedGrant {
     /// When to stop. Nothing serves on this grant afterwards, whatever the
     /// control plane's state — the hard bound on stale authorization (REQ-54).
     pub expires_at: u64,
+    /// `None` on a version-1 grant and where a bad claim was read as absent:
+    /// either way unpaced and without usage headers (REQ-70).
+    pub usage: Option<UsageClaim>,
 }
 
 /// A grant as the cache holds it, with what the replica learned since it was
@@ -396,12 +400,25 @@ impl GrantCache {
             .saturating_sub(self.jitter(renew_at.saturating_sub(now)))
             .max(now.saturating_add(1));
 
+        // Speed, not access: a bad claim costs pacing, never the grant
+        // (REQ-70). Counted on arrival, in every pacing mode, so a control
+        // plane sending bad claims is seen before pacing is switched on.
+        let usage = grant.usage_claim().unwrap_or_else(|field| {
+            self.report(metrics::report_bad_usage_claim);
+            tracing::warn!(
+                key_id = grant.key_id,
+                field,
+                "grant carried a bad usage claim; serving it unpaced"
+            );
+            None
+        });
         let cached = Arc::new(CachedGrant {
             key_id: grant.key_id,
             datasets: grant.datasets,
             organization_id: grant.organization_id,
             refresh_after,
             expires_at,
+            usage,
         });
         let evicted = self.grants.lock().unwrap().push(
             fingerprint.to_owned(),
@@ -850,6 +867,7 @@ mod tests {
                     organization_id: None,
                     refresh_after,
                     expires_at,
+                    usage: None,
                 },
             );
             if failing {
@@ -1096,6 +1114,7 @@ mod tests {
             organization_id: None,
             refresh_after: NOW,
             expires_at: NOW + 900,
+            usage: None,
         });
 
         for refusal in [Resolved::Unavailable, Resolved::Saturated] {
@@ -1175,6 +1194,49 @@ mod tests {
             matches!(expired, Resolved::Unavailable),
             "past the hard expiry the outage is a dependency failure, got {expired:?}"
         );
+    }
+
+    /// A bad usage claim decides speed, not access: the grant is stored and
+    /// admits, unpaced, and the claim is counted — except in shadow, where the
+    /// count would publish the verdict shadow mode withholds (REQ-70, REQ-55).
+    /// The only test that sends a bad claim, so the global count is its own.
+    #[tokio::test]
+    async fn a_bad_usage_claim_is_stored_unpaced_and_counted_while_enforcing() {
+        let cp = MockControlPlane::spawn().await;
+        let good = serde_json::json!({
+            "state": "within",
+            "stream_bytes_per_sec": 20_000_000,
+            "floor_bytes_per_sec": 500_000,
+            "allowance_bytes": 400_000_000_000u64,
+            "used_bytes": 1u64,
+            "period_end": NOW + 86_400,
+            "as_of": null,
+        });
+        cp.grant_v2(KEY_ID, good, NOW);
+        let cache = cache_for(&cp).await;
+        let usage = granted(&cache.resolve(&credential(), NOW).await)
+            .usage
+            .clone();
+        assert_eq!(
+            usage.map(|usage| usage.stream_bytes_per_sec),
+            Some(Some(20_000_000))
+        );
+
+        for (enforcement, counted) in [(Enforcement::Enforce, 1), (Enforcement::LogOnly, 0)] {
+            cp.grant_v2(KEY_ID, serde_json::json!({"state": "over"}), NOW);
+            let cache = crate::auth::test_support::cache_with(&cp, enforcement).await;
+            let before = metrics::bad_usage_claims();
+
+            let grant = granted(&cache.resolve(&credential(), NOW).await).clone();
+
+            assert_eq!(grant.usage, None, "{enforcement:?}");
+            assert_eq!(grant.key_id, KEY_ID, "the grant itself is used");
+            assert_eq!(
+                metrics::bad_usage_claims() - before,
+                counted,
+                "{enforcement:?}"
+            );
+        }
     }
 
     /// INV-6: the authority has spoken since, so the remaining lifetime does not
@@ -1379,6 +1441,7 @@ mod tests {
                     organization_id: None,
                     refresh_after: NOW + 300,
                     expires_at: NOW + 900,
+                    usage: None,
                 },
             );
         }
@@ -1418,6 +1481,7 @@ mod tests {
                     organization_id: None,
                     refresh_after: NOW + 300,
                     expires_at: NOW + 900,
+                    usage: None,
                 },
             );
         }
