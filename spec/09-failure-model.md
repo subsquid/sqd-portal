@@ -79,8 +79,10 @@ policy, and it is the control plane's `expires_at` under the Portal's cap (REQ-5
 | Fault | Required response |
 |---|---|
 | Exchange unreachable / timeout / error status, cached grant inside `expires_at` | degrade: serve on the cached grant; count the grace-serving and alarm on it (OB-9/13). No request fails for this reason while the grant lives |
+| Exchange unreachable while responses are paced on a version-2 grant | degrade, failing open on the rate: the held grant keeps admitting requests at its rate and with its headers until `expires_at`, and a response already open keeps its admission rate until it ends, so an organization that crosses its allowance stays at full speed and one whose period resets stays at the floor (REQ-71). Long paced streams still reach their age limit and resume, at most once per P-PACED-STREAM-MAX-AGE and with no loop; a resumption that lands on a replica with no usable grant is refused as UPSTREAM-FAILURE, like any uncached credential (REQ-75) |
 | Exchange unreachable, no usable grant (never cached, or past `expires_at`) | fail-safe: refuse as UPSTREAM-FAILURE, retryable, attributed to the dependency. This is the accepted cost of asking on demand, not a defect |
-| Answer malformed, missing a field, or carrying an unrecognized claims version | integrity: treat as a failed exchange, store nothing, alarm. Never read for the parts that parsed — an unread restriction is a granted permission |
+| Version-2 answer whose usage claim is missing, malformed or carries a rate below P-PACING-MIN-RATE | degrade: read the claim as absent, use the grant unpaced and without usage headers, count it (REQ-70, OB-16). It decides speed, not access |
+| Answer malformed, missing a field, or carrying an unrecognized claims version, other than the usage claim above | integrity: treat as a failed exchange, store nothing, alarm. Never read for the parts that parsed — an unread restriction is a granted permission |
 | Answer about a different credential than was asked about | integrity: discard and refuse as UPSTREAM-FAILURE |
 | Answer offers a lifetime beyond P-GRANT-MAX-LIFETIME | mask: accept, capped at the bound; count it as a control-plane misconfiguration |
 | Authoritative denial arriving against a live cached grant | fail-closed: evict and refuse from that moment; a denial is never outranked by remaining lifetime (INV-6) |

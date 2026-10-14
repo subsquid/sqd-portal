@@ -112,6 +112,21 @@ set, which is the only thing that can size them honestly.
 | P-KEY-ID-MAX-LEN | Max accepted key-id length; mirrors what the control plane can mint (IB-9, REQ-52) | 64 *(fixed)* | 64 |
 | P-KEY-SECRET-MAX-LEN | Max accepted secret length (IB-9, REQ-52) | 128 *(fixed)* | 128 |
 
+## Usage pacing
+
+Bound only on an authorizing deployment, under `auth.limits.pacing` (REQ-70..REQ-75,
+ADR-018). The two switches are operator-bindable per portal; the rest are fixed. Nothing
+here is implemented yet, so the observed column is empty and every target waits on ADR-018.
+
+| Parameter | Role (where used) | Observed | Target |
+|---|---|---|---|
+| P-PACING-MODE | `auth.limits.pacing.mode`: `off` reads the grant's usage claim, counts a bad one, and does not act on it, `log_only` computes and counts waits without taking them, `enforce` paces, ends long paced streams, clamps and adds the usage headers (REQ-70..REQ-75). Separate from the authorization enforcement mode, and inert on a portal whose authorization runs in shadow | — | ⚠ `off` (ratify via ADR-018) |
+| P-PACE-REAL-TIME | `auth.limits.pacing.pace_real_time`: whether responses served by the real-time source are paced. They count toward the allowance either way, and when not paced their would-be waits are counted (REQ-71, OB-16) | — | ⚠ false (ratify via ADR-018) |
+| P-PACING-BURST | What a paced response may send ahead of its rate, and the largest piece a frame is released in. A response that must wait waits until it may send this much, so it wakes at most twice in the time its rate takes to fill this (REQ-71, INV-16, LIV-2) | — | ⚠ 1 s × rate *(fixed)* (ratify via ADR-018) |
+| P-PACING-MIN-RATE | Lowest non-null `stream_bytes_per_sec` a usage claim may carry. A lower one is a units error rather than a floor, and the claim is read as absent: the response is unpaced and the claim counted (REQ-70, DC-8). Below the smallest published floor, about 0.1 MB/s, and above what any plan rate up to 64 MB/s reads as when sent in KB/s | — | ⚠ 64 KiB/s *(fixed)* (ratify via ADR-018) |
+| P-FLOOR-READ-AHEAD | Read-ahead a stream admitted over its allowance and paced is clamped to (REQ-72, INV-11) | — | ⚠ 1 chunk *(fixed)* (ratify via ADR-018) |
+| P-PACED-STREAM-MAX-AGE | Age past which a paced network stream starts no chunk after its first and ends once those in flight are sent, so its client resumes on a current grant. No shorter than the control plane's refresh interval, which it matches (REQ-75, LIV-13) | — | ⚠ 5 min *(fixed)* (ratify via ADR-018) |
+
 ## SLO targets
 
 | Parameter | Role (where used) | Observed | Target |

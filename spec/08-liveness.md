@@ -38,7 +38,10 @@ timeout plus a rerouted attempt (the same worst case as LIV-2). Witness: OB-2
 **LIV-2 — Stream progress (stall budget).** Healthy environment, draining client ⇒ a
 stream's coverage advances; zero-progress intervals never exceed P-STALL-BUDGET ⚠
 (worst honest case: a worker timeout plus rerouted attempt). A stream that cannot
-progress within the budget terminates (truncation or error) rather than hanging.
+progress within the budget terminates (truncation or error) rather than hanging. A paced
+response (REQ-71) is held to its rate instead, and any pause pacing adds lasts at most the
+time that rate takes to fill P-PACING-BURST, plus the lateness of the timer that ends it
+(INV-16).
 Witness: OB-2 heartbeat vs coverage. Check: CT-2 — stub-induced stalls.
 
 **LIV-3 — Non-stream termination.** Every non-stream operation (OP-2..OP-10) answers
@@ -95,8 +98,13 @@ within P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT + slack, regardless of client behavio
 **LIV-13 — Revocation convergence.** Authorizing deployment ⇒ a key revoked at the control
 plane stops being served by a replica within its grant's `refresh_after` + one exchange +
 P-GRANT-REFRESH-JITTER, and unconditionally at that grant's `expires_at`. The same bound
-covers every narrowing of a live key — a withdrawn dataset, a reduced scope — since all of
-them reach the Portal only as the next grant. The first bound
+covers every narrowing of a live key — a withdrawn dataset, a reduced scope, a lowered rate —
+since all of them reach the Portal only as the next grant. Both bounds are on admission: a
+request admitted after the renewal is served on the narrowed grant. A response already open
+keeps the terms it was admitted on until it ends (REQ-71). A long paced network stream picks
+the narrowing up, a revocation included, through its age limit, with no count of resumptions
+promised (REQ-75); a response nothing ends — an unpaced stream, a real-time response paced
+under P-PACE-REAL-TIME — keeps its terms for as long as it runs. The first bound
 needs a healthy control plane and a request to arrive — an idle credential converges
 trivially, since nothing is being served on it — and holds through a flood of unknown
 tokens, since renewals spend their own budget (DC-8, HZ-10). The second needs nothing at all: it holds
@@ -109,6 +117,8 @@ interval (OQ-16). Witness: enforcing-mode OB-13 grace count, minimum remaining e
 exchange outcomes; shadow-mode and per-request details remain protected. Check: CT-10 —
 revoke a key while the stub is healthy and assert the first request past `refresh_after`
 converges; repeat with the stub unreachable and assert convergence exactly at `expires_at`.
+CT-12 — lower the rate a long paced stream's grant carries and assert that a resumption after
+the age limit, once admitted on the renewed grant, is paced at the new rate.
 
 **LIV-14 — New-key admission.** Healthy control plane ⇒ a key minted a moment ago is served
 on its first request: there is no set to be absent from, only an exchange to make, so

@@ -126,8 +126,8 @@ connection to it and this contract is vacuous.
 — and is the source of every authorization decision (OP-11). It publishes nothing and the
 Portal mirrors nothing.
 
-*Call contract.* One interaction, the **exchange**: the presented credential (DEF-16) in,
-a grant or a denial (DEF-17) out. It runs on the request path, and only when the cache holds
+*Call contract.* One interaction, the **exchange**: the presented credential (DEF-16) and
+the claims versions this build reads in, a grant or a denial (DEF-17) out. It runs on the request path, and only when the cache holds
 no *fresh* grant for that credential's fingerprint — after a token outside the grammar has
 already been refused, that means an unseen credential or one whose grant has passed
 `refresh_after`. Freshness governs when an exchange happens; usability — not past
@@ -138,6 +138,16 @@ already been refused, that means an unseen credential or one whose grant has pas
   under the Portal's configured Ed25519 identity. The control plane rejects absent,
   repeated, or malformed signing headers, a portal with no matching active registered key,
   and a timestamp whose absolute skew exceeds P-SIGNATURE-MAX-SKEW.
+- *Claims versions negotiated.* The signed body carries the credential and
+  `claims_versions`, every version this build reads (REQ-57). The control plane answers in a
+  version the list names, and in version 1 to a body without the list, which is what a build
+  that predates it sends. It answers only in a version that expresses every restriction the
+  key carries, and fails the exchange when no listed version does. Version 2 adds only the
+  usage claim, which decides speed, so version 1 always qualifies: it may answer version 1 to
+  any body, and that is how it stops pacing everywhere at once.
+- *No rate below the minimum.* A version-2 usage claim's `stream_bytes_per_sec`, when set, is
+  never below P-PACING-MIN-RATE, so no floor, staff overrides included, is set below it; the
+  Portal reads a lower one as a bad claim and leaves the response unpaced (REQ-70).
 - *No redirects.* A redirected exchange carries a client's credential somewhere the
   operator did not configure, and its answer is not the control plane's.
 - *Deadline.* P-GRANT-EXCHANGE-TIMEOUT per call, strictly below P-CLIENT-TIMEOUT (ADR-010)
@@ -169,7 +179,7 @@ already been refused, that means an unseen credential or one whose grant has pas
 |---|---|
 | Exchange denies the credential | refuse on the rung it names (REQ-53), mapped to its DEF-10 row; evict any cached grant for that fingerprint at once; remember the denial for P-GRANT-NEGATIVE-TTL |
 | Exchange unreachable, times out, or returns a non-success status | serve on a cached grant that has not passed `expires_at`, if one exists; otherwise refuse as UPSTREAM-FAILURE. Never BAD-CREDENTIAL — the credential was never judged (REQ-54) |
-| Answer missing a required field, or carrying a claims version this build does not understand | unusable, not permissive: handled as a failed exchange. Reading a newer vocabulary for the parts it recognizes is how an added restriction becomes an accidental permission (DEF-17) |
+| Answer missing a required field, or carrying a claims version this build does not understand | a usage claim that is missing or malformed is the exception: it is read as absent and the grant is used unpaced (REQ-70). Anything else is unusable, not permissive: handled as a failed exchange. Reading a newer vocabulary for the parts it recognizes is how an added restriction becomes an accidental permission (DEF-17) |
 | Answer about a credential other than the one asked about | discard and refuse as UPSTREAM-FAILURE |
 | Answer offering a lifetime beyond P-GRANT-MAX-LIFETIME | accept the grant, capped at the bound, and count it — a control plane drifting past the cap is a misconfiguration an operator should see before it becomes an incident |
 | Signing headers absent, repeated, malformed, unattributable, or outside P-SIGNATURE-MAX-SKEW in either direction | UPSTREAM-FAILURE like any other failed exchange, and alarm. The cause is the Portal's own clock, identity, or request construction, not the client's key, and it fails every exchange at once |
