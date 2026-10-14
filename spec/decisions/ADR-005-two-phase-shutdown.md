@@ -26,7 +26,9 @@ Shutdown is bounded by P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT (50 s at current valu
 the orchestrator's kill grace must exceed it — recommend ≥ 60 s (Kubernetes
 `terminationGracePeriodSeconds`) to leave headroom for network-client wind-down, Sentry
 flush, and runtime drop. Clients on streams longer than the drain
-window see truncation, recovered per REQ-6/REQ-2. Cooperative per-stream wind-down and
+window see their connection dropped at process exit, a transport error rather than a short
+body, recovered per REQ-2 (corrected 2026-10-14: this had said truncation per REQ-6, which
+the drain never wrote; GAP-40 tracks the change that would). Cooperative per-stream wind-down and
 a network-client wind-down timeout were explicit non-goals. If frequent hard kills
 appear, the sanctioned escalation is an explicit early process exit after force-close.
 Shapes REQ-24, REQ-23.

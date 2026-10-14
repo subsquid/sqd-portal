@@ -182,7 +182,8 @@ reported heads never lie).
 **INV-25 — Truncation well-formedness.** [response]
 A stream body always ends on a record boundary with valid encoding — whether complete
 or truncated; a truncated body is indistinguishable from a short complete one at the
-encoding level.
+encoding level. A connection dropped when the process exits at shutdown (REQ-24) is no
+end: the transport reports the drop, and this invariant says nothing of the bytes before it.
 *Why:* torn records corrupt client decoders (ADR-001's price must stay this low).
 *Check:* CT-2 — kill the serving stub mid-stream at every phase; decode-validate.
 

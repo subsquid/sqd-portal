@@ -81,10 +81,12 @@ P-NO-DATA-DELAY per connection.
 
 **REQ-6 — Every delivered prefix is valid and resumable.** [MUST]
 A stream may end before the requested range is exhausted, for any reason (worker
-failure, caps, shutdown). Whatever was delivered must be a well-formed prefix: complete
+failure, caps). Whatever was delivered must be a well-formed prefix: complete
 records, valid encoding, ordering per REQ-1. Failures before the first record map to an
 error status; failures after it truncate the body without corrupting it. Truncation is
-recovered via REQ-2, not signaled in-band.
+recovered via REQ-2, not signaled in-band. A connection still open when the process exits
+at shutdown is not ended but dropped (REQ-24): the client sees a transport error, not a short
+body, and resumes via REQ-2.
 *Acceptance:* forcibly failing the data source mid-stream yields a decodable response
 prefix whose records satisfy REQ-1 and from which a follow-up request continues
 correctly.
@@ -231,11 +233,13 @@ accepting work and drains in-flight streams for at most P-DRAIN-TIMEOUT. Total s
 never exceeds P-PRE-DRAIN-GRACE + P-DRAIN-TIMEOUT plus a constant, and the deployment
 must give the process that long: P-KILL-GRACE exceeds that sum. The Portal cannot enforce
 its own grace — below it the process is killed mid-drain and this requirement is void,
-which is an environment defect rather than a Portal one.
+which is an environment defect rather than a Portal one. Past P-DRAIN-TIMEOUT the Portal
+stops waiting for in-flight streams; one still open when the process exits has its connection
+dropped: no end is written, and its client sees a transport error (REQ-6).
 *Acceptance:* under load, SIGTERM → readiness 503 at once; new connections keep being
 served during the grace window; process exits within the budget; in-flight streams
-either complete or truncate per REQ-6; the deployment manifest sets P-KILL-GRACE above
-the budget.
+complete, truncate per REQ-6, or, still open at process exit, have their connection
+dropped; the deployment manifest sets P-KILL-GRACE above the budget.
 *Trace:* ADR-005.
 
 **REQ-25 — Fault isolation across upstreams.** [MUST]
