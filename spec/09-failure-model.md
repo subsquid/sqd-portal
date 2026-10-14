@@ -29,7 +29,7 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 | Malformed body / unknown fields / oversized query | fail-safe BAD-REQUEST before any upstream work (INV-10) |
 | Hostile header/param bytes (any encoding) | fail-safe; never panic (INV-36) |
 | Zero/absurd tuning values | fail-safe BAD-REQUEST; over-cap values mask via clamping (INV-11) |
-| Stalled reader (not draining) | backpressure within the stream's buffer bounds; no unbounded buffering; stream may truncate at shutdown (LIV-11) |
+| Stalled reader (not draining) | backpressure within the stream's buffer bounds; no unbounded buffering; stream still open when the process exits after the drain budget is dropped (LIV-11, REQ-24) |
 | Mid-response disconnect | mask; reclaim everything within LIV-10's bound |
 | Instant-retry storm (ignoring hints) | fail-safe per request (cheap refusal path); capacity for admitted work preserved (INV-12) |
 
@@ -109,7 +109,7 @@ policy, and it is the control plane's `expires_at` under the Portal's cap (REQ-5
 | Panic inside a stream task | truncate that stream (INV-25); process lives (FM-1) |
 | Panic in a background loop | alarm; loop restarts or the failure is surfaced — a dead refresh loop must not be silent (ties to GAP-2) |
 | Memory pressure beyond P-MEMORY-BUDGET | fail-safe refusal preferred over process death — byte-budget admission is the pressure valve (REQ-27; today unmet — GAP-3/GAP-17) |
-| Kill grace below the shutdown budget (P-KILL-GRACE) | environment defect, outside the Portal's reach: the process dies mid-drain, streams are severed without a well-formed truncation (INV-25) and LIV-11's bound is void — the deployment must raise it (REQ-24) |
+| Kill grace below the shutdown budget (P-KILL-GRACE) | environment defect, outside the Portal's reach: the process dies mid-drain, streams are dropped before the drain budget is spent (REQ-24) and LIV-11's bound is void — the deployment must raise it (REQ-24) |
 | Invalid config values | fail-safe at startup: refuse to run (REQ-33) |
 | Unknown config keys | mask + warn (ADR-008) |
 | Dual instance behind one address | tolerated: no shared mutable state exists outside the process (NG5) |
