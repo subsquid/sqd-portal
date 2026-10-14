@@ -28,7 +28,7 @@ use tower_http::request_id::{
 };
 use utoipa_scalar::{Scalar, Servable as _};
 
-use crate::auth::{AuthExt, EndpointExt, Gate, Gated};
+use crate::auth::{AuthExt, EndpointExt, Gate, Gated, PacedStream};
 use crate::datasets::DatasetConfig;
 use crate::endpoints::{
     block_number_by_timestamp::get_blocknumber_by_timestamp,
@@ -69,13 +69,20 @@ use axum::body;
 ///
 /// Spelled out rather than `Any`, so a header added later is invisible until someone
 /// decides it is public — `x-internal-*` above all.
-const EXPOSED_HEADERS: [axum::http::HeaderName; 6] = [
+const EXPOSED_HEADERS: [axum::http::HeaderName; 12] = [
     header::RETRY_AFTER,
     logging::X_REQUEST_ID,
     axum::http::HeaderName::from_static(crate::endpoints::stream::DATA_SOURCE_HEADER),
     axum::http::HeaderName::from_static(crate::endpoints::stream::HEAD_NUMBER_HEADER),
     axum::http::HeaderName::from_static(crate::endpoints::stream::FINALIZED_NUMBER_HEADER),
     axum::http::HeaderName::from_static(crate::endpoints::stream::FINALIZED_HASH_HEADER),
+    // IB-10, on a portal whose pacing enforces.
+    axum::http::HeaderName::from_static(crate::auth::USAGE_HEADERS[0]),
+    axum::http::HeaderName::from_static(crate::auth::USAGE_HEADERS[1]),
+    axum::http::HeaderName::from_static(crate::auth::USAGE_HEADERS[2]),
+    axum::http::HeaderName::from_static(crate::auth::USAGE_HEADERS[3]),
+    axum::http::HeaderName::from_static(crate::auth::USAGE_HEADERS[4]),
+    axum::http::HeaderName::from_static(crate::auth::USAGE_HEADERS[5]),
 ];
 
 fn cors_layer() -> CorsLayer {
@@ -1232,6 +1239,13 @@ where
         };
 
         let compression = determine_compression_format(req.headers());
+        // Set by the gate on a paced stream, and read here so the debug
+        // variant, which skips the server-side clamps, is clamped too
+        // (REQ-72, REQ-75).
+        let paced = req.extensions().get::<PacedStream>().copied();
+        let buffer_size = paced
+            .and_then(|paced| paced.read_ahead)
+            .map_or(buffer_size, |cap| buffer_size.min(cap));
 
         let query: ParsedQuery = req.extract().await.map_err(IntoResponse::into_response)?;
 
@@ -1247,6 +1261,7 @@ where
             retries,
             compression,
             skip_parent_hash_validation: config.skip_parent_hash_validation,
+            age_limit: paced.map(|paced| paced.age_limit),
         })
     }
 }
@@ -1604,6 +1619,13 @@ mod tests {
             "x-sqd-head-number",
             "x-sqd-finalized-head-number",
             "x-sqd-finalized-head-hash",
+            // IB-10's usage headers, on a portal whose pacing enforces.
+            "x-sqd-usage-state",
+            "x-sqd-usage-limit-bytes",
+            "x-sqd-usage-used-bytes",
+            "x-sqd-usage-reset",
+            "x-sqd-usage-floor-bytes-per-sec",
+            "x-sqd-usage-as-of",
         ] {
             assert!(
                 exposed.contains(&name),

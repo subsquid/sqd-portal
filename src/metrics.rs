@@ -272,6 +272,10 @@ lazy_static::lazy_static! {
     static ref GRANTS_IN_GRACE: Gauge = Default::default();
     static ref GRACE_MIN_REMAINING: Gauge = Default::default();
     static ref BAD_USAGE_CLAIMS: Counter = Default::default();
+    static ref PACED_SECONDS: Family<Labels, Counter<f64>> = Default::default();
+    static ref PACED_RESPONSES: Family<Labels, Counter> = Default::default();
+    static ref PACED_BYTES: Family<Labels, Counter> = Default::default();
+    static ref AGED_ENDS: Family<Labels, Counter> = Default::default();
 
     // Usage measurement (OB-15). Registered for the process like every other
     // family, so they exist at zero on a portal that measures nothing.
@@ -525,6 +529,44 @@ pub fn report_bad_usage_claim() {
 #[cfg(test)]
 pub fn bad_usage_claims() -> u64 {
     BAD_USAGE_CLAIMS.get()
+}
+
+/// One wrapped response's handles on the OB-16 counters, resolved once at
+/// admission so a frame costs an atomic add rather than a label lookup.
+#[derive(Clone)]
+pub struct PacingCounters {
+    pub seconds: Counter<f64>,
+    pub responses: Counter,
+    pub bytes: Counter,
+}
+
+/// Labelled by the grant's usage state and the serving source, closed sets
+/// both, and nothing finer: no key, organization, dataset or path (OB-16).
+pub fn pacing_counters(state: &str, source: &str) -> PacingCounters {
+    let labels = vec![
+        ("state".to_owned(), state.to_owned()),
+        ("source".to_owned(), source.to_owned()),
+    ];
+    PacingCounters {
+        seconds: PACED_SECONDS.get_or_create(&labels).clone(),
+        responses: PACED_RESPONSES.get_or_create(&labels).clone(),
+        bytes: PACED_BYTES.get_or_create(&labels).clone(),
+    }
+}
+
+/// A paced network stream that started no further chunk past its age limit
+/// (REQ-75).
+pub fn report_aged_end(state: &str) {
+    AGED_ENDS
+        .get_or_create(&vec![("state".to_owned(), state.to_owned())])
+        .inc();
+}
+
+#[cfg(test)]
+pub fn aged_ends(state: &str) -> u64 {
+    AGED_ENDS
+        .get_or_create(&vec![("state".to_owned(), state.to_owned())])
+        .get()
 }
 
 /// Count a capacity-based stream refusal.
@@ -937,6 +979,26 @@ pub fn register_metrics(registry: &mut Registry) {
         "limit_bad_usage_claims",
         "Version-2 grants whose usage claim was read as absent and served unpaced; moves in every pacing mode, never where authorization runs in shadow",
         BAD_USAGE_CLAIMS.clone(),
+    );
+    registry.register(
+        "limit_paced_seconds",
+        "Seconds paced responses waited on their rate: taken in enforce, computed and not taken in log_only and for real-time responses not paced; by usage state and serving source",
+        PACED_SECONDS.clone(),
+    );
+    registry.register(
+        "limit_paced_responses",
+        "Responses that waited on their rate at least once, or would have; by usage state and serving source",
+        PACED_RESPONSES.clone(),
+    );
+    registry.register(
+        "limit_bytes",
+        "Encoded body bytes of responses admitted with a rate, waited or not; by usage state and serving source",
+        PACED_BYTES.clone(),
+    );
+    registry.register(
+        "limit_aged_ends",
+        "Paced network streams that started no further chunk past their age limit; by usage state",
+        AGED_ENDS.clone(),
     );
     registry.register(
         "usage_events_enqueued",

@@ -1,6 +1,7 @@
 //! Portal-side half of access control: each presented credential is
-//! exchanged for a short-lived grant, which then answers per request. No quota
-//! or limit — an admitted key streams unrestricted.
+//! exchanged for a short-lived grant, which then answers per request. The grant
+//! may carry a per-stream rate, which [`pacing`] holds each response to; the
+//! portal keeps no quota and refuses nothing for usage (ADR-018).
 //!
 //! What an admitted key streams is *measured*, where the operator asked for it
 //! (`auth.usage:`, REQ-60): shadow accounting that records bytes and can never
@@ -23,6 +24,7 @@ mod client;
 mod config;
 mod evaluate;
 mod extractor;
+mod pacing;
 mod routes;
 mod signing;
 mod singleflight;
@@ -33,6 +35,7 @@ mod usage;
 pub mod test_support;
 
 pub use config::{AuthConfig, Enforcement, PacingMode, ResolvedAuth};
+pub(crate) use pacing::{PacedStream, USAGE_HEADERS};
 pub(crate) use usage::tap_middleware;
 pub use usage::UsageConfig;
 
