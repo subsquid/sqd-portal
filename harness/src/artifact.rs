@@ -6,9 +6,9 @@ use std::io::Write;
 
 use flate2::{write::GzEncoder, Compression};
 use libp2p_identity::PeerId;
-use sqd_assignments::{AssignmentBuilder, PortalAssignmentBuilder};
+use sqd_assignments::{AssignmentBuilder, DataChunk, PortalAssignmentBuilder};
 
-use crate::world::ToyWorld;
+use crate::world::{ToyChunk, ToyWorld};
 
 /// The scheduler's own type, re-exported: it is both what the portal is pinned to and what a
 /// published state names, so the stubs and the CT files spell it the way the portal does.
@@ -33,7 +33,7 @@ pub fn build_gzipped(world: &ToyWorld, workers: &[PeerId]) -> anyhow::Result<Vec
         };
         for chunk in &ds.chunks {
             b.new_chunk()
-                .id(&chunk.id(&ds.name))
+                .id(chunk_id(chunk, &ds.name)?)
                 .dataset_id(network_id)
                 .dataset_base_url(&format!("https://{}.example.invalid", ds.name))
                 .block_range(chunk.first..=chunk.last)
@@ -83,7 +83,7 @@ pub fn build_portal_gzipped(world: &ToyWorld, workers: &[PeerId]) -> anyhow::Res
         for chunk in &ds.chunks {
             dataset
                 .new_chunk()
-                .id(&chunk.id(&ds.name))
+                .id(chunk_id(chunk, &ds.name)?)
                 .block_range(chunk.first..=chunk.last)
                 .last_block_timestamp(world.timestamp(chunk.last))
                 .worker_indexes(&worker_indexes)
@@ -103,6 +103,12 @@ pub fn build_portal_gzipped(world: &ToyWorld, workers: &[PeerId]) -> anyhow::Res
     }
 
     gzip(b.finish())
+}
+
+fn chunk_id(chunk: &ToyChunk, ds: &str) -> anyhow::Result<DataChunk> {
+    let id = chunk.id(ds);
+    id.parse()
+        .map_err(|()| anyhow::anyhow!("chunk id '{id}' does not parse"))
 }
 
 fn gzip(bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
