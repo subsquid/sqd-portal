@@ -179,7 +179,14 @@ the Portal's only to cap (P-GRANT-MAX-LIFETIME): `refresh_after` is when the ans
 be renewed, `expires_at` when it may no longer be acted on. A grant whose claims version
 this build does not fully understand is unusable rather than partly usable — reading a
 newer vocabulary for the parts it recognizes is how an added restriction becomes an
-accidental permission (REQ-54).
+accidental permission (REQ-54). Each exchange names the versions this build reads, and the
+control plane answers in one of them (REQ-57); the rule above stays as the guard. Claims
+version 2 adds a **usage claim**, which decides speed rather than access, and so is read as
+absent rather than failing the grant when it is missing or malformed (REQ-70): the
+organization's usage state, the per-response rate the Portal paces to (absent: unpaced), and
+figures the Portal only copies into headers — allowance, used bytes, floor rate, period end,
+and when the usage was last computed (REQ-70, REQ-73). The Portal paces to the rate, clamps
+read-ahead on the state (REQ-72), and derives nothing from the rest.
 
 A **denial** is the exchange's other authoritative answer: the earliest ladder rung that
 failed (REQ-53), which the Portal maps to its DEF-10 row. A denial is not a grant and is
@@ -243,7 +250,8 @@ snapshots (staleness: 05 §caches).
 **DEF-15 — Configuration.** The operator-supplied object binding every `P-*` parameter
 ([15-parameters.md](15-parameters.md)) plus identity (peer key), upstream endpoints,
 and the dataset map; on an authorizing deployment it also binds the control-plane endpoint,
-the enforcement mode, and the signing identity DC-8 authenticates with. Static
+the enforcement mode, the pacing mode (P-PACING-MODE), and the signing identity DC-8
+authenticates with. Static
 per process lifetime.
 
 ## Input events (background, not client-driven)
@@ -297,3 +305,4 @@ Semantics in [04-operations.md](04-operations.md).
 | `log_only` / `enforce` | Shadow and enforcing modes (REQ-55) |
 | exchange | The one control-plane call: credential in, grant or denial out (DC-8) |
 | fingerprint | The digest of a whole credential that keys the grant cache (DEF-16, DEF-18) |
+| `auth.limits.pacing`, pacer | Usage pacing (REQ-70..REQ-75) |

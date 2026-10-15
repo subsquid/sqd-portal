@@ -192,6 +192,26 @@ configuration. A family that appeared only where measurement was on would make a
 counter ambiguous between "not configured" and "nothing reported", which is the harder
 question to answer during an incident.
 
+**OB-16 — Pacing.** Portals enforcing authorization only: where authorization runs in
+shadow every family here reads zero, since pacing does not act there and its counts would
+publish the verdict shadow mode withholds (REQ-55). In every pacing mode, off included:
+version-2 grants whose usage claim was read as absent (REQ-70), so a control plane sending
+bad claims is seen before pacing is switched on. With pacing not off: the encoded bytes of
+responses admitted with a rate, responses that waited on their rate at least once, the time
+they spent waiting (REQ-71), and streams ended by their age limit (REQ-75); in log_only the
+same wait signals count the waits computed and not taken (REQ-74), no stream ends, and the
+deployment's pacing mode says which a reading is. Real-time responses count their waits
+computed and not taken in enforce too, unless P-PACE-REAL-TIME is set. The byte, wait and
+age-limit signals are counted by the usage state of the grant the response was paced at, the
+byte and wait signals also by serving source (network or real_time) — closed sets — and the
+bad-claim count by nothing; none carries a key id, an
+organization, a dataset or a request path, for OB-15's reasons. Nothing is logged per
+response for pacing; a single customer's pacing is the control plane's estimate (ADR-018).
+The families are registered for the process unconditionally and read zero where they do
+not apply. In log_only they are what a cutover is judged on: the would-be wait volume by
+state, against the organizations the control plane holds over their allowance, and per
+replica, against the room left under P-MAX-STREAMS (HZ-16).
+
 ## Property → observable mapping
 
 | Property | Decided by |
@@ -209,6 +229,7 @@ question to answer during an incident.
 | INV-6, INV-15, INV-39 | protected OB-12 reason logs + public non-disclosure; neutral shadow projection and enforcing-only OB-13 classes |
 | INV-30/31 | OB-1, OB-5 (they are the invariant's subject) |
 | INV-32, REQ-60/61 | OB-15 drop reasons and queue depth against the sink stub's ledger |
+| INV-16, INV-17, REQ-70..REQ-75 | OB-16 bytes and waits by state and source, and age-limit ends by state, against the harness's byte-curve and header ledger |
 | SLI-1..6 | OB-2, OB-3, OB-1 + process RSS |
 
 ## Logging
