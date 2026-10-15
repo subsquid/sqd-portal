@@ -842,7 +842,7 @@ mod tests {
         for (first, last) in [(0u64, 99u64), (200, 299)] {
             let staged = dataset
                 .new_chunk()
-                .id(&format!("0000000000/{first:010}-{last:010}-aaaaa"))
+                .id(sqd_assignments::DataChunk::new(0, first, last, "aaaaa").unwrap())
                 .block_range(first..=last)
                 .finish();
             // With the check off a gap is still reported, but the chunk is staged anyway. Any
@@ -864,7 +864,7 @@ mod tests {
         for (first, last) in [(0u64, 99u64), (200, 299)] {
             let staged = builder
                 .new_chunk()
-                .id(&format!("0000000000/{first:010}-{last:010}-aaaaa"))
+                .id(sqd_assignments::DataChunk::new(0, first, last, "aaaaa").unwrap())
                 .dataset_id(GAPPED_DATASET)
                 .block_range(first..=last)
                 .size(1)
@@ -890,7 +890,7 @@ mod tests {
         let mut dataset = builder.new_dataset(GAPPED_DATASET, 0);
         dataset
             .new_chunk()
-            .id("0000000000/0000000000-0000000099-aaaaa")
+            .id(sqd_assignments::DataChunk::new(0, 0, 99, "aaaaa").unwrap())
             .block_range(0..=99)
             .version(7)
             .finish()
