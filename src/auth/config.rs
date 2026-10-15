@@ -115,6 +115,52 @@ pub struct Limits {
     /// cohort of grants issued together does not come back together (HZ-12).
     #[serde(default = "default_refresh_jitter_pct")]
     pub refresh_jitter_pct: u64,
+
+    /// Usage pacing (ADR-018). Under `limits` because unknown keys here only
+    /// warn, so a rollback to a release that predates the block still boots
+    /// (ADR-008).
+    #[serde(default, deserialize_with = "pacing_block")]
+    pub pacing: Pacing,
+}
+
+/// `auth.limits.pacing` (P-PACING-MODE, P-PACE-REAL-TIME).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct Pacing {
+    #[serde(default)]
+    pub mode: PacingMode,
+
+    /// Whether responses served by the real-time source are paced. Off, their
+    /// waits are counted and never taken (REQ-71).
+    #[serde(default)]
+    pub pace_real_time: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PacingMode {
+    /// Reads the usage claim and counts a bad one; acts on nothing.
+    #[default]
+    Off,
+    /// Computes and counts waits without taking them (REQ-74).
+    LogOnly,
+    Enforce,
+}
+
+impl PacingMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::LogOnly => "log_only",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+/// `pacing:` with nothing under it is the default, `off`: a template that
+/// rendered empty must not stop a replica booting over a switch that only
+/// ever slows responses down.
+fn pacing_block<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Pacing, D::Error> {
+    Ok(Option::<Pacing>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -367,6 +413,7 @@ impl Default for Limits {
             denial_cache_capacity: default_denial_cache_capacity(),
             denial_ttl_secs: default_denial_ttl_secs(),
             refresh_jitter_pct: default_refresh_jitter_pct(),
+            pacing: Pacing::default(),
         }
     }
 }
@@ -454,6 +501,31 @@ portal_id: portal-premium-eu
         // P-GRANT-NEGATIVE-TTL / -CAPACITY
         assert_eq!(config.limits.denial_ttl_secs, 15);
         assert_eq!(config.limits.denial_cache_capacity, 4096);
+        // P-PACING-MODE, P-PACE-REAL-TIME
+        assert_eq!(config.limits.pacing.mode, PacingMode::Off);
+        assert!(!config.limits.pacing.pace_real_time);
+    }
+
+    /// Spelled as ADR-018 writes it, `off` unquoted included.
+    #[test]
+    fn the_pacing_block_parses_every_mode() {
+        for (mode, expected) in [
+            ("off", PacingMode::Off),
+            ("log_only", PacingMode::LogOnly),
+            ("enforce", PacingMode::Enforce),
+        ] {
+            let config = parse(&format!(
+                "{MINIMAL}limits:\n  pacing:\n    mode: {mode}\n    pace_real_time: true\n"
+            ));
+            assert_eq!(config.limits.pacing.mode, expected);
+            assert!(config.limits.pacing.pace_real_time);
+        }
+        let empty = parse(&format!("{MINIMAL}limits:\n  pacing:\n"));
+        assert_eq!(empty.limits.pacing, Pacing::default());
+        assert!(serde_yaml::from_str::<AuthConfig>(&format!(
+            "{MINIMAL}limits:\n  pacing:\n    mode: slow\n"
+        ))
+        .is_err());
     }
 
     #[test]

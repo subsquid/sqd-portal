@@ -230,6 +230,7 @@ mod tests {
             organization_id: Some("org-7".into()),
             refresh_after: 1,
             expires_at: 2,
+            usage: None,
         });
         let evicted = Arc::downgrade(&grant);
         let attribution = Attribution::new(grant, Some("dataset-1".into()), Arc::from("/stream"));

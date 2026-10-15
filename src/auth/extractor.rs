@@ -1364,7 +1364,7 @@ mod tests {
             serde_json::json!({
                 "result": "granted",
                 "grant": {
-                    "claims_version": crate::auth::types::CLAIMS_VERSION,
+                    "claims_version": 1,
                     "key_id": KEY_ID,
                     "organization_id": organization,
                     "refresh_after": NOW + 86_400,
@@ -1439,7 +1439,7 @@ mod tests {
             serde_json::json!({
                 "result": "granted",
                 "grant": {
-                    "claims_version": crate::auth::types::CLAIMS_VERSION,
+                    "claims_version": 1,
                     "key_id": KEY_ID,
                     "organization_id": {"unexpected": "shape"},
                     "refresh_after": NOW + 86_400,

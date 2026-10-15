@@ -271,6 +271,7 @@ lazy_static::lazy_static! {
     static ref GRACE_ADMISSIONS: Counter = Default::default();
     static ref GRANTS_IN_GRACE: Gauge = Default::default();
     static ref GRACE_MIN_REMAINING: Gauge = Default::default();
+    static ref BAD_USAGE_CLAIMS: Counter = Default::default();
 
     // Usage measurement (OB-15). Registered for the process like every other
     // family, so they exist at zero on a portal that measures nothing.
@@ -512,6 +513,18 @@ pub fn grace_admissions() -> u64 {
 pub fn report_grace_census(in_grace: usize, min_remaining_secs: u64) {
     GRANTS_IN_GRACE.set(in_grace as i64);
     GRACE_MIN_REMAINING.set(min_remaining_secs as i64);
+}
+
+/// A version-2 grant whose usage claim was read as absent (OB-16). Counted in
+/// every pacing mode, off included, and never where authorization runs in
+/// shadow.
+pub fn report_bad_usage_claim() {
+    BAD_USAGE_CLAIMS.inc();
+}
+
+#[cfg(test)]
+pub fn bad_usage_claims() -> u64 {
+    BAD_USAGE_CLAIMS.get()
 }
 
 /// Count a capacity-based stream refusal.
@@ -919,6 +932,11 @@ pub fn register_metrics(registry: &mut Registry) {
         "auth_grace_min_remaining_seconds",
         "Smallest time to expires_at among grants in grace; a conservative bound that may name an idle grant; zero when none are in grace",
         GRACE_MIN_REMAINING.clone(),
+    );
+    registry.register(
+        "limit_bad_usage_claims",
+        "Version-2 grants whose usage claim was read as absent and served unpaced; moves in every pacing mode, never where authorization runs in shadow",
+        BAD_USAGE_CLAIMS.clone(),
     );
     registry.register(
         "usage_events_enqueued",

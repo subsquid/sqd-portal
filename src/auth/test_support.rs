@@ -99,6 +99,7 @@ struct MockState {
     statuses: Mutex<HashMap<String, u16>>,
     exchanges: AtomicUsize,
     signatures: Mutex<Vec<(String, String, String)>>,
+    bodies: Mutex<Vec<serde_json::Value>>,
     stopped: AtomicBool,
     delay_ms: AtomicUsize,
 }
@@ -146,11 +147,28 @@ impl MockControlPlane {
             serde_json::json!({
                 "result": "granted",
                 "grant": {
-                    "claims_version": types::CLAIMS_VERSION,
+                    "claims_version": 1,
                     "key_id": key_id,
                     "datasets": datasets,
                     "refresh_after": refresh_after,
                     "expires_at": expires_at,
+                },
+            }),
+        );
+    }
+
+    /// A version-2 grant carrying `usage` verbatim, unrestricted and fresh.
+    pub fn grant_v2(&self, key_id: &str, usage: serde_json::Value, now: u64) {
+        self.raw(
+            key_id,
+            serde_json::json!({
+                "result": "granted",
+                "grant": {
+                    "claims_version": 2,
+                    "key_id": key_id,
+                    "refresh_after": now + 300,
+                    "expires_at": now + 900,
+                    "usage": usage,
                 },
             }),
         );
@@ -200,6 +218,11 @@ impl MockControlPlane {
         self.state.exchanges.load(Ordering::SeqCst)
     }
 
+    /// Every exchange body, in order.
+    pub fn bodies(&self) -> Vec<serde_json::Value> {
+        self.state.bodies.lock().unwrap().clone()
+    }
+
     /// `(portal_id, timestamp, signature)` per exchange, in order.
     pub fn signatures(&self) -> Vec<(String, String, String)> {
         self.state.signatures.lock().unwrap().clone()
@@ -225,6 +248,7 @@ async fn exchange(
         header(signing::TIMESTAMP_HEADER),
         header(signing::SIGNATURE_HEADER),
     ));
+    state.bodies.lock().unwrap().push(body.clone());
     if header(signing::SIGNATURE_HEADER).is_empty() {
         return Err(StatusCode::UNAUTHORIZED);
     }

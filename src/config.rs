@@ -599,31 +599,44 @@ sqd_network:
 
     /// A limit is the one thing under `auth:` whose fallback is a plain default,
     /// so it stays a warning — otherwise rolling back to a build that predates a
-    /// knob turns the config that build is handed into a crash loop.
+    /// knob turns the config that build is handed into a crash loop. The pacing
+    /// block lives here for that reason (ADR-018).
     #[test]
     fn a_misspelled_limit_under_auth_is_reported_rather_than_fatal() {
         let _guard = crate::auth::test_support::env_guard();
-        let yaml = format!(
-            "{MINIMAL_YAML}auth:\n  \
-             control_plane_url: https://cp.example/authority\n  \
-             portal_id: portal-premium-eu\n  \
-             limits:\n    \
-             max_grant_lifetime_seconds: 60\n"
-        );
+        for (knob, path) in [
+            (
+                "max_grant_lifetime_seconds: 60",
+                "limits.max_grant_lifetime_seconds",
+            ),
+            (
+                "pacing:\n      burst_seconds: 2",
+                // `?` is serde_ignored's mark for a value inside an `Option`.
+                "limits.pacing.?.burst_seconds",
+            ),
+        ] {
+            let yaml = format!(
+                "{MINIMAL_YAML}auth:\n  \
+                 control_plane_url: https://cp.example/authority\n  \
+                 portal_id: portal-premium-eu\n  \
+                 limits:\n    \
+                 {knob}\n"
+            );
 
-        let config = Config::from_reader(yaml.as_bytes()).expect("a limit typo still starts");
+            let config = Config::from_reader(yaml.as_bytes()).expect("a limit typo still starts");
 
-        assert_eq!(
-            config.ignored_fields.len(),
-            1,
-            "{:?}",
-            config.ignored_fields
-        );
-        assert!(
-            config.ignored_fields[0].ends_with("limits.max_grant_lifetime_seconds"),
-            "got {:?}",
-            config.ignored_fields
-        );
+            assert_eq!(
+                config.ignored_fields.len(),
+                1,
+                "{:?}",
+                config.ignored_fields
+            );
+            assert!(
+                config.ignored_fields[0].ends_with(path),
+                "got {:?}",
+                config.ignored_fields
+            );
+        }
     }
 
     /// A usage knob is the second thing under `auth:` whose fallback is a plain

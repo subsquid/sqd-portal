@@ -291,6 +291,7 @@ mod tests {
                 organization_id: Some(long.clone()),
                 refresh_after: 1,
                 expires_at: 2,
+                usage: None,
             }),
             Some(long),
             std::sync::Arc::from("/stream"),

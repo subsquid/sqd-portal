@@ -398,6 +398,7 @@ mod tests {
                 organization_id: Some("org-7".to_owned()),
                 refresh_after: 1,
                 expires_at: 2,
+                usage: None,
             }),
             Some("ethereum-mainnet".to_owned()),
             Arc::from("/stream"),

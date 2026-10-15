@@ -32,7 +32,7 @@ mod usage;
 #[cfg(test)]
 pub mod test_support;
 
-pub use config::{AuthConfig, Enforcement, ResolvedAuth};
+pub use config::{AuthConfig, Enforcement, PacingMode, ResolvedAuth};
 pub(crate) use usage::tap_middleware;
 pub use usage::UsageConfig;
 
