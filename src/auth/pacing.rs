@@ -299,9 +299,9 @@ impl HttpBody for PacedBody {
                     Ok(data) => data,
                     Err(frame) => return Poll::Ready(Some(Ok(frame))),
                 };
-                this.counters.bytes.inc_by(data.len() as u64);
                 if !this.enforce {
                     this.shadow(data.len());
+                    this.counters.bytes.inc_by(data.len() as u64);
                     return Poll::Ready(Some(Ok(Frame::data(data))));
                 }
                 if data.is_empty() {
@@ -312,6 +312,7 @@ impl HttpBody for PacedBody {
             let piece = this.held.len().min(this.bucket.burst());
             let wait = this.bucket.take(piece, Instant::now());
             if wait.is_zero() {
+                this.counters.bytes.inc_by(piece as u64);
                 return Poll::Ready(Some(Ok(Frame::data(this.held.split_to(piece)))));
             }
             this.count_wait(wait);
@@ -493,6 +494,23 @@ mod tests {
         assert!(released.iter().all(|(at, _)| at.is_zero()));
         assert_eq!(counters.responses.get(), 0);
         assert_eq!(counters.seconds.get(), 0.0);
+    }
+
+    /// OB-16: a response dropped mid-frame, at a piece or waiting for the next,
+    /// counts the bytes it sent, not the ones still held.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_response_counts_only_what_it_sent() {
+        let counters = counters();
+        let mut body = PacedBody::new(body_of(&[10 * BURST]), RATE, true, counters.clone());
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+        let first = Pin::new(&mut body).poll_frame(&mut cx);
+        assert!(matches!(first, Poll::Ready(Some(Ok(_)))));
+        assert_eq!(counters.bytes.get(), BURST as u64);
+
+        assert!(Pin::new(&mut body).poll_frame(&mut cx).is_pending());
+        drop(body);
+        assert_eq!(counters.bytes.get(), BURST as u64);
     }
 
     /// A single buffered body keeps its exact length through hyper, which stops
