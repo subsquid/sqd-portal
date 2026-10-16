@@ -992,7 +992,7 @@ pub fn register_metrics(registry: &mut Registry) {
     );
     registry.register(
         "limit_bytes",
-        "Encoded body bytes of responses admitted with a rate, waited or not; by usage state and serving source",
+        "Encoded body bytes of successful responses admitted with a rate, waited or not; by usage state and serving source",
         PACED_BYTES.clone(),
     );
     registry.register(
