@@ -66,6 +66,8 @@ pub struct StreamController<N: StreamingNetwork = NetworkClient> {
     last_error: Option<String>,
     stream_index: u32,
     priority_stride: u32,
+    /// The usage state of a stream its age limit stopped, counted when it ends.
+    aged_out: Option<&'static str>,
 }
 
 #[derive(Clone)]
@@ -221,6 +223,7 @@ impl<N: StreamingNetwork> StreamController<N> {
             last_error: None,
             stream_index,
             priority_stride,
+            aged_out: None,
         })
     }
 
@@ -256,6 +259,11 @@ impl<N: StreamingNetwork> StreamController<N> {
         self.stats.maybe_write_log();
 
         let result = self.pop_response(ctx);
+        if matches!(result, Poll::Ready(None)) {
+            if let Some(state) = self.aged_out.take() {
+                metrics::report_aged_end(state);
+            }
+        }
 
         self.try_fill_slots(ctx);
 
@@ -713,6 +721,9 @@ impl<N: StreamingNetwork> StreamController<N> {
                 .max_chunks
                 .is_none_or(|limit| self.buffer.total_size() < limit)
         {
+            if self.past_age_limit() {
+                break;
+            }
             let Some(chunk) = self.next_chunk.take() else {
                 break;
             };
@@ -760,6 +771,24 @@ impl<N: StreamingNetwork> StreamController<N> {
                 }
             }
         }
+    }
+
+    /// A paced stream starts no chunk past its deadline, the way `max_chunks`
+    /// stops it: the chunks already started are sent, and the body is a whole
+    /// encoding. The first chunk is exempt, so the stream is never empty
+    /// (REQ-75, INV-25).
+    fn past_age_limit(&mut self) -> bool {
+        let Some(limit) = self.request.age_limit else {
+            return false;
+        };
+        if self.buffer.total_size() == 0
+            || self.next_chunk.is_none()
+            || Instant::now() < limit.deadline
+        {
+            return false;
+        }
+        self.aged_out = Some(limit.state);
+        true
     }
 
     fn get_next_chunk(&self, chunk: &DataChunk) -> Option<DataChunk> {
@@ -1383,6 +1412,7 @@ mod tests {
             retries: 1,
             compression: Compression::Gzip,
             skip_parent_hash_validation: false,
+            age_limit: None,
         }
     }
 
@@ -1464,6 +1494,45 @@ mod tests {
         let responses: Vec<_> = controller.map(Result::unwrap).collect().await;
 
         assert_eq!(responses, [b"data-100-200".to_vec()]);
+    }
+
+    /// REQ-75: past its deadline a paced stream starts no chunk after its
+    /// first, ends whole, and is counted once; before it, nothing changes.
+    #[tokio::test]
+    async fn an_aged_stream_starts_no_chunk_after_its_first() {
+        let run = |deadline: Instant, state: &'static str| {
+            let network = Arc::new(MockNetwork {
+                chunk: test_chunk(),
+                next: Some(DataChunk::new(0, 201, 300, "aaaaa").unwrap()),
+                backoff_until: Instant::now(),
+                queries_sent: AtomicUsize::new(0),
+            });
+            let mut request = stream_request();
+            request.query =
+                ParsedQuery::try_from(r#"{"type": "evm", "fromBlock": 100}"#.into()).unwrap();
+            request.query.cap_last_block(300);
+            request.age_limit = Some(crate::types::AgeLimit { deadline, state });
+            StreamController::new(request, network, 0, 1)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+
+        // A label of its own, so parallel tests cannot move the count.
+        let aged = "test-aged";
+        assert_eq!(
+            run(Instant::now(), aged).await,
+            [b"data-100-200".to_vec()],
+            "the first chunk is exempt, the next is never started"
+        );
+        assert_eq!(metrics::aged_ends(aged), 1);
+
+        let young = "test-young";
+        assert_eq!(
+            run(Instant::now() + Duration::from_secs(300), young).await,
+            [b"data-100-200".to_vec(), b"data-201-300".to_vec()],
+        );
+        assert_eq!(metrics::aged_ends(young), 0);
     }
 
     // ------------------------------------------------------------------
@@ -1749,6 +1818,7 @@ mod tests {
                 retries: self.retries,
                 compression: Compression::Gzip,
                 skip_parent_hash_validation: false,
+                age_limit: None,
             }
         }
     }

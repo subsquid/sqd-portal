@@ -10,9 +10,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     cache::{CachedGrant, GrantCache},
-    config::{Enforcement, ResolvedAuth},
+    config::{Enforcement, Pacing, ResolvedAuth},
     evaluate::{self, Decision, LazyDataset, Rejection, Verdict},
     now_secs,
+    pacing::Terms,
     usage::{Attribution, UsageSink},
 };
 use crate::{
@@ -134,6 +135,7 @@ pub struct Gate {
     catalog: Arc<dyn DatasetCatalog>,
     portal_id: String,
     enforcement: Enforcement,
+    pacing: Pacing,
     /// Present only with an `auth.usage:` block. Its absence is the whole kill
     /// switch: no sink, so no attribution is deposited and no route is tapped.
     usage: Option<Arc<UsageSink>>,
@@ -151,6 +153,7 @@ impl Gate {
             catalog,
             portal_id: config.portal_id.clone(),
             enforcement: config.enforcement,
+            pacing: config.limits.pacing,
             usage,
         }
     }
@@ -353,11 +356,26 @@ pub(super) async fn middleware(
         return rejection.into_response();
     }
 
+    // Pacing acts only where authorization enforces: in shadow its counters
+    // would publish the verdict shadow mode withholds (REQ-55, ADR-018).
+    let terms = admission
+        .grant
+        .as_deref()
+        .filter(|_| gate.enforcing())
+        .and_then(|grant| Terms::at_admission(gate.pacing, grant));
+    let mut req = req;
+    if let Some(paced) = terms.as_ref().and_then(Terms::paced_stream) {
+        req.extensions_mut().insert(paced);
+    }
     let attribution = match (&gate.usage, admission.grant) {
         (Some(_), Some(grant)) => Some(Attribution::new(grant, admission.dataset, endpoint)),
         _ => None,
     };
     let mut response = next.run(req).await;
+    // Inside the tap, which counts what the pacer releases, when it does.
+    if let Some(terms) = terms {
+        response = terms.apply(response);
+    }
     if let Some(attribution) = attribution {
         // Response extensions survive normalization and HEAD body stripping,
         // allowing the outer tap to measure the body actually sent.
@@ -548,6 +566,7 @@ mod tests {
             }),
             portal_id: PORTAL.to_string(),
             enforcement,
+            pacing: Pacing::default(),
             usage: None,
         });
         (gate, lookups)
@@ -1379,8 +1398,92 @@ mod tests {
             catalog: gate.catalog.clone(),
             portal_id: PORTAL.to_string(),
             enforcement: Enforcement::Enforce,
+            pacing: Pacing::default(),
             usage: Some(sink),
         })
+    }
+
+    /// ADR-018: the gate fixes a paced response's terms at admission — the
+    /// stream limits on the request, the usage headers on the response — and
+    /// only where authorization enforces and pacing enforces too.
+    #[tokio::test]
+    async fn the_gate_fixes_pacing_terms_at_admission() {
+        use crate::auth::{config::PacingMode, PacedStream};
+        let cp = MockControlPlane::spawn().await;
+        cp.grant_v2(
+            KEY_ID,
+            serde_json::json!({
+                "state": "over",
+                "stream_bytes_per_sec": 500_000,
+                "floor_bytes_per_sec": 500_000,
+                "allowance_bytes": 1_000u64,
+                "used_bytes": 2_000u64,
+                "period_end": NOW,
+                "as_of": null,
+            }),
+            now_secs(),
+        );
+        let cases = [
+            (
+                Enforcement::Enforce,
+                PacingMode::Enforce,
+                "Some(1)",
+                Some("over"),
+            ),
+            (Enforcement::Enforce, PacingMode::LogOnly, "unlimited", None),
+            (Enforcement::Enforce, PacingMode::Off, "unlimited", None),
+            (Enforcement::LogOnly, PacingMode::Enforce, "unlimited", None),
+        ];
+        for (enforcement, mode, limits, state) in cases {
+            let (gate, _) = gate_for(&cp, enforcement).await;
+            let gate = Arc::new(Gate {
+                cache: gate.cache.clone(),
+                catalog: gate.catalog.clone(),
+                portal_id: PORTAL.to_string(),
+                enforcement,
+                pacing: Pacing {
+                    mode,
+                    pace_real_time: false,
+                },
+                usage: None,
+            });
+            let app = Router::new().route(
+                "/datasets/:dataset/stream",
+                post(|req: Request| async move {
+                    req.extensions()
+                        .get::<PacedStream>()
+                        .map_or("unlimited".to_owned(), |paced| {
+                            format!("{:?}", paced.read_ahead)
+                        })
+                })
+                .route_layer(from_fn(move |req, next| {
+                    middleware(gate.clone(), true, Arc::from("/stream"), req, next)
+                })),
+            );
+            let response = app
+                .oneshot(
+                    request("/datasets/base/stream")
+                        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let context = format!("{enforcement:?} auth, pacing {mode:?}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-sqd-usage-state")
+                    .map(|value| value.to_str().unwrap()),
+                state,
+                "{context}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body, limits, "{context}");
+        }
     }
 
     /// Attribution follows the response to the outer tap without another cache lookup.

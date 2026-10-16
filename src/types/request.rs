@@ -1,4 +1,5 @@
 use sqd_query::Query;
+use tokio::time::Instant;
 
 use super::{BlockRange, DatasetId};
 
@@ -15,6 +16,17 @@ pub struct StreamRequest {
     pub retries: u8,
     pub compression: Compression,
     pub skip_parent_hash_validation: bool,
+    /// Set on a paced network stream (REQ-75).
+    pub age_limit: Option<AgeLimit>,
+}
+
+/// Past `deadline` a stream starts no chunk after its first, sends the ones
+/// already started, and ends, the way `max_chunks` ends it (ADR-018).
+#[derive(Debug, Clone, Copy)]
+pub struct AgeLimit {
+    pub deadline: Instant,
+    /// The grant's usage state, the label an end is counted under (OB-16).
+    pub state: &'static str,
 }
 
 #[derive(Debug, Clone)]

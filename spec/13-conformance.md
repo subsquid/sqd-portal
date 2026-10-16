@@ -49,9 +49,11 @@ Coverage outside those four classes is still inline unit tests.
 All four suites run on every pull request: the harness is a separate crate, so it needs a
 build of the portal and a job of its own — a status this document cites has to be one
 something re-checks.
-**CT-12 covers only the usage claim so far** (REQ-70): the rest of the usage pacing band
-(REQ-71..REQ-75, INV-16/17, ADR-018) was specified on 2026-10-09 ahead of its implementation,
-so every other row it owns is U.
+**CT-12 cannot make a response wait**: its toy world's responses are smaller than one
+P-PACING-BURST at P-PACING-MIN-RATE, and P-PACED-STREAM-MAX-AGE is minutes. So the usage
+pacing band's waits, bound, wake count and age limit (REQ-71, REQ-75, INV-16) are unit-tested
+on a paused clock, and CT-12 drives what a response shows: the claim, the headers, the signals
+and log_only's equality with pacing off.
 
 ## Harness architecture
 
@@ -184,8 +186,8 @@ chunk-boundary records FV-6 licenses.
 | INV-23 | CT-2 | P | verdict parsing tested; flow untested; minimum 409 payload meets the invariant; richer ancestors remain a REQ-3 SHOULD shortfall (GAP-7); EMPTY-precedence at the head unverified (GAP-19); verdict detection is exact-string parsing of worker messages (GAP-25) |
 | INV-24 | CT-5 | P | smoke asserts head markers against stub/artifact heads on success paths |
 | INV-25 | CT-2/12 | U | truncation never exercised; the age limit's complete encoding is CT-12's, unbuilt |
-| INV-16 | CT-12 | U | pacing unimplemented (ADR-018) |
-| INV-17 | CT-12 | U | pacing unimplemented (ADR-018) |
+| INV-16 | CT-12 | P | unit-tested in `auth::pacing` on a paused clock: responses of many small frames and of one huge final frame keep every interval's bytes within the bound through the last byte, release no piece over a burst, and arrive whole. Not driven black-box: no CT-12 response is large enough to wait |
+| INV-17 | CT-12 | P | CT-12 serves log_only's network and real-time responses with the same status, headers and bytes as pacing off, and an enforcing portal's bad-claim grant exactly as a version-1 one; a refused request keeps its status and gains only the usage headers. A response enforce made wait, and an age-limited stream as a prefix of the unpaced one, are compared only in unit tests (`auth::pacing`, `controller::stream`) |
 | INV-26 | CT-5 | C | CT-5 asserts the envelope, status, type/code and hint presence across the local and proxied emitters, including the 409 sibling, the OVERLOADED hint floor, replacement of an unusable upstream hint (0, non-numeric, HTTP-date), the classes that get no invented hint (upstream 503/500), a wrong verb keeping 405 with its `Allow`, and normalization of the router's other rejections |
 | INV-27 | CT-1 | P | retention-gap detection tested; coverage-gap resolution unit-tested on both artifacts, as is a range sharing no block with the chunk it resolved to; proxied 204 smoke-tested; delay untested |
 | INV-28 | CT-3 | U | — |
@@ -264,7 +266,11 @@ chunk-boundary records FV-6 licenses.
 | REQ-57 | P | CT-10 asserts that every exchange body it drives offers claims versions `[1, 2]` inside the body the signature verified, and that an answer in version 3, which no exchange offered, reaches the client as `upstream_unavailable`. Renewals build their body the same way and are not driven separately |
 | REQ-60 | P | CT-11 asserts a record per gated request carrying the key id, the organization the grant named, the canonical dataset, the route label, the encoding and the serving source (`network` on an archival stream), with a byte count equal to the encoded body the client received; that a paced stream outliving P-USAGE-INTERIM reports interim deltas, each naming `real_time`, whose sum is exactly that response's encoded bytes; that six requests reach the sink in fewer deliveries than there were records; and that a portal with no `usage:` block calls the ingest not at all and leaves every OB-15 signal at zero. Not driven: the drop-on-age path and a queue saturated black-box (unit-tested), and the `/sql/query` route label, which needs the non-default feature build |
 | REQ-70 | P | CT-12 serves a version-2 grant with a well-formed claim exactly as a version-1 grant, and likewise one with no claim, one with an unknown state and one with a rate one below P-PACING-MIN-RATE; the three bad claims are counted on an enforcing portal and not on a shadow one (REQ-55). The full table of malformed fields is unit-tested in `auth::types` |
-| REQ-71..REQ-75 | U | pacing unimplemented (ADR-018) |
+| REQ-71 | P | unit-tested in `auth::pacing`: INV-16's curve, pieces no larger than a burst, a held response waking at most twice per burst, a buffered body arriving whole under its exact length, and which responses are paced — not errors, not a grant with no rate, not log_only, and real-time only with P-PACE-REAL-TIME, its waits counted otherwise. CT-12 asserts the byte signal by state and source. Not driven: a wait black-box, and a renewal mid-response, which cannot reach the terms fixed at admission |
+| REQ-72 | P | unit tests in `auth` assert that an over stream is admitted with P-FLOOR-READ-AHEAD and a within one with none, only where authorization and pacing both enforce; the clamp itself sits in the stream extractor every network stream route shares, and no test reads the window it produced |
+| REQ-73 | P | CT-12 asserts in enforce every IB-10 header with a value from the grant, the omission of null ones, the state header on a refused request and on a real-time response, the CORS expose list naming all six, and none on a version-1 grant, a bad claim, log_only or a shadow portal |
+| REQ-74 | P | CT-12 compares log_only with pacing off on network and real-time responses, status, headers and bytes, and sees the byte signal move. That its wait signal equals enforce's sleeps on a response whose frames are all ready at once is unit-tested in `auth::pacing`; CT-12's responses never wait |
+| REQ-75 | P | unit-tested in `controller::stream`: past its deadline a paced stream starts no chunk after its first, ends after the chunk it started, and is counted once by state; before it nothing changes. Not driven: decode-validation under gzip and zstd, and a resumption picking up a changed rate |
 | REQ-61 | P | the response-equality half is CT-11-covered against a refusing sink, including that the stream still completes; the never-blocks half is unit-tested at the hand-off (a full queue drops and the response is served whole) and is not yet driven under a saturating swarm; the per-frame cost the requirement declines to call zero is unmeasured, and belongs to CT-6 |
 
 ## Gap register — 2026-08-18
