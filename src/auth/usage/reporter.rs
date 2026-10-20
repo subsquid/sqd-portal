@@ -410,7 +410,7 @@ impl Reporter {
             .body(body)
             .send()
             .await
-            .map_err(|err| Delivery::Retry(err.to_string()))?;
+            .map_err(|err| Delivery::Retry(transport_failure(&err)))?;
         let status = response.status();
         if status.is_success() {
             return Ok(());
@@ -442,6 +442,25 @@ impl std::fmt::Display for Delivery {
             Self::Retry(why) | Self::Rejected(why) => f.write_str(why),
         }
     }
+}
+
+/// A failed send, with the causes under it. reqwest's own message stops at
+/// "error sending request for url (…)" whatever happened, so a refused connect,
+/// a reset, a pooled connection the far end had already closed and a timeout
+/// all log the same line; only the chain beneath tells them apart.
+fn transport_failure(err: &reqwest::Error) -> String {
+    let mut why = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        // Some layers already repeat their source in their own message.
+        if !why.contains(&cause_text) {
+            why.push_str(": ");
+            why.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    why
 }
 
 /// Backoff, spread by up to [`JITTER`] either way.
@@ -1106,6 +1125,44 @@ mod tests {
             signals.drops(UsageDrop::Rejected) > rejected,
             "a content refusal at shutdown is still a content refusal"
         );
+    }
+
+    /// The logged reason has to name the cause: the chain is the only thing
+    /// that separates a sink that is down from a connection that was dropped.
+    #[tokio::test]
+    async fn a_transport_failure_names_its_cause() {
+        let refused = reporter(&dead_sink(), UsageConfig::default())
+            .post(&pending(vec![queued("refused")]))
+            .await;
+        let Err(Delivery::Retry(why)) = refused else {
+            panic!("a refused connect is a retryable failure");
+        };
+        assert!(why.starts_with("error sending request for url"), "{why}");
+        assert!(why.contains("Connection refused"), "{why}");
+
+        // Accepted, then closed before any answer: what a pooled connection the
+        // far end dropped looks like. Whether the close lands as a FIN or a
+        // reset depends on the platform and on timing, so only the layer under
+        // reqwest's own message is pinned.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                drop(socket);
+            }
+        });
+        let config = ResolvedAuth {
+            control_plane_url: format!("http://{addr}/authority").parse().unwrap(),
+            ..dead_sink()
+        };
+        let dropped = reporter(&config, UsageConfig::default())
+            .post(&pending(vec![queued("dropped")]))
+            .await;
+        let Err(Delivery::Retry(why)) = dropped else {
+            panic!("a dropped connection is a retryable failure");
+        };
+        assert!(why.contains("): client error ("), "{why}");
     }
 
     #[test]
