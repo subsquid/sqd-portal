@@ -52,7 +52,8 @@ routes — GAP-8/OQ-1). Body (JSONC sketch; chain dialects add entity filters):
 }
 ```
 
-Unknown fields → 400. Body > P-QUERY-SIZE-LIMIT → 400.
+Unknown fields → 400, except in a query that declares `sets`, whose body the dynamic engine
+validates (REQ-45). Body > P-QUERY-SIZE-LIMIT → 400.
 
 **IB-4 — Stream response.** Headers: `x-sqd-head-number`, `x-sqd-finalized-head-number`,
 `x-sqd-finalized-head-hash` (INV-24), `x-sqd-data-source: network|real_time` (DEF-6;

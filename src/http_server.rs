@@ -1085,12 +1085,14 @@ async fn execute_query(
                 .into_response()
         }
     };
+    let engine = query.engine();
     let fut = client.query_worker(
         lease,
         request_id,
         ChunkId::new(dataset_id, chunk),
         range,
         query.into_string(),
+        engine,
         Compression::Gzip,
         None,
     );

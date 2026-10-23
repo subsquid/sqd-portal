@@ -926,6 +926,7 @@ impl<N: StreamingNetwork> StreamController<N> {
                 ChunkId::new(self.request.dataset_id.clone(), range.chunk),
                 range.range.clone(),
                 query,
+                self.request.query.engine(),
                 self.request.compression,
                 Some(priority),
             )
@@ -1330,7 +1331,7 @@ mod tests {
     use futures::{future::BoxFuture, StreamExt};
 
     use crate::network::QuerySuccess;
-    use crate::types::{Compression, DatasetId, ParsedQuery, StreamRequest};
+    use crate::types::{Compression, DatasetId, Engine, ParsedQuery, StreamRequest};
 
     /// A dataset of `chunk`, then `next` if set, whose workers are all in a
     /// backoff until `backoff_until`; afterwards every query succeeds and
@@ -1370,6 +1371,7 @@ mod tests {
             _chunk_id: ChunkId,
             block_range: BlockRange,
             _query: String,
+            _engine: Engine,
             _compression: Compression,
             _priority: Option<u32>,
         ) -> BoxFuture<'static, QueryResult> {
@@ -1622,6 +1624,8 @@ mod tests {
         live_queries: Arc<AtomicI64>,
         /// Workers the controller reported as returning contract-violating data.
         integrity_failures: StdMutex<Vec<PeerId>>,
+        /// The engine each query asked for, in send order.
+        engines: StdMutex<Vec<Engine>>,
     }
 
     impl ScriptedNetwork {
@@ -1638,6 +1642,7 @@ mod tests {
                 ok_ranges: StdMutex::new(Vec::new()),
                 live_queries: Arc::new(AtomicI64::new(0)),
                 integrity_failures: StdMutex::new(Vec::new()),
+                engines: StdMutex::new(Vec::new()),
             })
         }
     }
@@ -1689,9 +1694,11 @@ mod tests {
             _chunk_id: ChunkId,
             block_range: BlockRange,
             _query: String,
+            engine: Engine,
             _compression: Compression,
             _priority: Option<u32>,
         ) -> BoxFuture<'static, QueryResult> {
+            self.engines.lock().unwrap().push(engine);
             let event = self
                 .query_script
                 .lock()
@@ -2158,6 +2165,32 @@ mod tests {
             "one transient attempt means a later retry can still succeed: {:?}",
             mixed_outcome.error
         );
+    }
+
+    /// A query with sets asks every worker for the dynamic engine (REQ-45).
+    #[tokio::test(start_paused = true)]
+    async fn a_query_with_sets_runs_on_the_dynamic_engine() {
+        let scenario = Scenario {
+            n_chunks: 2,
+            streams: vec![StreamSpec { from: 100, to: 250 }],
+            find_worker_script: Vec::new(),
+            query_script: Vec::new(),
+            buffer_size: 10,
+            retries: 1,
+            max_stored_results_per_chunk: 1,
+            max_chunks: None,
+        };
+        let mut request = scenario.request(&scenario.streams[0], 0);
+        request.query = ParsedQuery::try_from(
+            r#"{"type": "evm", "fromBlock": 100, "toBlock": 250, "sets": {}}"#.to_owned(),
+        )
+        .unwrap();
+        let network = ScriptedNetwork::new(scenario.build_chunks(), Vec::new(), Vec::new());
+
+        let outcome = collect_stream(request, network.clone(), 0).await;
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(*network.engines.lock().unwrap(), vec![Engine::Dynamic; 2]);
     }
 
     /// A refusal is counted once even when all read-ahead slots fail.
