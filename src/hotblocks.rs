@@ -2,10 +2,13 @@ use std::{collections::BTreeMap, time::Duration};
 
 use sqd_primitives::BlockNumber;
 
-use crate::{config::Config, metrics::HotblocksRequestOutcome};
+use crate::{config::Config, metrics::HotblocksRequestOutcome, types::Engine};
 
 /// P-HOTBLOCKS-CONNECT-TIMEOUT.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Names the engine a query needs. Absent means the legacy one (REQ-45).
+const QUERY_ENGINE_HEADER: &str = "x-sqd-query-engine";
 
 pub struct HotblocksHandle {
     pub client: reqwest::Client,
@@ -292,27 +295,41 @@ impl HotblocksHandle {
         &self,
         dataset: &str,
         query: &str,
+        engine: Engine,
         mode: HeadMode,
     ) -> Result<reqwest::Response, HotblocksErr> {
         let Some(url) = self.urls.get(dataset) else {
             return Err(HotblocksErr::UnknownDataset);
         };
 
+        let request = self.stream_request(url, query, engine, mode);
+        let response = self.send_with_replay(request).await?;
+
+        Ok(response)
+    }
+
+    fn stream_request(
+        &self,
+        url: &str,
+        query: &str,
+        engine: Engine,
+        mode: HeadMode,
+    ) -> reqwest::RequestBuilder {
         let endpoint = match mode {
             HeadMode::Finalized => "finalized-stream",
             HeadMode::RealTime => "stream",
         };
 
-        let response = self
-            .send_with_replay(
-                self.client
-                    .post(format!("{url}/{endpoint}"))
-                    .header("Content-Type", "application/json")
-                    .body(query.to_string()),
-            )
-            .await?;
+        let request = self
+            .client
+            .post(format!("{url}/{endpoint}"))
+            .header("Content-Type", "application/json")
+            .body(query.to_string());
 
-        Ok(response)
+        match engine {
+            Engine::Legacy => request,
+            Engine::Dynamic => request.header(QUERY_ENGINE_HEADER, "dynamic"),
+        }
     }
 }
 
@@ -417,6 +434,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_a_query_with_sets_names_its_engine() {
+        let handle = handle(([127, 0, 0, 1], 9).into(), Duration::from_secs(1));
+        let header = |engine| {
+            handle
+                .stream_request(
+                    "http://hotblocks/datasets/ds",
+                    "{}",
+                    engine,
+                    HeadMode::RealTime,
+                )
+                .build()
+                .unwrap()
+                .headers()
+                .get(QUERY_ENGINE_HEADER)
+                .cloned()
+        };
+
+        assert_eq!(header(Engine::Dynamic).unwrap(), "dynamic");
+        assert_eq!(header(Engine::Legacy), None);
+    }
+
     async fn wait_for_connections(connections: &AtomicUsize, expected: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while connections.load(Ordering::SeqCst) < expected {
@@ -434,7 +473,10 @@ mod tests {
         let (addr, connections) = stub(vec![Act::CloseBeforeHead, Act::Answer]).await;
         let handle = handle(addr, Duration::from_secs(5));
 
-        let response = handle.stream("ds", "{}", HeadMode::RealTime).await.unwrap();
+        let response = handle
+            .stream("ds", "{}", Engine::Legacy, HeadMode::RealTime)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), 200);
         assert_eq!(
@@ -458,7 +500,10 @@ mod tests {
         let (addr, connections) = stub(vec![Act::ResetBeforeHead, Act::Answer]).await;
         let handle = handle(addr, Duration::from_secs(5));
 
-        let response = handle.stream("ds", "{}", HeadMode::RealTime).await.unwrap();
+        let response = handle
+            .stream("ds", "{}", Engine::Legacy, HeadMode::RealTime)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), 200);
         assert_eq!(connections.load(Ordering::SeqCst), 2, "one replay");
@@ -477,7 +522,7 @@ mod tests {
         let handle = handle(addr, Duration::from_secs(5));
 
         handle
-            .stream("ds", "{}", HeadMode::RealTime)
+            .stream("ds", "{}", Engine::Legacy, HeadMode::RealTime)
             .await
             .unwrap_err();
 
@@ -505,8 +550,11 @@ mod tests {
         let (addr, connections) = stub(vec![Act::CloseBeforeHead, Act::Stall]).await;
         let handle = handle(addr, Duration::from_secs(5));
 
-        let request =
-            tokio::spawn(async move { handle.stream("ds", "{}", HeadMode::RealTime).await });
+        let request = tokio::spawn(async move {
+            handle
+                .stream("ds", "{}", Engine::Legacy, HeadMode::RealTime)
+                .await
+        });
         wait_for_connections(&connections, 2).await;
 
         request.abort();
@@ -531,8 +579,11 @@ mod tests {
         let (addr, connections) = stub(vec![Act::Stall]).await;
         let handle = handle(addr, Duration::from_secs(5));
 
-        let request =
-            tokio::spawn(async move { handle.stream("ds", "{}", HeadMode::RealTime).await });
+        let request = tokio::spawn(async move {
+            handle
+                .stream("ds", "{}", Engine::Legacy, HeadMode::RealTime)
+                .await
+        });
         wait_for_connections(&connections, 1).await;
 
         request.abort();
@@ -556,7 +607,10 @@ mod tests {
         let (addr, connections) = stub(vec![Act::CloseMidBody, Act::Answer]).await;
         let handle = handle(addr, Duration::from_secs(5));
 
-        let response = handle.stream("ds", "{}", HeadMode::RealTime).await.unwrap();
+        let response = handle
+            .stream("ds", "{}", Engine::Legacy, HeadMode::RealTime)
+            .await
+            .unwrap();
 
         assert!(response.bytes().await.is_err(), "the body truncates");
         assert_eq!(
@@ -580,7 +634,7 @@ mod tests {
         let handle = handle(addr, Duration::from_millis(200));
 
         let err = handle
-            .stream("ds", "{}", HeadMode::RealTime)
+            .stream("ds", "{}", Engine::Legacy, HeadMode::RealTime)
             .await
             .unwrap_err();
 

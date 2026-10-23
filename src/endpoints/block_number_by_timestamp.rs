@@ -17,7 +17,7 @@ use crate::{
     network::NetworkClient,
     openapi::BlockNumberResponse,
     types::{
-        coded_response, error_response, Compression, DatasetId, ErrorCode, ErrorResponse,
+        coded_response, error_response, Compression, DatasetId, Engine, ErrorCode, ErrorResponse,
         ParsedQuery, RequestError, StreamRequest,
     },
     utils::{
@@ -445,7 +445,12 @@ async fn get_hotblocks_blocknumber_by_timestamp_once(
         status,
         |query| async move {
             let response = hotblocks
-                .stream(&dataset.default_name, &query, HeadMode::RealTime)
+                .stream(
+                    &dataset.default_name,
+                    &query,
+                    Engine::Legacy,
+                    HeadMode::RealTime,
+                )
                 .await
                 .map_err(|e| {
                     tracing::warn!("hotblocks stream error: {:?}", e);

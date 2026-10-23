@@ -29,7 +29,7 @@ use super::{AssignmentType, ChunkNotFound, NetworkState, WorkerLease};
 use crate::controller::download_scheduler::{DownloadScheduler, Outcome, Priority};
 use crate::datasets::{DatasetConfig, Datasets};
 use crate::types::api_types::{DatasetState, WorkerDebugInfo};
-use crate::types::{BlockNumber, BlockRange, ChunkId, Compression, DataChunk};
+use crate::types::{BlockNumber, BlockRange, ChunkId, Compression, DataChunk, Engine};
 use crate::utils::{RwLock, UseOnce};
 use crate::{
     config::Config,
@@ -56,6 +56,7 @@ pub trait StreamingNetwork: Send + Sync + 'static {
         chunk_id: ChunkId,
         block_range: BlockRange,
         query: String,
+        engine: Engine,
         compression: Compression,
         priority: Option<u32>,
     ) -> futures::future::BoxFuture<'static, QueryResult>;
@@ -86,6 +87,7 @@ impl StreamingNetwork for NetworkClient {
         chunk_id: ChunkId,
         block_range: BlockRange,
         query: String,
+        engine: Engine,
         compression: Compression,
         priority: Option<u32>,
     ) -> futures::future::BoxFuture<'static, QueryResult> {
@@ -96,6 +98,7 @@ impl StreamingNetwork for NetworkClient {
             chunk_id,
             block_range,
             query,
+            engine,
             compression,
             priority,
         ))
@@ -673,6 +676,7 @@ impl NetworkClient {
         chunk_id: ChunkId,
         block_range: BlockRange,
         query: String,
+        engine: Engine,
         compression: Compression,
         priority: Option<u32>,
     ) -> QueryResult {
@@ -690,6 +694,7 @@ impl NetworkClient {
                 chunk_id,
                 &block_range,
                 query,
+                engine,
                 compression,
             )
             .await;
@@ -726,11 +731,16 @@ impl NetworkClient {
         chunk_id: ChunkId,
         block_range: &BlockRange,
         query: String,
+        engine: Engine,
         compression: Compression,
     ) -> Query {
         let compression = match compression {
             Compression::Gzip => sqd_messages::Compression::Gzip,
             Compression::Zstd => sqd_messages::Compression::Zstd,
+        } as i32;
+        let query_engine = match engine {
+            Engine::Legacy => sqd_messages::QueryEngine::Default,
+            Engine::Dynamic => sqd_messages::QueryEngine::Dynamic,
         } as i32;
         let mut query = Query {
             dataset: chunk_id.dataset.to_url().to_owned(),
@@ -748,7 +758,7 @@ impl NetworkClient {
             // 0 for a chunk the legacy artifact produced, which names no version: proto3 leaves
             // the default off the wire, so the field is absent exactly when there is none to send.
             chunk_version: chunk_id.chunk.version(),
-            query_engine: Default::default(),
+            query_engine,
             output_format: Default::default(),
         };
         tokio::task::spawn_blocking({

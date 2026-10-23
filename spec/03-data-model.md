@@ -69,7 +69,8 @@ source marker.
 block, optional last block, optional parent hash, field selection, item filters,
 include-all-blocks flag); *mode* (real-time | finalized); *tuning* (read-ahead size,
 chunk count limit — clamped per INV-11). Well-formed iff: body decodes with no unknown
-fields, size ≤ P-QUERY-SIZE-LIMIT, item selections ≤ P-QUERY-MAX-ITEMS, last ≥ first,
+fields (a query that declares `sets` passes REQ-45's checks instead), size ≤
+P-QUERY-SIZE-LIMIT, item selections ≤ P-QUERY-MAX-ITEMS, last ≥ first,
 first ≥ dataset start, tuning values non-zero.
 
 **DEF-8 — Stream response and coverage.** A successful stream response is (metadata,
