@@ -215,7 +215,8 @@ dataset, current time) — it consults no capacity, no load, and no prior reques
 An exchange required because no usable grant exists may fail before a verdict: budget
 exhaustion is OVERLOADED and a failed, timed-out, or unreadable exchange is
 UPSTREAM-FAILURE (DC-8), both retryable system outcomes rather than claims about the
-credential. A renewal suppressed while its old grant remains usable does not replace that
+credential, unless the control plane denied this credential earlier, whose remembered
+denial is then the verdict (REQ-54). A renewal suppressed while its old grant remains usable does not replace that
 grant's verdict. A verdict is separately *acted on* or not, per the
 enforcement mode (REQ-55): shadow mode discards a verdict when one exists, and records an
 indeterminate exchange when one does not. The rung is the internal reason; what reaches the

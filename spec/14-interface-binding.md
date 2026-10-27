@@ -101,8 +101,10 @@ credential cannot succeed, and treating an auth refusal as transient reproduces 
 ADR-012 refusal storm. All six share one status, so the status line never reveals that a
 presented secret was the right one (ADR-011); none carries a challenge. None is an
 `api_error`, so none pages. When no usable grant exists, an exchange that could not be made
-is not one of these six rows: budget exhaustion maps to retryable `overloaded`, and a failed
-exchange to retryable `upstream_unavailable`. A suppressed renewal keeps serving on its
+is not one of these six rows: budget exhaustion maps to retryable `overloaded` (529), and a failed
+exchange to retryable `upstream_unavailable` (502). The exception is a credential the
+control plane denied earlier: it gets that denial's row, a 403 on the rung the denial names,
+not retryable and without a retry hint (REQ-54). A suppressed renewal keeps serving on its
 still-usable grant instead (DC-8).
 
 EMPTY (204) is not in this table: it is a success, not a refusal, and carries no

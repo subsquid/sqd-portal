@@ -552,7 +552,7 @@ expresses every restriction the key carries, and fails the exchange when none do
 a restriction a later version adds never reaches an older Portal as its absence.
 *Acceptance:* every exchange body, first and renewal, carries the versions the build reads,
 covered by the signature; an answer in a version the list did not name is unusable —
-UPSTREAM-FAILURE with no usable grant held, served on grace with one.
+UPSTREAM-FAILURE with no usable grant held (or the credential's remembered denial, REQ-54), served on grace with one.
 *Trace:* ADR-018, ADR-017.
 
 ## Commercial usage measurement (60–61)

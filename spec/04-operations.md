@@ -157,7 +157,8 @@ grant cache (DEF-18). A grant that has not passed `refresh_after` answers locall
 consults nothing. Otherwise, and only then, it exchanges at the control plane (DC-8) under
 that contract's rate, concurrency and single-flight bounds. With no usable grant, an
 exchange it is not allowed to make is an immediate OVERLOADED outcome, not a delay and not
-a BAD-CREDENTIAL claim, and a failed one is UPSTREAM-FAILURE. Past `refresh_after` but
+a BAD-CREDENTIAL claim, and a failed one is UPSTREAM-FAILURE — unless the control plane denied this credential
+earlier, in which case that denial is the outcome (REQ-54). Past `refresh_after` but
 inside `expires_at`, the existing grant answers whether the renewal runs or its local
 budget is exhausted; past `expires_at` the request waits only for an exchange already
 admitted by the limiter, and is refused immediately rather than queued when no permit is

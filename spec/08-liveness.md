@@ -126,7 +126,8 @@ admission latency for a fresh key is one exchange (DC-8) and never a sync interv
 bound holds only within the exchange budget — P-GRANT-EXCHANGE-RATE and
 P-GRANT-EXCHANGE-INFLIGHT — and outside it the key is refused as OVERLOADED with a retry
 hint rather than delayed or mislabeled as an invalid credential (HZ-10). A failed exchange
-is UPSTREAM-FAILURE and likewise retryable. Witness: protected OB-13 exchange events plus
+is UPSTREAM-FAILURE and likewise retryable. Neither applies to a credential the control
+plane denied earlier, which keeps its denial (REQ-54). Witness: protected OB-13 exchange events plus
 the control-plane stub ledger. Check: CT-10 — present a key the stub minted after the
 replica started; assert it is served, that budget saturation returns OVERLOADED, and that a
 control-plane failure returns UPSTREAM-FAILURE before the same credential succeeds after
