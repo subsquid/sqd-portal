@@ -61,7 +61,11 @@ impl ControlPlaneClient {
             request = request.header(name, value);
         }
 
-        let response = request.body(body).send().await?;
+        let response = request
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!(transport_failure(&err)))?;
         let status = response.status();
         anyhow::ensure!(status.is_success(), "exchange returned status {status}");
 
@@ -89,6 +93,25 @@ impl ControlPlaneClient {
             }
         }
     }
+}
+
+/// A failed request, with the causes under it. reqwest's own message stops at
+/// "error sending request for url (…)" whatever happened, so a refused connect,
+/// a reset, a pooled connection the far end had already closed and a timeout
+/// all log the same line; only the chain beneath tells them apart.
+pub(in crate::auth) fn transport_failure(err: &reqwest::Error) -> String {
+    let mut why = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        // Some layers already repeat their source in their own message.
+        if !why.contains(&cause_text) {
+            why.push_str(": ");
+            why.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    why
 }
 
 /// The signed exchange body: the credential and every claims version this
@@ -131,6 +154,27 @@ mod tests {
 
     async fn client_for(config: &ResolvedAuth) -> ControlPlaneClient {
         ControlPlaneClient::new(config, config.signer(signing::test_keypair()).unwrap()).unwrap()
+    }
+
+    /// The failure is logged from the error alone, so the chain has to be in
+    /// it: reqwest's own message is the same line whatever went wrong.
+    #[tokio::test]
+    async fn a_failed_send_names_its_cause() {
+        let cp = MockControlPlane::spawn().await;
+        let config = ResolvedAuth {
+            control_plane_url: "http://127.0.0.1:1/authority".parse().unwrap(),
+            ..cp.config()
+        };
+
+        let err = client_for(&config)
+            .await
+            .exchange(&credential(), NOW)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.starts_with("error sending request for url"), "{err}");
+        assert!(err.contains("Connection refused"), "{err}");
     }
 
     #[tokio::test]
@@ -182,6 +226,20 @@ mod tests {
             serde_json::json!({"result": "granted", "grant": {}}),
         );
         assert!(client.exchange(&credential(), NOW).await.is_err());
+
+        // A decode error quotes the offending value, and this error is logged:
+        // its cause chain stays out of the message that is logged.
+        cp.raw(
+            KEY_ID,
+            serde_json::json!({"result": "granted", "grant": {
+                "claims_version": "sqd_portal_leaked_secret",
+                "key_id": KEY_ID,
+                "refresh_after": NOW + 300,
+                "expires_at": NOW + 900,
+            }}),
+        );
+        let err = client.exchange(&credential(), NOW).await.unwrap_err();
+        assert!(!err.to_string().contains("leaked_secret"), "got {err}");
 
         cp.raw(
             KEY_ID,

@@ -163,8 +163,10 @@ already been refused, that means an unseen credential or one whose grant has pas
   coordination state. Timing out or replacing an attempt retires its generation before a
   successor starts; a late transport completion from a retired generation cannot mutate
   either cache. The generation is local coordination metadata, not a grant field. A
-  denial is remembered for P-GRANT-NEGATIVE-TTL across at most P-GRANT-NEGATIVE-CAPACITY
-  entries. If no usable grant exists, a rate or in-flight bound produces an immediate
+  denial suppresses repeat exchanges for P-GRANT-NEGATIVE-TTL and is kept across at most
+  P-GRANT-NEGATIVE-CAPACITY entries; once the TTL has passed it no longer suppresses an
+  exchange, but still answers if that exchange establishes nothing (REQ-54). If no usable
+  grant exists, a rate or in-flight bound produces an immediate
   OVERLOADED response with a retry hint — never a queue or an admission (HZ-10). If a grant
   remains inside `expires_at`, the same bound merely suppresses that renewal attempt: the
   request is served on the grant and the skipped renewal is observed as grace-serving.
@@ -177,13 +179,13 @@ already been refused, that means an unseen credential or one whose grant has pas
 
 | Fault | Own class / action |
 |---|---|
-| Exchange denies the credential | refuse on the rung it names (REQ-53), mapped to its DEF-10 row; evict any cached grant for that fingerprint at once; remember the denial for P-GRANT-NEGATIVE-TTL |
-| Exchange unreachable, times out, or returns a non-success status | serve on a cached grant that has not passed `expires_at`, if one exists; otherwise refuse as UPSTREAM-FAILURE. Never BAD-CREDENTIAL — the credential was never judged (REQ-54) |
+| Exchange denies the credential | refuse on the rung it names (REQ-53), mapped to its DEF-10 row; evict any cached grant for that fingerprint at once; remember the denial: it suppresses repeat exchanges for P-GRANT-NEGATIVE-TTL and stands as the verdict whenever a later exchange establishes nothing |
+| Exchange unreachable, times out, or returns a non-success status | serve on a cached grant that has not passed `expires_at`, if one exists; otherwise, if the control plane denied this credential earlier, refuse with that denial's reason; otherwise refuse as UPSTREAM-FAILURE. Never BAD-CREDENTIAL for a credential that was never judged (REQ-54) |
 | Answer missing a required field, or carrying a claims version this build does not understand | a usage claim that is missing or malformed is the exception: it is read as absent and the grant is used unpaced (REQ-70). Anything else is unusable, not permissive: handled as a failed exchange. Reading a newer vocabulary for the parts it recognizes is how an added restriction becomes an accidental permission (DEF-17) |
 | Answer about a credential other than the one asked about | discard and refuse as UPSTREAM-FAILURE |
 | Answer offering a lifetime beyond P-GRANT-MAX-LIFETIME | accept the grant, capped at the bound, and count it — a control plane drifting past the cap is a misconfiguration an operator should see before it becomes an incident |
 | Signing headers absent, repeated, malformed, unattributable, or outside P-SIGNATURE-MAX-SKEW in either direction | UPSTREAM-FAILURE like any other failed exchange, and alarm. The cause is the Portal's own clock, identity, or request construction, not the client's key, and it fails every exchange at once |
-| Rate or in-flight bound reached | with no usable grant, refuse immediately as OVERLOADED with `Retry-After` ≥ P-RETRY-AFTER-MIN; with a grant still inside `expires_at`, skip the renewal and serve on that grant. Never queue, and never claim the credential is bad |
+| Rate or in-flight bound reached | with no usable grant, refuse immediately as OVERLOADED with `Retry-After` ≥ P-RETRY-AFTER-MIN, unless the control plane denied this credential earlier, which is then refused with that denial's reason (REQ-54); with a grant still inside `expires_at`, skip the renewal and serve on that grant. Never queue, and never claim the credential is bad |
 | Cache at P-GRANT-CACHE-CAPACITY | evict by least-recent use; the evicted credential's next request is an ordinary miss. Sustained eviction of live grants is the HZ-13 capacity signal, not a correctness event |
 
 *Degradation.* Fail-static, and bounded by construction: a cached grant rides an outage out
