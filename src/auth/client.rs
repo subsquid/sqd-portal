@@ -69,11 +69,7 @@ impl ControlPlaneClient {
         let status = response.status();
         anyhow::ensure!(status.is_success(), "exchange returned status {status}");
 
-        let answer = response
-            .json::<ExchangeAnswer>()
-            .await
-            .map_err(|err| anyhow::anyhow!(transport_failure(&err)))?;
-        match answer {
+        match response.json::<ExchangeAnswer>().await? {
             ExchangeAnswer::Denied { reason } => Ok(Exchanged::Denied(reason)),
             ExchangeAnswer::Granted { grant } => {
                 // Listing a version is how the portal asks, not a reason to
@@ -230,6 +226,20 @@ mod tests {
             serde_json::json!({"result": "granted", "grant": {}}),
         );
         assert!(client.exchange(&credential(), NOW).await.is_err());
+
+        // A decode error quotes the offending value, and this error is logged:
+        // its cause chain stays out of the message that is logged.
+        cp.raw(
+            KEY_ID,
+            serde_json::json!({"result": "granted", "grant": {
+                "claims_version": "sqd_portal_leaked_secret",
+                "key_id": KEY_ID,
+                "refresh_after": NOW + 300,
+                "expires_at": NOW + 900,
+            }}),
+        );
+        let err = client.exchange(&credential(), NOW).await.unwrap_err();
+        assert!(!err.to_string().contains("leaked_secret"), "got {err}");
 
         cp.raw(
             KEY_ID,

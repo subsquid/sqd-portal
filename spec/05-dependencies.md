@@ -185,7 +185,7 @@ already been refused, that means an unseen credential or one whose grant has pas
 | Answer about a credential other than the one asked about | discard and refuse as UPSTREAM-FAILURE |
 | Answer offering a lifetime beyond P-GRANT-MAX-LIFETIME | accept the grant, capped at the bound, and count it — a control plane drifting past the cap is a misconfiguration an operator should see before it becomes an incident |
 | Signing headers absent, repeated, malformed, unattributable, or outside P-SIGNATURE-MAX-SKEW in either direction | UPSTREAM-FAILURE like any other failed exchange, and alarm. The cause is the Portal's own clock, identity, or request construction, not the client's key, and it fails every exchange at once |
-| Rate or in-flight bound reached | with no usable grant, refuse immediately as OVERLOADED with `Retry-After` ≥ P-RETRY-AFTER-MIN; with a grant still inside `expires_at`, skip the renewal and serve on that grant. Never queue, and never claim the credential is bad |
+| Rate or in-flight bound reached | with no usable grant, refuse immediately as OVERLOADED with `Retry-After` ≥ P-RETRY-AFTER-MIN, unless the control plane denied this credential earlier, which is then refused with that denial's reason (REQ-54); with a grant still inside `expires_at`, skip the renewal and serve on that grant. Never queue, and never claim the credential is bad |
 | Cache at P-GRANT-CACHE-CAPACITY | evict by least-recent use; the evicted credential's next request is an ordinary miss. Sustained eviction of live grants is the HZ-13 capacity signal, not a correctness event |
 
 *Degradation.* Fail-static, and bounded by construction: a cached grant rides an outage out
