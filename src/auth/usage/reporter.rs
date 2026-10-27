@@ -21,7 +21,12 @@ use uuid::Uuid;
 
 use super::{config::UsageConfig, event::UsageEvent, Queued};
 use crate::{
-    auth::{client::endpoint_url, config::ResolvedAuth, now_secs, signing::RequestSigner},
+    auth::{
+        client::{endpoint_url, transport_failure},
+        config::ResolvedAuth,
+        now_secs,
+        signing::RequestSigner,
+    },
     metrics::{UsageDrop, UsageSignals},
 };
 
@@ -442,25 +447,6 @@ impl std::fmt::Display for Delivery {
             Self::Retry(why) | Self::Rejected(why) => f.write_str(why),
         }
     }
-}
-
-/// A failed send, with the causes under it. reqwest's own message stops at
-/// "error sending request for url (…)" whatever happened, so a refused connect,
-/// a reset, a pooled connection the far end had already closed and a timeout
-/// all log the same line; only the chain beneath tells them apart.
-fn transport_failure(err: &reqwest::Error) -> String {
-    let mut why = err.to_string();
-    let mut source = std::error::Error::source(err);
-    while let Some(cause) = source {
-        let cause_text = cause.to_string();
-        // Some layers already repeat their source in their own message.
-        if !why.contains(&cause_text) {
-            why.push_str(": ");
-            why.push_str(&cause_text);
-        }
-        source = cause.source();
-    }
-    why
 }
 
 /// Backoff, spread by up to [`JITTER`] either way.
