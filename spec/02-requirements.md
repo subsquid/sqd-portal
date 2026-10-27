@@ -491,9 +491,14 @@ and the requested dataset. Around that, four rules:
   further. That window is the entire outage grace; the control plane sizes it and the Portal
   caps what it will accept at P-GRANT-MAX-LIFETIME. Two deadlines rather than one is what
   buys the grace at all — OQ-14 records what collapsing them would cost.
-- **A missing answer is never a verdict.** With no usable grant, an exchange the local budget
-  refuses is OVERLOADED and one that failed, timed out, or returned something unusable is
-  UPSTREAM-FAILURE. Neither is BAD-CREDENTIAL: the same credential may succeed a second later.
+- **A missing answer is never a verdict; a remembered one still is.** With no usable grant and
+  no denial on record for the credential, an exchange the local budget refuses is OVERLOADED
+  and one that failed, timed out, or returned something unusable is UPSTREAM-FAILURE. Neither
+  is BAD-CREDENTIAL: the same credential may succeed a second later. A denial the control plane
+  gave for this credential is the authority's last word, not a guess, so it keeps answering
+  after P-GRANT-NEGATIVE-TTL when the Portal cannot ask again: the exchange is still
+  attempted, and only if it establishes nothing is the remembered denial the verdict. A grant
+  from a later exchange replaces the denial.
 
 Readiness is conditioned on none of this. A Portal that has never reached the control plane
 is ready and refuses retryably (INV-31): every replica shares one authority, so withholding
@@ -503,7 +508,10 @@ expiry keeps being served and one whose grant has passed it is refused as UPSTRE
 never as BAD-CREDENTIAL; a key revoked while the control plane is healthy stops being served
 no later than LIV-13's bound; with no usable grant, an exchange denied by the local budget
 receives OVERLOADED with `Retry-After`, while the same denial during renewal leaves a usable
-grant serving and increments the grace signal; a grant offering a lifetime beyond
+grant serving and increments the grace signal; a credential the control plane denied, once
+P-GRANT-NEGATIVE-TTL has passed and the exchange fails or is refused by the local budget, is
+refused with the reason it was denied for rather than as UPSTREAM-FAILURE or OVERLOADED, while
+one never denied is still refused as those; a grant offering a lifetime beyond
 P-GRANT-MAX-LIFETIME is honored only to the cap; a grant carrying a claims version this
 build does not recognize admits nothing; a Portal started with the control plane already
 unreachable reports ready and refuses retryably.

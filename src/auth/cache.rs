@@ -209,6 +209,7 @@ impl GrantCache {
         // control plane costs one full timeout per request, serially.
         if let Some(resolved) = self.failure_since(&credential.fingerprint, arrived) {
             return self.or_grace(
+                &credential.fingerprint,
                 resolved,
                 held,
                 latest_second_reached(now, arrived.elapsed()),
@@ -216,6 +217,7 @@ impl GrantCache {
         }
         let resolved = self.exchange(credential, now, held.is_some()).await;
         self.or_grace(
+            &credential.fingerprint,
             resolved,
             held,
             latest_second_reached(now, arrived.elapsed()),
@@ -227,7 +229,17 @@ impl GrantCache {
     /// the request arrived (REQ-54). `now` is the admission second, not the
     /// arrival: the wait plus a failed exchange can outlast what the fast path
     /// saw.
-    fn or_grace(&self, resolved: Resolved, held: Option<Arc<CachedGrant>>, now: u64) -> Resolved {
+    ///
+    /// With no grant to serve on, a denial remembered past its TTL answers
+    /// instead: the authority's last word on this credential, standing when the
+    /// portal cannot ask again.
+    fn or_grace(
+        &self,
+        fingerprint: &str,
+        resolved: Resolved,
+        held: Option<Arc<CachedGrant>>,
+        now: u64,
+    ) -> Resolved {
         match (resolved, held) {
             (Resolved::Saturated | Resolved::Unavailable, Some(grant))
                 if grant.expires_at > now =>
@@ -235,6 +247,9 @@ impl GrantCache {
                 self.admit_on_grace();
                 Resolved::Grant(grant)
             }
+            (failed @ (Resolved::Saturated | Resolved::Unavailable), _) => self
+                .remembered_denial(fingerprint)
+                .map_or(failed, Resolved::Denied),
             (resolved, _) => resolved,
         }
     }
@@ -561,11 +576,14 @@ impl GrantCache {
     fn live_denial(&self, fingerprint: &str, now: u64) -> Option<String> {
         let mut denials = self.denials.lock().unwrap();
         let denial = denials.get(fingerprint)?;
-        if denial.until > now {
-            return Some(denial.reason.clone());
-        }
-        denials.pop(fingerprint);
-        None
+        (denial.until > now).then(|| denial.reason.clone())
+    }
+
+    /// The denial the authority last gave for this credential, whether or not
+    /// its TTL has passed. Only the LRU bound removes one, or a grant.
+    fn remembered_denial(&self, fingerprint: &str) -> Option<String> {
+        let mut denials = self.denials.lock().unwrap();
+        denials.get(fingerprint).map(|denial| denial.reason.clone())
     }
 
     fn publish_gauges(&self) {
@@ -1118,22 +1136,42 @@ mod tests {
         });
 
         for refusal in [Resolved::Unavailable, Resolved::Saturated] {
-            let graced = cache.or_grace(refusal, Some(held.clone()), NOW + 1);
+            let graced = cache.or_grace(
+                &credential().fingerprint,
+                refusal,
+                Some(held.clone()),
+                NOW + 1,
+            );
             assert_eq!(granted(&graced).key_id, KEY_ID);
         }
 
         // With nothing to fall back on the refusal stands, and stays retryable
         // rather than becoming a verdict about the credential.
-        let bare = cache.or_grace(Resolved::Unavailable, None, NOW + 1);
+        let bare = cache.or_grace(
+            &credential().fingerprint,
+            Resolved::Unavailable,
+            None,
+            NOW + 1,
+        );
         assert!(matches!(bare, Resolved::Unavailable), "got {bare:?}");
 
         // The expiry is judged as of the admission, not the arrival: a lock
         // wait plus a failed exchange can outlast the grant, and past
         // `expires_at` the refusal stands however live the grant looked when
         // the request came in (REQ-54).
-        let served = cache.or_grace(Resolved::Unavailable, Some(held.clone()), NOW + 899);
+        let served = cache.or_grace(
+            &credential().fingerprint,
+            Resolved::Unavailable,
+            Some(held.clone()),
+            NOW + 899,
+        );
         assert_eq!(granted(&served).key_id, KEY_ID);
-        let expired = cache.or_grace(Resolved::Unavailable, Some(held), NOW + 900);
+        let expired = cache.or_grace(
+            &credential().fingerprint,
+            Resolved::Unavailable,
+            Some(held),
+            NOW + 900,
+        );
         assert!(matches!(expired, Resolved::Unavailable), "got {expired:?}");
     }
 
@@ -1288,6 +1326,85 @@ mod tests {
         let resolved = cache.resolve(&credential(), NOW + 3600).await;
         granted(&resolved);
         assert_eq!(cp.exchanges(), 2);
+    }
+
+    /// A denial the authority gave is its last word on the credential, so it
+    /// still answers when the portal cannot ask again — an exchange that
+    /// failed is not a reason to tell the holder of a revoked key the portal is
+    /// down. The exchange itself is still attempted past the TTL.
+    #[tokio::test]
+    async fn a_remembered_denial_answers_when_the_re_exchange_fails() {
+        let cp = MockControlPlane::spawn().await;
+        cp.deny(KEY_ID, "revoked");
+        let cache = cache_for(&cp).await;
+        assert!(matches!(
+            cache.resolve(&credential(), NOW).await,
+            Resolved::Denied(_)
+        ));
+
+        cp.status(KEY_ID, 503);
+        let resolved = cache.resolve(&credential(), NOW + 3600).await;
+
+        assert!(
+            matches!(&resolved, Resolved::Denied(reason) if reason == "revoked"),
+            "got {resolved:?}"
+        );
+        assert_eq!(
+            cp.exchanges(),
+            2,
+            "the denial must not suppress the exchange"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remembered_denial_answers_when_the_exchange_budget_is_spent() {
+        let cp = MockControlPlane::spawn().await;
+        cp.deny(KEY_ID, "unknown_key");
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+
+        cache.exhaust_budget_for_test();
+        let resolved = cache.resolve(&credential(), NOW + 3600).await;
+
+        assert!(
+            matches!(&resolved, Resolved::Denied(reason) if reason == "unknown_key"),
+            "got {resolved:?}"
+        );
+        assert_eq!(cp.exchanges(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_key_never_denied_is_still_unavailable_when_the_exchange_fails() {
+        let cp = MockControlPlane::spawn().await;
+        cp.status(KEY_ID, 503);
+        let cache = cache_for(&cp).await;
+
+        let resolved = cache.resolve(&credential(), NOW).await;
+
+        assert!(
+            matches!(resolved, Resolved::Unavailable),
+            "got {resolved:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grant_replaces_a_remembered_denial() {
+        let cp = MockControlPlane::spawn().await;
+        cp.deny(KEY_ID, "revoked");
+        let cache = cache_for(&cp).await;
+        cache.resolve(&credential(), NOW).await;
+
+        cp.grant(KEY_ID, None, NOW + 3900, NOW + 4500);
+        granted(&cache.resolve(&credential(), NOW + 3600).await);
+
+        // The denial is gone, so a later failure has nothing to fall back on
+        // but the grant, and then nothing at all.
+        cp.status(KEY_ID, 503);
+        let after_expiry = cache.resolve(&credential(), NOW + 4500).await;
+        assert!(
+            matches!(after_expiry, Resolved::Unavailable),
+            "got {after_expiry:?}"
+        );
     }
 
     /// A denial and a failure are alternatives for one fingerprint, but sharing
