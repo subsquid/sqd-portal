@@ -21,11 +21,11 @@ use crate::{
     network::NetworkClient,
 };
 
-/// Accepted layouts, all `<prefix><key_id>_<secret>`: the minted prefix plus
-/// the two it replaced. Exactly the set the control plane still honours —
+/// Accepted layouts, all `<prefix><key_id>_<secret>`: the minted prefixes (prod
+/// and dev) plus the two they replaced. Exactly the set the control plane still honours —
 /// a prefix it cannot have issued is not a key, and dropping one here refuses
 /// a live key as `unknown_key` rather than as the removal it is.
-const TOKEN_PREFIXES: [&str; 3] = ["sqd_prt_", "sqd_portal_", "prt_"];
+const TOKEN_PREFIXES: [&str; 4] = ["sqd_prt_", "sqd_dev_prt_", "sqd_portal_", "prt_"];
 
 /// Mirrors the control plane's own `[A-Za-z0-9~-]+`, capped at what it mints:
 /// a token it could never have issued is rejected before it reaches the cache,
@@ -626,6 +626,16 @@ mod tests {
             assert_eq!(credential.key_id, "k1");
             assert_eq!(credential.token.expose(), token);
         }
+    }
+
+    #[test]
+    fn a_dev_prefixed_token_splits_into_key_id_and_secret() {
+        let credential = parse_token(&format!("sqd_dev_prt_k1_{SECRET}")).unwrap();
+        assert_eq!(credential.key_id, "k1");
+        assert_eq!(
+            credential.token.expose(),
+            format!("sqd_dev_prt_k1_{SECRET}")
+        );
     }
 
     /// The property the cache key rests on: the same id with a different secret

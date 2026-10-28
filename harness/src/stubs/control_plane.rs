@@ -57,7 +57,7 @@ const MAX_SKEW_SECS: u64 = 300;
 
 /// Token layouts the control plane mints, mirrored so the stub can answer per
 /// key id (IB-9).
-const TOKEN_PREFIXES: [&str; 2] = ["sqd_portal_", "prt_"];
+const TOKEN_PREFIXES: [&str; 3] = ["sqd_dev_prt_", "sqd_portal_", "prt_"];
 
 /// What the control plane says about one credential. The last two are the DC-8
 /// error table's fault rows: a status carries no answer at all, and a raw body
