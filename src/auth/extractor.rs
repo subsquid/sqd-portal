@@ -22,9 +22,10 @@ use crate::{
 };
 
 /// Accepted layouts, all `<prefix><key_id>_<secret>`: the minted prefixes (prod
-/// and dev) plus the two they replaced. Exactly the set the control plane still honours —
-/// a prefix it cannot have issued is not a key, and dropping one here refuses
-/// a live key as `unknown_key` rather than as the removal it is.
+/// and dev) plus the two they replaced. Exactly the set some control plane
+/// still honours — a prefix none can have issued is not a key, and dropping one
+/// here refuses a live key as `unknown_key` rather than as the removal it is.
+/// A prod portal that sees a dev token gets `unknown_key` from the exchange.
 const TOKEN_PREFIXES: [&str; 4] = ["sqd_prt_", "sqd_dev_prt_", "sqd_portal_", "prt_"];
 
 /// Mirrors the control plane's own `[A-Za-z0-9~-]+`, capped at what it mints:
@@ -667,8 +668,9 @@ mod tests {
         }
     }
 
-    /// The control plane mints two prefixes. Accepting a third widens what can
-    /// buy an exchange and enter the rejection logs, for no benefit.
+    /// The control planes mint only the listed prefixes. Accepting another
+    /// widens what can buy an exchange and enter the rejection logs, for no
+    /// benefit.
     #[test]
     fn rejects_prefixes_the_control_plane_never_mints() {
         for token in [
