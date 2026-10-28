@@ -383,8 +383,9 @@ async fn stream_from_hotblocks(
     hotblocks_name: String,
 ) -> Response {
     let first_block = request.query.first_block();
+    let engine = request.query.engine();
     let hotblocks_response = hotblocks
-        .stream(&hotblocks_name, &request.query.into_string(), mode)
+        .stream(&hotblocks_name, &request.query.into_string(), engine, mode)
         .await;
 
     let mut res = match hotblocks_response {

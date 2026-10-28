@@ -74,7 +74,9 @@ per-read idle deadline P-HOTBLOCKS-READ-TIMEOUT, strictly below P-CLIENT-TIMEOUT
 (ADR-010); at most one replay, and only for a connection-class fault before the response
 head (ADR-015) — a replayed request gets a fresh read budget, so its worst case is twice
 the deadline and is not bounded by P-CLIENT-TIMEOUT; HTTP/1.1 only, since the replay's
-fault classification reads HTTP/1 error shapes (ADR-015); no redirects. Success and 204
+fault classification reads HTTP/1 error shapes (ADR-015); no redirects. A query with sets
+names the dynamic engine in `x-sqd-query-engine: dynamic`, and every other query sends no
+such header (REQ-45). Success and 204
 responses stream through with internal headers stripped; error responses are
 status-classified and rewritten into the Portal envelope (ADR-003, amended by ADR-011;
 IB-4/IB-5).

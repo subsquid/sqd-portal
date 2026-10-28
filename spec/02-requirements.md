@@ -95,7 +95,8 @@ Malformed requests are rejected with a BAD REQUEST and a human-readable reason, 
 any upstream work: unparsable or unknown-field query bodies; query bodies larger than
 P-QUERY-SIZE-LIMIT; more than P-QUERY-MAX-ITEMS item selections; an upper bound below
 the first block; zero-valued tuning parameters; a first block before the dataset's
-start. Unknown dataset aliases return NOT FOUND.
+start. Unknown dataset aliases return NOT FOUND. A query that declares `sets` is checked
+per REQ-45 instead of for unknown fields.
 *Acceptance:* each listed violation returns HTTP 400 (404 for unknown dataset) with the
 ADR-011 error envelope and a stable code plus human-readable message, and no worker or
 real-time call is made.
@@ -303,7 +304,7 @@ source are mandatory.
 a config with an invalid value (e.g. congestion floor > ceiling) refuses to start with
 a reason.
 
-## Network integration (40–44)
+## Network integration (40–45)
 
 **REQ-40 — Assignment ingestion.** [MUST]
 The Portal polls the assignment publisher every P-ASSIGNMENT-REFRESH, reads the
@@ -353,6 +354,25 @@ The Portal reports query logs to the network's accounting. Reporting is best-eff
 bounded (queue of P-LOGS-QUEUE); under pressure logs are dropped rather than ever
 delaying or failing data serving.
 *Acceptance:* saturating the log queue never blocks a stream; drops are observable.
+
+**REQ-45 — Queries with sets run on the dynamic engine.** [MAY]
+A query that declares `sets` — named value sets too large for a list, which item filters
+refer to by name — is sent to workers on the dynamic engine; every other query keeps the
+default engine. The legacy parser cannot read such a query, so the Portal checks only what
+it acts on and what REQ-7 bounds: the dialect tag is a string, `sets` is an object, the
+block range is ordered, the parent hash is a string, and item selections stay within
+P-QUERY-MAX-ITEMS. The body is otherwise forwarded unchanged and the engine validates the
+rest; its refusal reaches the client as BAD-REQUEST (DC-1). Every chunk after the first
+loses only the parent hash, so `sets` and each reference to them reach every worker. A
+real-time request carries the body unchanged and names the engine in
+`x-sqd-query-engine: dynamic` (DC-4); a query without sets sends no such header. Such
+a query is never served from a traceless dataset: the Portal does not read it far enough
+to know that it needs no traces. Nothing routes by worker capability (GAP-40).
+*Acceptance:* a query with sets reaches the first worker unchanged and later workers
+without its parent hash, each on the dynamic engine, and reaches the real-time source with
+`x-sqd-query-engine: dynamic`; a query without sets keeps the default engine and sends no
+such header; a query with sets that breaks a REQ-7 bound is refused before any worker
+call.
 
 ## Access control (50–57)
 
