@@ -43,6 +43,7 @@ requests only; the publisher ⇒ freshness only; chain RPC ⇒ status only (REQ-
 | Clock skew (rejects the query envelope as stale) | mask via reroute + cooldown P-WORKER-ERROR-COOLDOWN; a skew on *our* side hits every candidate ⇒ fail-safe RETRIES-EXHAUSTED, never BAD-REQUEST |
 | Rate-limiting | mask via backoff honor; all-candidates-limited ⇒ fail-safe OVERLOADED |
 | Oversized response | fail-safe BAD-REQUEST (advise narrower query) |
+| Missing data (the queried blocks lack a table or a column the query needs) | fail-safe BAD-REQUEST (name the blocks and what they lack; advise later blocks or a narrower query); no reroute, no cooldown |
 | Equivocating (bad signature / wrong-range data) | integrity: discard, reroute, count (REQ-43); never delivered; all attempts equivocating ⇒ fail-safe WORKER-FAILURE (pages); equivocation mixed with transient failures ⇒ fail-safe RETRIES-EXHAUSTED, the equivocation still counted and alarmed (DC-1) |
 | Fork verdict (parent mismatch) | fail-safe CONFLICT (INV-23) |
 | All attempts exhausted transiently | fail-safe RETRIES-EXHAUSTED listing nothing sensitive; alarm-adjacent counter |

@@ -8,6 +8,9 @@
 //! another worker could serve. Exhaustion is where the families diverge —
 //! all-integrity pages, anything with a transient attempt in it tells the client
 //! to come back (INV-22, FM-2, LIV-12, DC-1).
+//!
+//! The missing-data verdict is the one row that must not reroute: every worker
+//! holds the same chunk, so the first answer is final and is worded for the client.
 
 use std::time::Duration;
 
@@ -189,6 +192,69 @@ async fn run(fx: &mut Fixture) -> anyhow::Result<()> {
         deviations == known_violated,
         "known-violated set drifted: {deviations:?}"
     );
+
+    // --- Blocks that lack what the query needs: the client's to act on (DC-1) ---
+    //
+    // Terminal on the first verdict, since every worker holds the same chunk. The
+    // legacy engine refuses as a bad request and the dynamic one as a server error;
+    // the client must be told the same thing either way, with the range the worker
+    // was asked for and none of the worker's own words.
+    let column = "column 'access_list_size' is not found in 'transactions'";
+    for (label, fault, lacking) in [
+        (
+            "missing-column",
+            WorkerFault::BadRequest(column.into()),
+            "'access_list_size' data in 'transactions'",
+        ),
+        (
+            "missing-column-as-server-error",
+            WorkerFault::ServerError(column.into()),
+            "'access_list_size' data in 'transactions'",
+        ),
+        (
+            "missing-table",
+            WorkerFault::BadRequest("table 'traces' does not exist".into()),
+            "'traces' data",
+        ),
+    ] {
+        await_pool_recovery(fx, label).await?;
+        fx.worker_faults.always(fault);
+        let before = fx.queries_answered();
+        let refused = driver::stream(
+            &http,
+            &base,
+            "toy",
+            "finalized-stream",
+            &query(FROM, TO),
+            &format!("ct2-{label}"),
+        )
+        .await?;
+        ensure!(
+            fx.queries_answered() > before,
+            "{label}: no worker query was recorded — the fault never reached a worker"
+        );
+        ensure!(
+            refused.status == 400,
+            "{label}: expected 400, got {} — body: {}",
+            refused.status,
+            String::from_utf8_lossy(&refused.body),
+        );
+        ensure!(
+            error_code(label, &refused)? == "malformed_request",
+            "{label}: must be BAD-REQUEST, got {}",
+            error_code(label, &refused)?
+        );
+        let body: serde_json::Value = serde_json::from_slice(&refused.body)?;
+        let want = format!(
+            "Blocks {FROM}-{TO} have no {lacking}, which this query needs; query from a \
+             later block, or drop the part of the query that needs it"
+        );
+        ensure!(
+            body["error"]["message"] == want.as_str(),
+            "{label}: unexpected message {}",
+            body["error"]["message"]
+        );
+    }
 
     // --- Exhaustion: every attempt equivocating pages (DC-1, FM-2) ---
     //

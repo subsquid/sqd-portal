@@ -47,6 +47,8 @@ pub enum WorkerFault {
     NotFound(String),
     /// Refuse for clock skew: a bad-request verdict that must still reroute.
     StaleEnvelope,
+    /// Answer with a bad-request verdict carrying this text.
+    BadRequest(String),
     /// Refuse for capacity: the rate-limit verdict.
     TooManyRequests,
     /// Refuse for capacity: the overload verdict. One DC-1 row with the above.
@@ -213,6 +215,9 @@ fn answer(
                 keypair,
                 query_error::Err::BadRequest("timestamp out of allowed range".to_owned()),
             )
+        }
+        Some(WorkerFault::BadRequest(m)) => {
+            return verdict_result(query, keypair, query_error::Err::BadRequest(m.clone()))
         }
         Some(WorkerFault::TooManyRequests) => {
             return verdict_result(query, keypair, query_error::Err::TooManyRequests(()))

@@ -6,6 +6,8 @@ use serde::Serialize;
 use sqd_contract_client::PeerId;
 use tokio::time::Instant;
 
+use super::BlockRange;
+
 /// Coarse category, the wire's `type`. `Api` is the only one that should page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorType {
@@ -389,12 +391,39 @@ pub enum RequestError {
     BusyFor(Duration),
     #[error("Base block mismatch")]
     BaseBlockMismatch(sqd_primitives::BlockRef),
+    /// The query is well-formed, but these blocks lack data it needs. Its own variant so
+    /// each entry point words it for whoever wrote the query: a client, or the Portal.
+    #[error("Blocks {}-{} have no {data}", .range.start(), .range.end())]
+    MissingData {
+        data: MissingData,
+        /// The range a worker was asked for.
+        range: BlockRange,
+    },
+}
+
+/// A table, or one column of it, that a query needs and the queried blocks do not have.
+/// The names are the stored ones, which are not always the names a query uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingData {
+    pub table: String,
+    pub column: Option<String>,
+}
+
+impl std::fmt::Display for MissingData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.column {
+            Some(column) => write!(f, "'{column}' data in '{}'", self.table),
+            None => write!(f, "'{}' data", self.table),
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum QueryError {
     #[error("{0}")]
     BadRequest(String),
+    #[error("the queried blocks have no {0}")]
+    MissingData(MissingData),
     #[error("{0}")]
     Retriable(String),
     /// The response contradicts the query contract — bad signature, undecodable
@@ -432,6 +461,7 @@ impl QueryError {
             Self::Integrity(_) => ExhaustionClass::Integrity,
             Self::RateLimitExceeded => ExhaustionClass::Capacity,
             Self::BadRequest(_)
+            | Self::MissingData(_)
             | Self::Retriable(_)
             | Self::Failure(_)
             | Self::BaseBlockMismatch(_) => ExhaustionClass::Transient,
@@ -448,9 +478,14 @@ pub enum SendQueryError {
 }
 
 impl RequestError {
-    pub fn from_query_error(value: QueryError, worker: PeerId) -> Self {
+    /// `range` is the one the worker was asked for.
+    pub fn from_query_error(value: QueryError, worker: PeerId, range: &BlockRange) -> Self {
         match value {
             QueryError::BadRequest(s) => RequestError::BadRequest(s),
+            QueryError::MissingData(data) => RequestError::MissingData {
+                data,
+                range: range.clone(),
+            },
             QueryError::Retriable(s) => RequestError::RetriesExhausted(format!(
                 "received an error from worker {worker}: {s}"
             )),
@@ -468,7 +503,10 @@ impl RequestError {
     pub fn code(&self) -> Option<ErrorCode> {
         Some(match self {
             Self::NoData => return None,
-            Self::BadRequest(_) | Self::InvalidParam { .. } => ErrorCode::MalformedRequest,
+            // BAD-REQUEST like an oversized result: the request cannot succeed unchanged.
+            Self::BadRequest(_) | Self::InvalidParam { .. } | Self::MissingData { .. } => {
+                ErrorCode::MalformedRequest
+            }
             Self::RetriesExhausted(_) => ErrorCode::RetriesExhausted,
             Self::Internal(_) => ErrorCode::Internal,
             Self::Failure(_) => ErrorCode::WorkerFailure,
@@ -501,6 +539,15 @@ impl axum::response::IntoResponse for RequestError {
                 ErrorBody::new(code, format!("Bad request: {message}")).with_param(param)
             }
             Self::BadRequest(ref e) => ErrorBody::new(code, format!("Bad request: {e}")),
+            // What was found, not why: the Portal cannot tell data added to a dataset
+            // later from a query written for another kind of dataset.
+            Self::MissingData { .. } => ErrorBody::new(
+                code,
+                format!(
+                    "{self}, which this query needs; query from a later block, \
+                     or drop the part of the query that needs it"
+                ),
+            ),
             Self::Internal(ref e) => ErrorBody::new(code, format!("Internal error: {e}")),
             Self::RetriesExhausted(ref e) => {
                 ErrorBody::new(code, format!("All query attempts failed: {e}"))
@@ -553,6 +600,17 @@ mod tests {
         let cases = [
             (
                 RequestError::BadRequest("nope".into()),
+                StatusCode::BAD_REQUEST,
+                ErrorCode::MalformedRequest,
+            ),
+            (
+                RequestError::MissingData {
+                    data: MissingData {
+                        table: "traces".into(),
+                        column: None,
+                    },
+                    range: 0..=9,
+                },
                 StatusCode::BAD_REQUEST,
                 ErrorCode::MalformedRequest,
             ),
@@ -615,6 +673,41 @@ mod tests {
         assert_eq!(code, Some(ErrorCode::MalformedRequest));
         assert_eq!(body["error"]["param"], "buffer_size");
         assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    /// The client is told which blocks lack what, and what it can change. The words do
+    /// not call the query malformed, and name no cause the Portal cannot know.
+    #[tokio::test]
+    async fn missing_data_names_the_blocks_and_what_they_lack() {
+        let cases = [
+            (
+                Some("access_list_size"),
+                "Blocks 11170000-11170999 have no 'access_list_size' data in 'transactions', \
+                 which this query needs; query from a later block, or drop the part of the \
+                 query that needs it",
+            ),
+            (
+                None,
+                "Blocks 11170000-11170999 have no 'transactions' data, which this query needs; \
+                 query from a later block, or drop the part of the query that needs it",
+            ),
+        ];
+        for (column, want) in cases {
+            let verdict = QueryError::MissingData(MissingData {
+                table: "transactions".into(),
+                column: column.map(str::to_owned),
+            });
+            let error = RequestError::from_query_error(
+                verdict,
+                PeerId::random(),
+                &(11_170_000..=11_170_999),
+            );
+            let (status, code, body) = parts(error.into_response()).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, Some(ErrorCode::MalformedRequest));
+            assert_eq!(body["error"]["message"], want);
+        }
     }
 
     /// `param` is absent, not null, when the error isn't about a parameter.
