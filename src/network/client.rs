@@ -120,10 +120,6 @@ enum Health {
 /// Matched verbatim: the wire carries no code for this verdict (GAP-25).
 const STALE_ENVELOPE: &str = "timestamp out of allowed range";
 
-/// One DC-1 row: how a worker verdict is classified, counted, and charged. The three
-/// were chosen independently in each match arm — eight arms times three decisions — and
-/// they drifted: the two capacity refusals shared a row in the spec while disagreeing
-/// here on both the error class and the health signal.
 /// What a query asked for, for the words of a verdict that has to name it.
 struct Asked<'a> {
     dataset: &'a DatasetId,
@@ -140,8 +136,7 @@ fn missing_column(text: &str) -> Option<(&str, &str)> {
         .then_some((column, table))
 }
 
-fn missing_column_message(text: &str, asked: &Asked<'_>) -> String {
-    let (column, table) = missing_column(text).unwrap_or(("?", "?"));
+fn missing_column_message((column, table): (&str, &str), asked: &Asked<'_>) -> String {
     format!(
         "the data of dataset {} for blocks {}-{} was written before one of the requested \
          fields existed; remove that field from the query or query from a later block \
@@ -152,6 +147,10 @@ fn missing_column_message(text: &str, asked: &Asked<'_>) -> String {
     )
 }
 
+/// One DC-1 row: how a worker verdict is classified, counted, and charged. The three
+/// were chosen independently in each match arm — eight arms times three decisions — and
+/// they drifted: the two capacity refusals shared a row in the spec while disagreeing
+/// here on both the error class and the health signal.
 struct Verdict {
     error: QueryError,
     label: &'static str,
@@ -173,21 +172,23 @@ impl Verdict {
             Err::BadRequest(s) if s == STALE_ENVELOPE => {
                 row(QueryError::Retriable(s), "clock_skew", Health::Error, false)
             }
-            // Not a malformed query: the chunk was written before a requested field existed.
-            // The worker refuses on purpose, since null would read as "no data", and another
-            // worker would refuse the same.
-            Err::BadRequest(s) if missing_column(&s).is_some() => row(
-                QueryError::BadRequest(missing_column_message(&s, asked)),
-                "bad_request",
-                Health::Ok,
-                false,
-            ),
-            Err::BadRequest(s) => row(
-                QueryError::BadRequest(format!("couldn't parse request: {s}")),
-                "bad_request",
-                Health::Ok,
-                false,
-            ),
+            Err::BadRequest(s) => match missing_column(&s) {
+                // Not a malformed query: the chunk was written before a requested field
+                // existed. The worker refuses on purpose, since null would read as "no data",
+                // and another worker would refuse the same.
+                Some((column, table)) => row(
+                    QueryError::BadRequest(missing_column_message((column, table), asked)),
+                    "bad_request",
+                    Health::Ok,
+                    false,
+                ),
+                None => row(
+                    QueryError::BadRequest(format!("couldn't parse request: {s}")),
+                    "bad_request",
+                    Health::Ok,
+                    false,
+                ),
+            },
             // Probably still downloading the chunk.
             Err::NotFound(s) => row(QueryError::Retriable(s), "not_found", Health::Error, false),
             // Split inside the arm, not by guard: a guard cannot bind what it matched, so it
