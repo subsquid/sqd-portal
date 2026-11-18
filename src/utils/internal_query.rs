@@ -14,16 +14,32 @@ struct SummaryHeader {
     timestamp: u64,
 }
 
+/// A header timestamp below this is in seconds, above it in milliseconds.
+///
+/// The dataset kind sets the unit: EVM, Solana and Bitcoin headers have seconds, Substrate,
+/// Tron and Hyperliquid headers have milliseconds. The two ranges do not overlap for any
+/// date after 1973.
+const MILLIS_THRESHOLD: u64 = 100_000_000_000;
+
+/// The header timestamp in Unix milliseconds, whatever unit the dataset kind uses.
+fn header_millis(timestamp: u64) -> u64 {
+    if timestamp < MILLIS_THRESHOLD {
+        timestamp.saturating_mul(1000)
+    } else {
+        timestamp
+    }
+}
+
 #[tracing::instrument]
-/// Find the first streamed block whose timestamp is greater than or equal to `ts`.
+/// Find the first streamed block whose timestamp is greater than or equal to `ts_millis`.
 ///
 /// `js` must be JSON Lines ordered by block height/timestamp and each row must
 /// contain `header.number` and `header.timestamp`. The archive and HotblocksDB
 /// timestamp lookups rely on that ordering contract.
-pub fn find_block_in_chunk(ts: u64, js: &str) -> Result<u64, anyhow::Error> {
+pub fn find_block_in_chunk(ts_millis: u64, js: &str) -> Result<u64, anyhow::Error> {
     for line in js.lines() {
         let summary = serde_json::from_str::<BlockSummary>(line)?;
-        if summary.header.timestamp >= ts {
+        if header_millis(summary.header.timestamp) >= ts_millis {
             return Ok(summary.header.number);
         }
     }
@@ -81,26 +97,57 @@ mod tests {
             .join("\n")
     }
 
+    const T: u64 = 1_700_000_000;
+
     #[test]
     fn find_block_in_chunk_returns_first_block_with_timestamp_gte_target() {
-        let chunk = jsonl(&[(10, 100), (11, 112), (12, 124)]);
+        let chunk = jsonl(&[(10, T), (11, T + 12), (12, T + 24)]);
 
-        assert_eq!(find_block_in_chunk(100, &chunk).unwrap(), 10);
-        assert_eq!(find_block_in_chunk(101, &chunk).unwrap(), 11);
-        assert_eq!(find_block_in_chunk(112, &chunk).unwrap(), 11);
+        assert_eq!(find_block_in_chunk(T * 1000, &chunk).unwrap(), 10);
+        assert_eq!(find_block_in_chunk((T + 1) * 1000, &chunk).unwrap(), 11);
+        assert_eq!(find_block_in_chunk((T + 12) * 1000, &chunk).unwrap(), 11);
     }
 
     #[test]
     fn find_block_in_chunk_returns_error_when_target_is_after_chunk() {
-        let chunk = jsonl(&[(10, 100), (11, 112), (12, 124)]);
+        let chunk = jsonl(&[(10, T), (11, T + 12), (12, T + 24)]);
 
-        assert!(find_block_in_chunk(125, &chunk).is_err());
+        assert!(find_block_in_chunk((T + 25) * 1000, &chunk).is_err());
     }
 
     #[test]
     fn find_block_in_chunk_requires_ordered_stream_rows() {
-        let unordered_chunk = jsonl(&[(12, 124), (10, 100), (11, 112)]);
+        let unordered_chunk = jsonl(&[(12, T + 24), (10, T), (11, T + 12)]);
 
-        assert_eq!(find_block_in_chunk(101, &unordered_chunk).unwrap(), 12);
+        assert_eq!(
+            find_block_in_chunk((T + 1) * 1000, &unordered_chunk).unwrap(),
+            12
+        );
+    }
+
+    #[test]
+    fn find_block_in_chunk_reads_millisecond_headers() {
+        // Polkadot block 20000001 has the timestamp 1711049430000 ms.
+        let chunk = jsonl(&[
+            (19_999_999, 1_711_049_418_000),
+            (20_000_000, 1_711_049_424_000),
+            (20_000_001, 1_711_049_430_000),
+        ]);
+
+        assert_eq!(
+            find_block_in_chunk(1_711_049_430_000, &chunk).unwrap(),
+            20_000_001
+        );
+        assert_eq!(
+            find_block_in_chunk(1_711_049_419_000, &chunk).unwrap(),
+            20_000_000
+        );
+    }
+
+    #[test]
+    fn find_block_in_chunk_skips_a_zero_timestamp() {
+        let chunk = jsonl(&[(10, 0), (11, T)]);
+
+        assert_eq!(find_block_in_chunk(T * 1000, &chunk).unwrap(), 11);
     }
 }
