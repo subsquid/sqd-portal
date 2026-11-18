@@ -108,7 +108,7 @@ async fn status(State(s): State<HotblocksState>, Path(ds): Path<String>) -> Resp
             "firstBlock": d.start_block,
             "lastBlock": h,
             "lastBlockHash": s.world.hash(&ds, h),
-            "lastBlockTimestamp": s.world.timestamp(h),
+            "lastBlockTimestamp": s.world.timestamp(h) * 1000,
             "finalizedHead": { "number": f, "hash": s.world.hash(&ds, f) },
         }
     }))

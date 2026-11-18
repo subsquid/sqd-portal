@@ -41,6 +41,7 @@ pub struct StatusData {
     pub first_block: BlockNumber,
     pub last_block: BlockNumber,
     pub last_block_hash: String,
+    /// Unix milliseconds for every dataset kind, unlike the raw `header.timestamp`.
     pub last_block_timestamp: Option<u64>,
     pub finalized_head: Option<sqd_primitives::BlockRef>,
 }

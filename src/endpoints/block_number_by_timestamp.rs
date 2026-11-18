@@ -210,7 +210,7 @@ impl BlockNumberLookupError {
     }
 }
 
-/// Resolve the first block whose timestamp is greater than or equal to `timestamp`.
+/// Resolve the first block whose timestamp is greater than or equal to `timestamp`, in Unix seconds.
 ///
 /// Archive data is preferred when the dataset has an SQD Network mapping. If
 /// the archive lookup cannot find a matching chunk, the resolver falls back to
@@ -224,6 +224,13 @@ pub async fn resolve(
     hotblocks: &HotblocksHandle,
     dataset: &DatasetConfig,
 ) -> Result<ResolvedBlockNumber, UnresolvedBlockNumber> {
+    let Some(ts_millis) = timestamp.checked_mul(1000) else {
+        return Err(UnresolvedBlockNumber {
+            error: BlockNumberLookupError::Internal("timestamp overflow".to_string()),
+            data_source: None,
+        });
+    };
+
     get_blocknumber_by_timestamp_inner(
         dataset.network_id.is_some(),
         dataset.hotblocks.is_some(),
@@ -235,7 +242,7 @@ pub async fn resolve(
             };
 
             get_archival_blocknumber_by_timestamp(
-                timestamp,
+                ts_millis,
                 req,
                 network,
                 task_manager,
@@ -245,7 +252,7 @@ pub async fn resolve(
             )
             .await
         },
-        || async { get_hotblocks_blocknumber_by_timestamp(timestamp, hotblocks, dataset).await },
+        || async { get_hotblocks_blocknumber_by_timestamp(ts_millis, hotblocks, dataset).await },
     )
     .await
 }
@@ -314,7 +321,7 @@ where
 }
 
 async fn get_archival_blocknumber_by_timestamp(
-    timestamp: u64,
+    ts_millis: u64,
     req: &RequestId,
     network: &NetworkClient,
     task_manager: &Arc<TaskManager>,
@@ -322,11 +329,8 @@ async fn get_archival_blocknumber_by_timestamp(
     dataset: &DatasetConfig,
     dataset_id: &DatasetId,
 ) -> Result<u64, BlockNumberLookupError> {
-    let ts = timestamp
-        .checked_mul(1000) // milliseconds
-        .ok_or_else(|| BlockNumberLookupError::Internal("timestamp overflow".to_string()))?;
     let chunk = network
-        .find_chunk_by_timestamp(dataset_id, ts)
+        .find_chunk_by_timestamp(dataset_id, ts_millis)
         .map_err(|_| {
             BlockNumberLookupError::NotFound("No chunk found for timestamp".to_string())
         })?;
@@ -367,7 +371,7 @@ async fn get_archival_blocknumber_by_timestamp(
         BlockNumberLookupError::Internal("stream processing error".to_string())
     })?;
 
-    find_block_in_chunk(timestamp, &js).map_err(|e| {
+    find_block_in_chunk(ts_millis, &js).map_err(|e| {
         tracing::warn!("cannot find blocknumber in chunk: {:?}", e);
         BlockNumberLookupError::NotFound("block not in chunk".to_string())
     })
@@ -378,12 +382,12 @@ async fn get_archival_blocknumber_by_timestamp(
 /// It sends two requests non-atomically. A change of state between them can lead
 /// to, e.g., "range unavailable" responses. Retry to reduce the number of 503s.
 async fn get_hotblocks_blocknumber_by_timestamp(
-    timestamp: u64,
+    ts_millis: u64,
     hotblocks: &HotblocksHandle,
     dataset: &DatasetConfig,
 ) -> Result<u64, BlockNumberLookupError> {
     retry_once_on_unavailable(|| {
-        get_hotblocks_blocknumber_by_timestamp_once(timestamp, hotblocks, dataset)
+        get_hotblocks_blocknumber_by_timestamp_once(ts_millis, hotblocks, dataset)
     })
     .await
 }
@@ -425,7 +429,7 @@ fn retryable(code: ErrorCode) -> bool {
 }
 
 async fn get_hotblocks_blocknumber_by_timestamp_once(
-    timestamp: u64,
+    ts_millis: u64,
     hotblocks: &HotblocksHandle,
     dataset: &DatasetConfig,
 ) -> Result<u64, BlockNumberLookupError> {
@@ -439,7 +443,7 @@ async fn get_hotblocks_blocknumber_by_timestamp_once(
     let status = decode_status(response).await?;
 
     get_hotblocks_blocknumber_by_timestamp_inner(
-        timestamp,
+        ts_millis,
         &dataset.kind,
         &dataset.default_name,
         status,
@@ -510,7 +514,7 @@ fn classify_hotblocks_error(error: HotblocksErr, message: &str) -> BlockNumberLo
 }
 
 async fn get_hotblocks_blocknumber_by_timestamp_inner<StreamLookup, StreamFuture>(
-    timestamp: u64,
+    ts_millis: u64,
     kind: &str,
     dataset_name: &str,
     status: Status,
@@ -526,10 +530,10 @@ where
         ));
     };
 
-    if data
+    let after_last_block = data
         .last_block_timestamp
-        .is_some_and(|last_timestamp| timestamp > last_timestamp)
-    {
+        .is_some_and(|last_millis| ts_millis > last_millis);
+    if after_last_block {
         return Err(BlockNumberLookupError::NotFound(
             "block not in hotblocks".to_string(),
         ));
@@ -545,7 +549,7 @@ where
 
     let js = stream_lookup(pquery.into_string()).await?;
 
-    find_block_in_chunk(timestamp, &js).map_err(|e| {
+    find_block_in_chunk(ts_millis, &js).map_err(|e| {
         tracing::warn!("cannot find blocknumber in hotblocks: {:?}", e);
         BlockNumberLookupError::NotFound("block not in hotblocks".to_string())
     })
@@ -865,7 +869,7 @@ mod tests {
     async fn hotblocks_lookup_uses_status_and_stream_query() {
         assert_eq!(
             get_hotblocks_blocknumber_by_timestamp_inner(
-                1_700_000_000,
+                1_700_000_000_000,
                 "evm",
                 "base-mainnet",
                 fake_status(),
@@ -877,7 +881,7 @@ mod tests {
         );
         assert_eq!(
             get_hotblocks_blocknumber_by_timestamp_inner(
-                1_700_000_005,
+                1_700_000_005_000,
                 "evm",
                 "base-mainnet",
                 fake_status(),
@@ -889,7 +893,7 @@ mod tests {
         );
         assert!(matches!(
             get_hotblocks_blocknumber_by_timestamp_inner(
-                1_700_009_999,
+                1_700_009_999_000,
                 "evm",
                 "base-mainnet",
                 fake_status(),
@@ -898,6 +902,50 @@ mod tests {
             .await,
             Err(BlockNumberLookupError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn hotblocks_lookup_refuses_a_time_after_the_last_block_without_a_stream() {
+        async fn no_stream(_: String) -> Result<String, BlockNumberLookupError> {
+            panic!("the status alone answers a time after the last block");
+        }
+
+        let after_last_block = get_hotblocks_blocknumber_by_timestamp_inner(
+            1_700_000_013_000,
+            "evm",
+            "base-mainnet",
+            fake_status(),
+            no_stream,
+        )
+        .await;
+
+        assert!(matches!(
+            after_last_block,
+            Err(BlockNumberLookupError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hotblocks_lookup_reads_millisecond_headers() {
+        async fn substrate_stream(_: String) -> Result<String, BlockNumberLookupError> {
+            Ok(concat!(
+                "{\"header\":{\"number\":100,\"timestamp\":1700000000000}}\n",
+                "{\"header\":{\"number\":101,\"timestamp\":1700000006000}}\n"
+            )
+            .to_string())
+        }
+
+        let block = get_hotblocks_blocknumber_by_timestamp_inner(
+            1_700_000_001_000,
+            "substrate",
+            "polkadot",
+            fake_status(),
+            substrate_stream,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(block, 101);
     }
 
     #[test]
@@ -998,7 +1046,7 @@ mod tests {
                 last_block: 101,
                 last_block_hash:
                     "0x0202020202020202020202020202020202020202020202020202020202020202".to_string(),
-                last_block_timestamp: Some(1_700_000_012),
+                last_block_timestamp: Some(1_700_000_012_000),
                 finalized_head: Some(BlockRef {
                     number: 101,
                     hash: "0x0202020202020202020202020202020202020202020202020202020202020202"
