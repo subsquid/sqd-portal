@@ -34,7 +34,7 @@ use crate::utils::{RwLock, UseOnce};
 use crate::{
     config::Config,
     metrics,
-    types::{generate_query_id, DatasetId, QueryError},
+    types::{generate_query_id, DatasetId, MissingData, QueryError},
 };
 
 /// The subset of [`NetworkClient`] that the stream controller depends on.
@@ -120,6 +120,32 @@ enum Health {
 /// Matched verbatim: the wire carries no code for this verdict (GAP-25).
 const STALE_ENVELOPE: &str = "timestamp out of allowed range";
 
+/// The engines' words for a table or a column the queried blocks do not have; the wire
+/// carries no code for it either (GAP-25). A name that is not an identifier is not
+/// recognised, so what a client is shown is a parsed name and never worker prose.
+fn missing_data(text: &str) -> Option<MissingData> {
+    let name = |s: &str| {
+        let is_identifier =
+            !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        is_identifier.then(|| s.to_owned())
+    };
+    if let Some(rest) = text.strip_prefix("column '") {
+        let (column, table) = rest.strip_suffix('\'')?.split_once("' is not found in '")?;
+        return Some(MissingData {
+            table: name(table)?,
+            column: Some(name(column)?),
+        });
+    }
+    let rest = text.strip_prefix("table '")?;
+    let table = rest
+        .strip_suffix("' does not exist")
+        .or_else(|| rest.strip_suffix("' is not found in the chunk"))?;
+    Some(MissingData {
+        table: name(table)?,
+        column: None,
+    })
+}
+
 /// One DC-1 row: how a worker verdict is classified, counted, and charged. The three
 /// were chosen independently in each match arm — eight arms times three decisions — and
 /// they drifted: the two capacity refusals shared a row in the spec while disagreeing
@@ -140,6 +166,19 @@ impl Verdict {
             health,
             backs_off,
         };
+        // Asked of both classes: the legacy engine refuses as a bad request and the dynamic
+        // one as a server error, in the same words. Not the worker's fault, and every
+        // worker holds the same chunk, so no penalty and no reroute.
+        if let Err::BadRequest(s) | Err::ServerError(s) = &err {
+            if let Some(missing) = missing_data(s) {
+                return row(
+                    QueryError::MissingData(missing),
+                    "missing_data",
+                    Health::Ok,
+                    false,
+                );
+            }
+        }
         match err {
             // Clock skew, not a bad query: another worker may accept the same bytes.
             Err::BadRequest(s) if s == STALE_ENVELOPE => {
@@ -1298,6 +1337,70 @@ mod tests {
             &[7u8; 8],
             "the copy still carries the payload"
         );
+    }
+
+    fn missing(table: &str, column: Option<&str>) -> MissingData {
+        MissingData {
+            table: table.to_owned(),
+            column: column.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn missing_data_is_one_verdict_in_either_wire_class() {
+        use query_error::Err;
+        let column = "column 'access_list_size' is not found in 'transactions'";
+        let cases = [
+            // The legacy engine's class, then the dynamic engine's.
+            (
+                Err::BadRequest(column.to_owned()),
+                missing("transactions", Some("access_list_size")),
+            ),
+            (
+                Err::ServerError(column.to_owned()),
+                missing("transactions", Some("access_list_size")),
+            ),
+            (
+                Err::BadRequest("table 'traces' does not exist".to_owned()),
+                missing("traces", None),
+            ),
+            (
+                Err::ServerError("table 'traces' is not found in the chunk".to_owned()),
+                missing("traces", None),
+            ),
+        ];
+        for (err, want) in cases {
+            let case = format!("{err:?}");
+            let verdict = Verdict::of(err);
+            assert!(
+                matches!(verdict.error, QueryError::MissingData(ref got) if *got == want),
+                "{case}: {:?}",
+                verdict.error
+            );
+            assert_eq!(verdict.label, "missing_data", "{case}");
+            assert!(matches!(verdict.health, Health::Ok), "{case}");
+            assert!(!verdict.backs_off, "{case}");
+        }
+    }
+
+    #[test]
+    fn only_the_missing_data_texts_are_recognised() {
+        for other in [
+            "column 'a' not found in schema",
+            "unknown column 'a' is not found in 't'",
+            // The chunk's own key column, and a fork check: neither is data a query chose.
+            "block-number column 'number' is not found in 'blocks'",
+            "column 'hash' is not found in 'blocks', so 'parentBlockHash' cannot be checked",
+            "table 'traces' is locked",
+            // Not identifiers, so not echoed.
+            "column '' is not found in 't'",
+            "column 'a b' is not found in 't'",
+            "column 'a' is not found in 't' or 'u'",
+            "table '<script>' does not exist",
+            "invalid query signature",
+        ] {
+            assert_eq!(missing_data(other), None, "{other}");
+        }
     }
 
     #[test]

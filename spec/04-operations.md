@@ -112,6 +112,8 @@ greater than or equal to the request; a pre-history request therefore returns th
 available block, while a timestamp after the data frontier is the EMPTY outcome
 (INV-27; ADR-014) — the head advances and the same request later succeeds. Overload and
 error outcomes match OP-1 (REQ-13), including the ADR-011 code and hint on OVERLOADED.
+The one exception is DC-1's missing-data verdict: the query is the Portal's own, so the
+outcome is INTERNAL, not BAD-REQUEST.
 
 ## OP-6 — Dataset state read · OP-7 — Status read
 

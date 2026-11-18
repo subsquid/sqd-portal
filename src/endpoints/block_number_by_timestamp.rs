@@ -154,6 +154,18 @@ fn upstream_failure(response: &reqwest::Response) -> BlockNumberLookupError {
 }
 
 impl BlockNumberLookupError {
+    /// A lookup stream that did not start. The Portal wrote its query, so blocks that
+    /// lack what it reads are not the caller's to fix, and are not passed on as a
+    /// request the caller could change.
+    fn from_stream(error: RequestError) -> Self {
+        match error {
+            RequestError::MissingData { .. } => {
+                Self::Internal(format!("{error}, which the timestamp lookup needs"))
+            }
+            error => Self::Refused(error),
+        }
+    }
+
     pub fn class(&self) -> ErrorCode {
         match self {
             Self::NotFound(_) => ErrorCode::NotFound,
@@ -352,7 +364,7 @@ async fn get_archival_blocknumber_by_timestamp(
         Ok(stream) => stream,
         Err(e) => {
             tracing::warn!("spawn stream error: {:?}", e);
-            return Err(BlockNumberLookupError::Refused(e));
+            return Err(BlockNumberLookupError::from_stream(e));
         }
     };
 
@@ -643,6 +655,39 @@ mod tests {
             Some(ErrorCode::NoWorkers),
             "no capacity is not an upstream failure"
         );
+    }
+
+    /// The caller sent a timestamp, not a query: telling it to change one would be advice
+    /// it cannot follow. Any other refusal still passes through whole.
+    #[tokio::test]
+    async fn blocks_that_lack_what_the_lookup_reads_are_not_the_callers_bad_request() {
+        let response = BlockNumberLookupError::from_stream(RequestError::MissingData {
+            data: crate::types::MissingData {
+                table: "blocks".to_owned(),
+                column: Some("timestamp".to_owned()),
+            },
+            range: 0..=99,
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.extensions().get::<ErrorCode>().copied(),
+            Some(ErrorCode::Internal)
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["error"]["message"],
+            "Blocks 0-99 have no 'timestamp' data in 'blocks', which the timestamp lookup needs"
+        );
+
+        assert!(matches!(
+            BlockNumberLookupError::from_stream(RequestError::RateLimitExceeded),
+            BlockNumberLookupError::Refused(RequestError::RateLimitExceeded)
+        ));
     }
 
     /// One upstream status cannot mean two things depending on which endpoint asked. This

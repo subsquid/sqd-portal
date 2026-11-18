@@ -1102,7 +1102,7 @@ fn parse_response(
     let s = match response {
         Ok(success) => success,
         Err(e) => {
-            let error = RequestError::from_query_error(e, worker);
+            let error = RequestError::from_query_error(e, worker, range);
             tracing::debug!(
                 "Got error in {}ms from {}: {}",
                 duration.as_millis(),
@@ -1174,6 +1174,8 @@ fn retriable(result: &QueryResult) -> bool {
     match result {
         Ok(_) => false,
         Err(QueryError::BadRequest(_)) => false,
+        // Every worker holds the same chunk and would answer the same.
+        Err(QueryError::MissingData(_)) => false,
         Err(QueryError::Retriable(_)) => true,
         // Rerouted like a transient failure; only the exhaustion class differs.
         Err(QueryError::Integrity(_)) => true,

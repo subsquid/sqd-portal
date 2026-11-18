@@ -1090,7 +1090,7 @@ async fn execute_query(
         lease,
         request_id,
         ChunkId::new(dataset_id, chunk),
-        range,
+        range.clone(),
         query.into_string(),
         engine,
         Compression::Gzip,
@@ -1098,7 +1098,7 @@ async fn execute_query(
     );
     let result = match fut.await {
         Ok(success) => success.ok,
-        Err(err) => return RequestError::from_query_error(err, worker_id).into_response(),
+        Err(err) => return RequestError::from_query_error(err, worker_id, &range).into_response(),
     };
     match json_lines_to_json(&result.data) {
         Ok(data) => Response::builder()

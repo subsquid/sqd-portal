@@ -30,6 +30,7 @@ alternatives exist.
 | invalid-query verdict | BAD-REQUEST (terminal for the request) |
 | stale-envelope verdict (the worker's clock disagrees with ours beyond the protocol's freshness window) | reroute; cooldown P-WORKER-ERROR-COOLDOWN; exhausted ⇒ RETRIES-EXHAUSTED. Never BAD-REQUEST: the query is well-formed and the next worker may accept it unchanged |
 | result exceeds size cap | BAD-REQUEST advising a narrower query |
+| missing-data verdict (the queried blocks lack a table or a column the query needs) | BAD-REQUEST naming the block range asked of the worker and the data it lacks, and advising later blocks or a query without the part that needs it (terminal for the request; no cooldown, since every worker holds the same chunk). States what was found, never a cause. Where the Portal wrote the query itself (OP-5) ⇒ INTERNAL: the caller has no query to change |
 | parent-hash mismatch verdict | CONFLICT (real-time mode only — finalized-mode queries carry no parent hash, REQ-3) |
 | server error / not found | reroute; cooldown P-WORKER-ERROR-COOLDOWN; exhausted ⇒ RETRIES-EXHAUSTED |
 | timeout / transport failure | reroute; cooldown P-WORKER-TIMEOUT-COOLDOWN; congestion signal; exhausted ⇒ RETRIES-EXHAUSTED |

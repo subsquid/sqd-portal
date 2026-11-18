@@ -11,7 +11,7 @@ pub use common::*;
 pub use dataset::*;
 pub use errors::{
     coded_response, error_body_response, error_response, server_overloaded, ErrorBody, ErrorCode,
-    ErrorDetail, ErrorResponse, ErrorType, ExhaustionClass, QueryError, RequestError,
+    ErrorDetail, ErrorResponse, ErrorType, ExhaustionClass, MissingData, QueryError, RequestError,
     SendQueryError, RETRY_AFTER_FLOOR,
 };
 pub use request::*;
