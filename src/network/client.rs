@@ -124,6 +124,34 @@ const STALE_ENVELOPE: &str = "timestamp out of allowed range";
 /// were chosen independently in each match arm — eight arms times three decisions — and
 /// they drifted: the two capacity refusals shared a row in the spec while disagreeing
 /// here on both the error class and the health signal.
+/// What a query asked for, for the words of a verdict that has to name it.
+struct Asked<'a> {
+    dataset: &'a DatasetId,
+    range: &'a BlockRange,
+}
+
+/// Matched on the text of the legacy engine (`column '<col>' is not found in '<table>'`);
+/// the wire carries no code for it. Returns `(column, table)`.
+fn missing_column(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("column '")?;
+    let (column, rest) = rest.split_once("' is not found in '")?;
+    let table = rest.strip_suffix('\'')?;
+    (!column.is_empty() && !table.is_empty() && !column.contains('\'') && !table.contains('\''))
+        .then_some((column, table))
+}
+
+fn missing_column_message(text: &str, asked: &Asked<'_>) -> String {
+    let (column, table) = missing_column(text).unwrap_or(("?", "?"));
+    format!(
+        "the data of dataset {} for blocks {}-{} was written before one of the requested \
+         fields existed; remove that field from the query or query from a later block \
+         (missing column '{column}' in '{table}')",
+        asked.dataset,
+        asked.range.start(),
+        asked.range.end()
+    )
+}
+
 struct Verdict {
     error: QueryError,
     label: &'static str,
@@ -132,7 +160,7 @@ struct Verdict {
 }
 
 impl Verdict {
-    fn of(err: query_error::Err) -> Self {
+    fn of(err: query_error::Err, asked: &Asked<'_>) -> Self {
         use query_error::Err;
         let row = |error, label, health, backs_off| Verdict {
             error,
@@ -145,6 +173,15 @@ impl Verdict {
             Err::BadRequest(s) if s == STALE_ENVELOPE => {
                 row(QueryError::Retriable(s), "clock_skew", Health::Error, false)
             }
+            // Not a malformed query: the chunk was written before a requested field existed.
+            // The worker refuses on purpose, since null would read as "no data", and another
+            // worker would refuse the same.
+            Err::BadRequest(s) if missing_column(&s).is_some() => row(
+                QueryError::BadRequest(missing_column_message(&s, asked)),
+                "bad_request",
+                Health::Ok,
+                false,
+            ),
             Err::BadRequest(s) => row(
                 QueryError::BadRequest(format!("couldn't parse request: {s}")),
                 "bad_request",
@@ -686,6 +723,7 @@ impl NetworkClient {
         tracing::trace!("Sending query {query_id} to {worker}");
 
         let _guard = QueryGuard::new();
+        let dataset = chunk_id.dataset.clone();
         let query = self
             .prepare_query(
                 worker,
@@ -698,9 +736,11 @@ impl NetworkClient {
                 compression,
             )
             .await;
-        let result = self
-            .execute_query(worker, query, &block_range, priority)
-            .await;
+        let asked = Asked {
+            dataset: &dataset,
+            range: &block_range,
+        };
+        let result = self.execute_query(worker, query, &asked, priority).await;
         result
     }
 
@@ -708,7 +748,7 @@ impl NetworkClient {
         &self,
         worker: PeerId,
         query: Query,
-        block_range: &BlockRange,
+        asked: &Asked<'_>,
         priority: Option<u32>,
     ) -> QueryResult {
         let mut stream = self.send_to_transport(worker, query, priority).await?;
@@ -719,7 +759,7 @@ impl NetworkClient {
             .download_body(worker, &mut stream, &mut buf, priority)
             .await?;
         let query_time = network_start.elapsed();
-        self.finalize_response(worker, buf, block_range, ttfb, transfer_time, query_time)
+        self.finalize_response(worker, buf, asked, ttfb, transfer_time, query_time)
             .await
     }
 
@@ -873,7 +913,7 @@ impl NetworkClient {
         &self,
         worker: PeerId,
         buf: Vec<u8>,
-        block_range: &BlockRange,
+        asked: &Asked<'_>,
         ttfb: Duration,
         transfer_time: Duration,
         query_time: Duration,
@@ -897,7 +937,7 @@ impl NetworkClient {
         } else {
             None
         };
-        self.parse_query_result(worker, result, block_range, throughput)
+        self.parse_query_result(worker, result, asked, throughput)
             .await
             .inspect(|_| metrics::report_query_ok(query_time))
             .map(|ok| QuerySuccess {
@@ -952,9 +992,10 @@ impl NetworkClient {
         &self,
         peer_id: PeerId,
         result: Result<sqd_messages::QueryResult, QueryFailure>,
-        block_range: &BlockRange,
+        asked: &Asked<'_>,
         throughput: Option<f64>,
     ) -> Result<QueryOk, QueryError> {
+        let block_range = asked.range;
         match result {
             Ok(q) if self.verify_responses && !verify_signature(&q, peer_id).await => {
                 metrics::report_query_result(&peer_id, "integrity");
@@ -993,7 +1034,7 @@ impl NetworkClient {
                         Ok(ok)
                     }
                     query_result::Result::Err(sqd_messages::QueryError { err: Some(err) }) => {
-                        let verdict = Verdict::of(err);
+                        let verdict = Verdict::of(err, asked);
                         metrics::report_query_result(&peer_id, verdict.label);
                         match verdict.health {
                             Health::Ok => self.network_state.report_query_success(peer_id, None),
@@ -1300,9 +1341,62 @@ mod tests {
         );
     }
 
+    fn verdict_of(err: query_error::Err) -> Verdict {
+        let dataset = DatasetId::from_url("s3://zora-mainnet");
+        let range = 11_170_000..=11_170_999;
+        Verdict::of(
+            err,
+            &Asked {
+                dataset: &dataset,
+                range: &range,
+            },
+        )
+    }
+
+    #[test]
+    fn missing_column_names_the_range_and_the_fix() {
+        let verdict = verdict_of(query_error::Err::BadRequest(
+            "column 'access_list_size' is not found in 'transactions'".to_owned(),
+        ));
+        let QueryError::BadRequest(message) = verdict.error else {
+            panic!("expected a bad request, got {:?}", verdict.error);
+        };
+        assert_eq!(
+            message,
+            "the data of dataset s3://zora-mainnet for blocks 11170000-11170999 was written \
+             before one of the requested fields existed; remove that field from the query or \
+             query from a later block (missing column 'access_list_size' in 'transactions')"
+        );
+        assert!(!message.contains("couldn't parse request"));
+        assert!(matches!(verdict.health, Health::Ok));
+        assert_eq!(verdict.label, "bad_request");
+        assert!(!verdict.backs_off);
+    }
+
+    #[test]
+    fn only_the_missing_column_text_is_recognised() {
+        assert_eq!(
+            missing_column("column 'a' is not found in 't'"),
+            Some(("a", "t"))
+        );
+        for other in [
+            "column 'a' not found in schema",
+            "column '' is not found in 't'",
+            "unknown field 'a' is not found in 't'",
+            "invalid query signature",
+        ] {
+            assert_eq!(missing_column(other), None, "{other}");
+        }
+        let verdict = verdict_of(query_error::Err::BadRequest("invalid json".to_owned()));
+        assert!(matches!(
+            verdict.error,
+            QueryError::BadRequest(ref m) if m == "couldn't parse request: invalid json"
+        ));
+    }
+
     #[test]
     fn stale_envelope_reroutes() {
-        let verdict = Verdict::of(query_error::Err::BadRequest(STALE_ENVELOPE.to_owned()));
+        let verdict = verdict_of(query_error::Err::BadRequest(STALE_ENVELOPE.to_owned()));
         assert!(matches!(verdict.error, QueryError::Retriable(_)));
         assert!(matches!(verdict.health, Health::Error));
         assert_eq!(verdict.label, "clock_skew");
@@ -1311,7 +1405,7 @@ mod tests {
 
     #[test]
     fn other_bad_requests_stay_terminal() {
-        let verdict = Verdict::of(query_error::Err::BadRequest(
+        let verdict = verdict_of(query_error::Err::BadRequest(
             "invalid query signature".to_owned(),
         ));
         assert!(matches!(verdict.error, QueryError::BadRequest(_)));
@@ -1322,19 +1416,19 @@ mod tests {
     #[test]
     fn server_errors_split_into_three_rows() {
         // The wire's catch-all class; only the message tells the three apart.
-        let mismatch = Verdict::of(query_error::Err::ServerError(
+        let mismatch = verdict_of(query_error::Err::ServerError(
             "unexpected base block: expected 0xabc, but got 42#0xdef".to_owned(),
         ));
         assert!(matches!(mismatch.error, QueryError::BaseBlockMismatch(_)));
         assert_eq!(mismatch.label, "block_mismatch");
 
-        let too_large = Verdict::of(query_error::Err::ServerError(
+        let too_large = verdict_of(query_error::Err::ServerError(
             "Response too large".to_owned(),
         ));
         assert!(matches!(too_large.error, QueryError::BadRequest(_)));
         assert_eq!(too_large.label, "response_too_large");
 
-        let other = Verdict::of(query_error::Err::ServerError("disk on fire".to_owned()));
+        let other = verdict_of(query_error::Err::ServerError("disk on fire".to_owned()));
         assert!(matches!(other.error, QueryError::Failure(_)));
         assert_eq!(other.label, "server_error");
         assert!(matches!(other.health, Health::Error));
